@@ -18478,7 +18478,6 @@ async def send_long_message(
 
     s = text or ""
 
-    # Be safe if SAFE_CHUNK is missing or too large
     max_len = 3800
     try:
         max_len = int(globals().get("SAFE_CHUNK", 3800))
@@ -18489,7 +18488,6 @@ async def send_long_message(
     if max_len < 500:
         max_len = 2000
 
-    # Prefer line-aware chunking so Markdown/HTML/code blocks are less likely to be split.
     chunks = []
     buf = ""
     for line in str(s).splitlines(True):
@@ -18507,7 +18505,19 @@ async def send_long_message(
 
     def _is_parse_entity_error(exc: Exception) -> bool:
         msg = str(exc or '').lower()
-        return ('parse entities' in msg) or ('can\'t parse entities' in msg) or ('entity' in msg and 'parse' in msg)
+        return ('parse entities' in msg) or ("can't parse entities" in msg) or ('entity' in msg and 'parse' in msg)
+
+    # Production safety: Telegram Markdown parsing is fragile when long admin reports
+    # contain code fences/JSON/tables and the text has to be chunked. Do not spend retry
+    # time on entity parse failures; either send safe plain text up front for risky
+    # multi-chunk code-block payloads, or immediately fall back to plain text.
+    requested_parse_mode = parse_mode
+    try:
+        pm_name = str(parse_mode or '').lower()
+        if len(chunks) > 1 and '```' in str(s) and ('markdown' in pm_name):
+            parse_mode = None
+    except Exception:
+        pass
 
     first = True
     for ch in chunks:
@@ -18520,11 +18530,18 @@ async def send_long_message(
                 reply_markup=reply_markup if first else None,
             )
 
-        # Try with requested parse_mode first (or None). If Telegram rejects entities,
-        # immediately fall back to plain text. This fixes admin JSON/report outputs where
-        # underscores/brackets or chunked code fences can break Markdown parsing.
         try:
             await _send(parse_mode)
+
+        except BadRequest as e:
+            if _is_parse_entity_error(e):
+                logger.warning("Telegram parse_mode rejected; sent plain fallback (requested=%s): %s", requested_parse_mode, e)
+            else:
+                logger.warning("Telegram BadRequest (parse_mode=%s): %s | Falling back to plain text.", parse_mode, e)
+            try:
+                await _send(None)
+            except Exception as e2:
+                logger.warning("Telegram fallback send failed: %s", e2)
 
         except RetryAfter as e:
             wait_s = int(getattr(e, "retry_after", 1)) + 1
@@ -18541,13 +18558,13 @@ async def send_long_message(
                     logger.warning("Telegram retry failed after RetryAfter: %s", e2)
 
         except (TimedOut, NetworkError) as e:
-            logger.warning("Telegram send failed (network): %s", e)
             if _is_parse_entity_error(e):
                 try:
                     await _send(None)
                 except Exception as e2:
                     logger.warning("Telegram plain fallback failed: %s", e2)
             else:
+                logger.warning("Telegram send failed (network): %s", e)
                 await asyncio.sleep(2)
                 try:
                     await _send(parse_mode)
@@ -18560,13 +18577,6 @@ async def send_long_message(
                     else:
                         logger.warning("Telegram retry failed (network): %s", e2)
 
-        except BadRequest as e:
-            logger.warning("Telegram BadRequest (parse_mode=%s): %s | Falling back to plain text.", parse_mode, e)
-            try:
-                await _send(None)
-            except Exception as e2:
-                logger.warning("Telegram fallback send failed: %s", e2)
-
         except Exception as e:
             if _is_parse_entity_error(e):
                 try:
@@ -18577,6 +18587,7 @@ async def send_long_message(
                 logger.exception("Telegram send failed: %s", e)
 
         first = False
+
 
 # =========================================================
 # SIGNAL IDs
@@ -22103,26 +22114,47 @@ def _fmt_wr_block(title: str, item: dict) -> str:
     )
 
 
-async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    uid = int(update.effective_user.id)
-    snap = await to_thread_fast(_evolution_snapshot_cached)
-    if not snap:
-        await update.message.reply_text("No evolution snapshot yet.")
-        return
+def _edge_status_text(uid: int) -> str:
+    """Cached, worker-safe text builder for /edge_status.
 
-    overall = snap.get("overall") or {}
-    ny = snap.get("ny") or {}
+    Do not run this inline on the Telegram event loop: signal WR display can touch DB
+    and, in live mode, may opportunistically sync exchange-backed outcomes. Keeping it
+    in a worker with a short command timeout protects /status, /screen, and Telegram
+    responsiveness when admin diagnostics are requested during optimizer/backtest work.
+    """
+    uid = int(uid or 0)
+    cache_key = 'edge_status'
+    try:
+        cached = _admin_status_cache_get(cache_key, ttl=45.0)
+        if cached:
+            return str(cached)
+    except Exception:
+        pass
+
+    snap = _evolution_snapshot_cached()
+    if not snap:
+        return "No evolution snapshot yet."
+
     trend = snap.get("trend") or {}
-    last_opt = _db_get_last_opt_run() or {}
-    opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
-    verdict, blockers = _admin_assurance_verdict(uid)
+    try:
+        last_opt = _db_get_last_opt_run() or {}
+        opt_res = _db_get_opt_result(str(last_opt.get("run_id") or "")) if last_opt else {}
+    except Exception:
+        opt_res = {}
+    try:
+        verdict, blockers = _admin_assurance_verdict(uid)
+    except Exception as e:
+        verdict, blockers = 'CHECK REQUIRED', [f'assurance_error={type(e).__name__}']
     opt_live = bool((opt_res or {}).get("promoted"))
     owner = int(AUTOTRADE_OWNER_UID or uid)
-    overall_sig = _signal_wr_display_metrics(owner)
-    ny_sig = _signal_wr_display_metrics(owner, session='NY')
+    try:
+        overall_sig = _signal_wr_display_metrics(owner)
+    except Exception:
+        overall_sig = {}
+    try:
+        ny_sig = _signal_wr_display_metrics(owner, session='NY')
+    except Exception:
+        ny_sig = {}
 
     lines = [
         "🧠 Edge Status",
@@ -22140,7 +22172,42 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Latest optimizer result: {'PROMOTED TO LIVE PARAMS' if opt_live else 'NO NEW LIVE PARAMS PROMOTED'}",
         f"Detailed learning view: /learning_status",
     ]
-    await send_long_message(update, "\n".join(_compact_text_lines(lines)), parse_mode=None)
+    txt = "\n".join(_compact_text_lines(lines))
+    try:
+        _admin_status_cache_put(cache_key, txt)
+    except Exception:
+        pass
+    return txt
+
+
+async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    uid = int(update.effective_user.id)
+    cache_key = 'edge_status'
+    try:
+        cached = _admin_status_cache_get(cache_key, ttl=45.0)
+        if cached:
+            await send_long_message(update, cached, parse_mode=None)
+            return
+    except Exception:
+        pass
+    try:
+        txt = await to_thread_heavy(_edge_status_text, uid, timeout=max(3, int(FAST_ADMIN_COMMAND_TIMEOUT_SEC)))
+    except asyncio.TimeoutError:
+        stale = _admin_status_cache_get(cache_key, ttl=900.0)
+        if stale:
+            txt = str(stale) + "\n\n⏳ Note: live edge metrics are refreshing; showing latest cached snapshot."
+        else:
+            txt = "⏳ Edge-status snapshot is refreshing. Try /edge_status again in a few seconds. Other commands remain responsive."
+    except Exception as e:
+        stale = _admin_status_cache_get(cache_key, ttl=900.0)
+        if stale:
+            txt = str(stale) + f"\n\n⚠️ Refresh failed: {type(e).__name__}. Showing cached snapshot."
+        else:
+            txt = f"⚠️ Edge-status snapshot failed: {type(e).__name__}: {e}"
+    await send_long_message(update, txt, parse_mode=None)
 
 
 def _canon_signal_outcome_label(outcome: str, pnl: float | None = None) -> str:
@@ -26733,11 +26800,26 @@ async def goal_profile_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text('Invalid numbers. Example: /goal_set 5 8 60 0.10')
         return
     cfg = load_strategy_config(force=True)
-    cfg['goal_profile_target_setups_per_day_lo'] = float(max(0.1, lo))
-    cfg['goal_profile_target_setups_per_day_hi'] = float(max(cfg['goal_profile_target_setups_per_day_lo'], hi))
+    target_lo = float(max(0.1, lo))
+    target_hi = float(max(target_lo, hi))
+    cfg['goal_profile_target_setups_per_day_lo'] = target_lo
+    cfg['goal_profile_target_setups_per_day_hi'] = target_hi
     cfg['goal_profile_target_win_rate'] = float(max(1.0, min(95.0, wr)))
     if avg_r is not None:
         cfg['goal_profile_target_avg_r'] = float(avg_r)
+
+    # Keep the self-improvement stack wired to the same operator goal. Previously
+    # /goal_set only changed the goal-profile optimizer target, while the generic
+    # optimizer/objective, governor, and market-adaptive modules could continue using
+    # stale setup-frequency targets. That made diagnostics look contradictory and could
+    # let self-optimization fight the operator's requested daily setup range.
+    cfg['target_setups_per_day_lo'] = target_lo
+    cfg['target_setups_per_day_hi'] = target_hi
+    cfg['governor_target_lo'] = target_lo
+    cfg['governor_target_hi'] = target_hi
+    cfg['market_adaptive_target_setups_per_day_lo'] = target_lo
+    cfg['market_adaptive_target_setups_per_day_hi'] = target_hi
+
     save_strategy_config(cfg)
     apply_strategy_config(cfg)
     await update.message.reply_text(f"✅ Goal updated: {cfg['goal_profile_target_setups_per_day_lo']:.2f}–{cfg['goal_profile_target_setups_per_day_hi']:.2f}/day | WR≥{cfg['goal_profile_target_win_rate']:.1f}% | AvgR≥{float(cfg.get('goal_profile_target_avg_r', 0.10) or 0.10):.2f}")
