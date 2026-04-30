@@ -37203,37 +37203,205 @@ def _schedule_screen_cache_refresh(uid: int, session: str | None = None) -> None
 
 
 def _screen_plain_cleanup(txt: str) -> str:
-    """Return Telegram-safe plain text for /screen.
-
-    The old /screen body was Markdown-heavy and TradingView URLs/underscores could
-    make Telegram reject Markdown, which then displayed raw * and ` characters.
-    /screen is now intentionally plain text, with the TradingView buttons kept as
-    inline keyboard actions.
-    """
+    """Legacy plain-text fallback. /screen now uses HTML rendering instead."""
     try:
         import re as _re
         t = str(txt or '')
         out = []
         for line in t.splitlines():
-            ls = line.strip()
-            if ls == '```':
+            if line.strip() == '```':
                 continue
-            # Remove Telegram Markdown markers, but keep normal text and URLs.
-            line = line.replace('`', '')
-            line = line.replace('*', '')
-            # Remove italics markers only when they wrap the whole line.
+            line = line.replace('`', '').replace('*', '')
             st = line.strip()
             if len(st) >= 2 and st.startswith('_') and st.endswith('_'):
                 line = line.replace('_', '')
-            # Compact excessive chart URLs in setup cards; the inline buttons are the main chart action.
-            line = _re.sub(r'^Chart:\s*(https://www\.tradingview\.com/chart/\?symbol=BYBIT:[A-Z0-9]+USDT\.P)\s*$', r'Chart: \1', line)
             out.append(line.rstrip())
-        # Collapse 3+ blank lines to 2.
-        t = '\n'.join(out)
-        t = _re.sub(r'\n{3,}', '\n\n', t).strip()
-        return t
+        return _re.sub(r'\n{3,}', '\n\n', '\n'.join(out)).strip()
     except Exception:
         return str(txt or '')
+
+
+def _screen_markdown_to_html(txt: str) -> str:
+    """Render the old nice /screen Markdown layout as Telegram-safe HTML.
+
+    This keeps the previous readable format (bold headers, italic notes, inline
+    code, and copyable table boxes) without risking raw '*', '`' or code fences
+    appearing when Telegram Markdown parsing fails.
+    """
+    try:
+        import re as _re
+        import html as _html
+        text = str(txt or '')
+        out = []
+        in_code = False
+        code_buf = []
+
+        def _flush_code():
+            nonlocal code_buf
+            if code_buf:
+                raw = '\n'.join(code_buf).rstrip('\n')
+                out.append('<pre>' + _html.escape(raw, quote=False) + '</pre>')
+                code_buf = []
+
+        def _inline(line: str) -> str:
+            escaped = _html.escape(str(line or ''), quote=False)
+            # inline code first so bold conversion does not touch command text
+            escaped = _re.sub(r'`([^`]+)`', lambda m: '<code>' + m.group(1) + '</code>', escaped)
+            escaped = _re.sub(r'\*([^*\n]+)\*', lambda m: '<b>' + m.group(1) + '</b>', escaped)
+            st = escaped.strip()
+            if len(st) >= 2 and st.startswith('_') and st.endswith('_'):
+                inner = st[1:-1]
+                prefix = escaped[:len(escaped) - len(escaped.lstrip())]
+                suffix = escaped[len(escaped.rstrip()):]
+                escaped = prefix + '<i>' + inner + '</i>' + suffix
+            return escaped
+
+        for line in text.splitlines():
+            if line.strip() == '```':
+                if in_code:
+                    _flush_code()
+                    in_code = False
+                else:
+                    in_code = True
+                    code_buf = []
+                continue
+            if in_code:
+                code_buf.append(line)
+            else:
+                out.append(_inline(line.rstrip()))
+        if in_code:
+            _flush_code()
+        rendered = '\n'.join(out)
+        rendered = _re.sub(r'\n{3,}', '\n\n', rendered).strip()
+        return rendered
+    except Exception:
+        return _screen_plain_cleanup(txt)
+
+
+def _screen_display_limit() -> int:
+    try:
+        return max(1, min(5, int(os.environ.get('SCREEN_MAX_CARDS_DISPLAY', '5') or 5)))
+    except Exception:
+        return 5
+
+
+def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
+    """Return the nice card-style Markdown body used by /screen."""
+    if not setups:
+        return "_No high-quality setups right now._"
+
+    def _mv_dot(p: float) -> str:
+        try:
+            p = float(p or 0.0)
+        except Exception:
+            p = 0.0
+        if abs(p) < 2.0:
+            return "🟡"
+        return "🟢" if p >= 0 else "🔴"
+
+    lines2 = []
+    for s in list(setups or [])[:_screen_display_limit()]:
+        try:
+            sym = str(getattr(s, "symbol", "") or "").upper()
+            sid = str(getattr(s, "setup_id", "") or "")
+            side = str(getattr(s, "side", "") or "").upper()
+            conf = int(getattr(s, "conf", 0) or 0)
+            entry = float(getattr(s, "entry", 0.0) or 0.0)
+            sl = float(getattr(s, "sl", 0.0) or 0.0)
+            tp = float(_setup_target_tp(s, 0.0) or 0.0)
+            vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+            ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
+            ch4 = float(getattr(s, "ch4", 0.0) or 0.0)
+            ch1 = float(getattr(s, "ch1", 0.0) or 0.0)
+            ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
+            rr_den = abs(entry - sl)
+            rr = (abs(float(tp) - entry) / rr_den) if (rr_den > 0 and tp not in (None, 0, 0.0)) else 0.0
+            pos_word = "long" if side == "BUY" else "short"
+            size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+            emoji = "🟢" if side == "BUY" else "🔴"
+            typ = _setup_display_label(s)
+            block = []
+            block.append(f"{emoji} *{side} — {sym}*")
+            block.append(f"`{sid}` | Conf: `{conf}`")
+            try:
+                if symbol_recently_emailed(uid, sym, side, session):
+                    block.append("📩 *Email suppressed:* cooldown active")
+            except Exception:
+                pass
+            block.append(f"Type: {typ} | RR(TP): `{rr:.2f}`")
+            block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
+            block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp, 0.0, 0.0, side) or 0.0))}`")
+            block.append(
+                f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
+                f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
+            )
+            block.append(f"Volume: ~{vol/1e6:.1f}M")
+            block.append(f"Chart: {tv_chart_url(sym)}")
+            block.append(f"`{size_cmd}`")
+            lines2.append("\n".join(block))
+        except Exception:
+            continue
+
+    return ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
+
+
+def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int = 30):
+    """Lightweight no-OHLCV /screen fallback from the executable/candidate DB.
+
+    Used after a redeploy when memory cache is empty but a setup email or executable
+    queue was just created. It prevents /screen from showing only the ticker snapshot
+    while valid recent setups already exist in SQLite.
+    """
+    try:
+        sess = str(session or '').upper().strip()
+        cutoff = float(time.time()) - float(max(2, int(max_age_min))) * 60.0
+        out = []
+        seen = set()
+        try:
+            rows = db_list_executable_setups(int(uid), session_name=sess, ts_from=cutoff, limit=20)
+            candidates = _executable_rows_to_setup_objects(rows, session_name=sess)
+        except Exception:
+            candidates = []
+        if not candidates:
+            try:
+                candidates = _db_recent_candidate_setup_objects(int(uid), session_name=sess, max_age_min=max_age_min, limit=20) or []
+            except Exception:
+                candidates = []
+        for item in candidates:
+            try:
+                sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+                sym = str(getattr(item, 'symbol', '') or '').upper().strip()
+                if not sid or not sym or sid in seen:
+                    continue
+                ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=sess)
+                if not ok_exec:
+                    continue
+                out.append(item)
+                seen.add(sid)
+                if len(out) >= _screen_display_limit():
+                    break
+            except Exception:
+                continue
+        if not out:
+            return '', [], []
+        try:
+            up_list, dn_list = compute_directional_lists(best_fut or {})
+        except Exception:
+            up_list, dn_list = [], []
+        market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list[:5], losers=dn_list[:5])
+        body = "\n".join([
+            "",
+            "*Top Trade Setups*",
+            SEP,
+            "_Showing recent executable setups from the saved queue while the live scan refreshes._",
+            _screen_format_setup_cards(out, int(uid), sess),
+            "",
+            market_txt or "",
+        ]).strip()
+        kb = [(str(getattr(s, 'symbol', '') or '').upper(), str(getattr(s, 'setup_id', '') or '')) for s in out]
+        return body, kb, list(out)
+    except Exception:
+        return '', [], []
 
 
 def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
@@ -37345,10 +37513,10 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     if not setups and _exec_ready:
         setups = list(_exec_ready[:max(1, int(SETUPS_N))])
 
-    # Keep /screen readable: show max 5 top trade cards. The executable queue can
-    # still hold more for email/autotrade; /screen is an action dashboard, not a dump.
+    # Keep /screen readable. The executable queue can still hold more for email/autotrade;
+    # /screen is an action dashboard, not a dump.
     try:
-        setups = list(setups or [])[:min(5, max(1, int(SETUPS_N)))]
+        setups = list(setups or [])[:_screen_display_limit()]
     except Exception:
         setups = list(setups or [])[:5]
 
@@ -37371,78 +37539,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         pass
 
     # Setup cards -> combined text (single "Top Trade Setups" section)
-    combined_setups_txt = "_No high-quality setups right now._"
-    if setups:
-        def _mv_dot(p: float) -> str:
-            try:
-                p = float(p or 0.0)
-            except Exception:
-                p = 0.0
-            if abs(p) < 2.0:
-                return "🟡"
-            return "🟢" if p >= 0 else "🔴"
-
-        lines2 = []
-        for s in setups:
-            try:
-                sym = str(getattr(s, "symbol", "")).upper()
-                sid = str(getattr(s, "setup_id", "") or "")
-                side = str(getattr(s, "side", "") or "").upper()
-                conf = int(getattr(s, "conf", 0) or 0)
-
-                entry = float(getattr(s, "entry", 0.0) or 0.0)
-                sl = float(getattr(s, "sl", 0.0) or 0.0)
-                tp = float(_setup_target_tp(s, 0.0) or 0.0)
-                alt_target_a = 0.0
-                alt_target_b = 0.0
-                vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
-
-                ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
-                ch4 = float(getattr(s, "ch4", 0.0) or 0.0)
-                ch1 = float(getattr(s, "ch1", 0.0) or 0.0)
-                ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
-
-                rr_den = abs(entry - sl)
-                rr1 = (abs(float(tp) - entry) / rr_den) if (rr_den > 0 and tp not in (None, 0, 0.0)) else 0.0
-                rr2 = 0.0
-                rr3 = rr1
-
-                pos_word = "long" if side == "BUY" else "short"
-                size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
-
-                emoji = "🟢" if side == "BUY" else "🔴"
-                typ = _setup_display_label(s)
-
-                # Card-style formatting (same as previous detailed preview) + /size command
-                block = []
-                block.append(f"{emoji} *{side} — {sym}*")
-                block.append(f"`{sid}` | Conf: `{conf}`")
-                try:
-                    if symbol_recently_emailed(uid, sym, side, session):
-                        block.append("📩 *Email suppressed:* cooldown active")
-                except Exception:
-                    pass
-                if tp not in (None, 0, 0.0) and alt_target_a not in (None, 0, 0.0):
-                    block.append(f"Type: {typ} | RR(TP): `{(rr1 or rr2 or rr3):.2f}`")
-                else:
-                    block.append(f"Type: {typ} | RR(TP): `{(rr1 or rr2 or rr3):.2f}`")
-                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
-                if tp not in (None, 0, 0.0) and alt_target_a not in (None, 0, 0.0):
-                    block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp, alt_target_a, alt_target_b, side) or 0.0))}`")
-                else:
-                    block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp, alt_target_a, alt_target_b, side) or 0.0))}`")
-                block.append(
-                    f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
-                    f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
-                )
-                block.append(f"Volume: ~{vol/1e6:.1f}M")
-                block.append(f"Chart: {tv_chart_url(sym)}")
-                block.append(f"`{size_cmd}`")
-                lines2.append("\n".join(block))
-            except Exception:
-                continue
-
-        combined_setups_txt = ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
+    combined_setups_txt = _screen_format_setup_cards(setups, int(uid), str(session or ''))
 
     # -----------------------------------------------------
     # UX: Keep /screen clean and action-first.
@@ -37620,11 +37717,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
 
     kb = []
     try:
-        body = _screen_plain_cleanup(body)
-    except Exception:
-        pass
-    try:
-        kb = [(s.symbol, s.setup_id) for s in (setups or [])][:min(5, max(1, int(SETUPS_N)))]
+        kb = [(s.symbol, s.setup_id) for s in (setups or [])][:_screen_display_limit()]
     except Exception:
         kb = []
     return body, kb, list(setups or [])
@@ -37846,8 +37939,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             await send_long_message(
                 update,
-                _screen_plain_cleanup((header + "\n" + str(cache_entry.get('body') or '')).strip()),
-                parse_mode=None,
+                _screen_markdown_to_html((header + "\n" + str(cache_entry.get('body') or '')).strip()),
+                parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
@@ -37856,6 +37949,55 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Telegram command path. That was the source of visible lag and Render warnings.
         # A dedicated background refresh was already queued above; return a ticker
         # snapshot immediately so /equity, /why, /status and /open_trades stay responsive.
+
+        # First try a lightweight SQLite fallback. This is important immediately after
+        # deployment: memory cache is empty, but recent executable/email setups may
+        # already exist in the DB and should be visible on /screen.
+        try:
+            quick_best = get_cached_futures_tickers() or {}
+            if quick_best:
+                body, kb, shown_setups = _screen_recent_db_body_and_kb(
+                    int(uid),
+                    str(scan_session or '').upper(),
+                    quick_best,
+                    max_age_min=max(10, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)),
+                )
+                if body:
+                    header = (
+                        f"*PulseFutures — Market Scan*\n"
+                        f"{HDR}\n"
+                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                        f"_Showing recent executable setup queue while full scan refreshes._\n"
+                    )
+                    keyboard = [
+                        [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                        for (sym, sid) in (kb or [])
+                    ]
+                    await send_long_message(
+                        update,
+                        _screen_markdown_to_html((header + "\n" + body).strip()),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+                    )
+                    if MANUAL_SCREEN_SYNC_ENABLED and shown_setups:
+                        try:
+                            _safe_create_task(
+                                _screen_sync_pipeline_async(
+                                    int(uid),
+                                    dict(user or {}),
+                                    str(live_session or ''),
+                                    str(scan_session or ''),
+                                    quick_best,
+                                    list(shown_setups or []),
+                                ),
+                                'screen_db_sync_once'
+                            )
+                        except Exception:
+                            pass
+                    return
+        except Exception:
+            pass
 
         # Last-resort instant ticker snapshot from cached tickers. Do NOT cache it as a
         # full scan, otherwise it suppresses the next real rebuild for MAX_STALE_SCAN_SEC.
@@ -37871,8 +38013,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await send_long_message(
                     update,
-                    _screen_plain_cleanup((header + "\n" + body).strip()),
-                    parse_mode=None,
+                    _screen_markdown_to_html((header + "\n" + body).strip()),
+                    parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
                 return
@@ -37919,8 +38061,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]
                 await send_long_message(
                     update,
-                    _screen_plain_cleanup((header + "\n" + str(cache_entry.get('body') or '')).strip()),
-                    parse_mode=None,
+                    _screen_markdown_to_html((header + "\n" + str(cache_entry.get('body') or '')).strip()),
+                    parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                     reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
                 )
@@ -37961,8 +38103,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             await send_long_message(
                 update,
-                _screen_plain_cleanup((header + "\n" + str(cache_entry.get("body") or "")).strip()),
-                parse_mode=None,
+                _screen_markdown_to_html((header + "\n" + str(cache_entry.get("body") or "")).strip()),
+                parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
@@ -38001,7 +38143,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cached_body = str(cache_entry.get("body") or "")
             cached_kb = list(cache_entry.get("kb") or [])
 
-            msg = _screen_plain_cleanup((header + "\n" + cached_body).strip())
+            msg = _screen_markdown_to_html((header + "\n" + cached_body).strip())
 
             keyboard = [
                 [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
@@ -38016,7 +38158,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_long_message(
                 update,
                 msg,
-                parse_mode=None,
+                parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
@@ -38031,7 +38173,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cached_body = str(cache_entry.get("body") or "")
                 cached_kb = list(cache_entry.get("kb") or [])
 
-                msg = _screen_plain_cleanup((header + "\n" + cached_body).strip())
+                msg = _screen_markdown_to_html((header + "\n" + cached_body).strip())
                 keyboard = [
                     [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
                     for (sym, sid) in (cached_kb or [])
@@ -38045,7 +38187,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_long_message(
                     update,
                     msg,
-                    parse_mode=None,
+                    parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                     reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
                 )
@@ -38076,7 +38218,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Send final
         cache_entry = _SCREEN_CACHE.get(cache_key) or {}
-        msg = _screen_plain_cleanup((header + "\n" + str(cache_entry.get("body") or "")).strip())
+        msg = _screen_markdown_to_html((header + "\n" + str(cache_entry.get("body") or "")).strip())
         keyboard = [
             [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
             for (sym, sid) in (cache_entry.get("kb") or [])
@@ -38090,7 +38232,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_message(
             update,
             msg,
-            parse_mode=None,
+            parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
         )
