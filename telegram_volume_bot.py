@@ -1407,6 +1407,26 @@ DB_PATH = os.environ.get("DB_PATH", "/var/data/pulsefutures.db")
 # If this is missing, heavy optimizer jobs may incorrectly run during active trading hours.
 TIMEZONE = os.environ.get("TIMEZONE", "Australia/Melbourne").strip() or "Australia/Melbourne"
 
+# Production local-time default. All user-facing dates/session windows should
+# default to the configured bot timezone, not UTC, when a user has no saved tz.
+def _default_user_tz_name() -> str:
+    try:
+        return str(os.environ.get("DEFAULT_USER_TZ") or globals().get("TIMEZONE") or "Australia/Melbourne").strip() or "Australia/Melbourne"
+    except Exception:
+        return "Australia/Melbourne"
+
+def _zoneinfo_or_default(tz_name=None):
+    name = str(tz_name or _default_user_tz_name()).strip() or _default_user_tz_name()
+    try:
+        return ZoneInfo(name), name
+    except Exception:
+        fallback = _default_user_tz_name()
+        try:
+            return ZoneInfo(fallback), fallback
+        except Exception:
+            return timezone.utc, "UTC"
+
+
 CHECK_INTERVAL_MIN = int(os.environ.get("CHECK_INTERVAL_MIN", "1"))
 MANUAL_SCREEN_SYNC_ENABLED = True  # /screen uses the executable lane and may sync shown setups into email/autotrade
 
@@ -10820,7 +10840,7 @@ def get_user(user_id: int) -> dict:
     row = cur.fetchone()
 
     if not row:
-        tz_name = os.environ.get("DEFAULT_USER_TZ", "UTC")
+        tz_name = _default_user_tz_name()
         sessions = ['NY', 'LON', 'ASIA']
         now_local = datetime.now(ZoneInfo(tz_name)).date().isoformat()
         cur.execute("""
@@ -12511,7 +12531,7 @@ def _trading_day_context(user: dict, now_ts: Optional[float] = None) -> dict:
     Handles DST safely by building local wall-clock anchors for today/tomorrow.
     """
     tz = _user_tzinfo(user)
-    tz_name = tz.key if hasattr(tz, 'key') else str((user or {}).get('tz') or 'UTC')
+    tz_name = tz.key if hasattr(tz, 'key') else str((user or {}).get('tz') or _default_user_tz_name())
     anchor = _user_day_reset_hhmm(user)
     hh, mm = _parse_anchor_hhmm(anchor)
     now_local = datetime.fromtimestamp(float(now_ts), tz) if now_ts is not None else datetime.now(tz)
@@ -12622,7 +12642,7 @@ def _admin_today_window_utc(now_utc: Optional[datetime] = None, uid: Optional[in
         except Exception:
             base_user = {}
     if not base_user:
-        base_user = {'tz': 'UTC', 'day_reset_hhmm': DEFAULT_USER_DAY_RESET_HHMM}
+        base_user = {'tz': _default_user_tz_name(), 'day_reset_hhmm': DEFAULT_USER_DAY_RESET_HHMM}
 
     now_ts = None
     if isinstance(now_utc, datetime):
@@ -12658,11 +12678,14 @@ def _parse_anchor_hhmm(anchor_hhmm: str) -> tuple[int, int]:
 
 
 def _user_tzinfo(user: dict):
-    tz_name = str((user or {}).get("tz") or (user or {}).get("timezone") or "UTC").strip()
+    tz_name = str((user or {}).get("tz") or (user or {}).get("timezone") or _default_user_tz_name()).strip()
     try:
         return ZoneInfo(tz_name)
     except Exception:
-        return ZoneInfo("UTC")
+        try:
+            return ZoneInfo(_default_user_tz_name())
+        except Exception:
+            return timezone.utc
 
 
 def _user_day_reset_hhmm(user: dict) -> str:
@@ -17882,7 +17905,7 @@ def in_trade_window_now(user: dict, now_local: Optional[datetime] = None) -> boo
 
     # User timezone
     try:
-        tz = ZoneInfo(str(user.get("tz") or "UTC"))
+        tz, _ = _zoneinfo_or_default(user.get("tz") or user.get("timezone"))
     except Exception:
         tz = timezone.utc
 
@@ -22195,7 +22218,7 @@ def _signal_report_exchange_events_by_key(ts_from: float) -> dict[tuple[str, str
 def _signal_report_resolve_rows(user_id: int, emailed: list[dict], user: dict | None = None) -> tuple[list[dict], int]:
     user_id = int(user_id)
     try:
-        tz = ZoneInfo(str((user or {}).get('tz') or 'UTC'))
+        tz, _ = _zoneinfo_or_default((user or {}).get('tz') or (user or {}).get('timezone'))
     except Exception:
         tz = timezone.utc
     live_mode = str(_autotrade_runtime_mode()).lower() == 'live' and int(user_id) == int(AUTOTRADE_OWNER_UID or 0)
@@ -29442,7 +29465,7 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
     merged.update(dict(user or {}))
     user = merged
     try:
-        tz = ZoneInfo(str(user.get('tz') or 'UTC'))
+        tz, _ = _zoneinfo_or_default(user.get('tz') or user.get('timezone'))
     except Exception:
         tz = timezone.utc
     # Use the anchored trading day (/dayreset), not midnight local day.
@@ -29657,7 +29680,7 @@ def send_email(
         if enforce_trade_window:
             try:
                 try:
-                    tz = ZoneInfo(str(user.get("tz") or "UTC"))
+                    tz, _ = _zoneinfo_or_default(user.get("tz") or user.get("timezone"))
                 except Exception:
                     tz = timezone.utc
                 now_local = datetime.now(tz)
@@ -29923,12 +29946,7 @@ async def email_test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Local time (user TZ)
-    tz_name = str(user.get("tz") or "UTC")
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-        tz_name = "UTC"
+    tz, tz_name = _zoneinfo_or_default(user.get("tz") or user.get("timezone"))
     now_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
     subject = "PulseFutures — Email Test ✅"
@@ -30100,8 +30118,7 @@ def _guess_session_name_utc(now_utc: datetime) -> str:
 
 def in_session_now(user: dict) -> Optional[dict]:
     try:
-        tz_name = str((user or {}).get("tz") or "UTC")
-        tz = ZoneInfo(tz_name)
+        tz, tz_name = _zoneinfo_or_default((user or {}).get("tz") or (user or {}).get("timezone"))
     except Exception:
         tz = timezone.utc
     now_local = datetime.now(tz)
@@ -31619,7 +31636,7 @@ async def dayreset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current = _user_day_reset_hhmm(user)
     if not context.args:
         await update.message.reply_text(
-            f"Your daily reset anchor: {current} ({user.get('tz','UTC')})\n\n"
+            f"Your daily reset anchor: {current} ({user.get('tz') or _default_user_tz_name()})\n\n"
             "Set with: /dayreset HH:MM\n"
             "Examples:\n"
             "• /dayreset 00:00\n"
@@ -36138,12 +36155,7 @@ def user_location_and_time(user: dict):
     """
     Returns: (location_label, time_str) based on user's tz
     """
-    tz_name = str((user or {}).get("tz") or "UTC")
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = timezone.utc
-        tz_name = "UTC"
+    tz, tz_name = _zoneinfo_or_default((user or {}).get("tz") or (user or {}).get("timezone"))
 
     now_local = datetime.now(tz)
 
@@ -37564,12 +37576,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         return False
 
     uid = int(user["user_id"])
-    user_tz = str(user.get("tz") or "UTC")
-    try:
-        tz = ZoneInfo(user_tz)
-    except Exception:
-        tz = timezone.utc
-        user_tz = "UTC"
+    tz, user_tz = _zoneinfo_or_default(user.get("tz") or user.get("timezone"))
 
     now_local = datetime.now(tz)
 
@@ -38410,8 +38417,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             if not user_has_pro(uid):
                 continue
             try:
-                tz_name = str((u or {}).get("tz") or (get_user(uid) or {}).get("tz") or "UTC")
-                tz = ZoneInfo(tz_name)
+                tz_name = str((u or {}).get("tz") or (get_user(uid) or {}).get("tz") or _default_user_tz_name())
+                tz, tz_name = _zoneinfo_or_default(tz_name)
             except Exception:
                 tz = timezone.utc
             # Big-Move must not wait behind the session setup pool. DELAYFIX4
@@ -38447,11 +38454,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             if not uid:
                 continue
 
-            tz_name = str(user.get("tz") or "UTC")
-            try:
-                tz = ZoneInfo(tz_name)
-            except Exception:
-                tz = timezone.utc
+            tz, tz_name = _zoneinfo_or_default(user.get("tz") or user.get("timezone"))
 
             try:
                 sess = in_session_now(user)
@@ -39783,7 +39786,7 @@ async def admin_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         d = dict(r)
         uid = int(d.get("user_id") or 0)
-        tz = str(d.get("tz") or "UTC")
+        tz = str(d.get("tz") or _default_user_tz_name())
 
         # Use effective plan logic
         plan = str(effective_plan(uid, d)).upper()
