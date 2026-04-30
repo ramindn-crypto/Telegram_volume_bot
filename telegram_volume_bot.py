@@ -11675,6 +11675,8 @@ def _bigmove_confirm_next_15m_for_user(uid: int, candidates: list, p15: float, p
         try:
             if not bool(BIGMOVE_ALLOW_COLD_CONFIRM_FETCH):
                 return False
+            if _ohlcv_timeframe_cooling("15m"):
+                return False
             max_cold = max(0, int(BIGMOVE_CONFIRM_COLD_FETCH_MAX or 0))
             if cold_confirm_used >= max_cold:
                 return False
@@ -12004,6 +12006,7 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
                 and getattr(mv, "symbol", None)
                 and bool(BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK)
                 and fallback_symbols_checked < fallback_symbol_budget
+                and not _ohlcv_timeframe_cooling("15m", "1h")
             )
             if allow_symbol_fallback:
                 fallback_symbols_checked += 1
@@ -37911,17 +37914,17 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "70"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "300"))
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "3"))
-ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "3"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "2"))
+ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "2"))
 ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC", "12"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
 ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", False)
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
-BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "45") or 45)
+BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "60") or 60)
 EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
@@ -38308,7 +38311,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             rebuilds. It still respects confirmation, volume, cooldown, and SMTP status.
             """
             try:
-                payload_timeout = max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 45))
+                payload_timeout = max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60))
                 try:
                     payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=payload_timeout)
                 except asyncio.TimeoutError:
@@ -38969,9 +38972,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
             try:
                 try:
-                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 45)))
+                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60)))
                 except asyncio.TimeoutError:
-                    payload = {"status": "SKIP", "reasons": [f"bigmove_payload_timeout>{max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 45))}s"]}
+                    payload = {"status": "SKIP", "reasons": [f"bigmove_payload_timeout>{max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60))}s"]}
                 pstatus = str((payload or {}).get('status') or '').upper().strip()
                 if pstatus != 'READY':
                     _LAST_BIGMOVE_DECISION[uid] = {
@@ -39145,7 +39148,7 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
     lines.append(f"Thresholds: |15m| ≥ {bigm_p15:g}% AND |1H| ≥ {bigm_p1:g}% AND |4H| ≥ {bigm_p4:g}% (same direction only)")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
-    lines.append(f"Payload timeout: {int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 45)}s")
+    lines.append(f"Payload timeout: {int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60)}s")
     if bigm_updated_ts > 0:
         lines.append("Updated: " + _fmt_when_local(bigm_updated_ts))
     if bigm_updated_reason:
@@ -40392,7 +40395,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 and not tf_cooling
                 and not _job_budget_exhausted()
                 and bool(AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY)
-                and not _interactive_runtime_busy(240)
+                and not _live_trade_runtime_busy(240)
                 and _heavy_background_window_ok()
             ):
                 remaining_budget = max(4.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 22) - (time.time() - job_started_ts))
