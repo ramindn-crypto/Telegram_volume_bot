@@ -3122,6 +3122,8 @@ def _tz_melbourne():
     except Exception:
         return timezone.utc
 
+MEL_TZ = _tz_melbourne()
+
 def _parse_iso_utcish(iso_s: str) -> Optional[datetime]:
     """Parse ISO text and treat naive timestamps as UTC."""
     if not iso_s:
@@ -9674,7 +9676,7 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
     per_sym = rec.get("per_symbol") or {}  # base -> {"reason": str, "n": int}
 
     if not allow and not counts and not per_sym:
-        return "No reject stats recorded yet. Wait for the background scan or run /screen once."
+        return _no_reject_stats_fallback_report(int(uid))
 
     allow_set = [str(x).upper() for x in (allow or []) if str(x).strip()]
     allow_set_unique = []
@@ -17489,7 +17491,7 @@ OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "1.5") or 1
 OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") or 120)
 # Cold-start / cold-cache protection. Keep very short so Render restarts can rebuild quickly.
 PROCESS_START_TS = float(time.time())
-OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "20") or 20)
+OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "5") or 5)
 OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "40") or 40)
 OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.35") or 0.35)
 _OHLCV_RATE_LIMIT_HITS_TOTAL = 0
@@ -17537,6 +17539,75 @@ def _scan_health_snapshot() -> dict:
         return snap
     except Exception:
         return {}
+
+def _diagnostic_when_local(ts: float) -> str:
+    try:
+        ts_f = float(ts or 0.0)
+        if ts_f <= 0:
+            return '-'
+        return datetime.fromtimestamp(ts_f, tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M:%S Melbourne")
+    except Exception:
+        return '-'
+
+def _no_reject_stats_fallback_report(uid: int) -> str:
+    lines = ["🧩 Last Scan Diagnostics", HDR]
+    try:
+        h = _scan_health_snapshot() or {}
+        lines.append(f"Last scan: {_diagnostic_when_local(float(h.get('last_scan_ts') or 0.0))}")
+        lines.append(f"Mode/session: {str(h.get('last_scan_mode') or '-')}/{str(h.get('last_scan_session') or '-')}")
+        lines.append(f"TF phase: {str(h.get('last_tf_phase') or '-')} | Symbols processed: {int(h.get('symbols_processed') or 0)}")
+        lines.append(f"Rate-limit hits: {int(h.get('rate_limit_hits') or 0)} | Stale uses: {int(h.get('stale_usage') or 0)} | OHLCV limit: {int(h.get('ohlcv_limit') or MAX_OHLCV_LIMIT)}")
+    except Exception:
+        pass
+    try:
+        recent_universe = list(dict.fromkeys([str(x).upper().strip() for x in (globals().get('_LAST_SCAN_UNIVERSE') or []) if str(x).strip()]))
+        if recent_universe:
+            lines.append(f"Universe: {len(recent_universe)} symbols")
+            lines.append("Symbols: " + ", ".join(recent_universe[:30]) + ("…" if len(recent_universe) > 30 else ""))
+    except Exception:
+        pass
+    try:
+        sess = str(scan_session_name_utc(datetime.now(timezone.utc)) or '').upper().strip()
+    except Exception:
+        sess = ''
+    try:
+        build_ev = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
+        exec_ev = _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', session=sess, mode='email') or _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', mode='email') or {}
+        screen_ev = _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', session=sess, mode='screen') or _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', mode='screen') or {}
+        def _one(label, ev):
+            if not ev:
+                return
+            try:
+                det = json.loads(str(ev.get('details_json') or '{}')) if ev.get('details_json') else {}
+            except Exception:
+                det = {}
+            parts = [str(ev.get('status') or '-')]
+            try:
+                parts.append(_diagnostic_when_local(float(ev.get('event_ts') or 0.0)))
+            except Exception:
+                pass
+            for k in ('setups','eligible','raw_pool','executable_ready','persisted'):
+                if k in det:
+                    try:
+                        parts.append(f"{k}={int(det.get(k) or 0)}")
+                    except Exception:
+                        parts.append(f"{k}={det.get(k)}")
+            top = det.get('top_reasons') or det.get('top_rejects') or det.get('top_exec_rejects') or []
+            if top:
+                parts.append('top=' + ', '.join([str(x) for x in top[:4]]))
+            err = str(det.get('error') or '').strip()
+            if err:
+                parts.append(err[:160])
+            lines.append(f"{label}: " + " | ".join(parts))
+        lines.append(SEP)
+        _one('Email build', build_ev)
+        _one('Email executable', exec_ev)
+        _one('Screen executable', screen_ev)
+    except Exception:
+        pass
+    if len(lines) <= 2:
+        lines.append('No scan data captured yet. /screen has queued a refresh; run /why again in 1–2 minutes.')
+    return "\n".join(lines)
 
 def _current_scan_tf_phase() -> str:
     try:
@@ -27731,21 +27802,16 @@ def is_executable_setup_eligible(
             return (False, 'trend_structure_not_aligned')
 
         score = float(getattr(s, "quality_score", 0.0) or 0.0)
-        if score < score_floor:
-            return (False, "below_exec_quality")
-
         conf = int(getattr(s, "conf", 0) or 0)
-        if conf < conf_floor:
-            return (False, "below_exec_conf")
-
         entry = float(getattr(s, "entry", 0.0) or 0.0)
         sl = float(getattr(s, "sl", 0.0) or 0.0)
         final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
-        if rr_final < rr_floor:
-            return (False, "below_exec_rr")
-
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+
+        # Recovery setups are generated only when normal OHLCV engines return nothing.
+        # They already passed structural price checks in the shared gate above, so do not
+        # kill them on the normal high-quality floor before their recovery checks run.
         try:
             if bool(getattr(s, 'recovery_fallback', False)):
                 if engine != 'A':
@@ -27759,6 +27825,15 @@ def is_executable_setup_eligible(
                 return (True, 'ok')
         except Exception:
             pass
+
+        if score < score_floor:
+            return (False, "below_exec_quality")
+
+        if conf < conf_floor:
+            return (False, "below_exec_conf")
+
+        if rr_final < rr_floor:
+            return (False, "below_exec_rr")
         pb_dist = float(getattr(s, "pullback_ema_dist_pct", 999.0) or 999.0)
         ch15_val = float(getattr(s, "ch15", 0.0) or 0.0)
         ch1_val = float(getattr(s, "ch1", 0.0) or 0.0)
@@ -31152,7 +31227,25 @@ def build_help_html(title: str, sections: list) -> str:
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
-FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size", "health", "status", "equity", "trade_close"}
+FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size", "health", "status", "equity", "trade_close", "why"}
+
+
+def _command_args_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    """Return command args for both CommandHandler and MessageHandler fast-lane calls."""
+    try:
+        args = list(getattr(context, "args", None) or [])
+        if args:
+            return args
+    except Exception:
+        pass
+    try:
+        txt = str(getattr(getattr(update, "message", None), "text", "") or "").strip()
+        if not txt:
+            return []
+        parts = txt.split()
+        return parts[1:] if len(parts) > 1 else []
+    except Exception:
+        return []
 
 # =========================================================
 # INSTANT COMMAND LANE
@@ -31379,7 +31472,8 @@ async def _instant_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
-    if not context.args:
+    args = _command_args_from_message(update, context)
+    if not args:
         try:
             user = await asyncio.wait_for(asyncio.shield(_safe_create_task(get_user_cached_fast_async(uid, ttl=30), 'instant_equity_user_lookup')), timeout=0.8)
         except Exception:
@@ -31389,7 +31483,7 @@ async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(txt)
         return
     try:
-        eq = float(context.args[0])
+        eq = float(args[0])
         if eq < 0:
             raise ValueError()
     except Exception:
@@ -31415,7 +31509,7 @@ async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _instant_trade_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
-    raw = " ".join(context.args).strip()
+    raw = " ".join(_command_args_from_message(update, context)).strip()
     task = _safe_create_task(to_thread_fast(_instant_trade_close_sync, uid, raw), 'instant_trade_close')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=max(1.0, float(os.getenv('INSTANT_TRADE_CLOSE_TIMEOUT_SEC', '1.5') or 1.5)))
@@ -31438,6 +31532,12 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
         cmd = txt.split()[0][1:].split('@')[0].strip().lower()
         if cmd not in FAST_PATH_COMMANDS:
             return
+
+        try:
+            _parts = txt.split()
+            context.args = _parts[1:] if len(_parts) > 1 else []
+        except Exception:
+            pass
 
         if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
             ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
@@ -31465,6 +31565,9 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
             raise ApplicationHandlerStop
         if cmd == 'trade_close':
             await _instant_trade_close_cmd(update, context)
+            raise ApplicationHandlerStop
+        if cmd == 'why':
+            await why_no_setups_cmd(update, context)
             raise ApplicationHandlerStop
         if cmd == 'size':
             await size_cmd(update, context)
@@ -36790,7 +36893,7 @@ async def _refresh_screen_cache_async():
             best_fut,
             session,
             0,
-            timeout=35,
+            timeout=75,
         )
         cache_key = f"global::{str(session or '').upper()}"
         _SCREEN_CACHE[cache_key] = {
@@ -36821,9 +36924,13 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
                 return
             sess = str(session or scan_session_name_utc(datetime.now(timezone.utc)) or '').upper()
             try:
-                body, kb, _setups = await to_thread_screen(_build_screen_body_and_kb, best_fut, sess, int(uid or 0), timeout=35)
-            except Exception:
-                body, kb, _setups = _screen_quick_ticker_snapshot_body(best_fut, sess)
+                body, kb, _setups = await to_thread_screen(_build_screen_body_and_kb, best_fut, sess, int(uid or 0), timeout=75)
+            except Exception as e:
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='screen_cache_refresh', status='error', session=str(sess or ''), mode='screen', details={'error': f'{type(e).__name__}: {e}'})
+                except Exception:
+                    pass
+                return
             _SCREEN_CACHE[f"uid:{int(uid or 0)}::{sess}"] = {
                 "ts": time.time(),
                 "body": body,
@@ -37470,35 +37577,10 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
             return
-        # No usable full cache exists. Build once in the dedicated /screen lane so a
-        # cold deploy does not get stuck showing only the ticker warmup card.
-        try:
-            if not _SCREEN_LOCK.locked():
-                async with _SCREEN_LOCK:
-                    best_now = await to_thread_screen(_screen_best_fut_fast, timeout=12)
-                    if best_now:
-                        body, kb, _setups = await to_thread_screen(_build_screen_body_and_kb, best_now, scan_session, int(uid), timeout=55)
-                        _SCREEN_CACHE[f"uid:{int(uid)}::{scan_session}"] = {"ts": time.time(), "body": body, "kb": list(kb or []), "kind": "full"}
-                        header = (
-                            f"*PulseFutures — Market Scan*\n"
-                            f"{HDR}\n"
-                            f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                            f"_Fresh executable scan rebuilt now._\n"
-                        )
-                        keyboard = [[InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))] for (sym, sid) in (kb or [])]
-                        await send_long_message(
-                            update,
-                            (header + "\n" + body).strip(),
-                            parse_mode=ParseMode.MARKDOWN,
-                            disable_web_page_preview=True,
-                            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-                        )
-                        return
-        except Exception as e:
-            try:
-                logger.warning("cold /screen rebuild failed; using quick ticker fallback: %s", e)
-            except Exception:
-                pass
+        # No usable full cache exists. Do NOT run a cold OHLCV rebuild inside the
+        # Telegram command path. That was the source of visible lag and Render warnings.
+        # A dedicated background refresh was already queued above; return a ticker
+        # snapshot immediately so /equity, /why, /status and /open_trades stay responsive.
 
         # Last-resort instant ticker snapshot from cached tickers. Do NOT cache it as a
         # full scan, otherwise it suppresses the next real rebuild for MAX_STALE_SCAN_SEC.
