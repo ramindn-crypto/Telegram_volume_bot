@@ -34859,6 +34859,12 @@ def _setup_audit_price_result_from_row(row: dict, horizon_hours: int = 24) -> st
 
 
 def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
+    """Fast, admin-readable setup audit.
+
+    Output is HTML formatted for Telegram. It intentionally avoids live OHLCV
+    calls so the command stays instant and does not compete with production
+    scanning/email/autotrade jobs.
+    """
     limit = max(1, min(30, int(limit or 15)))
     hours = max(1, min(168, int(hours or 24)))
     cutoff = float(time.time()) - float(hours) * 3600.0
@@ -34876,7 +34882,7 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
                     WHERE user_id=? AND executable_ts>=?
                     ORDER BY executable_ts DESC
                     LIMIT ?
-                """, (int(uid), cutoff, int(limit * 3)))
+                """, (int(uid), cutoff, int(limit * 4)))
                 rows.extend([dict(r) for r in (cur.fetchall() or [])])
             except Exception:
                 pass
@@ -34894,12 +34900,12 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
                     WHERE user_id=? AND created_ts>=?
                     ORDER BY created_ts DESC
                     LIMIT ?
-                """, (int(uid), cutoff, int(limit * 3)))
+                """, (int(uid), cutoff, int(limit * 4)))
                 rows.extend([dict(r) for r in (cur.fetchall() or [])])
             except Exception:
                 pass
     except Exception as e:
-        return f"❌ setup_audit error: {type(e).__name__}: {e}"
+        return f"❌ <b>setup_audit error</b>: {html.escape(type(e).__name__)}: {html.escape(str(e))}"
 
     dedup = {}
     for r in sorted(rows, key=lambda x: float(x.get('ts') or 0.0), reverse=True):
@@ -34914,23 +34920,44 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
         dedup[sid] = r
 
     final = list(dedup.values())[:limit]
+    min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not final:
-        return f"🧪 Setup Audit\n{HDR}\nNo recent setups above ${_setup_min_volume_floor_usd()/1e6:.0f}M volume in the last {hours}h."
+        return f"🧪 <b>Setup Audit</b>\n{HDR}\nNo recent setups above ${min_vol_m:.0f}M volume in the last {hours}h."
 
     try:
         now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
     except Exception:
         now_txt = ''
 
+    def _audit_ts_txt(r: dict) -> str:
+        try:
+            ts = float(r.get('ts') or 0.0)
+            if ts > 0:
+                return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            pass
+        return '-'
+
+    def _result_badge(result: str) -> str:
+        rr = str(result or '').upper().strip()
+        if rr == 'WIN':
+            return '✅ <b>WIN</b>'
+        if rr in {'LOSE', 'LOSS', 'SL'}:
+            return '❌ <b>LOSE</b>'
+        return '🟡 <b>OPEN</b>'
+
+    def _side_badge(side: str) -> str:
+        return '🟢 <b>BUY</b>' if str(side).upper() == 'BUY' else '🔴 <b>SELL</b>'
+
     lines = [
-        "🧪 Setup Audit",
+        "🧪 <b>Setup Audit</b>",
         HDR,
-        f"Window: last {hours}h | Rows: {len(final)} | Min vol: ${_setup_min_volume_floor_usd()/1e6:.0f}M" + (f" | Now: {now_txt}" if now_txt else ""),
-        "Format: ID - Type: BUY/SELL Symbol - Volume - Family - Reason to Enter - Result",
-        "Result: WIN / LOSE / OPEN from cached candles/current price.",
-        "",
+        f"Window: <b>last {hours}h</b> | Rows: <b>{len(final)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
+        "Result is price-based: TP first = WIN, SL first = LOSE, otherwise OPEN.",
+        HDR,
     ]
-    for r in final:
+
+    for i, r in enumerate(final, start=1):
         sid = str(r.get('setup_id') or '').strip()
         side = str(r.get('side') or '').upper().strip()
         sym = str(r.get('symbol') or '').upper().strip()
@@ -34940,7 +34967,34 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
         fam = _setup_audit_family_from_row(r)
         reason = _setup_audit_reason_from_row(r)
         result = _setup_audit_price_result_from_row(r, horizon_hours=hours)
-        lines.append(f"• {sid} - Type: {side} {sym} - Volume: {vol_m:.1f}M - Family: {fam} - Reason to Enter: {reason} - Result: {result}")
+        conf = int(float(r.get('conf') or 0.0))
+        src = str(r.get('source') or '-').upper().strip()
+        session = str(r.get('session') or '-').upper().strip()
+        entry = float(r.get('entry') or 0.0)
+        sl = float(r.get('sl') or 0.0)
+        tp = float(r.get('tp') or 0.0)
+        if tp <= 0:
+            try:
+                tp = float(_resolve_single_tp(entry, sl, r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)
+            except Exception:
+                tp = 0.0
+        ch24 = float(r.get('ch24') or 0.0)
+        ch4 = float(r.get('ch4') or 0.0)
+        ch1 = float(r.get('ch1') or 0.0)
+        ch15 = float(r.get('ch15') or 0.0)
+
+        lines.extend([
+            f"{i}) <b>{html.escape(sid)}</b>",
+            f"   {_side_badge(side)} <b>{html.escape(sym)}</b> | Conf: <b>{conf}</b> | Result: {_result_badge(result)}",
+            f"   Volume: <b>{vol_m:.1f}M</b> | Family: <b>{html.escape(fam)}</b>",
+            f"   Reason to enter: {html.escape(reason)}",
+            f"   Entry: <code>{_fmt_price(entry)}</code> | SL: <code>{_fmt_price(sl)}</code> | TP: <code>{_fmt_price(tp)}</code>",
+            f"   Moves: 24H {ch24:+.0f}% | 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | 15m {ch15:+.1f}%",
+            f"   Source: {html.escape(src)} / {html.escape(session)} | Generated: {html.escape(_audit_ts_txt(r))}",
+        ])
+        if i != len(final):
+            lines.append("──────────────────")
+
     return "\n".join(lines)
 
 
@@ -34963,7 +35017,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await to_thread_fast(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=6)
     except Exception as e:
         text = f"❌ setup_audit failed: {type(e).__name__}: {e}"
-    await send_long_message(update, text, parse_mode=None, disable_web_page_preview=True)
+    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/setups_log [n] [screen|email|all] — view recently generated setups."""
@@ -36371,22 +36425,48 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     exec_recent = 0
     emailed_recent = 0
+    sent_email_batches_recent = 0
     since_ts = time.time() - 12 * 3600
     try:
         con = db_connect()
         cur = con.cursor()
-        cur.execute("SELECT COUNT(1) AS n FROM executable_setups WHERE user_id IN (?,0) AND executable_ts>=?", (int(owner), float(since_ts)))
+        # Count unique live opportunities, not every scanner refresh row.
+        # Raw row counts can be huge because equivalent executable opportunities
+        # are refreshed repeatedly during background scans.
+        min_vol = float(_setup_min_volume_floor_usd())
+        try:
+            cur.execute("""
+                SELECT COUNT(DISTINCT UPPER(COALESCE(NULLIF(symbol,''), setup_id)) || ':' || UPPER(COALESCE(NULLIF(side,''),'?'))) AS n
+                FROM executable_setups
+                WHERE user_id IN (?,0) AND executable_ts>=? AND COALESCE(fut_vol_usd,0)>=?
+            """, (int(owner), float(since_ts), float(min_vol)))
+        except Exception:
+            cur.execute("""
+                SELECT COUNT(DISTINCT UPPER(COALESCE(NULLIF(symbol,''), setup_id)) || ':' || UPPER(COALESCE(NULLIF(side,''),'?'))) AS n
+                FROM executable_setups
+                WHERE user_id IN (?,0) AND executable_ts>=?
+            """, (int(owner), float(since_ts)))
         row = cur.fetchone()
         try:
             exec_recent = int(row['n'] if hasattr(row, 'keys') and 'n' in row.keys() else row[0])
         except Exception:
             exec_recent = 0
-        cur.execute("SELECT COUNT(1) AS n FROM emailed_setups WHERE user_id IN (?,0) AND emailed_ts>=?", (int(owner), float(since_ts)))
+
+        cur.execute("SELECT COUNT(DISTINCT setup_id) AS n FROM emailed_setups WHERE user_id IN (?,0) AND emailed_ts>=?", (int(owner), float(since_ts)))
         row = cur.fetchone()
         try:
             emailed_recent = int(row['n'] if hasattr(row, 'keys') and 'n' in row.keys() else row[0])
         except Exception:
             emailed_recent = 0
+
+        try:
+            # Approximate sent setup-email batches; multiple setups in one email
+            # share nearly identical timestamps.
+            cur.execute("SELECT COUNT(DISTINCT CAST(emailed_ts / 60 AS INTEGER)) AS n FROM emailed_setups WHERE user_id IN (?,0) AND emailed_ts>=?", (int(owner), float(since_ts)))
+            row = cur.fetchone()
+            sent_email_batches_recent = int(row['n'] if hasattr(row, 'keys') and 'n' in row.keys() else row[0])
+        except Exception:
+            sent_email_batches_recent = 0
         con.close()
     except Exception:
         try:
@@ -36418,13 +36498,11 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Emails sent today: {int(email_gate.get('sent_today', 0) or 0)}",
         f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
         f"Executable lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
-        f"Recent emailed setups (12h): {emailed_recent}",
-        f"Recent executable setups (12h): {exec_recent}",
+        f"Recent emailed setups (unique, 12h): {emailed_recent}",
+        f"Recent executable setups (unique sym/side, 12h): {exec_recent}",
     ]
     try:
-        _sent_meta = _last_sent_email_meta(int(owner), get_user(int(owner)) or {})
-        _sent_recent = 1 if float(_sent_meta.get('ts') or 0.0) >= float(since_ts or 0.0) else 0
-        lines.append(f"Recent sent emails (12h): {_sent_recent}")
+        lines.append(f"Recent sent setup-email batches (12h): {int(sent_email_batches_recent or 0)}")
     except Exception:
         pass
     if reasons and not ready:
