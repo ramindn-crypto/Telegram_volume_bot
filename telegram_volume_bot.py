@@ -8668,6 +8668,12 @@ def cache_get(key: str) -> Optional[Any]:
 def cache_set(key: str, obj: Any):
     _CACHE[key] = (time.time(), obj)
 
+def cache_delete(key: str):
+    try:
+        _CACHE.pop(str(key), None)
+    except Exception:
+        pass
+
 def cache_valid(key: str, ttl: int) -> bool:
     v = _CACHE.get(key)
     if not v:
@@ -37892,6 +37898,15 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
                 except Exception:
                     pass
                 return
+            # If a setup email was delivered recently, keep /screen locked to that exact
+            # email/autotrade lane instead of overwriting it with a different background scan.
+            try:
+                if int(uid or 0) > 0 and _screen_user_can_see_email_source(int(uid or 0)) and _latest_recent_delivery_ts(int(uid or 0), sess, max_age_min=45) > 0:
+                    body_e, kb_e, _shown_e = _screen_recent_db_body_and_kb(int(uid or 0), sess, best_fut or {}, max_age_min=45, include_email_source=True)
+                    if body_e:
+                        body, kb = body_e, list(kb_e or [])
+            except Exception:
+                pass
             _screen_cache_put(f"uid:{int(uid or 0)}::{sess}", body, list(kb or []), ts=time.time())
             _screen_cache_put(f"global::{sess}", body, list(kb or []), ts=time.time())
     except Exception:
@@ -38084,6 +38099,19 @@ def _screen_cache_put(cache_key: str, body: str, kb: list | None = None, ts: flo
         old_has = _screen_body_has_trade_setups(old_body)
         old_age = now_ts - float(old.get('ts', 0.0) or 0.0)
         keep_window = max(float(SCREEN_STALE_CACHE_MAX_SEC or 0), 45.0 * 60.0)
+
+        # Keep the exact setup-email batch visible while it is still actionable.
+        # A background /screen rebuild can legitimately find a different pool one
+        # minute later, but Pro/Admin /screen must stay synced with email/autotrade.
+        old_is_email = ('Showing latest sent setup email' in old_body) or ('Emailed at ' in old_body)
+        new_is_email = ('Showing latest sent setup email' in body_s) or ('Emailed at ' in body_s)
+        if (not allow_empty_overwrite) and old_is_email and (not new_is_email) and old_has and old_age <= keep_window:
+            try:
+                db_log_setup_pipeline_event(0, stage='screen_cache_put', status='kept_recent_email_cache', session=str(key).split('::')[-1], mode='screen', details={'old_age_sec': round(old_age, 1)})
+            except Exception:
+                pass
+            return False
+
         if (not allow_empty_overwrite) and (not new_has) and old_has and old_age <= keep_window:
             try:
                 db_log_setup_pipeline_event(0, stage='screen_cache_put', status='kept_nonempty_cache', session=str(key).split('::')[-1], mode='screen', details={'old_age_sec': round(old_age, 1)})
@@ -38114,13 +38142,16 @@ def _screen_choose_best_cache(cache_keys: list[str]) -> tuple[dict, float]:
             if _is_quick:
                 continue
             _age = now_ts - float(_ce.get('ts', 0.0) or 0.0)
-            candidates.append((_screen_body_has_trade_setups(_body), _age, _ce))
+            _has = _screen_body_has_trade_setups(_body)
+            _is_email = ('Showing latest sent setup email' in _body) or ('Emailed at ' in _body)
+            candidates.append((_is_email, _has, _age, _ce))
         if not candidates:
             return {}, 999999.0
-        with_setups = [c for c in candidates if c[0]]
-        pool = with_setups if with_setups else candidates
-        pool.sort(key=lambda x: x[1])
-        return pool[0][2], pool[0][1]
+        recent_email = [c for c in candidates if c[0] and c[1] and c[2] <= max(45.0 * 60.0, float(SCREEN_STALE_CACHE_MAX_SEC or 0))]
+        with_setups = [c for c in candidates if c[1]]
+        pool = recent_email if recent_email else (with_setups if with_setups else candidates)
+        pool.sort(key=lambda x: x[2])
+        return pool[0][3], pool[0][2]
     except Exception:
         return {}, 999999.0
 
@@ -38435,7 +38466,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         _exec_ready = []
 
     try:
-        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(2, int(math.ceil(float(MAX_STALE_SCAN_SEC) / 60.0))), limit=max(1, int(SETUPS_N))))
+        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(45, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)), limit=max(1, int(SETUPS_N))))
     except Exception:
         setups = []
 
@@ -39697,7 +39728,18 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
     except Exception:
         pass
 
-    sent = send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
+    try:
+        sent = send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
+    except Exception as _smtp_exc:
+        sent = False
+        try:
+            _LAST_SMTP_ERROR[uid] = f"{type(_smtp_exc).__name__}: {_smtp_exc}"
+        except Exception:
+            pass
+        try:
+            logger.warning("setup email send raised uid=%s subject=%s error=%s", uid, subject, _LAST_SMTP_ERROR.get(uid, ''))
+        except Exception:
+            pass
     if (not sent) and _email_assume_sent_on_soft_smtp() and _smtp_error_probably_delivered(str(_LAST_SMTP_ERROR.get(uid, ''))):
         try:
             logger.warning("setup email soft-delivered uid=%s subject=%s smtp_error=%s", uid, subject, _LAST_SMTP_ERROR.get(uid, ''))
@@ -41052,8 +41094,21 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     _LAST_SMTP_ERROR[uid] = f"{type(e).__name__}: {e}"
                 except Exception:
                     pass
+                # Defensive: if SMTP raised after DATA was likely accepted, still record the
+                # exact email batch and continue into AutoTrade. This prevents delivered
+                # Gmail messages from being invisible to /screen and autotrade.
+                if _email_assume_sent_on_soft_smtp() and _smtp_error_probably_delivered(str(_LAST_SMTP_ERROR.get(uid, ''))):
+                    try:
+                        _record_setup_email_delivery_side_effects(int(uid), str(sess.get("name") or sess_name or ''), list(chosen_list or []), best_fut or {}, status='exception_assumed_sent')
+                    except Exception:
+                        pass
+                    ok = True
 
             if ok:
+                try:
+                    _LAST_EMAIL_ERROR.pop(uid, None)
+                except Exception:
+                    pass
                 try:
                     email_state_set(uid, last_email_ts=time.time(), sent_count=int(st.get("sent_count", 0) or 0) + 1)
                 except Exception:
@@ -42827,7 +42882,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                             pass
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'executable_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_set(f"autotrade_db_setups:{owner_uid}:{sess}:12:5", [])
+                        cache_delete(f"autotrade_db_setups:{owner_uid}:{sess}:12:5")
                     except Exception:
                         pass
             except Exception as e:
