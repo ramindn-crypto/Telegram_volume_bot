@@ -34988,7 +34988,7 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
             f"   {_side_badge(side)} <b>{html.escape(sym)}</b> | Conf: <b>{conf}</b> | Result: {_result_badge(result)}",
             f"   Volume: <b>{vol_m:.1f}M</b> | Family: <b>{html.escape(fam)}</b>",
             f"   Reason to enter: {html.escape(reason)}",
-            f"   Entry: <code>{_fmt_price(entry)}</code> | SL: <code>{_fmt_price(sl)}</code> | TP: <code>{_fmt_price(tp)}</code>",
+            f"   Entry: <code>{fmt_price(entry)}</code> | SL: <code>{fmt_price(sl)}</code> | TP: <code>{fmt_price(tp)}</code>",
             f"   Moves: 24H {ch24:+.0f}% | 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | 15m {ch15:+.1f}%",
             f"   Source: {html.escape(src)} / {html.escape(session)} | Generated: {html.escape(_audit_ts_txt(r))}",
         ])
@@ -35014,9 +35014,9 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     try:
-        text = await to_thread_fast(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=6)
+        text = await to_thread_fast(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=10)
     except Exception as e:
-        text = f"❌ setup_audit failed: {type(e).__name__}: {e}"
+        text = f"❌ setup_audit failed: {type(e).__name__}. Try /setup_audit 8 24."
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
