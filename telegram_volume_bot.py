@@ -258,6 +258,11 @@ def _autotrade_migrate_tables():
             add_col("atr_pct", "atr_pct REAL")
             add_col("engine", "engine TEXT")
             add_col("status", "status TEXT")
+            # Production DBs from older builds may have lifecycle timestamps with
+            # NOT NULL constraints. Keep them available and always populate them
+            # during inserts so live Bybit orders cannot open without a journal row.
+            add_col("created_ts", "created_ts REAL NOT NULL DEFAULT 0")
+            add_col("updated_ts", "updated_ts REAL NOT NULL DEFAULT 0")
             add_col("closed_ts", "closed_ts INTEGER")
             add_col("pnl_usdt", "pnl_usdt REAL")
             add_col("outcome", "outcome TEXT")
@@ -5616,6 +5621,8 @@ def _autotrade_db_insert_open_trade_row(uid: int, trade_row: dict) -> str:
         'atr_pct': float((trade_row or {}).get('atr_pct') or 0.0),
         'engine': str((trade_row or {}).get('engine') or ''),
         'status': 'OPEN',
+        'created_ts': float((trade_row or {}).get('created_ts') or opened_ts or time.time()),
+        'updated_ts': float((trade_row or {}).get('updated_ts') or time.time()),
         'closed_ts': None,
         'pnl_usdt': None,
         'outcome': '',
@@ -5630,8 +5637,9 @@ def _autotrade_db_insert_open_trade_row(uid: int, trade_row: dict) -> str:
             cur = conn.cursor()
             cols = [r[1] for r in cur.execute("PRAGMA table_info(autotrade_trades)").fetchall()]
             insert_cols = [
-                'trade_id','uid','opened_ts','day_utc','session','setup_id','symbol','side','entry','sl','tp','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine','status','closed_ts','pnl_usdt','outcome','note'
+                'trade_id','uid','opened_ts','day_utc','session','setup_id','symbol','side','entry','sl','tp','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine','status','created_ts','updated_ts','closed_ts','pnl_usdt','outcome','note'
             ]
+            insert_cols = [c for c in insert_cols if c in cols]
             if 'family_id' in cols:
                 insert_cols.append('family_id')
             if 'regime_primary' in cols:
@@ -6032,7 +6040,9 @@ def _autotrade_log_symbol_block(uid: int, symbol: str, side: str, reason: str, e
         msg = f"{reason} uid={int(uid)} symbol={sym} side={sd}"
         if extra:
             msg += f" | {extra}"
-        throttle = 90.0 if str(reason or '').startswith('blocked_manual_same_symbol_position') else 45.0
+        # Same-symbol external/manual conflicts are safety blocks, not bot faults.
+        # Keep them visible but avoid Render log spam during active scans.
+        throttle = 900.0 if str(reason or '').startswith('blocked_manual_same_symbol_position') else 90.0
         key = f"autotrade_block:{int(uid)}:{sym}:{sd}:{str(reason or '')}:{str(extra or '')[:80]}"
         _log_warning_throttled(key, throttle, msg)
     except Exception:
@@ -6292,108 +6302,84 @@ def _autotrade_has_live_open_order(symbol: str, side: str | None = None) -> bool
 
 
 def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float, lifecycle_state: str = 'executed_open', lifecycle_reason: str = '') -> str:
-    """Persist a bot-opened trade into SQLite.
+    """Persist a bot-opened trade into SQLite using the live DB schema.
 
-    NOTE: Some deployed DBs have a NOT NULL `day_utc` column on autotrade_trades.
-    We detect it and always populate it to avoid IntegrityError.
+    Older Render DBs can contain extra NOT NULL columns (created_ts/updated_ts).
+    The previous hard-coded INSERT opened the Bybit position, then failed on the
+    journal insert. This schema-aware INSERT always supplies lifecycle timestamps
+    when those columns exist.
     """
+    _autotrade_migrate_tables()
     trade_id = f"AT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
-    day_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    now_ts = float(time.time())
+    opened_ts = int(now_ts)
+    day_utc = datetime.fromtimestamp(opened_ts, tz=timezone.utc).strftime('%Y-%m-%d')
+    setup_id = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '')
+    symbol = str(getattr(s, 'symbol', '') or '').upper()
+    side = str(getattr(s, 'side', '') or '').upper()
 
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
+    payload = {
+        'trade_id': trade_id,
+        'uid': int(uid),
+        'opened_ts': opened_ts,
+        'created_ts': now_ts,
+        'updated_ts': now_ts,
+        'day_utc': str(day_utc),
+        'session': str(session_label or ''),
+        'setup_id': setup_id,
+        'symbol': symbol,
+        'side': side,
+        'entry': float(getattr(s, 'entry', 0.0) or 0.0),
+        'sl': float(getattr(s, 'sl', 0.0) or 0.0),
+        'tp': float(_setup_target_tp(s, 0.0) or 0.0),
+        'alt_target_a': 0.0,
+        'alt_target_b': 0.0,
+        'qty': float(qty or 0.0),
+        'conf': int(getattr(s, 'conf', 0) or 0),
+        'quality_score': float(getattr(s, 'quality_score', 0.0) or 0.0),
+        'atr_pct': float(getattr(s, 'atr_pct', 0.0) or 0.0),
+        'engine': str(getattr(s, 'engine', '') or ''),
+        'status': 'OPEN',
+        'closed_ts': None,
+        'pnl_usdt': None,
+        'pnl': None,
+        'outcome': '',
+        'note': str(lifecycle_reason or ''),
+        'family_id': str(getattr(s, 'family_id', '') or ''),
+        'regime_primary': str(getattr(s, 'regime_primary', '') or ''),
+        'allocator_plan_id': str(getattr(s, 'allocator_plan_id', '') or ''),
+        'param_set_id': str(getattr(s, 'param_set_id', '') or ''),
+    }
 
-        # Detect schema (older/newer deployments)
-        try:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
             cols = [r[1] for r in c.execute("PRAGMA table_info(autotrade_trades)").fetchall()]
-        except Exception:
-            cols = []
-
-        has_day = 'day_utc' in cols
-
-        if has_day:
-            c.execute(
-                """INSERT INTO autotrade_trades
-                       (trade_id, uid, opened_ts, day_utc, session, setup_id, symbol, side, entry, sl, tp, alt_target_a, alt_target_b, qty, conf, quality_score, atr_pct, engine, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
-                (
-                    trade_id,
-                    int(uid),
-                    int(time.time()),
-                    str(day_utc),
-                    str(session_label),
-                    str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
-                    str(getattr(s, 'symbol', '') or '').upper(),
-                    str(getattr(s, 'side', '') or '').upper(),
-                    float(getattr(s, 'entry', 0.0) or 0.0),
-                    float(getattr(s, 'sl', 0.0) or 0.0),
-                    float(_setup_target_tp(s, 0.0) or 0.0),
-                    0.0,
-                    0.0,
-                    float(qty),
-                    int(getattr(s, 'conf', 0) or 0),
-                    float(getattr(s, 'quality_score', 0.0) or 0.0),
-                    float(getattr(s, 'atr_pct', 0.0) or 0.0),
-                    str(getattr(s, 'engine', '') or ''),
-                ),
-            )
-        else:
-            c.execute(
-                """INSERT INTO autotrade_trades
-                       (trade_id, uid, opened_ts, session, setup_id, symbol, side, entry, sl, tp, alt_target_a, alt_target_b, qty, conf, quality_score, atr_pct, engine, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')""",
-                (
-                    trade_id,
-                    int(uid),
-                    int(time.time()),
-                    str(session_label),
-                    str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
-                    str(getattr(s, 'symbol', '') or '').upper(),
-                    str(getattr(s, 'side', '') or '').upper(),
-                    float(getattr(s, 'entry', 0.0) or 0.0),
-                    float(getattr(s, 'sl', 0.0) or 0.0),
-                    float(_setup_target_tp(s, 0.0) or 0.0),
-                    0.0,
-                    0.0,
-                    float(qty),
-                    int(getattr(s, 'conf', 0) or 0),
-                    float(getattr(s, 'quality_score', 0.0) or 0.0),
-                    float(getattr(s, 'atr_pct', 0.0) or 0.0),
-                    str(getattr(s, 'engine', '') or ''),
-                ),
-            )
-
+            preferred_order = [
+                'trade_id','uid','opened_ts','created_ts','updated_ts','day_utc','session','setup_id','symbol','side',
+                'entry','sl','tp','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine',
+                'status','closed_ts','pnl_usdt','pnl','outcome','note','family_id','regime_primary','allocator_plan_id','param_set_id'
+            ]
+            insert_cols = [name for name in preferred_order if name in cols and name in payload]
+            placeholders = ','.join(['?'] * len(insert_cols))
+            values = [payload.get(name) for name in insert_cols]
+            c.execute(f"INSERT INTO autotrade_trades ({','.join(insert_cols)}) VALUES ({placeholders})", values)
+            conn.commit()
+    except Exception as e:
         try:
-            if cols:
-                extra_updates = []
-                extra_params = []
-                if 'family_id' in cols:
-                    extra_updates.append('family_id=?')
-                    extra_params.append(str(getattr(s, 'family_id', '') or ''))
-                if 'regime_primary' in cols:
-                    extra_updates.append('regime_primary=?')
-                    extra_params.append(str(getattr(s, 'regime_primary', '') or ''))
-                if 'allocator_plan_id' in cols:
-                    extra_updates.append('allocator_plan_id=?')
-                    extra_params.append(str(getattr(s, 'allocator_plan_id', '') or ''))
-                if 'param_set_id' in cols:
-                    extra_updates.append('param_set_id=?')
-                    extra_params.append(str(getattr(s, 'param_set_id', '') or ''))
-                if extra_updates:
-                    extra_params.append(str(trade_id))
-                    c.execute(f"UPDATE autotrade_trades SET {', '.join(extra_updates)} WHERE trade_id=?", tuple(extra_params))
+            logger.exception("autotrade journal insert failed trade_id=%s setup=%s symbol=%s: %s", trade_id, setup_id, symbol, e)
         except Exception:
             pass
-        conn.commit()
+        raise
 
     try:
         _admin_setup_lifecycle_merge(
             int(uid),
-            str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''),
+            setup_id,
             session=str(session_label or ''),
-            symbol=str(getattr(s, 'symbol', '') or ''),
-            side=str(getattr(s, 'side', '') or ''),
-            executed_ts=float(time.time()),
+            symbol=symbol,
+            side=side,
+            executed_ts=now_ts,
             trade_id=str(trade_id),
             state=str(lifecycle_state or 'executed_open'),
             last_reason=str(lifecycle_reason or ''),
@@ -6401,7 +6387,6 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
     except Exception:
         pass
     return trade_id
-
 
 def _autotrade_estimated_risk_usd(entry: float, sl: float, qty: float) -> float:
     try:
@@ -37329,6 +37314,29 @@ def _schedule_screen_cache_refresh(uid: int, session: str | None = None) -> None
 
 
 
+def _screen_age_text(age_sec: float) -> str:
+    try:
+        age = max(0, int(float(age_sec or 0.0)))
+        if age < 60:
+            return f"{age}s"
+        if age < 3600:
+            return f"{age // 60}m"
+        return f"{age // 3600}h{(age % 3600) // 60:02d}m"
+    except Exception:
+        return "-"
+
+
+def _screen_when_line(label: str, ts: float) -> str:
+    try:
+        ts_f = float(ts or 0.0)
+        if ts_f <= 0:
+            return ""
+        when = _fmt_dt_local(datetime.fromtimestamp(ts_f, tz=timezone.utc), "%Y-%m-%d %H:%M:%S")
+        return f"*{label}:* `{when}` | *Age:* `{_screen_age_text(time.time() - ts_f)}`\n"
+    except Exception:
+        return ""
+
+
 def _screen_plain_cleanup(txt: str) -> str:
     """Legacy plain-text fallback. /screen now uses HTML rendering instead."""
     try:
@@ -38120,11 +38128,44 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     age = _age
         _schedule_screen_cache_refresh(int(uid), scan_session)
         try:
-            latest_delivery_ts = _latest_recent_delivery_ts(int(uid), str(scan_session or '').upper(), max_age_min=max(20, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)))
+            latest_delivery_ts = _latest_recent_delivery_ts(int(uid), str(scan_session or '').upper(), max_age_min=max(45, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)))
         except Exception:
             latest_delivery_ts = 0.0
         cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
-        if cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC) and not (latest_delivery_ts > cache_ts + 1.0):
+
+        # Latest setup email wins over a cached scan so /screen matches Gmail/autotrade.
+        if latest_delivery_ts > 0:
+            try:
+                quick_best_email = get_cached_futures_tickers() or {}
+                if quick_best_email:
+                    body_e, kb_e, shown_e = _screen_recent_db_body_and_kb(
+                        int(uid), str(scan_session or '').upper(), quick_best_email,
+                        max_age_min=max(45, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)),
+                    )
+                    if body_e:
+                        header_e = (
+                            f"*PulseFutures — Market Scan*\n"
+                            f"{HDR}\n"
+                            f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                            f"{_screen_when_line('Latest setup email', latest_delivery_ts)}"
+                            f"_Showing latest sent setup email while the live scan refreshes._\n"
+                        )
+                        keyboard_e = [
+                            [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                            for (sym, sid) in (kb_e or [])
+                        ]
+                        await send_long_message(
+                            update,
+                            _screen_markdown_to_html((header_e + "\n" + body_e).strip()),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                            reply_markup=InlineKeyboardMarkup(keyboard_e) if keyboard_e else None,
+                        )
+                        return
+            except Exception:
+                pass
+
+        if cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
             note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
             if age <= float(SCREEN_CACHE_TTL_SEC):
                 note = "_Showing latest cached scan._\n"
@@ -38132,6 +38173,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"*PulseFutures — Market Scan*\n"
                 f"{HDR}\n"
                 f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{_screen_when_line('Cached scan built', cache_ts)}"
                 f"{note}"
             )
             keyboard = [
@@ -38164,10 +38206,19 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     max_age_min=max(10, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)),
                 )
                 if body:
+                    try:
+                        source_ts = max([float(getattr(x, 'email_logged_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0) for x in (shown_setups or [])] or [0.0])
+                    except Exception:
+                        source_ts = 0.0
+                    try:
+                        source_ts = max([float(getattr(x, 'email_logged_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0) for x in (shown_setups or [])] or [0.0])
+                    except Exception:
+                        source_ts = 0.0
                     header = (
                         f"*PulseFutures — Market Scan*\n"
                         f"{HDR}\n"
                         f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                        f"{_screen_when_line('Displayed setup source', source_ts)}"
                         f"_Showing recent executable setup queue while full scan refreshes._\n"
                     )
                     keyboard = [
@@ -38210,6 +38261,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"*PulseFutures — Market Scan*\n"
                     f"{HDR}\n"
                     f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                    f"{_screen_when_line('Ticker snapshot', time.time())}"
                     f"_Showing instant ticker snapshot while full executable scan warms up._\n"
                 )
                 await send_long_message(
