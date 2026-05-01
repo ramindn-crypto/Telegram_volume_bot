@@ -34351,6 +34351,73 @@ def _email_priority_bases(best_fut: dict, directional_take: int = 12) -> set:
 
 
 
+def _recovery_family_and_reason(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol: float) -> tuple[str, str, str, str]:
+    """Classify recovery/fallback candidates into the best-fit family and produce an entry reason."""
+    try:
+        sd = str(side or '').upper().strip()
+        sign = 1.0 if sd == 'BUY' else -1.0
+        s15 = sign * float(ch15 or 0.0)
+        s1 = sign * float(ch1 or 0.0)
+        s4 = sign * float(ch4 or 0.0)
+        s24 = sign * float(ch24 or 0.0)
+        vol_m = float(fut_vol or 0.0) / 1_000_000.0
+        reasons = []
+        if abs(float(ch24 or 0.0)) >= 10.0:
+            reasons.append(f"24h {float(ch24):+.0f}% directional mover")
+        if s4 >= 2.0:
+            reasons.append(f"4h aligned {float(ch4):+.0f}%")
+        elif s4 >= 0.35:
+            reasons.append(f"4h supportive {float(ch4):+.1f}%")
+        if s1 >= 1.0:
+            reasons.append(f"1h trigger {float(ch1):+.1f}%")
+        elif s1 >= 0.20:
+            reasons.append(f"1h supportive {float(ch1):+.1f}%")
+        if s15 >= 0.20:
+            reasons.append(f"15m timing {float(ch15):+.1f}%")
+        if vol_m >= 50.0:
+            reasons.append(f"high liquidity {vol_m:.0f}M")
+        if s15 >= 1.5 and s1 >= 3.0 and s4 >= 5.0:
+            fam = str(globals().get('BIGMOVE_FAMILY_ID', 'F8_BIGMOVE_CONT'))
+            name = str(globals().get('BIGMOVE_FAMILY_NAME', 'Big Move Continuation'))
+            engine = 'M'
+        elif s15 >= 0.35 and s1 >= 0.75 and s4 >= 0.20:
+            fam, name, engine = 'F2_MOMENTUM_IGNITION', 'Momentum Ignition', 'B'
+        elif s24 >= 10.0 and s4 >= 1.2 and s15 >= -0.10:
+            fam, name, engine = 'F3_IMPULSE_BASE_CONT', 'Impulse Base Continuation', 'C'
+        elif s24 >= 5.0 and s4 >= 0.20:
+            fam, name, engine = 'F1_PULLBACK_CONT', 'Pullback Continuation', 'A'
+        else:
+            fam, name, engine = 'F1_PULLBACK_CONT', 'Pullback Continuation', 'A'
+        reason = '; '.join(reasons[:4]) if reasons else 'current price near continuation zone'
+        return fam, name, engine, reason
+    except Exception:
+        return 'F1_PULLBACK_CONT', 'Pullback Continuation', 'A', 'current continuation context'
+
+
+def _recovery_entry_quality_ok(side: str, ch24: float, ch4: float, ch1: float, ch15: float, fut_vol: float) -> tuple[bool, str]:
+    """Final quality gate for fallback/recovery entries."""
+    try:
+        sd = str(side or '').upper().strip()
+        sign = 1.0 if sd == 'BUY' else -1.0
+        s24 = sign * float(ch24 or 0.0)
+        s4 = sign * float(ch4 or 0.0)
+        s1 = sign * float(ch1 or 0.0)
+        s15 = sign * float(ch15 or 0.0)
+        if float(fut_vol or 0.0) < _setup_min_volume_floor_usd():
+            return False, 'below_min_volume'
+        if s24 < 2.0:
+            return False, '24h_not_directional'
+        if s1 <= -0.75 and s15 <= -0.15:
+            return False, '1h_and_15m_against_entry'
+        if s4 <= -3.0 and s1 <= -0.20:
+            return False, '4h_and_1h_against_entry'
+        if not (s15 >= 0.05 or s1 >= 0.20 or s4 >= 0.35 or s24 >= 12.0):
+            return False, 'no_entry_timing_trigger'
+        return True, 'ok'
+    except Exception:
+        return False, 'entry_quality_exception'
+
+
 def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, market_bases: list, session_name: str, max_items: int = 4) -> list:
     """Bounded recovery generator used only when the normal OHLCV engines return nothing.
 
@@ -34401,7 +34468,7 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             continue
 
         fut_vol = float(_fut_vol_usd_from_best(best_fut, base) or usd_notional(mv) or 0.0)
-        if fut_vol < max(4_000_000.0, float(MIN_FUT_VOL_USD) * 0.45):
+        if fut_vol < _setup_min_volume_floor_usd():
             continue
 
         pct24_raw = float(getattr(mv, "percentage", 0.0) or 0.0)
@@ -34444,21 +34511,43 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
         if abs(ch15) < 1e-9:
             ch15 = sign * float(clamp(pct24_abs * 0.010, 0.05, 0.24))
 
+        entry_ok, entry_quality_reason = _recovery_entry_quality_ok(side, pct24_raw, ch4, ch1, ch15, fut_vol)
+        if not entry_ok:
+            try:
+                _rej(str(entry_quality_reason or 'recovery_entry_quality_reject'), base, mv)
+            except Exception:
+                pass
+            continue
+
+        family_id, family_name, engine_id, entry_reason = _recovery_family_and_reason(side, pct24_raw, ch4, ch1, ch15, fut_vol)
+
         if atr_1h <= 0:
             atr_1h = max(entry * 0.0065, 0.0000001)
         atr_pct = float((atr_1h / entry) * 100.0) if entry > 0 else 0.80
 
         sl_dist = max(1.20 * atr_1h, entry * 0.0045)
+        try:
+            recent_c15 = _ohlcv_best_effort_cached(market_symbol, "15m", 12) or []
+            if recent_c15 and len(recent_c15) >= 4:
+                lows15 = [float(x[3]) for x in recent_c15[-8:] if float(x[3] or 0.0) > 0]
+                highs15 = [float(x[2]) for x in recent_c15[-8:] if float(x[2] or 0.0) > 0]
+            else:
+                lows15, highs15 = [], []
+        except Exception:
+            lows15, highs15 = [], []
         rr_target = 1.55
-        tp_dist = rr_target * sl_dist
         if side == "BUY":
-            sl = max(entry - sl_dist, entry * 0.001)
-            tp_target = entry + tp_dist
+            swing_sl = (min(lows15) - max(0.18 * atr_1h, entry * 0.0010)) if lows15 else (entry - sl_dist)
+            sl = max(min(entry - sl_dist, swing_sl), entry * 0.001)
+            actual_r = abs(entry - sl)
+            tp_target = entry + rr_target * actual_r
             trend = 'BULLISH TREND'
             structure = 'BULLISH CONTINUATION'
         else:
-            sl = entry + sl_dist
-            tp_target = max(entry - tp_dist, entry * 0.001)
+            swing_sl = (max(highs15) + max(0.18 * atr_1h, entry * 0.0010)) if highs15 else (entry + sl_dist)
+            sl = max(entry + sl_dist, swing_sl)
+            actual_r = abs(sl - entry)
+            tp_target = max(entry - rr_target * actual_r, entry * 0.001)
             trend = 'BEARISH TREND'
             structure = 'BEARISH CONTINUATION'
 
@@ -34486,11 +34575,11 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             pullback_ready=True,
             pullback_bypass_hot=bool(fut_vol >= 20_000_000.0),
             leader_base_override=True,
-            engine="A",
+            engine=str(engine_id or 'A'),
             is_trailing_alt_target_b=False,
             created_ts=time.time(),
-            family_id='F1_PULLBACK_CONT',
-            family_name='Recovery Pullback Continuation',
+            family_id=str(family_id or 'F1_PULLBACK_CONT'),
+            family_name=str(family_name or 'Pullback Continuation'),
             regime_primary='TRENDING',
             regime_secondary='RECOVERY',
             regime_confidence=0.55,
@@ -34501,6 +34590,8 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             setattr(setup, 'trend', trend)
             setattr(setup, 'structure', structure)
             setattr(setup, 'recovery_fallback', True)
+            setattr(setup, 'entry_reason', str(entry_reason or ''))
+            setattr(setup, 'generated_reason', str(entry_reason or ''))
             score, comps = compute_setup_quality_score(setup, session_name=session_name)
             setattr(setup, 'quality_score', float(max(score, 68.0)))
             setattr(setup, 'quality_components', comps or {})
@@ -34577,32 +34668,77 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _setup_audit_reason_from_row(row: dict) -> str:
     try:
-        engine = str(row.get('engine') or '').upper().strip() or '-'
-        fam = str(row.get('family_id') or '').upper().strip() or '-'
+        for key in ('entry_reason', 'generated_reason', 'reason_to_enter'):
+            val = str((row or {}).get(key) or '').strip()
+            if val:
+                return val[:120]
+        details = str((row or {}).get('details_json') or '').strip()
+        if details:
+            try:
+                obj = json.loads(details)
+                if isinstance(obj, dict):
+                    for key in ('entry_reason', 'generated_reason', 'reason_to_enter', 'reason'):
+                        val = str(obj.get(key) or '').strip()
+                        if val:
+                            return val[:120]
+            except Exception:
+                pass
+        fam = str(row.get('family_id') or '').upper().strip().replace('_', '-') or '-'
         ch24 = float(row.get('ch24') or 0.0)
         ch4 = float(row.get('ch4') or 0.0)
         ch1 = float(row.get('ch1') or 0.0)
         ch15 = float(row.get('ch15') or 0.0)
         side = str(row.get('side') or '').upper().strip()
-        direction = 'long' if side == 'BUY' else 'short' if side == 'SELL' else 'setup'
+        sign = 1.0 if side == 'BUY' else -1.0
         parts = []
         if fam and fam != '-':
-            parts.append(fam.replace('_', '-'))
-        elif engine and engine != '-':
-            parts.append(f'Engine {engine}')
-        if abs(ch24) >= 10:
+            parts.append(fam)
+        if sign * ch24 >= 10:
             parts.append(f'24h {ch24:+.0f}% mover')
-        if abs(ch4) >= 3:
-            parts.append(f'4h {ch4:+.0f}% context')
-        if abs(ch1) >= 2:
-            parts.append(f'1h {ch1:+.0f}% trigger')
-        if abs(ch15) >= 1:
-            parts.append(f'15m {ch15:+.0f}% timing')
+        if sign * ch4 >= 2:
+            parts.append(f'4h {ch4:+.0f}% aligned')
+        elif sign * ch4 >= 0.3:
+            parts.append(f'4h {ch4:+.1f}% supportive')
+        if sign * ch1 >= 1:
+            parts.append(f'1h {ch1:+.1f}% trigger')
+        elif sign * ch1 >= 0.2:
+            parts.append(f'1h {ch1:+.1f}% supportive')
+        if sign * ch15 >= 0.2:
+            parts.append(f'15m {ch15:+.1f}% timing')
         if not parts:
-            parts.append(f'{direction} continuation context')
-        return '; '.join(parts[:3])
+            parts.append('continuation zone with valid SL/TP')
+        return '; '.join(parts[:4])
     except Exception:
         return 'setup context'
+
+
+def _setup_audit_price_result_from_row(row: dict, horizon_hours: int = 24) -> str:
+    """Resolve setup result from actual post-signal price movement, not open positions."""
+    try:
+        side = str((row or {}).get('side') or '').upper().strip()
+        symbol = str((row or {}).get('symbol') or '').upper().strip()
+        symbol_base = symbol[:-4] if symbol.endswith('USDT') else symbol
+        payload = {
+            'setup_id': str((row or {}).get('setup_id') or ''),
+            'symbol': symbol_base,
+            'market_symbol': str((row or {}).get('market_symbol') or '').strip() or _market_symbol_from_base(symbol_base),
+            'side': side,
+            'entry': float((row or {}).get('entry') or 0.0),
+            'sl': float((row or {}).get('sl') or 0.0),
+            'tp': float((row or {}).get('tp') or 0.0),
+            'alt_target_a': 0.0,
+            'alt_target_b': 0.0,
+            'created_ts': float((row or {}).get('ts') or (row or {}).get('created_ts') or 0.0),
+        }
+        res = evaluate_signal_hit_order(payload, horizon_hours=int(horizon_hours), timeframe='1m') or {}
+        out = str(res.get('outcome') or '').upper().strip()
+        if out == 'TP':
+            return 'WIN'
+        if out == 'SL':
+            return 'LOSE'
+        return 'OPEN'
+    except Exception:
+        return 'OPEN'
 
 
 def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
@@ -34616,45 +34752,33 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
             cur = con.cursor()
             try:
                 cur.execute("""
-                    SELECT executable_ts AS ts, 'EXEC' AS source, session, setup_id, symbol, side, conf,
+                    SELECT executable_ts AS ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
                            COALESCE(family_id, '') AS family_id, entry, sl, tp
                     FROM executable_setups
                     WHERE user_id=? AND executable_ts>=?
                     ORDER BY executable_ts DESC
                     LIMIT ?
-                """, (int(uid), cutoff, int(limit * 3)))
+                """, (int(uid), cutoff, int(limit * 4)))
                 rows.extend([dict(r) for r in (cur.fetchall() or [])])
             except Exception:
                 pass
             try:
-                cur.execute("""
-                    SELECT created_ts AS ts, UPPER(source) AS source, session, setup_id, symbol, side, conf,
+                cols = {r[1] for r in cur.execute('PRAGMA table_info(generated_setups)').fetchall()}
+                market_expr = 'market_symbol' if 'market_symbol' in cols else "'' AS market_symbol"
+                reason_expr = 'entry_reason' if 'entry_reason' in cols else "'' AS entry_reason"
+                cur.execute(f"""
+                    SELECT created_ts AS ts, UPPER(source) AS source, session, setup_id, symbol, {market_expr}, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
-                           COALESCE(family_id, '') AS family_id, entry, sl, tp
+                           COALESCE(family_id, '') AS family_id, entry, sl, tp, {reason_expr}
                     FROM generated_setups
                     WHERE user_id=? AND created_ts>=?
                     ORDER BY created_ts DESC
                     LIMIT ?
-                """, (int(uid), cutoff, int(limit * 3)))
+                """, (int(uid), cutoff, int(limit * 4)))
                 rows.extend([dict(r) for r in (cur.fetchall() or [])])
             except Exception:
                 pass
-            outcomes = {}
-            auto = {}
-            setup_ids = [str(r.get('setup_id') or '') for r in rows if str(r.get('setup_id') or '')]
-            if setup_ids:
-                qmarks = ','.join(['?'] * len(setup_ids))
-                try:
-                    cur.execute(f"SELECT setup_id, outcome, hit_level, note FROM signal_outcomes WHERE setup_id IN ({qmarks})", setup_ids)
-                    outcomes = {str(r['setup_id']): dict(r) for r in (cur.fetchall() or [])}
-                except Exception:
-                    outcomes = {}
-                try:
-                    cur.execute(f"SELECT setup_id, status, outcome, pnl_usdt, closed_ts FROM autotrade_trades WHERE uid=? AND setup_id IN ({qmarks})", [int(uid)] + setup_ids)
-                    auto = {str(r['setup_id']): dict(r) for r in (cur.fetchall() or [])}
-                except Exception:
-                    auto = {}
     except Exception as e:
         return f"❌ setup_audit error: {type(e).__name__}: {e}"
 
@@ -34672,41 +34796,21 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
         "🧪 Setup Audit",
         HDR,
         f"Window: last {hours}h | Rows: {len(final)} | Min vol: ${_setup_min_volume_floor_usd()/1e6:.0f}M",
-        "Use this for quality review; /screen stays clean for trading.",
+        "Result uses actual price move to TP/SL: WIN / LOSE / OPEN.",
+        "Format: ID - Type - Volume - Family - Reason to Enter - Result",
         "",
     ]
-    table = []
     for r in final:
         sid = str(r.get('setup_id') or '')
-        try:
-            tstr = _fmt_dt_local(datetime.fromtimestamp(float(r.get('ts') or 0.0), tz=timezone.utc), "%m-%d %H:%M")
-        except Exception:
-            tstr = "?"
+        side = str(r.get('side') or '').upper().strip()
+        sym = str(r.get('symbol') or '').upper().strip()
+        if sym.endswith('USDT'):
+            sym = sym[:-4]
         vol_m = float(r.get('fut_vol_usd') or 0.0) / 1e6
-        outcome = str((outcomes.get(sid) or {}).get('outcome') or '').strip()
-        at = auto.get(sid) or {}
-        if at:
-            status = str(at.get('status') or '').strip() or 'OPEN'
-            pnl = at.get('pnl_usdt')
-            result = f"AT:{status} {float(pnl or 0.0):+.2f}" if pnl not in (None, '') else f"AT:{status}"
-        else:
-            result = outcome or 'OPEN/none'
-        family = str(r.get('family_id') or '').replace('_', '-')[:18] or str(r.get('engine') or '-')
-        table.append([
-            tstr,
-            str(r.get('source') or '')[:5],
-            sid.replace('PF-', '')[-10:],
-            f"{str(r.get('side') or '').upper():4s} {str(r.get('symbol') or '').upper():10s}",
-            int(float(r.get('conf') or 0)),
-            f"{vol_m:.1f}M",
-            family,
-            result[:14],
-        ])
-    lines.append(tabulate(table, headers=['Time','Src','Setup','Trade','Conf','Vol','Family','Result'], tablefmt='plain'))
-    lines.append("")
-    lines.append("Reasons")
-    for r in final[:10]:
-        lines.append(f"• {str(r.get('setup_id') or '')}: {_setup_audit_reason_from_row(r)}")
+        fam = str(r.get('family_id') or '').upper().replace('_', '-') or str(r.get('engine') or '-').upper()
+        reason = _setup_audit_reason_from_row(r)
+        result = _setup_audit_price_result_from_row(r, horizon_hours=hours)
+        lines.append(f"• {sid} - Type: {side} {sym} - Volume: {vol_m:.1f}M - Family: {fam} - Reason to Enter: {reason} - Result: {result}")
     return "\n".join(lines)
 
 
