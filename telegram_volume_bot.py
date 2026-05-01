@@ -8,7 +8,7 @@
 
 # --- ASIA tightening (hard-coded, no env vars) ---
 ASIA_MIN_CONF_BOOST = 10
-ASIA_MIN_FUT_VOL_USD = 9_000_000
+ASIA_MIN_FUT_VOL_USD = 10_000_000
 ASIA_EXCLUDED_PREFIXES = ("1000",)
 ASIA_SYMBOL_COOLDOWN_HOURS = 6
 
@@ -1510,15 +1510,36 @@ LEADERS_N = 10
 
 # ✅ More setups on /screen (UX), while email stays strict
 SETUPS_N = int(os.environ.get("SETUPS_N", "5") or 5)
-EMAIL_SETUPS_N = int(os.environ.get("EMAIL_SETUPS_N", "4") or 4)
+EMAIL_SETUPS_N = int(os.environ.get("EMAIL_SETUPS_N", "2") or 2)
 
 # ✅ Global setup quality floor (Premium & Selective)
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "72"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
+# Production quality floor: no setup display/email/autotrade below this 24h futures volume.
+SETUP_MIN_24H_VOL_USD = float(os.environ.get("SETUP_MIN_24H_VOL_USD", "10000000") or 10000000)
+MIN_FUT_VOL_USD = max(float(MIN_FUT_VOL_USD or 0.0), float(SETUP_MIN_24H_VOL_USD or 0.0), 10_000_000.0)
 MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP", os.environ.get("MIN_RR_TP", "1.45"))))
 MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as final target
+
+def _setup_min_volume_floor_usd() -> float:
+    try:
+        return max(10_000_000.0, float(SETUP_MIN_24H_VOL_USD or 0.0), float(MIN_FUT_VOL_USD or 0.0))
+    except Exception:
+        return 10_000_000.0
+
+def _setup_volume_ok(setup_or_vol) -> bool:
+    try:
+        if isinstance(setup_or_vol, (int, float)):
+            vol = float(setup_or_vol or 0.0)
+        elif isinstance(setup_or_vol, dict):
+            vol = float(setup_or_vol.get('fut_vol_usd') or setup_or_vol.get('volume') or setup_or_vol.get('vol_usd') or 0.0)
+        else:
+            vol = float(getattr(setup_or_vol, 'fut_vol_usd', 0.0) or 0.0)
+        return vol >= _setup_min_volume_floor_usd()
+    except Exception:
+        return False
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
@@ -2268,7 +2289,7 @@ def apply_strategy_config(cfg: dict) -> None:
 
     # Liquidity + RR
     try:
-        MIN_FUT_VOL_USD = float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD))
+        MIN_FUT_VOL_USD = max(_setup_min_volume_floor_usd(), float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD) or 0.0))
         EMAIL_MIN_FUT_VOL_USD = float(MIN_FUT_VOL_USD)
     except Exception:
         pass
@@ -2466,7 +2487,7 @@ ENGINE_C_MIN_BASE_BARS = 3
 ENGINE_C_MAX_BASE_WIDTH_PCT = 7.2
 ENGINE_C_HOLD_PORTION = 0.52
 ENGINE_C_BREAKOUT_BUFFER_PCT = 0.35
-ENGINE_C_MIN_FUT_VOL_USD = 8_000_000.0
+ENGINE_C_MIN_FUT_VOL_USD = 10_000_000.0
 ENGINE_C_RR_BONUS = 0.20
 ENGINE_C_TP_CAP_BONUS_PCT = 2.0
 
@@ -6429,6 +6450,8 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
+        if not _setup_volume_ok(s):
+            return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
 
         has_rich_exec_snapshot = bool(
             str(getattr(s, "engine", "") or "").strip()
@@ -27834,6 +27857,8 @@ def is_executable_setup_eligible(
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
+        if not _setup_volume_ok(s):
+            return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
 
         cfg_live = load_strategy_config(force=False)
         exec_engine_b_enabled = _cfg_bool((cfg_live or {}).get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
@@ -31419,6 +31444,8 @@ ADMIN_HELP_DESCRIPTIONS = {
     "lessons_learned": "Cached latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
+    "setup_audit": "Admin-only setup quality audit: setup id, buy/short, symbol, volume, family/engine, result, and generated reason",
+    "setup_quality": "Alias of /setup_audit",
     "signal_report": "Recent emailed setup outcomes",
     "signal_report_overall": "Overall emailed-signal outcome summary (WR, R, session split)",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
@@ -31465,7 +31492,7 @@ ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("⚖️ RISK / DAY RESET", ["dailycap", "dailycapAT", "dayrisk_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log"]),
+    ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
     ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
@@ -34544,6 +34571,163 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+def _setup_audit_reason_from_row(row: dict) -> str:
+    try:
+        engine = str(row.get('engine') or '').upper().strip() or '-'
+        fam = str(row.get('family_id') or '').upper().strip() or '-'
+        ch24 = float(row.get('ch24') or 0.0)
+        ch4 = float(row.get('ch4') or 0.0)
+        ch1 = float(row.get('ch1') or 0.0)
+        ch15 = float(row.get('ch15') or 0.0)
+        side = str(row.get('side') or '').upper().strip()
+        direction = 'long' if side == 'BUY' else 'short' if side == 'SELL' else 'setup'
+        parts = []
+        if fam and fam != '-':
+            parts.append(fam.replace('_', '-'))
+        elif engine and engine != '-':
+            parts.append(f'Engine {engine}')
+        if abs(ch24) >= 10:
+            parts.append(f'24h {ch24:+.0f}% mover')
+        if abs(ch4) >= 3:
+            parts.append(f'4h {ch4:+.0f}% context')
+        if abs(ch1) >= 2:
+            parts.append(f'1h {ch1:+.0f}% trigger')
+        if abs(ch15) >= 1:
+            parts.append(f'15m {ch15:+.0f}% timing')
+        if not parts:
+            parts.append(f'{direction} continuation context')
+        return '; '.join(parts[:3])
+    except Exception:
+        return 'setup context'
+
+
+def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
+    limit = max(1, min(50, int(limit or 15)))
+    hours = max(1, min(168, int(hours or 24)))
+    cutoff = float(time.time()) - float(hours) * 3600.0
+    rows = []
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            try:
+                cur.execute("""
+                    SELECT executable_ts AS ts, 'EXEC' AS source, session, setup_id, symbol, side, conf,
+                           fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
+                           COALESCE(family_id, '') AS family_id, entry, sl, tp
+                    FROM executable_setups
+                    WHERE user_id=? AND executable_ts>=?
+                    ORDER BY executable_ts DESC
+                    LIMIT ?
+                """, (int(uid), cutoff, int(limit * 3)))
+                rows.extend([dict(r) for r in (cur.fetchall() or [])])
+            except Exception:
+                pass
+            try:
+                cur.execute("""
+                    SELECT created_ts AS ts, UPPER(source) AS source, session, setup_id, symbol, side, conf,
+                           fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
+                           COALESCE(family_id, '') AS family_id, entry, sl, tp
+                    FROM generated_setups
+                    WHERE user_id=? AND created_ts>=?
+                    ORDER BY created_ts DESC
+                    LIMIT ?
+                """, (int(uid), cutoff, int(limit * 3)))
+                rows.extend([dict(r) for r in (cur.fetchall() or [])])
+            except Exception:
+                pass
+            outcomes = {}
+            auto = {}
+            setup_ids = [str(r.get('setup_id') or '') for r in rows if str(r.get('setup_id') or '')]
+            if setup_ids:
+                qmarks = ','.join(['?'] * len(setup_ids))
+                try:
+                    cur.execute(f"SELECT setup_id, outcome, hit_level, note FROM signal_outcomes WHERE setup_id IN ({qmarks})", setup_ids)
+                    outcomes = {str(r['setup_id']): dict(r) for r in (cur.fetchall() or [])}
+                except Exception:
+                    outcomes = {}
+                try:
+                    cur.execute(f"SELECT setup_id, status, outcome, pnl_usdt, closed_ts FROM autotrade_trades WHERE uid=? AND setup_id IN ({qmarks})", [int(uid)] + setup_ids)
+                    auto = {str(r['setup_id']): dict(r) for r in (cur.fetchall() or [])}
+                except Exception:
+                    auto = {}
+    except Exception as e:
+        return f"❌ setup_audit error: {type(e).__name__}: {e}"
+
+    dedup = {}
+    for r in sorted(rows, key=lambda x: float(x.get('ts') or 0.0), reverse=True):
+        sid = str(r.get('setup_id') or '')
+        if not sid or sid in dedup:
+            continue
+        dedup[sid] = r
+    final = [r for r in dedup.values() if _setup_volume_ok(float(r.get('fut_vol_usd') or 0.0))][:limit]
+    if not final:
+        return f"🧪 Setup Audit\n{HDR}\nNo recent setups above ${_setup_min_volume_floor_usd()/1e6:.0f}M volume in the last {hours}h."
+
+    lines = [
+        "🧪 Setup Audit",
+        HDR,
+        f"Window: last {hours}h | Rows: {len(final)} | Min vol: ${_setup_min_volume_floor_usd()/1e6:.0f}M",
+        "Use this for quality review; /screen stays clean for trading.",
+        "",
+    ]
+    table = []
+    for r in final:
+        sid = str(r.get('setup_id') or '')
+        try:
+            tstr = _fmt_dt_local(datetime.fromtimestamp(float(r.get('ts') or 0.0), tz=timezone.utc), "%m-%d %H:%M")
+        except Exception:
+            tstr = "?"
+        vol_m = float(r.get('fut_vol_usd') or 0.0) / 1e6
+        outcome = str((outcomes.get(sid) or {}).get('outcome') or '').strip()
+        at = auto.get(sid) or {}
+        if at:
+            status = str(at.get('status') or '').strip() or 'OPEN'
+            pnl = at.get('pnl_usdt')
+            result = f"AT:{status} {float(pnl or 0.0):+.2f}" if pnl not in (None, '') else f"AT:{status}"
+        else:
+            result = outcome or 'OPEN/none'
+        family = str(r.get('family_id') or '').replace('_', '-')[:18] or str(r.get('engine') or '-')
+        table.append([
+            tstr,
+            str(r.get('source') or '')[:5],
+            sid.replace('PF-', '')[-10:],
+            f"{str(r.get('side') or '').upper():4s} {str(r.get('symbol') or '').upper():10s}",
+            int(float(r.get('conf') or 0)),
+            f"{vol_m:.1f}M",
+            family,
+            result[:14],
+        ])
+    lines.append(tabulate(table, headers=['Time','Src','Setup','Trade','Conf','Vol','Family','Result'], tablefmt='plain'))
+    lines.append("")
+    lines.append("Reasons")
+    for r in final[:10]:
+        lines.append(f"• {str(r.get('setup_id') or '')}: {_setup_audit_reason_from_row(r)}")
+    return "\n".join(lines)
+
+
+async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    limit = 15
+    hours = 24
+    try:
+        if context.args:
+            if str(context.args[0]).isdigit():
+                limit = int(context.args[0])
+            if len(context.args) > 1 and str(context.args[1]).isdigit():
+                hours = int(context.args[1])
+    except Exception:
+        pass
+    try:
+        text = await to_thread_fast(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=6)
+    except Exception as e:
+        text = f"❌ setup_audit failed: {type(e).__name__}: {e}"
+    await send_long_message(update, text, parse_mode=None, disable_web_page_preview=True)
+
 async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/setups_log [n] [screen|email|all] — view recently generated setups."""
     uid = update.effective_user.id
@@ -37415,9 +37599,9 @@ def _screen_markdown_to_html(txt: str) -> str:
 
 def _screen_display_limit() -> int:
     try:
-        return max(1, min(5, int(os.environ.get('SCREEN_MAX_CARDS_DISPLAY', '5') or 5)))
+        return max(1, min(4, int(os.environ.get('SCREEN_MAX_CARDS_DISPLAY', '4') or 4)))
     except Exception:
-        return 5
+        return 4
 
 
 def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
@@ -37434,8 +37618,12 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
             return "🟡"
         return "🟢" if p >= 0 else "🔴"
 
+    visible_setups = [s for s in list(setups or []) if _setup_volume_ok(s)]
+    if not visible_setups:
+        return f"_No setup above ${_setup_min_volume_floor_usd()/1e6:.0f}M 24h volume right now._"
+
     lines2 = []
-    for s in list(setups or [])[:_screen_display_limit()]:
+    for s in visible_setups[:_screen_display_limit()]:
         try:
             sym = str(getattr(s, "symbol", "") or "").upper()
             sid = str(getattr(s, "setup_id", "") or "")
@@ -37467,7 +37655,7 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
                     block.append("📩 *Email suppressed:* cooldown active")
             except Exception:
                 pass
-            block.append(f"Type: {typ} | RR(TP): `{rr:.2f}`")
+            block.append(f"RR(TP): `{rr:.2f}`")
             block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
             block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp, 0.0, 0.0, side) or 0.0))}`")
             block.append(
@@ -37509,6 +37697,8 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                 if side == 'BUY' and not (sl < entry < tp):
                     return False
                 if side == 'SELL' and not (tp < entry < sl):
+                    return False
+                if not _setup_volume_ok(item):
                     return False
                 return True
             except Exception:
@@ -37618,6 +37808,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                         return False
                     if side == 'SELL' and not (tp < entry < sl):
                         return False
+                    if not _setup_volume_ok(item):
+                        return False
                     return True
                 except Exception:
                     return False
@@ -37718,7 +37910,11 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         setups = list(_exec_ready[:max(1, int(SETUPS_N))])
 
     # Keep /screen readable. The executable queue can still hold more for email/autotrade;
-    # /screen is an action dashboard, not a dump.
+    # /screen is an action dashboard, not a dump. Also enforce the production 24h-volume floor.
+    try:
+        setups = [s for s in list(setups or []) if _setup_volume_ok(s)]
+    except Exception:
+        setups = list(setups or [])
     try:
         setups = list(setups or [])[:_screen_display_limit()]
     except Exception:
@@ -42244,6 +42440,8 @@ def main():
     app.add_handler(CommandHandler("email_decision", email_decision_cmd, block=False))
     app.add_handler(CommandHandler("email_pipeline_status", email_pipeline_status_cmd, block=False))
     app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit", setup_audit_cmd, block=False))
+    app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
 
     app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
