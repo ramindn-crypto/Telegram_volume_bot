@@ -5517,17 +5517,24 @@ def _autotrade_user_settings(uid: int) -> dict:
         return get_user(int(uid)) or {}
 
 def _autotrade_per_trade_risk_usd(uid: int, equity: float) -> float:
-    user = _autotrade_user_settings(uid)
-    mode = str(user.get("risk_mode", DEFAULT_RISK_MODE)).upper()
-    val = float(user.get("risk_value", DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE)
-    # compute_risk_usd uses live equity when available, but we pass user updated equity anyway
+    """AutoTrade per-position risk from /autotrade_config only.
+
+    This must NOT use the manual /riskmode value. Manual trading and AutoTrade
+    have separate risk controls; /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT
+    is the source of truth for live bot entries.
+    """
     try:
-        if equity and equity > 0:
-            user = dict(user)
-            user["equity"] = float(equity)
+        eq = float(equity or 0.0)
     except Exception:
-        pass
-    return float(compute_risk_usd(user, mode, val) or 0.0)
+        eq = 0.0
+    if eq <= 0:
+        return 0.0
+    try:
+        pct = float(_autotrade_risk_per_trade_pct() or 0.0)
+    except Exception:
+        pct = float(AUTOTRADE_RISK_PER_TRADE_PCT or 0.0)
+    pct = max(0.0, float(pct or 0.0))
+    return float(_risk_amount_from_pct(eq, pct) or 0.0)
 
 def _autotrade_daily_cap_usd(uid: int, equity: float) -> float:
     user = _autotrade_user_settings(uid)
@@ -5546,21 +5553,17 @@ def _autotrade_daily_cap_usd(uid: int, equity: float) -> float:
     return _risk_amount_from_pct(eq, float(val or 0.0))
 
 def _autotrade_remaining_risk_usd(uid: int, equity: float) -> float:
-    user = _autotrade_user_settings(uid)
-    # keep equity aligned for pct caps
+    """Remaining AutoTrade risk from AutoTrade daily-cap settings only."""
     try:
-        if equity and equity > 0:
-            user2 = dict(user)
-            user2["equity"] = float(equity)
-        else:
-            user2 = user
+        cap = float(_autotrade_daily_cap_usd(int(uid), float(equity or 0.0)) or 0.0)
+        m = _autotrade_day_risk_metrics_cached(int(uid), float(equity or 0.0), ttl=3, force_refresh=True)
+        used = float(m.get('used_total') or m.get('current_day_open_risk') or 0.0)
     except Exception:
-        user2 = user
-    cap = float(daily_cap_usd(user2) or 0.0)
-    used = float(_risk_used_total_today(int(uid), user2) or 0.0)
+        cap = 0.0
+        used = 0.0
     if cap <= 0:
         return float("inf")
-    return max(0.0, cap - used)
+    return max(0.0, float(cap) - float(used))
 
 def _autotrade_db_init():
     with sqlite3.connect(DB_PATH) as conn:
@@ -7052,7 +7055,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         except Exception:
             pass
         return (False, 'max_trades_day_reached')
-    if int(AUTOTRADE_MAX_OPEN_TRADES or 0) > 0 and live_open_count >= int(_autotrade_runtime_max_open_trades()):
+    if int(_autotrade_runtime_max_open_trades()) > 0 and live_open_count >= int(_autotrade_runtime_max_open_trades()):
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
         except Exception:
@@ -7096,8 +7099,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'contractSize': float(contract_size),
             'tick_size': filt.get('tickSize'),
             'equity_used': float(equity),
-            'risk_mode': str((get_user(uid) or {}).get('risk_mode', DEFAULT_RISK_MODE)).upper(),
-            'risk_value': float((get_user(uid) or {}).get('risk_value', DEFAULT_RISK_VALUE) or DEFAULT_RISK_VALUE),
+            'risk_mode': 'AT_PCT',
+            'risk_value': float(_autotrade_risk_per_trade_pct() or 0.0),
             'risk_base_usd': float(base_per_trade_risk),
             'risk_effective_usd': float(effective_risk),
             'risk_multiplier': float(risk_mult),
@@ -11562,7 +11565,7 @@ def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
 # 1) first scan that meets 15m/1H/4H same-direction criteria records a pending trigger;
 # 2) only the NEXT closed 15m candle can release the email;
 # 3) if that next 15m candle is not in the same direction, the pending trigger is cancelled.
-BIGMOVE_CONFIRM_NEXT_15M_ENABLED = env_bool("BIGMOVE_CONFIRM_NEXT_15M_ENABLED", False)
+BIGMOVE_CONFIRM_NEXT_15M_ENABLED = True  # Admin rule: big-move email only after next closed 15m candle confirms direction
 BIGMOVE_PENDING_TTL_SEC = int(os.environ.get("BIGMOVE_PENDING_TTL_SEC", str(3 * 60 * 60)) or (3 * 60 * 60))
 
 
@@ -37521,6 +37524,30 @@ def _screen_when_line(label: str, ts: float) -> str:
         return ""
 
 
+def _screen_user_can_see_email_source(uid: int, user: dict | None = None) -> bool:
+    """Only admins and Pro/trial users should see email-source wording on /screen."""
+    try:
+        if is_admin_user(int(uid)):
+            return True
+    except Exception:
+        pass
+    try:
+        u = user if user is not None else (get_user(int(uid)) or {})
+        return effective_plan(int(uid), u) in {"pro", "trial"}
+    except Exception:
+        return False
+
+
+def _screen_ts_label(ts: float, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    try:
+        ts_f = float(ts or 0.0)
+        if ts_f <= 0:
+            return ""
+        return _fmt_dt_local(datetime.fromtimestamp(ts_f, tz=timezone.utc), fmt)
+    except Exception:
+        return ""
+
+
 def _screen_plain_cleanup(txt: str) -> str:
     """Legacy plain-text fallback. /screen now uses HTML rendering instead."""
     try:
@@ -37650,9 +37677,10 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
                 sk = str(getattr(s, 'source_kind', '') or '').lower().strip()
                 email_ts = float(getattr(s, 'email_logged_ts', 0.0) or getattr(s, 'emailed_ts', 0.0) or 0.0)
                 if sk in {'emailed_setups', 'recent_email_cache', 'recent_email_lane'} or email_ts > 0:
-                    block.append("📩 *Emailed recently*")
+                    when_txt = _screen_ts_label(email_ts) if email_ts > 0 else ''
+                    block.append(f"📩 *Emailed at {when_txt}*" if when_txt else "📩 *Emailed*")
                 elif symbol_recently_emailed(uid, sym, side, session):
-                    block.append("📩 *Email suppressed:* cooldown active")
+                    block.append("📩 *Email cooldown active*")
             except Exception:
                 pass
             block.append(f"RR(TP): `{rr:.2f}`")
@@ -37672,7 +37700,7 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
     return ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
 
 
-def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int = 30):
+def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int = 30, include_email_source: bool = True):
     """Lightweight no-OHLCV /screen fallback from the latest delivery/executable DB.
 
     Priority is deliberate:
@@ -37705,10 +37733,11 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                 return False
 
         sources = []
-        try:
-            sources.append(('emailed', _recent_delivery_lane_setup_objects(int(uid), session_name=sess, max_age_min=max_age_min, limit=20) or []))
-        except Exception:
-            sources.append(('emailed', []))
+        if include_email_source:
+            try:
+                sources.append(('emailed', _recent_delivery_lane_setup_objects(int(uid), session_name=sess, max_age_min=max_age_min, limit=20) or []))
+            except Exception:
+                sources.append(('emailed', []))
         try:
             cutoff = float(time.time()) - float(max(2, int(max_age_min))) * 60.0
             rows = db_list_executable_setups(int(uid), session_name=sess, ts_from=cutoff, limit=20)
@@ -37720,6 +37749,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         except Exception:
             sources.append(('candidate', []))
 
+        used_source_name = ''
         for source_name, candidates in sources:
             for item in candidates:
                 try:
@@ -37738,6 +37768,8 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                         ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=sess)
                     if not ok_exec:
                         continue
+                    if not used_source_name:
+                        used_source_name = str(source_name or '')
                     out.append(item)
                     seen.add(dedupe_key)
                     if len(out) >= _screen_display_limit():
@@ -37754,7 +37786,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         except Exception:
             up_list, dn_list = [], []
         market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list[:5], losers=dn_list[:5])
-        source_note = '_Showing latest sent setup email while the live scan refreshes._'
+        source_note = '_Showing latest sent setup email while the live scan refreshes._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue while the live scan refreshes._'
         body = "\n".join([
             "",
             "*Top Trade Setups*",
@@ -37815,10 +37847,11 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                     return False
 
             sources = []
-            try:
-                sources.append(('emailed', _recent_delivery_lane_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 3))) or []))
-            except Exception:
-                sources.append(('emailed', []))
+            if _screen_user_can_see_email_source(int(_uid)):
+                try:
+                    sources.append(('emailed', _recent_delivery_lane_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 3))) or []))
+                except Exception:
+                    sources.append(('emailed', []))
             try:
                 cutoff = float(time.time()) - float(max_age_min) * 60.0
                 rows = db_list_executable_setups(int(_uid), session_name=str(_session or ''), ts_from=float(cutoff), limit=max(1, int(limit * 4)))
@@ -38323,13 +38356,15 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cache_entry = _ce
                     age = _age
         _schedule_screen_cache_refresh(int(uid), scan_session)
+        can_show_email_source = _screen_user_can_see_email_source(int(uid), user)
         try:
-            latest_delivery_ts = _latest_recent_delivery_ts(int(uid), str(scan_session or '').upper(), max_age_min=max(45, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)))
+            latest_delivery_ts = _latest_recent_delivery_ts(int(uid), str(scan_session or '').upper(), max_age_min=max(45, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8))) if can_show_email_source else 0.0
         except Exception:
             latest_delivery_ts = 0.0
         cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
 
-        # Latest setup email wins over a cached scan so /screen matches Gmail/autotrade.
+        # Latest setup email wins over a cached scan only for Pro/trial users and admins,
+        # because Standard users do not receive setup emails.
         if latest_delivery_ts > 0:
             try:
                 quick_best_email = get_cached_futures_tickers() or {}
@@ -38337,13 +38372,13 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     body_e, kb_e, shown_e = _screen_recent_db_body_and_kb(
                         int(uid), str(scan_session or '').upper(), quick_best_email,
                         max_age_min=max(45, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)),
+                        include_email_source=True,
                     )
                     if body_e:
                         header_e = (
                             f"*PulseFutures — Market Scan*\n"
                             f"{HDR}\n"
                             f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                            f"{_screen_when_line('Latest setup email', latest_delivery_ts)}"
                             f"_Showing latest sent setup email while the live scan refreshes._\n"
                         )
                         keyboard_e = [
@@ -38400,6 +38435,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     str(scan_session or '').upper(),
                     quick_best,
                     max_age_min=max(10, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)),
+                    include_email_source=bool(can_show_email_source),
                 )
                 if body:
                     try:
@@ -38829,7 +38865,6 @@ def _email_body_pretty(
 
         # ✅ "ID-" prefix
         parts.append(f"ID-{s.setup_id} — {s.side} {s.symbol} — Conf {s.conf}")
-        parts.append(f"   Type: {_setup_display_label(s)}")
         _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp', None), getattr(s, 'alt_target_a', None), getattr(s, 'alt_target_b', None), getattr(s, 'side', ''))
         parts.append(f"   Entry: {fmt_price_email(s.entry)} | SL: {fmt_price_email(s.sl)} | RR(TP): {rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}")
 
@@ -38911,7 +38946,6 @@ def _email_body_pretty_html(
         card = []
         card.append(f"<div style='padding:10px 12px;border:1px solid #eee;border-radius:10px;margin:10px 0'>")
         card.append(f"<div style='font-weight:700;font-size:15px'>{i}) ID-{setup_id} — {side} {sym} — Conf {conf}</div>")
-        card.append(f"<div style='margin-top:4px'>Type: <b>{esc(_setup_display_label(s))}</b></div>")
         _tp = _resolve_single_tp(s.entry, s.sl, getattr(s, 'tp', None), getattr(s, 'alt_target_a', None), getattr(s, 'alt_target_b', None), getattr(s, 'side', ''))
         card.append(f"<div style='margin-top:4px'>Entry: <code>{esc(fmt_price_email(s.entry))}</code> &nbsp;|&nbsp; SL: <code>{esc(fmt_price_email(s.sl))}</code> &nbsp;|&nbsp; RR(TP): <code>{rr_to_tp(s.entry, s.sl, float(_tp or 0.0)):.2f}</code></div>")
 
@@ -39750,7 +39784,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     ch1 = float(c.get("ch1", 0.0) or 0.0)
                     vol = float(c.get("vol", 0.0) or 0.0)
                     arrow = "🟢" if c.get("direction") == "UP" else "🔴"
-                    lines.append(f"{arrow} {sym}: Confirm15m {ch15_display:+.1f}% | 1H {ch1:+.1f}% | 4H {ch4:+.1f}% | Vol ~{vol/1e6:.1f}M")
+                    confirm_dot = "🟢" if c.get("direction") == "UP" else "🔴"
+                    lines.append(f"{arrow} {sym}: 15m confirmation: {confirm_dot} | 15m: {ch15_display:+.1f}% | 1H {ch1:+.1f}% | 4H {ch4:+.1f}% | Vol ~{vol/1e6:.1f}M")
                     lines.append(f"Chart: https://www.tradingview.com/chart/?symbol=BYBIT:{sym}USDT.P")
                     lines.append("")
 
