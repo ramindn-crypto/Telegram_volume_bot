@@ -38896,11 +38896,23 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         include_email_source=True,
                     )
                     if body_e:
+                        # Keep the top /screen note consistent with the actual body source.
+                        # If the DB fallback had to show the executable queue rather than the exact
+                        # latest email batch, do not label the whole screen as a sent-email view.
+                        try:
+                            _body_is_latest_email = 'Showing latest sent setup email' in str(body_e or '')
+                        except Exception:
+                            _body_is_latest_email = False
+                        _source_note_e = (
+                            "_Showing latest sent setup email while the live scan refreshes._\n"
+                            if _body_is_latest_email else
+                            "_Showing recent executable setup queue while the live scan refreshes._\n"
+                        )
                         header_e = (
                             f"*PulseFutures — Market Scan*\n"
                             f"{HDR}\n"
                             f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                            f"_Showing latest sent setup email while the live scan refreshes._\n"
+                            f"{_source_note_e}"
                         )
                         keyboard_e = [
                             [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
