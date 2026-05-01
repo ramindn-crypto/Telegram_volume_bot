@@ -180,6 +180,7 @@ _INSTR_FILTER_CACHE: dict[str, dict] = {}
 # AutoTrade decision cache (owner/admin visibility)
 _LAST_AUTOTRADE_DECISION: dict[int, dict] = {}
 _LAST_AUTOTRADE_DETAIL: dict[int, dict] = {}
+_LAST_AUTOTRADE_ATTEMPTS: dict[int, list[dict]] = {}
 
 
 import json
@@ -6743,14 +6744,16 @@ def _autotrade_refresh_owner_executable_pool(uid: int, session_label: str, lookb
 
 def _autotrade_clear_debug_state(uid: int | None = None) -> None:
     """Clear in-memory autotrade debug state. If uid is None, clears all."""
-    global _LAST_AUTOTRADE_DECISION, _LAST_AUTOTRADE_DETAIL
+    global _LAST_AUTOTRADE_DECISION, _LAST_AUTOTRADE_DETAIL, _LAST_AUTOTRADE_ATTEMPTS
     try:
         if uid is None:
             _LAST_AUTOTRADE_DECISION.clear()
             _LAST_AUTOTRADE_DETAIL.clear()
+            _LAST_AUTOTRADE_ATTEMPTS.clear()
         else:
             _LAST_AUTOTRADE_DECISION.pop(int(uid), None)
             _LAST_AUTOTRADE_DETAIL.pop(int(uid), None)
+            _LAST_AUTOTRADE_ATTEMPTS.pop(int(uid), None)
     except Exception:
         pass
 
@@ -6849,6 +6852,55 @@ def _autotrade_clone_setup_for_execution(setup, **overrides):
         return SimpleNamespace(**data)
     except Exception:
         return setup
+
+
+def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict | None = None, status: str = '', reason: str = '') -> None:
+    """Keep a short in-memory list of recent AutoTrade attempts for /autotrade_last."""
+    try:
+        u = int(uid)
+        row = {}
+        if isinstance(meta, dict):
+            row.update(meta)
+        if isinstance(detail, dict):
+            for k in ('when','setup_id','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct'):
+                if k in detail and detail.get(k) not in (None, ''):
+                    row[k] = detail.get(k)
+        row['when'] = str(row.get('when') or datetime.now(timezone.utc).isoformat(timespec='seconds'))
+        row['status'] = str(status or row.get('status') or '').upper() or ('PLACED' if not reason else 'SKIP')
+        row['reason'] = str(reason or row.get('reason') or row.get('reject_reason') or '')
+        if not row.get('symbol'):
+            row['symbol'] = str(row.get('symbol_sent') or row.get('symbol_raw') or '')
+        if not row.get('setup_id'):
+            row['setup_id'] = str(row.get('id') or '')
+        hist = list(_LAST_AUTOTRADE_ATTEMPTS.get(u) or [])
+        hist.insert(0, row)
+        _LAST_AUTOTRADE_ATTEMPTS[u] = hist[:20]
+    except Exception:
+        pass
+
+
+def _autotrade_should_try_next_after_skip(reason: str) -> bool:
+    """Candidate-specific skips should not stop trying the rest of an emailed batch."""
+    r = str(reason or '').lower()
+    if not r:
+        return False
+    hard_stop_tokens = (
+        'daily_risk_cap_reached', 'daily_cap_reached', 'daily_remaining_risk_zero',
+        'max_open_trades_reached', 'max_trades_day_reached', 'autotrade_not_ready',
+        'session_not_allowed', 'trade_window_block', 'equity_unavailable',
+        'per_trade_risk_zero', 'open_risk_cap_reached', 'autotrade_exec_lock_busy',
+    )
+    if any(tok in r for tok in hard_stop_tokens):
+        return False
+    retry_tokens = (
+        'entry_drift_too_wide', 'setup_expired', 'bad_prices', 'missing_tp',
+        'sl_not_', 'stop_invalid', 'qty_invalid', 'blocked_duplicate_open_position',
+        'blocked_manual_same_symbol_position', 'blocked_duplicate_pending_order',
+        'blocked_duplicate_inflight_lock', 'blocked_by_cooldown',
+        'blocked_by_recent_symbol_trade', 'blocked_by_existing_local_trade_state',
+        'post_fill_risk_breach', 'exchange_reject', 'no_sltp',
+    )
+    return any(tok in r for tok in retry_tokens)
 
 def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
     if not _autotrade_ready():
@@ -34782,6 +34834,20 @@ def _setup_audit_result_from_cached_price_moves(row: dict, horizon_hours: int = 
     command fast and safe for production.
     """
     try:
+        # Prefer the bot's existing signal_outcomes table when available. It is
+        # created by the price-move evaluator and avoids showing OPEN for older
+        # setups that were already resolved by the background outcome sync.
+        try:
+            sid0 = str((row or {}).get('setup_id') or '').strip()
+            if sid0:
+                out0 = db_get_outcome(sid0) or {}
+                oc0 = str((out0 or {}).get('outcome') or '').upper().strip()
+                if oc0 in {'TP', 'WIN', 'WIN_TP', 'TP1', 'TP2', 'TP3'}:
+                    return 'WIN'
+                if oc0 in {'SL', 'LOSS', 'LOSE'}:
+                    return 'LOSE'
+        except Exception:
+            pass
         side = str((row or {}).get('side') or '').upper().strip()
         symbol_raw = str((row or {}).get('symbol') or '').upper().strip()
         base = symbol_raw[:-4] if symbol_raw.endswith('USDT') else symbol_raw
@@ -34875,7 +34941,7 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
             cur = con.cursor()
             try:
                 cur.execute("""
-                    SELECT executable_ts AS ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
+                    SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
                            COALESCE(family_id, '') AS family_id, entry, sl, tp, alt_target_a, alt_target_b
                     FROM executable_setups
@@ -34893,7 +34959,7 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
                 alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
                 alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
                 cur.execute(f"""
-                    SELECT created_ts AS ts, UPPER(source) AS source, session, setup_id, symbol, {market_expr}, side, conf,
+                    SELECT created_ts AS ts, 0 AS signal_created_ts, UPPER(source) AS source, session, setup_id, symbol, {market_expr}, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
                            COALESCE(family_id, '') AS family_id, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
                     FROM generated_setups
@@ -34919,7 +34985,45 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
             continue
         dedup[sid] = r
 
+    # Preserve a useful origin time for repeated scanner rows. The setup_id can
+    # change every refresh, so the latest DB row time alone is not always the
+    # true first time this opportunity appeared. Use signal_created_ts when it
+    # exists; otherwise group similar symbol/side/entry structures and show the
+    # earliest observed timestamp in the selected window.
+    first_seen = {}
+    try:
+        for _r in rows:
+            try:
+                _sym = str(_r.get('symbol') or '').upper().strip()
+                _side = str(_r.get('side') or '').upper().strip()
+                _fam = _setup_audit_family_from_row(_r)
+                _entry = round(float(_r.get('entry') or 0.0), 6)
+                _sl = round(float(_r.get('sl') or 0.0), 6)
+                _tp = round(float(_r.get('tp') or 0.0), 6)
+                _key = (_sym, _side, _fam, _entry, _sl, _tp)
+                _ts = float(_r.get('signal_created_ts') or _r.get('ts') or 0.0)
+                if _ts > 0 and (_key not in first_seen or _ts < first_seen[_key]):
+                    first_seen[_key] = _ts
+            except Exception:
+                continue
+    except Exception:
+        first_seen = {}
+
     final = list(dedup.values())[:limit]
+    for _r in final:
+        try:
+            _key = (
+                str(_r.get('symbol') or '').upper().strip(),
+                str(_r.get('side') or '').upper().strip(),
+                _setup_audit_family_from_row(_r),
+                round(float(_r.get('entry') or 0.0), 6),
+                round(float(_r.get('sl') or 0.0), 6),
+                round(float(_r.get('tp') or 0.0), 6),
+            )
+            _sig_ts = float(_r.get('signal_created_ts') or 0.0)
+            _r['first_seen_ts'] = float(_sig_ts or first_seen.get(_key) or _r.get('ts') or 0.0)
+        except Exception:
+            pass
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not final:
         return f"🧪 <b>Setup Audit</b>\n{HDR}\nNo recent setups above ${min_vol_m:.0f}M volume in the last {hours}h."
@@ -34931,9 +35035,18 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
 
     def _audit_ts_txt(r: dict) -> str:
         try:
-            ts = float(r.get('ts') or 0.0)
+            ts = float(r.get('first_seen_ts') or r.get('signal_created_ts') or r.get('ts') or 0.0)
             if ts > 0:
                 return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            pass
+        return '-'
+
+    def _audit_last_seen_txt(r: dict) -> str:
+        try:
+            ts = float(r.get('ts') or 0.0)
+            if ts > 0:
+                return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%H:%M')
         except Exception:
             pass
         return '-'
@@ -34990,7 +35103,7 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
             f"   Reason to enter: {html.escape(reason)}",
             f"   Entry: <code>{fmt_price(entry)}</code> | SL: <code>{fmt_price(sl)}</code> | TP: <code>{fmt_price(tp)}</code>",
             f"   Moves: 24H {ch24:+.0f}% | 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | 15m {ch15:+.1f}%",
-            f"   Source: {html.escape(src)} / {html.escape(session)} | Generated: {html.escape(_audit_ts_txt(r))}",
+            f"   Source: {html.escape(src)} / {html.escape(session)} | First seen: {html.escape(_audit_ts_txt(r))} | Last logged: {html.escape(_audit_last_seen_txt(r))}",
         ])
         if i != len(final):
             lines.append("──────────────────")
@@ -36336,53 +36449,63 @@ async def performance_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
             pass
 
 async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show last autotrade attempt details (admin only)."""
+    """Show recent autotrade attempts details (admin only)."""
     uid = update.effective_user.id
     if not is_admin_user(uid):
         await update.message.reply_text("⛔️ Admin only.")
         return
 
     owner = int(AUTOTRADE_OWNER_UID or uid)
-    det = _LAST_AUTOTRADE_DETAIL.get(owner) or {}
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
-    when_raw = str(det.get("when") or dec.get("when") or "")
-    when_m = _fmt_iso_to_local(when_raw) if when_raw else "—"
+    hist = list(_LAST_AUTOTRADE_ATTEMPTS.get(owner) or [])
+    dec_attempts = list(dec.get('attempted_candidates') or []) if isinstance(dec, dict) else []
+    # If the process has no in-memory history yet, still show the latest decision attempts.
+    if not hist and dec_attempts:
+        hist = dec_attempts
 
-    lines = ["AutoTrade — Last Attempt", HDR]
-    if not det and not dec:
+    lines = ["AutoTrade — Last Attempts", HDR]
+    if not hist and not dec:
         lines.append("No attempts recorded yet.")
         await send_long_message(update, "\n".join(lines), parse_mode=None)
         return
 
-    lines.append(f"When: {when_m}")
-    symbol_sent = str(det.get('symbol_sent','') or '')
-    symbol_raw = str(det.get('symbol_raw','') or '')
-    symbol = symbol_sent or symbol_raw or '—'
-    lines.append(f"Symbol: {symbol}")
-    lines.append(f"Side: {str(det.get('side') or '—')}")
-    lines.append(f"Entry: {_autotrade_price_str(det.get('entry'))}")
-    lines.append(f"Stop loss: {_autotrade_price_str(det.get('sl'))}")
-    lines.append(f"Setup ID: {str(det.get('setup_id') or (dec.get('latest_candidate') or {}).get('setup_id') or '—')}")
-    sig_time = det.get('signal_created_time') or ''
-    email_time = det.get('email_logged_time') or det.get('generated_logged_time') or ''
-    lines.append(f"Signal created: {_fmt_iso_to_local(sig_time) if sig_time else '—'}")
-    lines.append(f"Email logged: {_fmt_iso_to_local(email_time) if email_time else '—'}")
-    dec_status = str(dec.get('status') or '').strip()
-    dec_reason = str(dec.get('reason') or '').strip()
-    if dec_status or dec_reason:
-        result = dec_status or '—'
-        if dec_reason:
-            result += f" | {dec_reason}"
-        lines.append(f"Result: {result}")
-    try:
-        can_open_detail = dict(det.get('can_open_detail') or {})
-    except Exception:
-        can_open_detail = {}
-    if can_open_detail.get('live_open_position'):
-        owner_kind = str(can_open_detail.get('live_position_owner') or '').strip() or 'unknown'
-        pos_side = str(can_open_detail.get('live_position_side') or '').strip() or '—'
-        pos_qty = float(can_open_detail.get('live_position_qty') or 0.0)
-        lines.append(f"Conflict: {owner_kind} same-symbol live position | side {pos_side} | qty {pos_qty:.6g}")
+    if dec:
+        when_raw = str(dec.get('when') or '')
+        lines.append(f"Last decision: {str(dec.get('status') or '—')}" + (f" | {str(dec.get('reason') or '')}" if str(dec.get('reason') or '') else ''))
+        if when_raw:
+            lines.append(f"Decision time: {_fmt_iso_to_local(when_raw)}")
+        if dec.get('trigger'):
+            lines.append(f"Trigger: {dec.get('trigger')}")
+        lines.append(HDR)
+
+    max_rows = 8
+    for i, a in enumerate(hist[:max_rows], start=1):
+        try:
+            when_raw = str(a.get('when') or '')
+            when_txt = _fmt_iso_to_local(when_raw) if when_raw else '—'
+            sid = str(a.get('setup_id') or a.get('id') or '—')
+            sym = str(a.get('symbol') or a.get('symbol_sent') or a.get('symbol_raw') or '—')
+            side = str(a.get('side') or '—')
+            status = str(a.get('status') or '').upper() or '—'
+            reason = str(a.get('reason') or '').strip()
+            entry = _autotrade_price_str(a.get('entry'))
+            sl = _autotrade_price_str(a.get('sl'))
+            drift = a.get('entry_drift_pct', '')
+            drift_txt = ''
+            try:
+                if drift not in ('', None):
+                    drift_txt = f" | Drift: {float(drift):.2f}%"
+            except Exception:
+                pass
+            lines.append(f"{i}) {sym} {side} | {status}" + (f" | {reason}" if reason else ''))
+            lines.append(f"   Setup ID: {sid}")
+            lines.append(f"   Time: {when_txt}")
+            lines.append(f"   Entry: {entry} | SL: {sl}{drift_txt}")
+        except Exception:
+            continue
+        if i != min(len(hist), max_rows):
+            lines.append("────────────────────")
+
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -42409,18 +42532,22 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     )
                 except asyncio.TimeoutError:
                     ok, reason = False, f'autotrade_place_trade_timeout>{int(per_candidate_timeout)}s'
+                try:
+                    detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(uid) or {})
+                    if 0 <= attempted - 1 < len(attempt_summaries):
+                        attempt_summaries[attempted - 1].update({
+                            'status': 'PLACED' if ok else 'SKIP',
+                            'reason': '' if ok else str(reason or ''),
+                            'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
+                            'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
+                            'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+                        })
+                        _autotrade_record_attempt(uid, attempt_summaries[attempted - 1], detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
+                except Exception:
+                    pass
                 if ok:
                     break
-                if reason not in {
-                    'blocked_duplicate_open_position',
-                    'blocked_manual_same_symbol_position',
-                    'blocked_duplicate_pending_order',
-                    'blocked_duplicate_inflight_lock',
-                    'blocked_by_cooldown',
-                    'blocked_by_recent_symbol_trade',
-                    'blocked_by_existing_local_trade_state',
-                    'setup_expired',
-                }:
+                if not _autotrade_should_try_next_after_skip(reason):
                     break
 
             _LAST_AUTOTRADE_DECISION[uid] = {
@@ -42563,14 +42690,21 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                     ok, reason = False, 'autotrade_place_trade_timeout_after_email'
                 except Exception as e:
                     ok, reason = False, f'{type(e).__name__}: {e}'
+                try:
+                    detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
+                    attempts_meta[-1].update({
+                        'status': 'PLACED' if ok else 'SKIP',
+                        'reason': '' if ok else str(reason or ''),
+                        'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
+                        'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
+                        'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+                    })
+                    _autotrade_record_attempt(owner_uid, attempts_meta[-1], detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
+                except Exception:
+                    pass
                 if ok:
                     break
-                if reason not in {
-                    'blocked_duplicate_open_position', 'blocked_manual_same_symbol_position',
-                    'blocked_duplicate_pending_order', 'blocked_duplicate_inflight_lock',
-                    'blocked_by_cooldown', 'blocked_by_recent_symbol_trade',
-                    'blocked_by_existing_local_trade_state', 'setup_expired',
-                }:
+                if not _autotrade_should_try_next_after_skip(reason):
                     break
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
                 'status': 'PLACED' if ok else 'SKIP',
