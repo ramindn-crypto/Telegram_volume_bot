@@ -421,7 +421,7 @@ AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
 AUTOTRADE_CFG_MODE_KEY = 'mode'
 AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
-SCREEN_FALLBACK_MAX_AGE_MIN = 8
+SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
 
 def _autotrade_config_get(key: str, default=None):
@@ -37861,11 +37861,7 @@ async def _refresh_screen_cache_async():
             timeout=75,
         )
         cache_key = f"global::{str(session or '').upper()}"
-        _SCREEN_CACHE[cache_key] = {
-            "ts": time.time(),
-            "body": body,
-            "kb": list(kb or []),
-        }
+        _screen_cache_put(cache_key, body, list(kb or []), ts=time.time())
     except Exception:
         # never let background refresh crash the bot
         return
@@ -37896,16 +37892,8 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
                 except Exception:
                     pass
                 return
-            _SCREEN_CACHE[f"uid:{int(uid or 0)}::{sess}"] = {
-                "ts": time.time(),
-                "body": body,
-                "kb": list(kb or []),
-            }
-            _SCREEN_CACHE[f"global::{sess}"] = {
-                "ts": time.time(),
-                "body": body,
-                "kb": list(kb or []),
-            }
+            _screen_cache_put(f"uid:{int(uid or 0)}::{sess}", body, list(kb or []), ts=time.time())
+            _screen_cache_put(f"global::{sess}", body, list(kb or []), ts=time.time())
     except Exception:
         return
     finally:
@@ -38058,6 +38046,83 @@ def _screen_markdown_to_html(txt: str) -> str:
     except Exception:
         return _screen_plain_cleanup(txt)
 
+
+
+def _screen_body_has_trade_setups(body: str) -> bool:
+    """True only when a /screen body contains real setup cards, not just market context."""
+    try:
+        t = str(body or '')
+        if not t.strip():
+            return False
+        low = t.lower()
+        if 'no high-quality setups right now' in low:
+            return False
+        if 'executable scan is warming up' in low:
+            return False
+        if 'no confirmed setup' in low:
+            return False
+        return ('PF-' in t and 'Entry:' in t and ('BUY' in t or 'SELL' in t))
+    except Exception:
+        return False
+
+
+def _screen_cache_put(cache_key: str, body: str, kb: list | None = None, ts: float | None = None, allow_empty_overwrite: bool = False) -> bool:
+    """Write /screen cache without letting an empty refresh erase a useful recent setup view.
+
+    This fixes the observed behaviour where /screen showed setups, then one background
+    refresh returned an empty scan and the next /screen showed "No high-quality setups".
+    """
+    try:
+        key = str(cache_key or '')
+        if not key:
+            return False
+        body_s = str(body or '')
+        now_ts = float(ts or time.time())
+        new_has = _screen_body_has_trade_setups(body_s)
+        old = _SCREEN_CACHE.get(key) or {}
+        old_body = str(old.get('body') or '')
+        old_has = _screen_body_has_trade_setups(old_body)
+        old_age = now_ts - float(old.get('ts', 0.0) or 0.0)
+        keep_window = max(float(SCREEN_STALE_CACHE_MAX_SEC or 0), 45.0 * 60.0)
+        if (not allow_empty_overwrite) and (not new_has) and old_has and old_age <= keep_window:
+            try:
+                db_log_setup_pipeline_event(0, stage='screen_cache_put', status='kept_nonempty_cache', session=str(key).split('::')[-1], mode='screen', details={'old_age_sec': round(old_age, 1)})
+            except Exception:
+                pass
+            return False
+        _SCREEN_CACHE[key] = {'ts': now_ts, 'body': body_s, 'kb': list(kb or [])}
+        return True
+    except Exception:
+        try:
+            _SCREEN_CACHE[str(cache_key or '')] = {'ts': float(ts or time.time()), 'body': str(body or ''), 'kb': list(kb or [])}
+            return True
+        except Exception:
+            return False
+
+
+def _screen_choose_best_cache(cache_keys: list[str]) -> tuple[dict, float]:
+    """Prefer recent non-empty setup caches over newer empty/market-context-only caches."""
+    try:
+        candidates = []
+        now_ts = time.time()
+        for _ck in list(cache_keys or []):
+            _ce = _SCREEN_CACHE.get(_ck) or {}
+            _body = str(_ce.get('body') or '')
+            if not _body:
+                continue
+            _is_quick = ('Executable scan is warming up' in _body) or ('quick ticker snapshot' in _body) or ('full executable scan warms up' in _body)
+            if _is_quick:
+                continue
+            _age = now_ts - float(_ce.get('ts', 0.0) or 0.0)
+            candidates.append((_screen_body_has_trade_setups(_body), _age, _ce))
+        if not candidates:
+            return {}, 999999.0
+        with_setups = [c for c in candidates if c[0]]
+        pool = with_setups if with_setups else candidates
+        pool.sort(key=lambda x: x[1])
+        return pool[0][2], pool[0][1]
+    except Exception:
+        return {}, 999999.0
 
 def _screen_display_limit() -> int:
     try:
@@ -38779,17 +38844,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cache_keys.append(_k)
         except Exception:
             pass
-        cache_entry = {}
-        age = 999999.0
-        for _ck in cache_keys:
-            _ce = _SCREEN_CACHE.get(_ck) or {}
-            _body = str(_ce.get('body') or '')
-            _is_quick = ('Executable scan is warming up' in _body) or ('quick ticker snapshot' in _body) or ('full executable scan warms up' in _body)
-            if _ce.get('body') and not _is_quick:
-                _age = time.time() - float(_ce.get('ts', 0.0) or 0.0)
-                if _age < age:
-                    cache_entry = _ce
-                    age = _age
+        cache_entry, age = _screen_choose_best_cache(cache_keys)
         _schedule_screen_cache_refresh(int(uid), scan_session)
         can_show_email_source = _screen_user_can_see_email_source(int(uid), user)
         try:
@@ -39129,11 +39184,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # subject to the user's runtime email/session/cap configuration.
 
             # Cache for fast subsequent /screen calls (user + session scoped)
-            _SCREEN_CACHE[cache_key] = {
-                "ts": time.time(),
-                "body": body,
-                "kb": list(kb or []),
-            }
+            _screen_cache_put(cache_key, body, list(kb or []), ts=time.time())
 
 
         # Send final
@@ -39480,6 +39531,120 @@ def _email_body_pretty_html(
     return "".join(lines).strip()
 
 
+
+def _smtp_error_probably_delivered(err: str) -> bool:
+    """SMTP can time out/disconnect after DATA is accepted. Treat those as soft-delivered.
+
+    This is deliberately limited to late-SMTP/read/connection-close signatures; config,
+    recipient, auth and TLS/login errors are still hard failures.
+    """
+    try:
+        e = str(err or '').lower()
+        if not e:
+            return False
+        hard = ('auth', 'login', 'authentication', 'recipient', 'no_recipient', 'not configured', 'missing smtp', 'invalid email')
+        if any(h in e for h in hard):
+            return False
+        soft = (
+            'smtpserverdisconnected', 'connection unexpectedly closed', 'read operation timed out',
+            'timed out', 'timeout_after_', 'timeout after', 'network is unreachable',
+            'connection reset', 'broken pipe', 'server disconnected'
+        )
+        return any(x in e for x in soft)
+    except Exception:
+        return False
+
+
+def _email_assume_sent_on_soft_smtp() -> bool:
+    try:
+        return str(os.environ.get('EMAIL_ASSUME_SENT_ON_SOFT_SMTP', '1')).strip().lower() not in {'0','false','no','off'}
+    except Exception:
+        return True
+
+
+def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, setups: list, best_fut: dict | None = None, status: str = 'sent') -> int:
+    """Mirror a setup-email delivery into DB/cache/executable lane.
+
+    Used both for confirmed SMTP success and for late-SMTP soft timeouts where the
+    email is often delivered but the server disconnects before acknowledgement.
+    """
+    try:
+        uid = int(user_id or 0)
+        if uid <= 0 or not setups:
+            return 0
+        sess_u = str(session_name or '').upper().strip()
+        now_ts = time.time()
+        try:
+            owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+        except Exception:
+            owner_uid = 0
+        target_uids = [uid]
+        try:
+            if owner_uid > 0 and owner_uid not in target_uids and is_admin_user(uid):
+                target_uids.append(owner_uid)
+        except Exception:
+            pass
+        n = 0
+        for s in list(setups or []):
+            try:
+                db_insert_signal(s, user_id=uid)
+            except Exception:
+                pass
+            try:
+                setattr(s, 'email_logged_ts', float(now_ts))
+                setattr(s, 'emailed_ts', float(now_ts))
+                setattr(s, 'source_kind', 'emailed_setups')
+                setattr(s, 'source_session', sess_u)
+            except Exception:
+                pass
+            sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+            if not sid:
+                continue
+            for tuid in target_uids:
+                try:
+                    db_mark_emailed_setup(int(tuid), sid, sess_u, now_ts)
+                except Exception:
+                    pass
+                try:
+                    db_mark_executable_setup(int(tuid), sid, sess_u, now_ts, s=s, source_kind='emailed_setups', state='executable_pending')
+                except Exception:
+                    pass
+                try:
+                    db_log_generated_setup(int(tuid), 'email', sess_u, s)
+                except Exception:
+                    pass
+                try:
+                    _cache_recent_emailed_setup(int(tuid), s, session=sess_u, emailed_ts=now_ts, source_kind='recent_email_cache')
+                except Exception:
+                    pass
+                try:
+                    _mark_emailed_setup_identity(int(tuid), s, emailed_ts=now_ts)
+                except Exception:
+                    pass
+            n += 1
+        # Keep /screen aligned to the exact email batch.
+        try:
+            up_list, dn_list = compute_directional_lists(best_fut or {})
+            market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list[:5], losers=dn_list[:5])
+            for tuid in target_uids:
+                screen_body = "\n".join([
+                    "", "*Top Trade Setups*", SEP,
+                    "_Showing latest sent setup email while the live scan refreshes._",
+                    _screen_format_setup_cards(list(setups or []), int(tuid), sess_u),
+                    "", market_txt or "",
+                ]).strip()
+                screen_kb = [(str(getattr(_s, 'symbol', '') or '').upper(), str(getattr(_s, 'setup_id', '') or getattr(_s, 'id', '') or '')) for _s in list(setups or [])[:_screen_display_limit()]]
+                _screen_cache_put(f"uid:{int(tuid)}::{sess_u}", screen_body, screen_kb, ts=now_ts, allow_empty_overwrite=True)
+        except Exception:
+            pass
+        try:
+            db_log_setup_pipeline_event(uid, stage='email_delivery_side_effects', status=str(status or 'sent'), session=sess_u, mode='email', details={'setups': n})
+        except Exception:
+            pass
+        return n
+    except Exception:
+        return 0
+
 def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
     """
     One email containing multiple setups.
@@ -39533,6 +39698,16 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         pass
 
     sent = send_email(subject, body, user_id_for_debug=uid, body_html=body_html)
+    if (not sent) and _email_assume_sent_on_soft_smtp() and _smtp_error_probably_delivered(str(_LAST_SMTP_ERROR.get(uid, ''))):
+        try:
+            logger.warning("setup email soft-delivered uid=%s subject=%s smtp_error=%s", uid, subject, _LAST_SMTP_ERROR.get(uid, ''))
+        except Exception:
+            pass
+        try:
+            _record_setup_email_delivery_side_effects(int(uid), str(display_session or ''), list(setups or []), best_fut or {}, status='soft_smtp_assumed_sent')
+        except Exception:
+            pass
+        sent = True
     if sent:
         try:
             db_log_setup_pipeline_event(int(uid), stage='email_delivery', status='sent', session=str(display_session or ''), mode='email', details={'setups': len(setups or []), 'subject': str(subject or '')[:180]})
@@ -39609,7 +39784,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         market_txt or "",
                     ]).strip()
                     screen_kb = [(str(getattr(_s, 'symbol', '') or '').upper(), str(getattr(_s, 'setup_id', '') or getattr(_s, 'id', '') or '')) for _s in list(setups or [])[:_screen_display_limit()]]
-                    _SCREEN_CACHE[f"uid:{int(_target_uid)}::{str(display_session or '').upper()}"] = {'ts': float(now_ts), 'body': screen_body, 'kb': screen_kb}
+                    _screen_cache_put(f"uid:{int(_target_uid)}::{str(display_session or '').upper()}", screen_body, screen_kb, ts=float(now_ts), allow_empty_overwrite=True)
                 except Exception:
                     pass
         except Exception:
@@ -39857,7 +40032,7 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
-EMAIL_SEND_TIMEOUT_SEC = int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "15"))
+EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 45))
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "300"))
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "2"))
@@ -40860,11 +41035,16 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     timeout=EMAIL_SEND_TIMEOUT_SEC + 2,
                 )
             except asyncio.TimeoutError:
-                ok = False
                 try:
                     _LAST_SMTP_ERROR[uid] = f"timeout_after_{int(EMAIL_SEND_TIMEOUT_SEC)}s"
                 except Exception:
                     pass
+                ok = bool(_email_assume_sent_on_soft_smtp())
+                if ok:
+                    try:
+                        _record_setup_email_delivery_side_effects(int(uid), str(sess.get("name") or sess_name or ''), list(chosen_list or []), best_fut or {}, status='timeout_assumed_sent')
+                    except Exception:
+                        pass
             except Exception as e:
                 ok = False
                 logger.exception("send_email_alert_multi failed for uid=%s: %s", uid, e)
