@@ -34666,83 +34666,200 @@ async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-def _setup_audit_reason_from_row(row: dict) -> str:
+def _setup_audit_family_from_row(row: dict) -> str:
+    """Return a readable family/engine name for setup audit."""
     try:
-        for key in ('entry_reason', 'generated_reason', 'reason_to_enter'):
+        for key in ('family_id', 'family', 'engine_family'):
             val = str((row or {}).get(key) or '').strip()
             if val:
-                return val[:120]
+                return val.upper().replace('_', '-')
         details = str((row or {}).get('details_json') or '').strip()
         if details:
             try:
                 obj = json.loads(details)
                 if isinstance(obj, dict):
-                    for key in ('entry_reason', 'generated_reason', 'reason_to_enter', 'reason'):
+                    for key in ('family_id', 'family', 'engine_family', 'engine'):
                         val = str(obj.get(key) or '').strip()
                         if val:
-                            return val[:120]
+                            return val.upper().replace('_', '-')
             except Exception:
                 pass
-        fam = str(row.get('family_id') or '').upper().strip().replace('_', '-') or '-'
-        ch24 = float(row.get('ch24') or 0.0)
-        ch4 = float(row.get('ch4') or 0.0)
-        ch1 = float(row.get('ch1') or 0.0)
-        ch15 = float(row.get('ch15') or 0.0)
-        side = str(row.get('side') or '').upper().strip()
+        eng = str((row or {}).get('engine') or '').strip()
+        return eng.upper().replace('_', '-') if eng else '-'
+    except Exception:
+        return '-'
+
+
+def _setup_audit_reason_from_row(row: dict) -> str:
+    """Short entry-quality reason for /setup_audit.
+
+    This is intentionally one line. It focuses on why the entry exists, not a
+    repeated raw diagnostic dump.
+    """
+    try:
+        for key in ('entry_reason', 'generated_reason', 'reason_to_enter'):
+            val = str((row or {}).get(key) or '').strip()
+            if val:
+                return val.replace('\n', ' ')[:140]
+        details = str((row or {}).get('details_json') or '').strip()
+        if details:
+            try:
+                obj = json.loads(details)
+                if isinstance(obj, dict):
+                    for key in ('entry_reason', 'generated_reason', 'reason_to_enter', 'reason', 'entry_trigger'):
+                        val = str(obj.get(key) or '').strip()
+                        if val:
+                            return val.replace('\n', ' ')[:140]
+            except Exception:
+                pass
+
+        fam = _setup_audit_family_from_row(row)
+        ch24 = float((row or {}).get('ch24') or 0.0)
+        ch4 = float((row or {}).get('ch4') or 0.0)
+        ch1 = float((row or {}).get('ch1') or 0.0)
+        ch15 = float((row or {}).get('ch15') or 0.0)
+        vol_m = float((row or {}).get('fut_vol_usd') or 0.0) / 1e6
+        side = str((row or {}).get('side') or '').upper().strip()
         sign = 1.0 if side == 'BUY' else -1.0
+
         parts = []
         if fam and fam != '-':
             parts.append(fam)
-        if sign * ch24 >= 10:
-            parts.append(f'24h {ch24:+.0f}% mover')
+        if sign * ch24 >= 8:
+            parts.append(f"24h momentum {ch24:+.0f}%")
+        elif sign * ch24 >= 2:
+            parts.append(f"24h supportive {ch24:+.0f}%")
         if sign * ch4 >= 2:
-            parts.append(f'4h {ch4:+.0f}% aligned')
+            parts.append(f"4h aligned {ch4:+.0f}%")
         elif sign * ch4 >= 0.3:
-            parts.append(f'4h {ch4:+.1f}% supportive')
+            parts.append(f"4h supportive {ch4:+.1f}%")
+        elif sign * ch4 < -2:
+            parts.append(f"4h countertrend {ch4:+.0f}%")
         if sign * ch1 >= 1:
-            parts.append(f'1h {ch1:+.1f}% trigger')
+            parts.append(f"1h trigger {ch1:+.1f}%")
         elif sign * ch1 >= 0.2:
-            parts.append(f'1h {ch1:+.1f}% supportive')
+            parts.append(f"1h supportive {ch1:+.1f}%")
         if sign * ch15 >= 0.2:
-            parts.append(f'15m {ch15:+.1f}% timing')
-        if not parts:
-            parts.append('continuation zone with valid SL/TP')
-        return '; '.join(parts[:4])
+            parts.append(f"15m timing {ch15:+.1f}%")
+        if vol_m >= 10:
+            parts.append(f"vol {vol_m:.1f}M")
+        if len(parts) <= 1:
+            parts.append("valid entry/SL/TP structure")
+        return '; '.join(parts[:5])
     except Exception:
-        return 'setup context'
+        return 'valid entry/SL/TP structure'
+
+
+def _setup_audit_current_price_for_row(row: dict) -> float:
+    """No-network current/stale last price for audit fallback."""
+    try:
+        sym = str((row or {}).get('symbol') or '').upper().strip()
+        base = sym[:-4] if sym.endswith('USDT') else sym
+        ticks = get_cached_futures_tickers() or {}
+        mv = ticks.get(base)
+        if mv is None:
+            # Some caches are keyed by exchange symbol/base variants.
+            for k, v in (ticks or {}).items():
+                try:
+                    if str(k).upper().replace('/USDT:USDT', '').replace('USDT', '') == base:
+                        mv = v
+                        break
+                except Exception:
+                    continue
+        px = float(getattr(mv, 'last', 0.0) or 0.0) if mv is not None else 0.0
+        return px if px > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _setup_audit_result_from_cached_price_moves(row: dict, horizon_hours: int = 24) -> str:
+    """Resolve WIN/LOSE/OPEN without live OHLCV fetching.
+
+    /setup_audit must be instant. The previous implementation called the full
+    report evaluator for every setup, which could fetch 1m/5m/15m OHLCV and
+    time out. This version uses already-cached OHLCV first and then the cached
+    ticker price. That still reflects actual price movement while keeping the
+    command fast and safe for production.
+    """
+    try:
+        side = str((row or {}).get('side') or '').upper().strip()
+        symbol_raw = str((row or {}).get('symbol') or '').upper().strip()
+        base = symbol_raw[:-4] if symbol_raw.endswith('USDT') else symbol_raw
+        market_symbol = str((row or {}).get('market_symbol') or '').strip() or _market_symbol_from_base(base)
+        entry = float((row or {}).get('entry') or 0.0)
+        sl = float((row or {}).get('sl') or 0.0)
+        tp = float((row or {}).get('tp') or 0.0)
+        if tp <= 0:
+            tp = _resolve_single_tp(entry, sl, (row or {}).get('tp'), (row or {}).get('alt_target_a'), (row or {}).get('alt_target_b'), side)
+        created_ts = float((row or {}).get('ts') or (row or {}).get('created_ts') or (row or {}).get('signal_created_ts') or 0.0)
+        if side not in {'BUY', 'SELL'} or not market_symbol or entry <= 0 or sl <= 0 or tp <= 0:
+            return 'OPEN'
+
+        now_ts = float(time.time())
+        horizon_end = min(now_ts, created_ts + float(max(1, int(horizon_hours or 24))) * 3600.0) if created_ts > 0 else now_ts
+        candles_all = []
+        # Prefer cached candles only; never call fetch_ohlcv/fetch_ohlcv_paged here.
+        for tf, lim in (('1m', 300), ('5m', 300), ('15m', 200)):
+            try:
+                rows = _ohlcv_best_effort_cached(market_symbol, tf, lim) or []
+            except Exception:
+                rows = []
+            if not rows:
+                continue
+            for c in rows:
+                try:
+                    ts_sec = float(c[0]) / 1000.0
+                    if created_ts > 0 and ts_sec < created_ts - 60.0:
+                        continue
+                    if ts_sec > horizon_end + 60.0:
+                        continue
+                    candles_all.append((ts_sec, float(c[2]), float(c[3])))
+                except Exception:
+                    continue
+            if candles_all:
+                break
+
+        candles_all.sort(key=lambda x: x[0])
+        for _ts, hi, lo in candles_all:
+            if side == 'BUY':
+                hit_tp = hi >= tp
+                hit_sl = lo <= sl
+            else:
+                hit_tp = lo <= tp
+                hit_sl = hi >= sl
+            if hit_tp and hit_sl:
+                # Same candle ambiguity: keep OPEN rather than producing a false result.
+                return 'OPEN'
+            if hit_tp:
+                return 'WIN'
+            if hit_sl:
+                return 'LOSE'
+
+        # Fast current-price fallback from the cached ticker snapshot.
+        px = _setup_audit_current_price_for_row(row)
+        if px > 0:
+            if side == 'BUY':
+                if px >= tp:
+                    return 'WIN'
+                if px <= sl:
+                    return 'LOSE'
+            else:
+                if px <= tp:
+                    return 'WIN'
+                if px >= sl:
+                    return 'LOSE'
+        return 'OPEN'
+    except Exception:
+        return 'OPEN'
 
 
 def _setup_audit_price_result_from_row(row: dict, horizon_hours: int = 24) -> str:
-    """Resolve setup result from actual post-signal price movement, not open positions."""
-    try:
-        side = str((row or {}).get('side') or '').upper().strip()
-        symbol = str((row or {}).get('symbol') or '').upper().strip()
-        symbol_base = symbol[:-4] if symbol.endswith('USDT') else symbol
-        payload = {
-            'setup_id': str((row or {}).get('setup_id') or ''),
-            'symbol': symbol_base,
-            'market_symbol': str((row or {}).get('market_symbol') or '').strip() or _market_symbol_from_base(symbol_base),
-            'side': side,
-            'entry': float((row or {}).get('entry') or 0.0),
-            'sl': float((row or {}).get('sl') or 0.0),
-            'tp': float((row or {}).get('tp') or 0.0),
-            'alt_target_a': 0.0,
-            'alt_target_b': 0.0,
-            'created_ts': float((row or {}).get('ts') or (row or {}).get('created_ts') or 0.0),
-        }
-        res = evaluate_signal_hit_order(payload, horizon_hours=int(horizon_hours), timeframe='1m') or {}
-        out = str(res.get('outcome') or '').upper().strip()
-        if out == 'TP':
-            return 'WIN'
-        if out == 'SL':
-            return 'LOSE'
-        return 'OPEN'
-    except Exception:
-        return 'OPEN'
+    """Backward-compatible wrapper used by /setup_audit."""
+    return _setup_audit_result_from_cached_price_moves(row, horizon_hours=horizon_hours)
 
 
 def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
-    limit = max(1, min(50, int(limit or 15)))
+    limit = max(1, min(30, int(limit or 15)))
     hours = max(1, min(168, int(hours or 24)))
     cutoff = float(time.time()) - float(hours) * 3600.0
     rows = []
@@ -34754,12 +34871,12 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
                 cur.execute("""
                     SELECT executable_ts AS ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
-                           COALESCE(family_id, '') AS family_id, entry, sl, tp
+                           COALESCE(family_id, '') AS family_id, entry, sl, tp, alt_target_a, alt_target_b
                     FROM executable_setups
                     WHERE user_id=? AND executable_ts>=?
                     ORDER BY executable_ts DESC
                     LIMIT ?
-                """, (int(uid), cutoff, int(limit * 4)))
+                """, (int(uid), cutoff, int(limit * 3)))
                 rows.extend([dict(r) for r in (cur.fetchall() or [])])
             except Exception:
                 pass
@@ -34767,15 +34884,17 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
                 cols = {r[1] for r in cur.execute('PRAGMA table_info(generated_setups)').fetchall()}
                 market_expr = 'market_symbol' if 'market_symbol' in cols else "'' AS market_symbol"
                 reason_expr = 'entry_reason' if 'entry_reason' in cols else "'' AS entry_reason"
+                alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
+                alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
                 cur.execute(f"""
                     SELECT created_ts AS ts, UPPER(source) AS source, session, setup_id, symbol, {market_expr}, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
-                           COALESCE(family_id, '') AS family_id, entry, sl, tp, {reason_expr}
+                           COALESCE(family_id, '') AS family_id, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
                     FROM generated_setups
                     WHERE user_id=? AND created_ts>=?
                     ORDER BY created_ts DESC
                     LIMIT ?
-                """, (int(uid), cutoff, int(limit * 4)))
+                """, (int(uid), cutoff, int(limit * 3)))
                 rows.extend([dict(r) for r in (cur.fetchall() or [])])
             except Exception:
                 pass
@@ -34784,30 +34903,41 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
 
     dedup = {}
     for r in sorted(rows, key=lambda x: float(x.get('ts') or 0.0), reverse=True):
-        sid = str(r.get('setup_id') or '')
+        sid = str(r.get('setup_id') or '').strip()
         if not sid or sid in dedup:
             continue
+        try:
+            if not _setup_volume_ok(float(r.get('fut_vol_usd') or 0.0)):
+                continue
+        except Exception:
+            continue
         dedup[sid] = r
-    final = [r for r in dedup.values() if _setup_volume_ok(float(r.get('fut_vol_usd') or 0.0))][:limit]
+
+    final = list(dedup.values())[:limit]
     if not final:
         return f"🧪 Setup Audit\n{HDR}\nNo recent setups above ${_setup_min_volume_floor_usd()/1e6:.0f}M volume in the last {hours}h."
+
+    try:
+        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        now_txt = ''
 
     lines = [
         "🧪 Setup Audit",
         HDR,
-        f"Window: last {hours}h | Rows: {len(final)} | Min vol: ${_setup_min_volume_floor_usd()/1e6:.0f}M",
-        "Result uses actual price move to TP/SL: WIN / LOSE / OPEN.",
-        "Format: ID - Type - Volume - Family - Reason to Enter - Result",
+        f"Window: last {hours}h | Rows: {len(final)} | Min vol: ${_setup_min_volume_floor_usd()/1e6:.0f}M" + (f" | Now: {now_txt}" if now_txt else ""),
+        "Format: ID - Type: BUY/SELL Symbol - Volume - Family - Reason to Enter - Result",
+        "Result: WIN / LOSE / OPEN from cached candles/current price.",
         "",
     ]
     for r in final:
-        sid = str(r.get('setup_id') or '')
+        sid = str(r.get('setup_id') or '').strip()
         side = str(r.get('side') or '').upper().strip()
         sym = str(r.get('symbol') or '').upper().strip()
         if sym.endswith('USDT'):
             sym = sym[:-4]
         vol_m = float(r.get('fut_vol_usd') or 0.0) / 1e6
-        fam = str(r.get('family_id') or '').upper().replace('_', '-') or str(r.get('engine') or '-').upper()
+        fam = _setup_audit_family_from_row(r)
         reason = _setup_audit_reason_from_row(r)
         result = _setup_audit_price_result_from_row(r, horizon_hours=hours)
         lines.append(f"• {sid} - Type: {side} {sym} - Volume: {vol_m:.1f}M - Family: {fam} - Reason to Enter: {reason} - Result: {result}")
