@@ -251,6 +251,7 @@ def _autotrade_migrate_tables():
             try:
                 if LEGACY_TP_COL in cols and "tp" in cols:
                     c.execute(f"UPDATE autotrade_trades SET tp=COALESCE(tp,{LEGACY_TP_COL}) WHERE COALESCE(tp,0)=0")
+                    c.execute(f"UPDATE autotrade_trades SET {LEGACY_TP_COL}=COALESCE({LEGACY_TP_COL},tp,0) WHERE {LEGACY_TP_COL} IS NULL OR COALESCE({LEGACY_TP_COL},0)=0")
             except Exception:
                 pass
             add_col("qty", "qty REAL")
@@ -5620,6 +5621,81 @@ def _autotrade_db_get_trade(trade_id: str) -> dict:
         return {}
 
 
+
+def _autotrade_trade_insert_cols(cur, payload: dict, preferred_order: list[str]) -> tuple[list[str], list]:
+    """Return schema-safe INSERT columns/values for autotrade_trades.
+
+    Some long-lived production SQLite DBs still contain legacy NOT NULL columns
+    such as tp1. This helper always includes any required column that exists in
+    the live schema, using safe single-TP compatible defaults, so a Bybit order
+    cannot be opened and then fail to journal because of an old DB constraint.
+    """
+    try:
+        info = list(cur.execute("PRAGMA table_info(autotrade_trades)").fetchall())
+    except Exception:
+        info = []
+    cols = [str(r[1]) for r in info]
+    live_payload = dict(payload or {})
+
+    # Legacy/synonym columns used by older deployed DBs. Keep single-TP model:
+    # tp1 mirrors tp, higher TPs stay zero/empty.
+    tp_val = live_payload.get('tp')
+    if tp_val is None:
+        tp_val = live_payload.get(LEGACY_TP_COL) or live_payload.get('tp1') or 0.0
+    for name in ('tp1', LEGACY_TP_COL, 'take_profit', 'target', 'target_price'):
+        if name in cols and name not in live_payload:
+            live_payload[name] = float(tp_val or 0.0)
+    for name in ('tp2', 'tp3'):
+        if name in cols and name not in live_payload:
+            live_payload[name] = 0.0
+
+    now_ts = float(live_payload.get('created_ts') or live_payload.get('updated_ts') or time.time())
+    opened_ts = int(float(live_payload.get('opened_ts') or now_ts) or now_ts)
+    defaults = {
+        'created_ts': now_ts,
+        'updated_ts': now_ts,
+        'opened_ts': opened_ts,
+        'day_utc': live_payload.get('day_utc') or datetime.fromtimestamp(opened_ts, tz=timezone.utc).strftime('%Y-%m-%d'),
+        'status': live_payload.get('status') or 'OPEN',
+        'outcome': live_payload.get('outcome') or '',
+        'note': live_payload.get('note') or '',
+        'family_id': live_payload.get('family_id') or '',
+        'regime_primary': live_payload.get('regime_primary') or '',
+        'allocator_plan_id': live_payload.get('allocator_plan_id') or '',
+        'param_set_id': live_payload.get('param_set_id') or '',
+    }
+    for k, v in defaults.items():
+        if k in cols and (k not in live_payload or live_payload.get(k) is None):
+            live_payload[k] = v
+
+    insert_cols = [name for name in preferred_order if name in cols and name in live_payload]
+    used = set(insert_cols)
+
+    # Include every NOT NULL-without-default legacy column that is not already
+    # covered. SQLite table_info columns: cid, name, type, notnull, dflt_value, pk.
+    for r in info:
+        name = str(r[1])
+        col_type = str(r[2] or '').upper()
+        notnull = bool(r[3])
+        dflt = r[4]
+        pk = bool(r[5])
+        if name in used:
+            continue
+        if not (notnull or pk) or dflt is not None:
+            continue
+        if name not in live_payload:
+            if name.lower() in {'tp1', 'take_profit', 'target', 'target_price'}:
+                live_payload[name] = float(tp_val or 0.0)
+            elif name.lower() in {'tp2', 'tp3', 'pnl', 'pnl_usdt', 'qty', 'entry', 'sl', 'tp', 'conf', 'quality_score', 'atr_pct'} or any(t in col_type for t in ('INT', 'REAL', 'NUM', 'FLOAT', 'DOUBLE')):
+                live_payload[name] = 0.0
+            else:
+                live_payload[name] = ''
+        insert_cols.append(name)
+        used.add(name)
+
+    values = [live_payload.get(name) for name in insert_cols]
+    return insert_cols, values
+
 def _autotrade_db_insert_open_trade_row(uid: int, trade_row: dict) -> str:
     """Insert or replace an OPEN autotrade journal row from recovered live-position evidence."""
     _autotrade_migrate_tables()
@@ -5637,7 +5713,8 @@ def _autotrade_db_insert_open_trade_row(uid: int, trade_row: dict) -> str:
         'side': str((trade_row or {}).get('side') or '').upper(),
         'entry': float((trade_row or {}).get('entry') or 0.0),
         'sl': float((trade_row or {}).get('sl') or 0.0),
-        'tp': float((trade_row or {}).get('tp') or 0.0),
+        'tp': float((trade_row or {}).get('tp') or (trade_row or {}).get('tp1') or 0.0),
+        'tp1': float((trade_row or {}).get('tp1') or (trade_row or {}).get('tp') or 0.0),
         'alt_target_a': float((trade_row or {}).get('alt_target_a') or 0.0),
         'alt_target_b': float((trade_row or {}).get('alt_target_b') or 0.0),
         'qty': float((trade_row or {}).get('qty') or 0.0),
@@ -5660,20 +5737,12 @@ def _autotrade_db_insert_open_trade_row(uid: int, trade_row: dict) -> str:
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
-            cols = [r[1] for r in cur.execute("PRAGMA table_info(autotrade_trades)").fetchall()]
-            insert_cols = [
-                'trade_id','uid','opened_ts','day_utc','session','setup_id','symbol','side','entry','sl','tp','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine','status','created_ts','updated_ts','closed_ts','pnl_usdt','outcome','note'
+            preferred_order = [
+                'trade_id','uid','opened_ts','created_ts','updated_ts','day_utc','session','setup_id','symbol','side',
+                'entry','sl','tp','tp1','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine',
+                'status','closed_ts','pnl_usdt','pnl','outcome','note','family_id','regime_primary','allocator_plan_id','param_set_id'
             ]
-            insert_cols = [c for c in insert_cols if c in cols]
-            if 'family_id' in cols:
-                insert_cols.append('family_id')
-            if 'regime_primary' in cols:
-                insert_cols.append('regime_primary')
-            if 'allocator_plan_id' in cols:
-                insert_cols.append('allocator_plan_id')
-            if 'param_set_id' in cols:
-                insert_cols.append('param_set_id')
-            values = [payload.get(c) for c in insert_cols]
+            insert_cols, values = _autotrade_trade_insert_cols(cur, payload, preferred_order)
             placeholders = ','.join(['?'] * len(insert_cols))
             cur.execute(f"INSERT OR REPLACE INTO autotrade_trades ({','.join(insert_cols)}) VALUES ({placeholders})", values)
             conn.commit()
@@ -6357,6 +6426,7 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
         'entry': float(getattr(s, 'entry', 0.0) or 0.0),
         'sl': float(getattr(s, 'sl', 0.0) or 0.0),
         'tp': float(_setup_target_tp(s, 0.0) or 0.0),
+        'tp1': float(_setup_target_tp(s, 0.0) or 0.0),
         'alt_target_a': 0.0,
         'alt_target_b': 0.0,
         'qty': float(qty or 0.0),
@@ -6379,15 +6449,13 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
     try:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            cols = [r[1] for r in c.execute("PRAGMA table_info(autotrade_trades)").fetchall()]
             preferred_order = [
                 'trade_id','uid','opened_ts','created_ts','updated_ts','day_utc','session','setup_id','symbol','side',
-                'entry','sl','tp','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine',
+                'entry','sl','tp','tp1','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine',
                 'status','closed_ts','pnl_usdt','pnl','outcome','note','family_id','regime_primary','allocator_plan_id','param_set_id'
             ]
-            insert_cols = [name for name in preferred_order if name in cols and name in payload]
+            insert_cols, values = _autotrade_trade_insert_cols(c, payload, preferred_order)
             placeholders = ','.join(['?'] * len(insert_cols))
-            values = [payload.get(name) for name in insert_cols]
             c.execute(f"INSERT INTO autotrade_trades ({','.join(insert_cols)}) VALUES ({placeholders})", values)
             conn.commit()
     except Exception as e:
