@@ -421,6 +421,7 @@ AUTOTRADE_CFG_LEVERAGE_KEY = 'leverage'
 AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
 AUTOTRADE_CFG_MODE_KEY = 'mode'
 AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
+AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY = 'max_entry_drift_pct'
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
@@ -473,6 +474,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_ISOLATED_KEY: 1 if bool(AUTOTRADE_ISOLATED) else 0,
         AUTOTRADE_CFG_MODE_KEY: str(AUTOTRADE_MODE or 'paper').strip().lower(),
         AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(_autotrade_runtime_max_open_trades()),
+        AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT),
     }
     for k, v in defaults.items():
         try:
@@ -520,6 +522,21 @@ def _autotrade_runtime_max_open_trades() -> int:
     return max(1, int(val))
 
 
+def _autotrade_runtime_max_entry_drift_pct() -> float:
+    """Runtime adverse-entry drift guard.
+
+    Drift is directional: for BUY, only a live price ABOVE setup entry is adverse;
+    for SELL, only a live price BELOW setup entry is adverse. Favourable drift is
+    allowed so AutoTrade does not skip a better entry just because the absolute
+    price moved.
+    """
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, AUTOTRADE_MAX_ENTRY_DRIFT_PCT) or AUTOTRADE_MAX_ENTRY_DRIFT_PCT)
+    except Exception:
+        val = float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT or 0.0)
+    return max(0.0, float(val))
+
+
 def _autotrade_runtime_leverage() -> int:
     try:
         val = int(float(_autotrade_config_get(AUTOTRADE_CFG_LEVERAGE_KEY, AUTOTRADE_LEVERAGE) or AUTOTRADE_LEVERAGE))
@@ -545,6 +562,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_DAILY_RISK_CAP_MODE': str(mode_txt or 'PCT').upper(),
         'AUTOTRADE_MODE': str(_autotrade_runtime_mode()).lower(),
         'AUTOTRADE_MAX_OPEN_TRADES': int(_autotrade_runtime_max_open_trades()),
+        'AUTOTRADE_MAX_ENTRY_DRIFT_PCT': float(_autotrade_runtime_max_entry_drift_pct()),
         'AUTOTRADE_LEVERAGE': int(_autotrade_runtime_leverage()),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
     }
@@ -2693,7 +2711,7 @@ AUTOTRADE_BE_AFTER_TP_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AFT
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
-AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.50") or 0.50)
+AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.80") or 0.80)
 
 # Bybit V5 keys (required for live)
 BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
@@ -6930,7 +6948,7 @@ def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict |
         if isinstance(meta, dict):
             row.update(meta)
         if isinstance(detail, dict):
-            for k in ('when','setup_id','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct'):
+            for k in ('when','setup_id','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct'):
                 if k in detail and detail.get(k) not in (None, ''):
                     row[k] = detail.get(k)
         row['when'] = str(row.get('when') or datetime.now(timezone.utc).isoformat(timespec='seconds'))
@@ -7095,25 +7113,58 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             price_ref = live_ref
 
     entry_drift_pct = 0.0
+    entry_delta_pct = 0.0
+    adverse_entry_drift_pct = 0.0
+    favourable_entry_drift_pct = 0.0
+    entry_drift_direction = 'flat'
     try:
         if float(intended_entry) > 0 and float(price_ref) > 0:
-            entry_drift_pct = abs((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0
+            entry_delta_pct = ((float(price_ref) - float(intended_entry)) / float(intended_entry)) * 100.0
+            entry_drift_pct = abs(float(entry_delta_pct))
+            if side == 'BUY':
+                adverse_entry_drift_pct = max(0.0, float(entry_delta_pct))
+                favourable_entry_drift_pct = max(0.0, -float(entry_delta_pct))
+            elif side == 'SELL':
+                adverse_entry_drift_pct = max(0.0, -float(entry_delta_pct))
+                favourable_entry_drift_pct = max(0.0, float(entry_delta_pct))
+            if adverse_entry_drift_pct > 0:
+                entry_drift_direction = 'adverse'
+            elif favourable_entry_drift_pct > 0:
+                entry_drift_direction = 'favourable'
     except Exception:
         entry_drift_pct = 0.0
-    if str(_autotrade_runtime_mode()).lower() == 'live' and float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT) > 0 and entry_drift_pct > float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):
+        entry_delta_pct = 0.0
+        adverse_entry_drift_pct = 0.0
+        favourable_entry_drift_pct = 0.0
+        entry_drift_direction = 'flat'
+
+    try:
+        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'entry': float(price_ref),
+            'entry_source': 'live_ref' if str(_autotrade_runtime_mode()).lower() == 'live' else 'setup',
+            'setup_entry': float(intended_entry),
+            'entry_drift_pct': float(entry_drift_pct),
+            'entry_delta_pct': float(entry_delta_pct),
+            'entry_drift_adverse_pct': float(adverse_entry_drift_pct),
+            'entry_drift_favourable_pct': float(favourable_entry_drift_pct),
+            'entry_drift_direction': str(entry_drift_direction),
+            'max_adverse_entry_drift_pct': float(_autotrade_runtime_max_entry_drift_pct()),
+        })
+    except Exception:
+        pass
+
+    max_adverse_drift = float(_autotrade_runtime_max_entry_drift_pct())
+    if str(_autotrade_runtime_mode()).lower() == 'live' and max_adverse_drift > 0 and adverse_entry_drift_pct > max_adverse_drift:
         try:
             _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'entry': float(price_ref),
-                'entry_source': 'live_ref',
-                'setup_entry': float(intended_entry),
-                'entry_drift_pct': float(entry_drift_pct),
                 'reject_reason': 'entry_drift_too_wide',
             })
         except Exception:
             pass
         try:
-            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason=f'entry_drift_too_wide ({entry_drift_pct:.2f}%>{float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT):.2f}%)')
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason=f'entry_drift_too_wide adverse={adverse_entry_drift_pct:.2f}%>{max_adverse_drift:.2f}% total={entry_drift_pct:.2f}% direction={entry_drift_direction}')
         except Exception:
             pass
         return (False, 'entry_drift_too_wide')
@@ -32689,6 +32740,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
             f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
+            f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
             f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
             "",
@@ -32698,6 +32750,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
             "• /autotrade_config AUTOTRADE_MODE live",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 3",
+            "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 0.8",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_ISOLATED true",
             "",
@@ -32714,7 +32767,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     value_raw = " ".join(context.args[1:]).strip()
     if key not in {
         'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT',
-        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_ISOLATED'
+        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_ISOLATED'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -32737,6 +32790,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_MAX_OPEN_TRADES':
             val = max(1, int(float(value_raw)))
             _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, val)
+        elif key == 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT':
+            val = max(0.0, float(value_raw))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, val)
         elif key == 'AUTOTRADE_LEVERAGE':
             val = max(1, int(float(value_raw)))
             _autotrade_config_set(AUTOTRADE_CFG_LEVERAGE_KEY, val)
@@ -36565,10 +36621,20 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             entry = _autotrade_price_str(a.get('entry'))
             sl = _autotrade_price_str(a.get('sl'))
             drift = a.get('entry_drift_pct', '')
+            drift_dir = str(a.get('entry_drift_direction') or '').strip().lower()
+            adverse = a.get('entry_drift_adverse_pct', '')
             drift_txt = ''
             try:
                 if drift not in ('', None):
-                    drift_txt = f" | Drift: {float(drift):.2f}%"
+                    if drift_dir in {'favourable', 'favorable'}:
+                        drift_txt = f" | Drift: {float(drift):.2f}% favourable"
+                    elif drift_dir == 'adverse':
+                        try:
+                            drift_txt = f" | Drift: {float(drift):.2f}% adverse ({float(adverse):.2f}% adverse)"
+                        except Exception:
+                            drift_txt = f" | Drift: {float(drift):.2f}% adverse"
+                    else:
+                        drift_txt = f" | Drift: {float(drift):.2f}%"
             except Exception:
                 pass
             lines.append(f"{i}) {sym} {side} | {status}" + (f" | {reason}" if reason else ''))
@@ -42856,6 +42922,8 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                             'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
                             'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
                             'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+                            'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
+                            'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
                         })
                         _autotrade_record_attempt(uid, attempt_summaries[attempted - 1], detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
                 except Exception:
@@ -43013,6 +43081,8 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
                         'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
                         'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+                            'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
+                            'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
                     })
                     _autotrade_record_attempt(owner_uid, attempts_meta[-1], detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
                 except Exception:
