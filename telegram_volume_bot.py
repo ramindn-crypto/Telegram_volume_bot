@@ -5691,9 +5691,21 @@ def _autotrade_trade_insert_cols(cur, payload: dict, preferred_order: list[str])
 
     # Include every NOT NULL-without-default legacy column that is not already
     # covered. SQLite table_info columns: cid, name, type, notnull, dflt_value, pk.
+    #
+    # IMPORTANT: some long-lived Render DBs have a legacy primary-key column named
+    # `id` in addition to (or instead of) `trade_id`. The previous schema-safe
+    # filler treated unknown required TEXT columns as an empty string, or INTEGER
+    # PKs as 0.0. That made every live autotrade journal attempt collide on
+    # autotrade_trades.id.
+    #
+    # Rules here:
+    #   • INTEGER PRIMARY KEY / rowid aliases are omitted so SQLite allocates them.
+    #   • TEXT/legacy PK ids are populated with the unique trade_id.
+    #   • other required legacy columns still get safe defaults.
     for r in info:
         name = str(r[1])
         col_type = str(r[2] or '').upper()
+        name_l = name.lower()
         notnull = bool(r[3])
         dflt = r[4]
         pk = bool(r[5])
@@ -5701,10 +5713,18 @@ def _autotrade_trade_insert_cols(cur, payload: dict, preferred_order: list[str])
             continue
         if not (notnull or pk) or dflt is not None:
             continue
+
+        is_integer_pk = bool(pk and any(t in col_type for t in ('INT',)))
+        if pk and is_integer_pk and name not in live_payload:
+            # Do NOT insert id=0/0.0 for SQLite rowid primary keys.
+            continue
+
         if name not in live_payload:
-            if name.lower() in {'tp1', 'take_profit', 'target', 'target_price'}:
+            if pk or name_l in {'id', 'uuid', 'journal_id'}:
+                live_payload[name] = str(live_payload.get('trade_id') or f"AT-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}")
+            elif name_l in {'tp1', 'take_profit', 'target', 'target_price'}:
                 live_payload[name] = float(tp_val or 0.0)
-            elif name.lower() in {'tp2', 'tp3', 'pnl', 'pnl_usdt', 'qty', 'entry', 'sl', 'tp', 'conf', 'quality_score', 'atr_pct'} or any(t in col_type for t in ('INT', 'REAL', 'NUM', 'FLOAT', 'DOUBLE')):
+            elif name_l in {'tp2', 'tp3', 'pnl', 'pnl_usdt', 'qty', 'entry', 'sl', 'tp', 'conf', 'quality_score', 'atr_pct'} or any(t in col_type for t in ('INT', 'REAL', 'NUM', 'FLOAT', 'DOUBLE')):
                 live_payload[name] = 0.0
             else:
                 live_payload[name] = ''
