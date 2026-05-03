@@ -422,6 +422,7 @@ AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
 AUTOTRADE_CFG_MODE_KEY = 'mode'
 AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
 AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY = 'max_entry_drift_pct'
+AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY = 'liq_buffer_pct'
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
@@ -475,6 +476,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_MODE_KEY: str(AUTOTRADE_MODE or 'paper').strip().lower(),
         AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(_autotrade_runtime_max_open_trades()),
         AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT),
+        AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY: float(AUTOTRADE_LIQ_BUFFER_PCT),
     }
     for k, v in defaults.items():
         try:
@@ -545,6 +547,19 @@ def _autotrade_runtime_leverage() -> int:
     return max(1, int(val))
 
 
+def _autotrade_runtime_liq_buffer_pct() -> float:
+    """Minimum safety buffer between SL and estimated liquidation price.
+
+    Example: 2.0 means estimated liquidation must be at least ~2% of entry
+    beyond the SL, so liquidation should not happen before the stop-loss.
+    """
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY, AUTOTRADE_LIQ_BUFFER_PCT) or AUTOTRADE_LIQ_BUFFER_PCT)
+    except Exception:
+        val = float(AUTOTRADE_LIQ_BUFFER_PCT or 0.0)
+    return max(0.0, min(25.0, float(val)))
+
+
 def _autotrade_runtime_isolated() -> bool:
     try:
         raw = _autotrade_config_get(AUTOTRADE_CFG_ISOLATED_KEY, 1 if AUTOTRADE_ISOLATED else 0)
@@ -564,6 +579,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_MAX_OPEN_TRADES': int(_autotrade_runtime_max_open_trades()),
         'AUTOTRADE_MAX_ENTRY_DRIFT_PCT': float(_autotrade_runtime_max_entry_drift_pct()),
         'AUTOTRADE_LEVERAGE': int(_autotrade_runtime_leverage()),
+        'AUTOTRADE_LIQ_BUFFER_PCT': float(_autotrade_runtime_liq_buffer_pct()),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
     }
 
@@ -2712,6 +2728,10 @@ AUTOTRADE_BE_AFTER_TP_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AFT
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
 AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.80") or 0.80)
+# Estimated liquidation must sit this many percent-of-entry beyond the SL.
+# This protects isolated futures positions where a wide SL with high leverage would
+# otherwise liquidate before the stop can execute.
+AUTOTRADE_LIQ_BUFFER_PCT = float(os.environ.get("AUTOTRADE_LIQ_BUFFER_PCT", "2.0") or 2.0)
 
 # Bybit V5 keys (required for live)
 BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
@@ -2811,6 +2831,114 @@ def _bybit_v5_request(method: str, path: str, payload: dict | None = None) -> di
         return r.json()
     except Exception as e:
         return {"retCode": -1, "retMsg": f"{type(e).__name__}: {e}", "result": None}
+def _autotrade_liq_before_sl(side: str, liq_price: float, sl_price: float) -> bool:
+    """True when exchange liquidation would happen before/at the stop loss."""
+    try:
+        side_u = str(side or '').upper().strip()
+        liq = float(liq_price or 0.0)
+        sl = float(sl_price or 0.0)
+        if liq <= 0 or sl <= 0:
+            return False
+        if side_u == 'BUY':
+            return liq >= sl
+        if side_u == 'SELL':
+            return liq <= sl
+    except Exception:
+        pass
+    return False
+
+
+def _autotrade_liq_safety_plan(entry: float, sl: float, side: str, configured_leverage: int | float, buffer_pct: float | None = None) -> dict:
+    """Plan a per-symbol leverage that keeps liquidation beyond the stop-loss.
+
+    Conservative isolated-linear approximation:
+      long  liq ≈ entry * (1 - 1/leverage)
+      short liq ≈ entry * (1 + 1/leverage)
+
+    We require the approximate liquidation point to sit beyond SL by buffer_pct of
+    entry. If configured leverage is too high for a wide SL, the bot automatically
+    lowers leverage for this symbol before opening the trade.
+    """
+    out = {
+        'ok': False,
+        'reason': 'liq_plan_not_computed',
+        'configured_leverage': int(float(configured_leverage or 1) or 1),
+        'safe_leverage': int(float(configured_leverage or 1) or 1),
+        'stop_distance_pct': 0.0,
+        'buffer_pct': float(buffer_pct if buffer_pct is not None else 0.0),
+        'estimated_liq_price': 0.0,
+    }
+    try:
+        e = float(entry or 0.0)
+        st = float(sl or 0.0)
+        side_u = str(side or '').upper().strip()
+        cfg_lev = max(1, int(float(configured_leverage or 1)))
+        buf_pct = max(0.0, min(25.0, float(buffer_pct if buffer_pct is not None else _autotrade_runtime_liq_buffer_pct())))
+        out['configured_leverage'] = cfg_lev
+        out['buffer_pct'] = float(buf_pct)
+        if e <= 0 or st <= 0 or side_u not in {'BUY', 'SELL'}:
+            out['reason'] = 'bad_liq_inputs'
+            return out
+        if side_u == 'BUY' and st >= e:
+            out['reason'] = 'bad_buy_sl_for_liq_guard'
+            return out
+        if side_u == 'SELL' and st <= e:
+            out['reason'] = 'bad_sell_sl_for_liq_guard'
+            return out
+        stop_frac = abs(e - st) / e
+        buf_frac = float(buf_pct) / 100.0
+        # Use 0.94 instead of 1.00 to leave room for maintenance margin, fees and
+        # mark-price slippage. This intentionally chooses a slightly lower leverage.
+        denom = max(1e-9, stop_frac + buf_frac)
+        max_safe_lev = int(math.floor(0.94 / denom))
+        safe_lev = max(1, min(cfg_lev, max_safe_lev if max_safe_lev > 0 else 1))
+        if safe_lev <= 0:
+            safe_lev = 1
+        liq_distance_frac = 1.0 / float(safe_lev)
+        est_liq = e * (1.0 - liq_distance_frac) if side_u == 'BUY' else e * (1.0 + liq_distance_frac)
+        out.update({
+            'safe_leverage': int(safe_lev),
+            'stop_distance_pct': float(stop_frac * 100.0),
+            'estimated_liq_price': float(est_liq),
+            'reason': 'ok',
+        })
+        # Estimated liquidation must be beyond the buffered stop level.
+        if side_u == 'BUY':
+            out['ok'] = bool(est_liq < (st - e * buf_frac))
+        else:
+            out['ok'] = bool(est_liq > (st + e * buf_frac))
+        if not out['ok'] and safe_lev == 1:
+            out['reason'] = 'stop_too_wide_for_liq_buffer_even_1x'
+        elif not out['ok']:
+            out['reason'] = 'liq_plan_failed'
+        return out
+    except Exception as exc:
+        out['reason'] = f'liq_plan_error:{type(exc).__name__}'
+        return out
+
+
+def _autotrade_set_symbol_leverage_safe(symbol: str, leverage: int | float) -> tuple[bool, str, dict]:
+    """Best-effort Bybit V5 leverage setter. Accepts 'not modified' as OK."""
+    try:
+        sym = _bybit_linear_symbol(symbol)
+        lev = max(1, int(float(leverage or 1)))
+        payload = {
+            'category': 'linear',
+            'symbol': sym,
+            'buyLeverage': str(lev),
+            'sellLeverage': str(lev),
+        }
+        res = _bybit_v5_request('POST', '/v5/position/set-leverage', payload)
+        code = int((res or {}).get('retCode', -1))
+        msg = str((res or {}).get('retMsg') or '')
+        low = msg.lower()
+        if code == 0 or 'not modified' in low or 'same leverage' in low:
+            return True, msg or 'ok', (res or {})
+        return False, f'{code} {msg}'.strip(), (res or {})
+    except Exception as exc:
+        return False, f'{type(exc).__name__}: {exc}', {}
+
+
 def _bybit_get_instr_filters(symbol: str) -> dict:
     """Return best-effort Bybit linear instrument filters.
 
@@ -3303,6 +3431,12 @@ def _pos_mark(p: dict) -> float:
 def _pos_entry(p: dict) -> float:
     try:
         return float(p.get("avgPrice") or p.get("entryPrice") or 0.0)
+    except Exception:
+        return 0.0
+
+def _pos_liq_price(p: dict) -> float:
+    try:
+        return float(p.get("liqPrice") or p.get("liquidationPrice") or 0.0)
     except Exception:
         return 0.0
 
@@ -7311,6 +7445,48 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
     if stop_distance <= 0:
         return (False, 'stop_distance_zero_or_invalid')
+
+    # Liquidation safety guard: do not open a futures position where the exchange
+    # liquidation price can be reached before the bot/exchange stop-loss. For wide
+    # stops, automatically lower symbol leverage below AUTOTRADE_LEVERAGE.
+    configured_lev = int(_autotrade_runtime_leverage())
+    liq_plan = _autotrade_liq_safety_plan(price_ref, sl_for_order, side, configured_lev, _autotrade_runtime_liq_buffer_pct())
+    try:
+        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'liq_guard': liq_plan,
+            'configured_leverage': int(configured_lev),
+            'safe_leverage': int(liq_plan.get('safe_leverage') or configured_lev),
+            'liq_estimated_price': float(liq_plan.get('estimated_liq_price') or 0.0),
+            'liq_buffer_pct': float(liq_plan.get('buffer_pct') or 0.0),
+            'stop_distance_pct': float(liq_plan.get('stop_distance_pct') or 0.0),
+        })
+    except Exception:
+        pass
+    if not bool(liq_plan.get('ok')):
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': str(liq_plan.get('reason') or 'liq_guard_failed')})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f"liq_guard_failed:{liq_plan.get('reason')}")
+        except Exception:
+            pass
+        return (False, f"liq_guard_failed:{liq_plan.get('reason')}")
+    safe_lev = int(liq_plan.get('safe_leverage') or configured_lev)
+    if str(_autotrade_runtime_mode()).lower() == 'live':
+        lev_ok, lev_msg, lev_res = _autotrade_set_symbol_leverage_safe(sym, safe_lev)
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'leverage_set_ok': bool(lev_ok), 'leverage_set_msg': str(lev_msg), 'leverage_set_res': lev_res})
+        except Exception:
+            pass
+        if not lev_ok:
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'leverage_set_failed_for_liq_guard:{lev_msg}')
+            except Exception:
+                pass
+            return (False, f'leverage_set_failed_for_liq_guard:{lev_msg}')
+
     if math.isfinite(remaining_risk) and remaining_risk <= 0:
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'daily_remaining_risk_zero'})
@@ -7556,6 +7732,42 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             except Exception:
                 pass
             return (False, 'live_position_visibility_pending_for_sltp_attach')
+
+        # Last-resort live liquidation verification. If Bybit reports a liq price
+        # that would be hit before the SL, immediately flatten the just-opened
+        # position instead of leaving it exposed.
+        live_liq = float(_pos_liq_price(final_pos) or 0.0)
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'live_liq_price': float(live_liq)})
+        except Exception:
+            pass
+        if _autotrade_liq_before_sl(side, live_liq, sl_for_order):
+            liq_reason = f'live_liq_before_sl liq={live_liq:g} sl={sl_for_order:g}'
+            try:
+                close_payload = {
+                    'category': 'linear',
+                    'symbol': sym,
+                    'side': 'Sell' if side == 'BUY' else 'Buy',
+                    'orderType': 'Market',
+                    'qty': _fmt_qty(float(qty_for_db), qty_step),
+                    'timeInForce': 'IOC',
+                    'reduceOnly': True,
+                    'closeOnTrigger': True,
+                }
+                close_res = _bybit_v5_request('POST', '/v5/order/create', close_payload)
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_before_sl_closed', 'liq_close_payload': close_payload, 'liq_close_res': close_res})
+            except Exception as exc:
+                close_res = {'retCode': -1, 'retMsg': f'{type(exc).__name__}: {exc}'}
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_before_sl_close_failed', 'liq_close_res': close_res})
+                except Exception:
+                    pass
+            _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_liq_before_sl')
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason=liq_reason)
+            except Exception:
+                pass
+            return (False, 'live_liq_before_sl_closed')
 
         s_live = _autotrade_clone_setup_for_execution(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
         trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened_pending_exit_attach')
@@ -18884,6 +19096,18 @@ def table_md(rows: List[List[Any]], headers: List[str]) -> str:
     return "```\n" + tabulate(rows, headers=headers, tablefmt="github") + "\n```"
 
 
+def _screen_context_volume_floor_usd() -> float:
+    """Minimum 24h futures volume for /screen Market Context leaders/losers.
+
+    Keep this aligned with the setup liquidity floor so /screen does not advertise
+    thin symbols in Leaders/Losers while setups are filtered at >= 10M.
+    """
+    try:
+        return max(10_000_000.0, float(_setup_min_volume_floor_usd() or 0.0))
+    except Exception:
+        return 10_000_000.0
+
+
 def _screen_market_context_table(best_fut: dict, leaders=None, losers=None, tone: str | None = None) -> str:
     """Pretty /screen Market Context tables only.
 
@@ -18891,6 +19115,7 @@ def _screen_market_context_table(best_fut: dict, leaders=None, losers=None, tone
     """
     try:
         best_fut = best_fut or {}
+        context_min_vol = float(_screen_context_volume_floor_usd())
 
         def _mv_for(sym: str):
             sym_u = str(sym or '').upper().strip()
@@ -18913,6 +19138,18 @@ def _screen_market_context_table(best_fut: dict, leaders=None, losers=None, tone
                 return f"{float(v) / 1e6:.1f}M"
             except Exception:
                 return '—'
+
+        def _pick_vol_usd(pick) -> float:
+            try:
+                # Regular /screen path passes (sym, vol_usd, ch24).
+                if isinstance(pick, (list, tuple)) and len(pick) >= 3:
+                    return float(pick[1] or 0.0)
+                # Quick ticker fallback passes (sym, MarketVol).
+                if isinstance(pick, (list, tuple)) and len(pick) >= 2:
+                    return float(usd_notional(pick[1]) or 0.0)
+            except Exception:
+                pass
+            return 0.0
 
         def _pick_row(pick):
             try:
@@ -18950,16 +19187,30 @@ def _screen_market_context_table(best_fut: dict, leaders=None, losers=None, tone
                 continue
 
         leader_rows = []
-        for item in list(leaders or [])[:5]:
+        for item in list(leaders or []):
+            try:
+                if _pick_vol_usd(item) < context_min_vol:
+                    continue
+            except Exception:
+                continue
             row = _pick_row(item)
             if row:
                 leader_rows.append(row)
+            if len(leader_rows) >= 5:
+                break
 
         loser_rows = []
-        for item in list(losers or [])[:5]:
+        for item in list(losers or []):
+            try:
+                if _pick_vol_usd(item) < context_min_vol:
+                    continue
+            except Exception:
+                continue
             row = _pick_row(item)
             if row:
                 loser_rows.append(row)
+            if len(loser_rows) >= 5:
+                break
 
         lines = ["*Market Context*", SEP]
         if tone:
@@ -32772,6 +33023,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 3",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 0.8",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
+            "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
             "• /autotrade_config AUTOTRADE_ISOLATED true",
             "",
             "Note: daily cap mode stays under /dailycapAT pct|usd <value>.",
@@ -32787,7 +33039,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     value_raw = " ".join(context.args[1:]).strip()
     if key not in {
         'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT',
-        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_ISOLATED'
+        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -37972,6 +38224,10 @@ def _screen_quick_ticker_snapshot_body(best_fut: Dict[str, MarketVol], session: 
     try:
         items = list((best_fut or {}).items())
         items = [(str(b).upper(), mv) for b, mv in items if mv]
+        # /screen market context should not advertise thin leaders/losers.
+        # Keep the same 10M+ floor used by setup generation.
+        min_ctx_vol = float(_screen_context_volume_floor_usd())
+        items = [(b, mv) for b, mv in items if float(usd_notional(mv) or 0.0) >= min_ctx_vol]
         items.sort(key=lambda kv: abs(float(getattr(kv[1], 'percentage', 0.0) or 0.0)), reverse=True)
         leaders = sorted(items, key=lambda kv: float(getattr(kv[1], 'percentage', 0.0) or 0.0), reverse=True)[:5]
         losers = sorted(items, key=lambda kv: float(getattr(kv[1], 'percentage', 0.0) or 0.0))[:5]
@@ -38470,7 +38726,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
             up_list, dn_list = compute_directional_lists(best_fut or {})
         except Exception:
             up_list, dn_list = [], []
-        market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list[:5], losers=dn_list[:5])
+        market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
         source_note = '_Showing latest sent setup email while the live scan refreshes._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue while the live scan refreshes._'
         body = "\n".join([
             "",
@@ -38744,7 +39000,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         # Build Leaders/Losers for Market Context
         # Goal: show up to 5 items each (when available), preferring "directional" movers,
         # but backfilling with high-volume movers so the section is informative.
-        vol_min = float(MOVER_VOL_USD_MIN)
+        vol_min = float(_screen_context_volume_floor_usd())
 
         movers = []
         for sym, mv in (best_fut or {}).items():
@@ -39822,7 +40078,7 @@ def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, s
         # Keep /screen aligned to the exact email batch.
         try:
             up_list, dn_list = compute_directional_lists(best_fut or {})
-            market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list[:5], losers=dn_list[:5])
+            market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
             for tuid in target_uids:
                 screen_body = "\n".join([
                     "", "*Top Trade Setups*", SEP,
@@ -39981,7 +40237,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                 try:
                     # Keep /screen immediately aligned with the exact setup email just sent.
                     up_list, dn_list = compute_directional_lists(best_fut or {})
-                    market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list[:5], losers=dn_list[:5])
+                    market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
                     screen_body = "\n".join([
                         "",
                         "*Top Trade Setups*",
