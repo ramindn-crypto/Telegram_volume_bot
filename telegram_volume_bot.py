@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - FIX25: Big-Move alert emails now generate immediate owner AutoTrade attempts using ATR-capped SL/TP.
 # - Simplified /learning_status, /autotrade_debug, and /autotrade_last outputs.
 # - Daily risk remaining now restores capacity from positive realized PnL and reduces it from losses.
 # - /performance_report and /autotrade_report_overall now use the canonical 2-TP outcome model for reporting.
@@ -11918,6 +11919,20 @@ BIGMOVE_SIGNAL_FINAL_RR = float(os.environ.get("BIGMOVE_SIGNAL_FINAL_RR", "1.8")
 BIGMOVE_SIGNAL_TP1_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP1_RR", str(BIGMOVE_SIGNAL_FINAL_RR)) or BIGMOVE_SIGNAL_FINAL_RR)
 BIGMOVE_SIGNAL_TP2_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP2_RR", str(BIGMOVE_SIGNAL_FINAL_RR)) or BIGMOVE_SIGNAL_FINAL_RR)
 
+# Big-Move Alert → AutoTrade bridge.
+# Best-practice implementation: adaptive 15m ATR stop, fixed 2R target, hard capped
+# to the user's requested 10% SL / 20% TP envelope. If ATR is unavailable, the
+# fallback is exactly 10% SL and 20% TP.
+BIGMOVE_AUTOTRADE_ENABLED = env_bool("BIGMOVE_AUTOTRADE_ENABLED", True)
+BIGMOVE_AUTOTRADE_ATR_TIMEFRAME = str(os.environ.get("BIGMOVE_AUTOTRADE_ATR_TIMEFRAME", "15m") or "15m").strip() or "15m"
+BIGMOVE_AUTOTRADE_ATR_MULT = float(os.environ.get("BIGMOVE_AUTOTRADE_ATR_MULT", "2.2") or 2.2)
+BIGMOVE_AUTOTRADE_SL_MIN_PCT = float(os.environ.get("BIGMOVE_AUTOTRADE_SL_MIN_PCT", "3.0") or 3.0)
+BIGMOVE_AUTOTRADE_SL_MAX_PCT = float(os.environ.get("BIGMOVE_AUTOTRADE_SL_MAX_PCT", "10.0") or 10.0)
+BIGMOVE_AUTOTRADE_RR = float(os.environ.get("BIGMOVE_AUTOTRADE_RR", "2.0") or 2.0)
+BIGMOVE_AUTOTRADE_TP_MAX_PCT = float(os.environ.get("BIGMOVE_AUTOTRADE_TP_MAX_PCT", "20.0") or 20.0)
+BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS = int(os.environ.get("BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS", "8") or 8)
+BIGMOVE_AUTOTRADE_ALLOW_COLD_OHLCV = env_bool("BIGMOVE_AUTOTRADE_ALLOW_COLD_OHLCV", False)
+
 # Low-flow setup generation recovery. This is deliberately modest: it only softens
 # final executable gates when the bot has produced too few executable/email setups
 # recently. It does not bypass direction, RR, SL/TP, liquidity, or session checks.
@@ -12601,6 +12616,435 @@ def _bigmove_candidates(best_fut: dict, p15: float, p1: float, p4: float, min_vo
     out.sort(key=lambda x: (x["score"], x["vol"]), reverse=True)
     return out[:max_items]
 
+
+
+def _bigmove_autotrade_session_name(now_utc: Optional[datetime] = None) -> str:
+    """Session label for immediate Big-Move AutoTrade.
+
+    Big-Move alert emails are not tied to the normal setup-email session pool, but
+    the central AutoTrade execution function requires ASIA/LON/NY for its risk and
+    cooldown rules. Use the live session when available and the scan bucket during
+    the small session gap.
+    """
+    try:
+        live = str(current_session_utc(now_utc or datetime.now(timezone.utc)) or '').upper().strip()
+        if live in {'ASIA', 'LON', 'NY'}:
+            return live
+    except Exception:
+        pass
+    try:
+        scan = str(scan_session_name_utc(now_utc or datetime.now(timezone.utc)) or '').upper().strip()
+        if scan in {'ASIA', 'LON', 'NY'}:
+            return scan
+    except Exception:
+        pass
+    return 'NY'
+
+
+def _bigmove_candidate_marketvol(candidate: dict, best_fut: dict | None = None):
+    try:
+        sym = str((candidate or {}).get('symbol') or '').upper().strip()
+        if not sym:
+            return None
+        best = best_fut or get_cached_futures_tickers() or {}
+        mv = (best or {}).get(sym)
+        if mv is not None:
+            return mv
+        # Fallback: loose match against base/name because some caches use BYBIT/ccxt forms.
+        for _k, _mv in (best or {}).items():
+            try:
+                if str(_k or '').upper().strip() == sym:
+                    return _mv
+                if str(getattr(_mv, 'base', '') or '').upper().strip() == sym:
+                    return _mv
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _bigmove_candidate_market_symbol(candidate: dict, best_fut: dict | None = None) -> str:
+    try:
+        mv = _bigmove_candidate_marketvol(candidate, best_fut)
+        ms = str(getattr(mv, 'symbol', '') or '').strip()
+        if ms:
+            return ms
+    except Exception:
+        pass
+    try:
+        base = str((candidate or {}).get('symbol') or '').upper().strip()
+        return f"{base}/USDT:USDT" if base else ''
+    except Exception:
+        return ''
+
+
+def _bigmove_candidate_entry_price(candidate: dict, best_fut: dict | None = None) -> float:
+    """Best immediate entry reference for a Big-Move alert candidate."""
+    try:
+        mv = _bigmove_candidate_marketvol(candidate, best_fut)
+        for key in ('last', 'vwap', 'open'):
+            try:
+                px = float(getattr(mv, key, 0.0) or 0.0)
+                if px > 0:
+                    return px
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        sym = str((candidate or {}).get('symbol') or '').upper().strip()
+        px = _autotrade_live_reference_price(_bybit_linear_symbol(sym), fallback_entry=0.0)
+        return float(px or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _bigmove_autotrade_atr_pct(candidate: dict, best_fut: dict | None = None) -> float:
+    """15m ATR% used for the Big-Move AutoTrade stop distance."""
+    try:
+        market_symbol = _bigmove_candidate_market_symbol(candidate, best_fut)
+        if not market_symbol:
+            return 0.0
+        limit = max(int(ATR_PERIOD) + 5, 80)
+        rows = _ohlcv_cached_or_optional_fetch(
+            market_symbol,
+            str(BIGMOVE_AUTOTRADE_ATR_TIMEFRAME or '15m'),
+            int(limit),
+            allow_cold=bool(BIGMOVE_AUTOTRADE_ALLOW_COLD_OHLCV),
+        )
+        if not rows or len(rows) < int(ATR_PERIOD) + 1:
+            return 0.0
+        atr = float(compute_atr_from_ohlcv(rows, int(ATR_PERIOD)) or 0.0)
+        close = float(rows[-1][4] or 0.0)
+        if atr > 0 and close > 0:
+            return float((atr / close) * 100.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _bigmove_autotrade_price_plan(candidate: dict, best_fut: dict | None = None) -> dict:
+    """Return entry/SL/TP plan for a confirmed Big-Move alert.
+
+    Rules:
+    - direction UP => BUY; DOWN => SELL
+    - SL distance = clamp(2.2 × 15m ATR%, 3%, 10%)
+    - TP distance = min(SL distance × 2R, 20%)
+    - if ATR is unavailable, use the requested 10% SL / 20% TP fallback.
+    """
+    out = {
+        'ok': False,
+        'reason': 'not_computed',
+        'side': '',
+        'entry': 0.0,
+        'sl': 0.0,
+        'tp': 0.0,
+        'sl_pct': 0.0,
+        'tp_pct': 0.0,
+        'rr': float(BIGMOVE_AUTOTRADE_RR),
+        'atr_pct': 0.0,
+        'sl_model': 'ATR_CAPPED',
+    }
+    try:
+        direction = str((candidate or {}).get('direction') or '').upper().strip()
+        side = 'BUY' if direction == 'UP' else 'SELL' if direction == 'DOWN' else ''
+        entry = float(_bigmove_candidate_entry_price(candidate, best_fut) or 0.0)
+        if side not in {'BUY', 'SELL'}:
+            out['reason'] = 'bad_bigmove_direction'
+            return out
+        if entry <= 0:
+            out['reason'] = 'entry_unavailable'
+            return out
+
+        atr_pct = float(_bigmove_autotrade_atr_pct(candidate, best_fut) or 0.0)
+        if atr_pct > 0:
+            sl_pct = max(float(BIGMOVE_AUTOTRADE_SL_MIN_PCT), min(float(BIGMOVE_AUTOTRADE_SL_MAX_PCT), atr_pct * float(BIGMOVE_AUTOTRADE_ATR_MULT)))
+            sl_model = f"{BIGMOVE_AUTOTRADE_ATR_TIMEFRAME}_ATRx{float(BIGMOVE_AUTOTRADE_ATR_MULT):g}_clamped"
+        else:
+            sl_pct = float(BIGMOVE_AUTOTRADE_SL_MAX_PCT)
+            sl_model = 'fallback_fixed_10pct'
+
+        rr = max(1.0, float(BIGMOVE_AUTOTRADE_RR or 2.0))
+        tp_pct = min(float(BIGMOVE_AUTOTRADE_TP_MAX_PCT), float(sl_pct) * rr)
+        if side == 'BUY':
+            sl = entry * (1.0 - sl_pct / 100.0)
+            tp = entry * (1.0 + tp_pct / 100.0)
+        else:
+            sl = entry * (1.0 + sl_pct / 100.0)
+            tp = entry * (1.0 - tp_pct / 100.0)
+        if sl <= 0 or tp <= 0:
+            out['reason'] = 'bad_sl_tp'
+            return out
+        out.update({
+            'ok': True,
+            'reason': 'ok',
+            'side': side,
+            'entry': float(entry),
+            'sl': float(sl),
+            'tp': float(tp),
+            'sl_pct': float(sl_pct),
+            'tp_pct': float(tp_pct),
+            'rr': float(rr_to_tp(entry, sl, tp) or rr),
+            'atr_pct': float(atr_pct),
+            'sl_model': sl_model,
+        })
+        return out
+    except Exception as exc:
+        out['reason'] = f'{type(exc).__name__}: {exc}'
+        return out
+
+
+def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None = None, session_name: str = '') -> Optional[Setup]:
+    """Convert a confirmed Big-Move email row into a single-TP executable Setup."""
+    try:
+        if not bool(BIGMOVE_AUTOTRADE_ENABLED):
+            return None
+        c = dict(candidate or {})
+        sym = str(c.get('symbol') or '').upper().strip()
+        if not sym:
+            return None
+        plan = _bigmove_autotrade_price_plan(c, best_fut)
+        if not bool(plan.get('ok')):
+            return None
+        mv = _bigmove_candidate_marketvol(c, best_fut)
+        fut_vol = float(c.get('vol') or (usd_notional(mv) if mv is not None else 0.0) or 0.0)
+        ch15 = float(c.get('confirm_15m_pct', c.get('ch15', 0.0)) or 0.0)
+        ch1 = float(c.get('ch1', 0.0) or 0.0)
+        ch4 = float(c.get('ch4', 0.0) or 0.0)
+        ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0) if mv is not None else 0.0
+        side = str(plan.get('side') or '').upper().strip()
+        conf = _bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, fut_vol, 0.0)
+        conf = int(clamp(max(float(conf), 82.0), 68.0, 96.0))
+        setup_id = f"BMAT-{sym}-{side}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        market_symbol = _bigmove_candidate_market_symbol(c, best_fut)
+        s = Setup(
+            setup_id=setup_id,
+            symbol=sym,
+            market_symbol=market_symbol,
+            side=side,
+            conf=int(conf),
+            entry=float(plan.get('entry') or 0.0),
+            sl=float(plan.get('sl') or 0.0),
+            tp=float(plan.get('tp') or 0.0),
+            alt_target_a=0.0,
+            alt_target_b=0.0,
+            fut_vol_usd=float(fut_vol),
+            ch24=float(ch24),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
+            ema_support_period=0,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=0,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=True,
+            leader_base_override=True,
+            engine='',  # Keep DB structural gate simple; family_id carries Big-Move identity.
+            is_trailing_alt_target_b=False,
+            created_ts=float(time.time()),
+            family_id=BIGMOVE_FAMILY_ID,
+            family_name=BIGMOVE_FAMILY_NAME,
+            session=str(session_name or '').upper().strip(),
+        )
+        setattr(s, 'atr_pct', float(plan.get('atr_pct') or 0.0))
+        setattr(s, 'quality_score', 0.0)
+        setattr(s, 'source_kind', 'emailed_setups')
+        setattr(s, 'source_session', str(session_name or '').upper().strip())
+        setattr(s, 'email_logged_ts', float(time.time()))
+        setattr(s, 'emailed_ts', float(time.time()))
+        setattr(s, 'bigmove_signal', True)
+        setattr(s, 'bigmove_alert_autotrade', True)
+        setattr(s, 'bigmove_direction', str(c.get('direction') or '').upper().strip())
+        setattr(s, 'bigmove_sl_model', str(plan.get('sl_model') or ''))
+        setattr(s, 'bigmove_sl_pct', float(plan.get('sl_pct') or 0.0))
+        setattr(s, 'bigmove_tp_pct', float(plan.get('tp_pct') or 0.0))
+        setattr(s, 'bigmove_rr', float(plan.get('rr') or BIGMOVE_AUTOTRADE_RR))
+        setattr(s, 'why', f"Confirmed Big-Move alert {str(c.get('direction') or '').upper()} | SL {float(plan.get('sl_pct') or 0.0):.2f}% ({plan.get('sl_model')}) | TP {float(plan.get('tp_pct') or 0.0):.2f}% (~{float(plan.get('rr') or BIGMOVE_AUTOTRADE_RR):.2f}R)")
+        return _research_finalize_setup(s, session_name=session_name)
+    except Exception:
+        return None
+
+
+def _bigmove_candidates_to_autotrade_setups(candidates: list, best_fut: dict | None = None, session_name: str = '') -> list:
+    out = []
+    try:
+        max_n = max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 1))
+    except Exception:
+        max_n = 8
+    for c in list(candidates or [])[:max_n]:
+        try:
+            s = _bigmove_candidate_to_autotrade_setup(c, best_fut, session_name=session_name)
+            if s is not None:
+                out.append(s)
+        except Exception:
+            continue
+    return out
+
+
+async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: str, candidates: list, best_fut: dict | None = None, tag: str = 'bigmove'):
+    """Run immediate owner AutoTrade after a confirmed Big-Move email is sent.
+
+    This deliberately reuses _autotrade_place_trade, the same execution/risk/SL/TP
+    enforcement lane used by normal setup emails. The only Big-Move-specific part is
+    converting the alert into a synthetic single-TP Setup with ATR-capped SL/TP.
+    """
+    try:
+        owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+        caller_uid = int(uid or 0)
+        sess = str(session_name or _bigmove_autotrade_session_name()).upper().strip()
+        now_utc = datetime.now(timezone.utc)
+        if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
+            return
+        if not bool(BIGMOVE_AUTOTRADE_ENABLED):
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': 'bigmove_autotrade_disabled', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
+            }
+            return
+        if not _autotrade_ready():
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': 'autotrade_not_ready_or_disabled', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
+            }
+            return
+        try:
+            if caller_uid != owner_uid and not is_admin_user(caller_uid):
+                return
+        except Exception:
+            if caller_uid != owner_uid:
+                return
+        if not _autotrade_allowed_session(sess):
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': f'session_not_allowed ({sess})', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
+            }
+            return
+        try:
+            user_owner = get_user(owner_uid) or {}
+            if not trade_window_allows_now(user_owner):
+                _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                    'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                    'reason': 'trade_window_block', 'session': sess,
+                    'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
+                }
+                return
+        except Exception:
+            pass
+        if AUTOTRADE_EXEC_LOCK.locked():
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': 'autotrade_exec_lock_busy_after_bigmove_email', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
+            }
+            return
+
+        setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(candidates or []), best_fut or {}, sess, timeout=8)
+        if not setup_list:
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': 'no_bigmove_autotrade_setups_built', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
+            }
+            return
+
+        async with AUTOTRADE_EXEC_LOCK:
+            now_ts = float(time.time())
+            for _s in list(setup_list or []):
+                try:
+                    setattr(_s, 'source_kind', 'emailed_setups')
+                    setattr(_s, 'source_session', sess)
+                    setattr(_s, 'email_logged_ts', now_ts)
+                    setattr(_s, 'emailed_ts', now_ts)
+                    setattr(_s, 'created_ts', float(getattr(_s, 'created_ts', 0.0) or now_ts))
+                except Exception:
+                    pass
+            try:
+                await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
+                try:
+                    cache_delete(f"autotrade_db_setups:{owner_uid}:{sess}:12:5")
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    db_log_setup_pipeline_event(owner_uid, stage='bigmove_autotrade_persist', status='error', session=sess, mode='autotrade', details={'error': f'{type(e).__name__}: {e}'})
+                except Exception:
+                    pass
+
+            attempted = 0
+            placed = 0
+            attempts_meta = []
+            last_reason = 'no_bigmove_candidates_attempted'
+            for cand in list(setup_list or [])[:max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 1))]:
+                attempted += 1
+                meta = {
+                    'setup_id': str(getattr(cand, 'setup_id', '') or getattr(cand, 'id', '') or ''),
+                    'symbol': str(getattr(cand, 'symbol', '') or ''),
+                    'side': str(getattr(cand, 'side', '') or ''),
+                    'source_kind': str(getattr(cand, 'source_kind', '') or ''),
+                    'sl_pct': float(getattr(cand, 'bigmove_sl_pct', 0.0) or 0.0),
+                    'tp_pct': float(getattr(cand, 'bigmove_tp_pct', 0.0) or 0.0),
+                    'rr': float(getattr(cand, 'bigmove_rr', 0.0) or 0.0),
+                    'sl_model': str(getattr(cand, 'bigmove_sl_model', '') or ''),
+                }
+                try:
+                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(35, max(10, int(AUTOTRADE_JOB_TIMEOUT_SEC or 25))))
+                except asyncio.TimeoutError:
+                    ok, reason = False, 'autotrade_place_trade_timeout_after_bigmove_email'
+                except Exception as e:
+                    ok, reason = False, f'{type(e).__name__}: {e}'
+                last_reason = '' if ok else str(reason or '')
+                if ok:
+                    placed += 1
+                try:
+                    detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
+                    meta.update({
+                        'status': 'PLACED' if ok else 'SKIP',
+                        'reason': '' if ok else str(reason or ''),
+                        'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
+                        'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
+                        'tp': detail_snapshot.get('live_exit_tp') or getattr(cand, 'tp', ''),
+                        'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+                        'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
+                        'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
+                    })
+                    _autotrade_record_attempt(owner_uid, meta, detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
+                except Exception:
+                    pass
+                attempts_meta.append(meta)
+                if not ok and not _autotrade_should_try_next_after_skip(reason):
+                    break
+
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'PLACED' if placed > 0 else 'SKIP',
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': '' if placed > 0 else str(last_reason or 'no_tradable_bigmove_setup'),
+                'attempted': int(attempted),
+                'placed': int(placed),
+                'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(),
+                'attempted_candidates': attempts_meta,
+                'latest_candidate': attempts_meta[0] if attempts_meta else {},
+                'trigger': 'bigmove_email_immediate',
+            }
+            try:
+                db_log_setup_pipeline_event(owner_uid, stage='bigmove_autotrade_after_email', status='placed' if placed > 0 else 'skip', session=sess, mode='autotrade', details={'reason': last_reason, 'attempted': attempted, 'placed': placed, 'tag': str(tag or ''), 'candidates': attempts_meta[:8]})
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+            if owner_uid:
+                _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                    'status': 'ERROR', 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'reason': f'{type(e).__name__}: {e}', 'trigger': 'bigmove_email_immediate',
+                }
+        except Exception:
+            pass
 
 def _spike_reversal_candidates(
     best_fut: Dict[str, Any],
@@ -40949,6 +41393,24 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
                         except Exception:
                             pass
+                    try:
+                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready() and (int(uid) == owner_uid_for_bm_at or is_admin_user(int(uid))):
+                            bm_sess = _bigmove_autotrade_session_name()
+                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                                "status": "QUEUED",
+                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                "reason": "bigmove_email_sent_waiting_for_immediate_autotrade",
+                                "session": str(bm_sess or ""),
+                                "mode": str(_autotrade_runtime_mode()).lower(),
+                                "trigger": "bigmove_email_immediate",
+                            }
+                            _safe_create_task(
+                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
+                                "autotrade_after_bigmove_email",
+                            )
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[int(uid)] = {
@@ -41664,6 +42126,24 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             mark_bigmove_emailed(uid, c["symbol"], c["direction"])
                         except Exception:
                             pass
+                    try:
+                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready() and (int(uid) == owner_uid_for_bm_at or is_admin_user(int(uid))):
+                            bm_sess = _bigmove_autotrade_session_name()
+                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                                "status": "QUEUED",
+                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                "reason": "bigmove_email_sent_waiting_for_immediate_autotrade",
+                                "session": str(bm_sess or ""),
+                                "mode": str(_autotrade_runtime_mode()).lower(),
+                                "trigger": "bigmove_email_immediate",
+                            }
+                            _safe_create_task(
+                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred"),
+                                "autotrade_after_bigmove_email_deferred",
+                            )
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.exception("Deferred big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[uid] = {
