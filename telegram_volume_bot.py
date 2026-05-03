@@ -522,22 +522,7 @@ def _autotrade_runtime_max_open_trades() -> int:
             val = int(AUTOTRADE_MAX_OPEN_TRADES)
         except Exception:
             val = 1
-
-    # Email batches must be able to execute more than the first setup in the email.
-    # The stored max-open-trades cap can remain conservative for scheduled scans, but
-    # while the immediate email batch runner is active we temporarily lift the open-count
-    # ceiling up to the current emailed batch size. Daily risk, open-risk, duplicate,
-    # SL/TP and liquidation guards still remain fully enforced inside _autotrade_place_trade.
-    try:
-        base = max(1, int(val))
-        override = int(globals().get('_AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE', 0) or 0)
-        enabled = bool(globals().get('AUTOTRADE_EMAIL_BATCH_OPEN_ALL_ENABLED', True))
-        cap = int(globals().get('AUTOTRADE_EMAIL_BATCH_MAX_OPEN_TRADES_CAP', 5) or 0)
-        if enabled and override > 0 and cap > 0:
-            base = max(base, min(int(override), int(cap)))
-        return max(1, int(base))
-    except Exception:
-        return max(1, int(val))
+    return max(1, int(val))
 
 
 def _autotrade_runtime_max_entry_drift_pct() -> float:
@@ -2691,16 +2676,6 @@ AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT"
 AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "3") or 3)
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "1") or 1)
-
-# Immediate email-batch AutoTrade control. When a setup email contains multiple
-# setups, the bot should attempt every emailed setup, not stop after the first fill.
-# This temporary batch override only lifts the *open-count* ceiling up to the emailed
-# batch size. It does not bypass equity, daily risk, open-risk, duplicate-position,
-# manual-position, SL/TP, quantity, drift, session or liquidation guards.
-AUTOTRADE_EMAIL_BATCH_OPEN_ALL_ENABLED = env_bool("AUTOTRADE_EMAIL_BATCH_OPEN_ALL_ENABLED", True)
-AUTOTRADE_EMAIL_BATCH_MAX_OPEN_TRADES_CAP = int(os.environ.get("AUTOTRADE_EMAIL_BATCH_MAX_OPEN_TRADES_CAP", "5") or 5)
-_AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE = 0
-
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
 EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
@@ -7164,7 +7139,7 @@ def _autotrade_should_try_next_after_skip(reason: str) -> bool:
         'blocked_manual_same_symbol_position', 'blocked_duplicate_pending_order',
         'blocked_duplicate_inflight_lock', 'blocked_by_cooldown',
         'blocked_by_recent_symbol_trade', 'blocked_by_existing_local_trade_state',
-        'post_fill_risk_breach', 'exchange_reject', 'no_sltp', 'timeout',
+        'post_fill_risk_breach', 'exchange_reject', 'no_sltp',
     )
     return any(tok in r for tok in retry_tokens)
 
@@ -12909,7 +12884,6 @@ def _bigmove_candidates_to_autotrade_setups(candidates: list, best_fut: dict | N
 
 
 async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: str, candidates: list, best_fut: dict | None = None, tag: str = 'bigmove'):
-    global _AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE
     """Run immediate owner AutoTrade after a confirmed Big-Move email is sent.
 
     This deliberately reuses _autotrade_place_trade, the same execution/risk/SL/TP
@@ -13005,70 +12979,45 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             placed = 0
             attempts_meta = []
             last_reason = 'no_bigmove_candidates_attempted'
-            stop_reason = ''
-            batch_candidates = list(setup_list or [])[:max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 1))]
-            old_batch_override = int(globals().get('_AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE', 0) or 0)
-            try:
-                if bool(globals().get('AUTOTRADE_EMAIL_BATCH_OPEN_ALL_ENABLED', True)):
-                    _AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE = max(old_batch_override, int(globals().get('AUTOTRADE_EMAIL_BATCH_MAX_OPEN_TRADES_CAP', 5) or len(batch_candidates or [])))
-                for cand in list(batch_candidates or []):
-                    attempted += 1
-                    meta = {
-                        'setup_id': str(getattr(cand, 'setup_id', '') or getattr(cand, 'id', '') or ''),
-                        'symbol': str(getattr(cand, 'symbol', '') or ''),
-                        'side': str(getattr(cand, 'side', '') or ''),
-                        'source_kind': str(getattr(cand, 'source_kind', '') or ''),
-                        'sl_pct': float(getattr(cand, 'bigmove_sl_pct', 0.0) or 0.0),
-                        'tp_pct': float(getattr(cand, 'bigmove_tp_pct', 0.0) or 0.0),
-                        'rr': float(getattr(cand, 'bigmove_rr', 0.0) or 0.0),
-                        'sl_model': str(getattr(cand, 'bigmove_sl_model', '') or ''),
-                        'batch_index': int(attempted),
-                        'batch_total': int(len(batch_candidates or [])),
-                    }
-                    try:
-                        per_setup_timeout = max(45, min(90, int(os.environ.get('AUTOTRADE_EMAIL_PER_SETUP_TIMEOUT_SEC', str(max(45, int(AUTOTRADE_JOB_TIMEOUT_SEC or 25) + 25))) or 60)))
-                    except Exception:
-                        per_setup_timeout = 60
-                    try:
-                        ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=per_setup_timeout)
-                    except asyncio.TimeoutError:
-                        ok, reason = False, 'autotrade_place_trade_timeout_after_bigmove_email'
-                        try:
-                            if str(_autotrade_runtime_mode()).lower() == 'live':
-                                live_pos = _autotrade_find_live_position(str(getattr(cand, 'symbol', '') or ''), side=str(getattr(cand, 'side', '') or ''))
-                                if live_pos and abs(float(_pos_size(live_pos) or 0.0)) > 0:
-                                    ok, reason = True, ''
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        ok, reason = False, f'{type(e).__name__}: {e}'
-                    last_reason = '' if ok else str(reason or '')
-                    if ok:
-                        placed += 1
-                    try:
-                        detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
-                        meta.update({
-                            'status': 'PLACED' if ok else 'SKIP',
-                            'reason': '' if ok else str(reason or ''),
-                            'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
-                            'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
-                            'tp': detail_snapshot.get('live_exit_tp') or getattr(cand, 'tp', ''),
-                            'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
-                            'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
-                            'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
-                        })
-                        _autotrade_record_attempt(owner_uid, meta, detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
-                    except Exception:
-                        pass
-                    attempts_meta.append(meta)
-                    if not ok and not _autotrade_should_try_next_after_skip(reason):
-                        stop_reason = str(reason or '')
-                        break
-            finally:
+            for cand in list(setup_list or [])[:max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 1))]:
+                attempted += 1
+                meta = {
+                    'setup_id': str(getattr(cand, 'setup_id', '') or getattr(cand, 'id', '') or ''),
+                    'symbol': str(getattr(cand, 'symbol', '') or ''),
+                    'side': str(getattr(cand, 'side', '') or ''),
+                    'source_kind': str(getattr(cand, 'source_kind', '') or ''),
+                    'sl_pct': float(getattr(cand, 'bigmove_sl_pct', 0.0) or 0.0),
+                    'tp_pct': float(getattr(cand, 'bigmove_tp_pct', 0.0) or 0.0),
+                    'rr': float(getattr(cand, 'bigmove_rr', 0.0) or 0.0),
+                    'sl_model': str(getattr(cand, 'bigmove_sl_model', '') or ''),
+                }
                 try:
-                    _AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE = int(old_batch_override or 0)
+                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(35, max(10, int(AUTOTRADE_JOB_TIMEOUT_SEC or 25))))
+                except asyncio.TimeoutError:
+                    ok, reason = False, 'autotrade_place_trade_timeout_after_bigmove_email'
+                except Exception as e:
+                    ok, reason = False, f'{type(e).__name__}: {e}'
+                last_reason = '' if ok else str(reason or '')
+                if ok:
+                    placed += 1
+                try:
+                    detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
+                    meta.update({
+                        'status': 'PLACED' if ok else 'SKIP',
+                        'reason': '' if ok else str(reason or ''),
+                        'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
+                        'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
+                        'tp': detail_snapshot.get('live_exit_tp') or getattr(cand, 'tp', ''),
+                        'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+                        'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
+                        'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
+                    })
+                    _autotrade_record_attempt(owner_uid, meta, detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
                 except Exception:
-                    _AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE = 0
+                    pass
+                attempts_meta.append(meta)
+                if not ok and not _autotrade_should_try_next_after_skip(reason):
+                    break
 
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
                 'status': 'PLACED' if placed > 0 else 'SKIP',
@@ -13076,8 +13025,6 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                 'reason': '' if placed > 0 else str(last_reason or 'no_tradable_bigmove_setup'),
                 'attempted': int(attempted),
                 'placed': int(placed),
-                'email_batch_total': int(len(batch_candidates or [])),
-                'stopped_reason': str(stop_reason or ''),
                 'session': sess,
                 'mode': str(_autotrade_runtime_mode()).lower(),
                 'attempted_candidates': attempts_meta,
@@ -13085,7 +13032,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                 'trigger': 'bigmove_email_immediate',
             }
             try:
-                db_log_setup_pipeline_event(owner_uid, stage='bigmove_autotrade_after_email', status='placed' if placed > 0 else 'skip', session=sess, mode='autotrade', details={'reason': last_reason, 'attempted': attempted, 'placed': placed, 'email_batch_total': len(batch_candidates or []), 'stopped_reason': stop_reason, 'tag': str(tag or ''), 'candidates': attempts_meta[:8]})
+                db_log_setup_pipeline_event(owner_uid, stage='bigmove_autotrade_after_email', status='placed' if placed > 0 else 'skip', session=sess, mode='autotrade', details={'reason': last_reason, 'attempted': attempted, 'placed': placed, 'tag': str(tag or ''), 'candidates': attempts_meta[:8]})
             except Exception:
                 pass
     except Exception as e:
@@ -31854,7 +31801,7 @@ KNOWN_COMMANDS = sorted(set([
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
-    "signal_report", "signal_report_overall", "email_decision", "adaptive_status",
+    "setup_audit_overall", "email_decision", "adaptive_status",
     "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
@@ -32392,10 +32339,9 @@ ADMIN_HELP_DESCRIPTIONS = {
     "lessons_learned": "Cached latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
-    "setup_audit": "Admin-only setup quality audit: setup id, buy/short, symbol, volume, family/engine, result, and generated reason",
+    "setup_audit": "Admin-only setup audit table for the selected window: setup ID, conf, volume, family/reason, moves and price-based TP/SL result",
     "setup_quality": "Alias of /setup_audit",
-    "signal_report": "Recent emailed setup outcomes",
-    "signal_report_overall": "Overall emailed-signal outcome summary (WR, R, session split)",
+    "setup_audit_overall": "Overall setup-family audit: generated count, TP/SL/open, WR, PnL/R and session/family usefulness",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
@@ -32440,9 +32386,9 @@ ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("⚖️ RISK / DAY RESET", ["dailycap", "dailycapAT", "dayrisk_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit"]),
+    ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
+    ("📊 SETUP AUDIT / FAMILY REPORTS", ["setup_audit", "setup_audit_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
@@ -43770,7 +43716,6 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chosen_list: list):
-    global _AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE
     """Run one immediate autotrade attempt after a setup email is sent.
 
     The previous build waited only for the scheduled autotrade_job (default 5 min),
@@ -43863,102 +43808,49 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                     except Exception:
                         continue
             attempted = 0
-            placed = 0
             attempts_meta = []
             ok = False
             reason = 'no_setups_after_email'
-            stop_reason = ''
-            # Immediate execution must follow the exact batch that was emailed,
-            # in the same order. DB rows are only a fallback if the in-memory email
-            # batch is unavailable. This prevents one older DB setup from masking
-            # the second setup in the actual sent email.
-            email_batch_candidates = [s for s in list(chosen_list or []) if s is not None]
-            if not email_batch_candidates:
-                email_batch_candidates = [s for s in list(db_setups or []) if s is not None]
-            batch_candidates = list(email_batch_candidates or [])[:max(1, min(12, int(max(len(email_batch_candidates or []), int(EMAIL_SETUPS_N or 2)))))]
-
-            # Allow this emailed batch to open more than one position if the email contains
-            # multiple executable setups. This fixes the old behavior where AutoTrade stopped
-            # after the first successful setup in the email. Risk caps still apply inside
-            # _autotrade_place_trade.
-            old_batch_override = int(globals().get('_AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE', 0) or 0)
-            try:
-                if bool(globals().get('AUTOTRADE_EMAIL_BATCH_OPEN_ALL_ENABLED', True)):
-                    _AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE = max(old_batch_override, int(globals().get('AUTOTRADE_EMAIL_BATCH_MAX_OPEN_TRADES_CAP', 5) or len(batch_candidates or [])))
-
-                for cand in list(batch_candidates or []):
-                    attempted += 1
-                    meta_idx = len(attempts_meta)
-                    try:
-                        attempts_meta.append({
-                            'setup_id': str(getattr(cand, 'setup_id', '') or getattr(cand, 'id', '') or ''),
-                            'symbol': str(getattr(cand, 'symbol', '') or ''),
-                            'side': str(getattr(cand, 'side', '') or ''),
-                            'source_kind': str(getattr(cand, 'source_kind', '') or ''),
-                            'batch_index': int(attempted),
-                            'batch_total': int(len(batch_candidates or [])),
-                        })
-                    except Exception:
-                        attempts_meta.append({'batch_index': int(attempted), 'batch_total': int(len(batch_candidates or []))})
-                    try:
-                        per_setup_timeout = max(45, min(90, int(os.environ.get('AUTOTRADE_EMAIL_PER_SETUP_TIMEOUT_SEC', str(max(45, int(AUTOTRADE_JOB_TIMEOUT_SEC or 25) + 25))) or 60)))
-                    except Exception:
-                        per_setup_timeout = 60
-                    try:
-                        ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=per_setup_timeout)
-                    except asyncio.TimeoutError:
-                        ok, reason = False, 'autotrade_place_trade_timeout_after_email'
-                        # Bybit sometimes opens the market order and attaches SL/TP slightly after
-                        # the local timeout. Verify live position before recording a false SKIP.
-                        try:
-                            if str(_autotrade_runtime_mode()).lower() == 'live':
-                                live_pos = _autotrade_find_live_position(str(getattr(cand, 'symbol', '') or ''), side=str(getattr(cand, 'side', '') or ''))
-                                if live_pos and abs(float(_pos_size(live_pos) or 0.0)) > 0:
-                                    ok, reason = True, ''
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        ok, reason = False, f'{type(e).__name__}: {e}'
-                    if ok:
-                        placed += 1
-                    try:
-                        detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
-                        attempts_meta[meta_idx].update({
-                            'status': 'PLACED' if ok else 'SKIP',
-                            'reason': '' if ok else str(reason or ''),
-                            'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
-                            'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
-                            'tp': detail_snapshot.get('live_exit_tp') or getattr(cand, 'tp', ''),
-                            'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+            for cand in list(db_setups or [])[:5]:
+                attempted += 1
+                try:
+                    attempts_meta.append({
+                        'setup_id': str(getattr(cand, 'setup_id', '') or getattr(cand, 'id', '') or ''),
+                        'symbol': str(getattr(cand, 'symbol', '') or ''),
+                        'side': str(getattr(cand, 'side', '') or ''),
+                        'source_kind': str(getattr(cand, 'source_kind', '') or ''),
+                    })
+                except Exception:
+                    pass
+                try:
+                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(35, max(10, int(AUTOTRADE_JOB_TIMEOUT_SEC or 25))))
+                except asyncio.TimeoutError:
+                    ok, reason = False, 'autotrade_place_trade_timeout_after_email'
+                except Exception as e:
+                    ok, reason = False, f'{type(e).__name__}: {e}'
+                try:
+                    detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
+                    attempts_meta[-1].update({
+                        'status': 'PLACED' if ok else 'SKIP',
+                        'reason': '' if ok else str(reason or ''),
+                        'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
+                        'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
+                        'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
                             'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
                             'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
-                        })
-                        _autotrade_record_attempt(owner_uid, attempts_meta[meta_idx], detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
-                    except Exception:
-                        pass
-
-                    # Do NOT break after a successful placement. The whole point of the
-                    # immediate email runner is to walk through every setup in the sent email.
-                    # Only stop on hard risk/session/account caps where later setups cannot
-                    # be placed safely in this cycle.
-                    if (not ok) and (not _autotrade_should_try_next_after_skip(reason)):
-                        stop_reason = str(reason or '')
-                        break
-
-            finally:
-                try:
-                    _AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE = int(old_batch_override or 0)
+                    })
+                    _autotrade_record_attempt(owner_uid, attempts_meta[-1], detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
                 except Exception:
-                    _AUTOTRADE_EMAIL_BATCH_OPEN_TRADES_OVERRIDE = 0
-
+                    pass
+                if ok:
+                    break
+                if not _autotrade_should_try_next_after_skip(reason):
+                    break
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                'status': 'PLACED' if placed > 0 else 'SKIP',
+                'status': 'PLACED' if ok else 'SKIP',
                 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                'reason': '' if placed > 0 else str(reason or 'no_tradable_setup'),
+                'reason': '' if ok else str(reason or 'no_tradable_setup'),
                 'attempted': int(attempted),
-                'placed': int(placed),
-                'email_batch_total': int(len(batch_candidates or [])),
-                'stopped_reason': str(stop_reason or ''),
                 'session': sess,
                 'mode': str(_autotrade_runtime_mode()).lower(),
                 'attempted_candidates': attempts_meta,
@@ -43966,7 +43858,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 'trigger': 'email_sent_immediate',
             }
             try:
-                db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email', status='placed' if placed > 0 else 'skip', session=sess, mode='autotrade', details={'reason': reason, 'attempted': attempted, 'placed': placed, 'email_batch_total': len(batch_candidates or []), 'stopped_reason': stop_reason, 'candidates': attempts_meta[:12]})
+                db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email', status='placed' if ok else 'skip', session=sess, mode='autotrade', details={'reason': reason, 'attempted': attempted, 'candidates': attempts_meta[:5]})
             except Exception:
                 pass
     except Exception as e:
@@ -44149,9 +44041,8 @@ def main():
     app.add_handler(CommandHandler("report_weekly", report_weekly_cmd, block=False))
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
-    app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
-    app.add_handler(CommandHandler("signbal_report", signal_report_cmd, block=False))
-    app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
+    # /signal_report removed: replaced by /setup_audit and /setup_audit_overall
+    # /signal_report_overall removed: replaced by /setup_audit_overall
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
@@ -44171,6 +44062,7 @@ def main():
     app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
 
     app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
@@ -45065,6 +44957,728 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 # ==========================================================
 # END SIGNAL QUALITY GATE ENGINE
 # ==========================================================
+
+
+# =========================================================
+# FINAL PATCH — SETUP AUDIT / AUTOTRADE REPORT REWORK
+# - /setup_audit = unlimited 24h table, price-based and independent from Bybit positions
+# - /setup_audit_overall = family/session performance summary from all generated setups
+# - /autotrade_report = unlimited table for open + closed exchange/journal positions
+# - /signal_report and /signal_report_overall are intentionally removed from handlers/help
+# =========================================================
+
+PF_SETUP_AUDIT_MAX_SYNC_FETCH_ROWS = int(os.environ.get("PF_SETUP_AUDIT_MAX_SYNC_FETCH_ROWS", "80") or 80)
+PF_SETUP_AUDIT_OVERALL_RECENT_FETCH_HOURS = int(os.environ.get("PF_SETUP_AUDIT_OVERALL_RECENT_FETCH_HOURS", "48") or 48)
+PF_SETUP_AUDIT_REPORT_CACHE_TTL_SEC = int(os.environ.get("PF_SETUP_AUDIT_REPORT_CACHE_TTL_SEC", "20") or 20)
+PF_AUTOTRADE_REPORT_MAX_ROWS = int(os.environ.get("PF_AUTOTRADE_REPORT_MAX_ROWS", "10000") or 10000)
+
+
+def _pf_table(rows: list[list], headers: list[str]) -> str:
+    try:
+        if not rows:
+            return "(none)"
+        return tabulate(rows, headers=headers, tablefmt="simple", stralign="left", numalign="right")
+    except Exception:
+        try:
+            all_rows = [headers] + rows
+            widths = [max(len(str(r[i])) if i < len(r) else 0 for r in all_rows) for i in range(len(headers))]
+            out = []
+            out.append(" | ".join(str(headers[i]).ljust(widths[i]) for i in range(len(headers))))
+            out.append("-+-".join("-" * widths[i] for i in range(len(headers))))
+            for r in rows:
+                out.append(" | ".join(str(r[i] if i < len(r) else "").ljust(widths[i]) for i in range(len(headers))))
+            return "\n".join(out)
+        except Exception:
+            return "\n".join([" | ".join(map(str, headers))] + [" | ".join(map(str, r)) for r in rows])
+
+
+def _pf_short_symbol(symbol: str) -> str:
+    try:
+        s = str(symbol or '').upper().replace('/USDT:USDT', '').replace('/USDT', '').replace(':USDT', '')
+        if s.endswith('USDT'):
+            s = s[:-4]
+        return s or '-'
+    except Exception:
+        return str(symbol or '-') or '-'
+
+
+def _pf_pct(v) -> str:
+    try:
+        return f"{float(v or 0.0):+.0f}%"
+    except Exception:
+        return "+0%"
+
+
+def _pf_usd(v) -> str:
+    try:
+        return f"{float(v or 0.0):+.2f}"
+    except Exception:
+        return "0.00"
+
+
+def _pf_num(v, digits: int = 2) -> str:
+    try:
+        return f"{float(v or 0.0):.{int(digits)}f}"
+    except Exception:
+        return "0.00"
+
+
+def _pf_table_exists(cur, table: str) -> bool:
+    try:
+        return cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (str(table),)).fetchone() is not None
+    except Exception:
+        return False
+
+
+def _pf_table_cols(cur, table: str) -> set[str]:
+    try:
+        return {str(r[1]) for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
+
+
+def _pf_col_expr(cols: set[str], name: str, default_sql: str = "NULL", alias: str | None = None) -> str:
+    alias = alias or name
+    if name in cols:
+        return f"{name} AS {alias}"
+    return f"{default_sql} AS {alias}"
+
+
+def _pf_setup_rows(uid: int, hours: int | None = 24, all_history: bool = False) -> list[dict]:
+    """All generated/executable setup rows for the owner/admin audit lane.
+
+    This deliberately reads setup databases only. It does not require any Bybit
+    position to exist, so /setup_audit stays independent from AutoTrade.
+    """
+    uid = int(uid or 0)
+    cutoff = 0.0 if all_history or hours is None else float(time.time()) - float(max(1, int(hours))) * 3600.0
+    rows: list[dict] = []
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            if _pf_table_exists(cur, 'executable_setups'):
+                cols = _pf_table_cols(cur, 'executable_setups')
+                where = "WHERE user_id=?"
+                params: list = [uid]
+                if cutoff > 0:
+                    where += " AND COALESCE(executable_ts, signal_created_ts, 0)>=?"
+                    params.append(float(cutoff))
+                select = [
+                    _pf_col_expr(cols, 'executable_ts', '0', 'ts'),
+                    _pf_col_expr(cols, 'signal_created_ts', '0', 'signal_created_ts'),
+                    "'EXEC' AS source",
+                    _pf_col_expr(cols, 'session', "''", 'session'),
+                    _pf_col_expr(cols, 'setup_id', "''", 'setup_id'),
+                    _pf_col_expr(cols, 'symbol', "''", 'symbol'),
+                    _pf_col_expr(cols, 'market_symbol', "''", 'market_symbol'),
+                    _pf_col_expr(cols, 'side', "''", 'side'),
+                    _pf_col_expr(cols, 'conf', '0', 'conf'),
+                    _pf_col_expr(cols, 'fut_vol_usd', '0', 'fut_vol_usd'),
+                    _pf_col_expr(cols, 'ch24', '0', 'ch24'),
+                    _pf_col_expr(cols, 'ch4', '0', 'ch4'),
+                    _pf_col_expr(cols, 'ch1', '0', 'ch1'),
+                    _pf_col_expr(cols, 'ch15', '0', 'ch15'),
+                    _pf_col_expr(cols, 'engine', "''", 'engine'),
+                    _pf_col_expr(cols, 'details_json', "''", 'details_json'),
+                    _pf_col_expr(cols, 'quality_score', '0', 'quality_score'),
+                    _pf_col_expr(cols, 'family_id', "''", 'family_id'),
+                    _pf_col_expr(cols, 'entry', '0', 'entry'),
+                    _pf_col_expr(cols, 'sl', '0', 'sl'),
+                    _pf_col_expr(cols, 'tp', '0', 'tp'),
+                    _pf_col_expr(cols, 'alt_target_a', '0', 'alt_target_a'),
+                    _pf_col_expr(cols, 'alt_target_b', '0', 'alt_target_b'),
+                    _pf_col_expr(cols, 'entry_reason', "''", 'entry_reason'),
+                ]
+                q = f"SELECT {', '.join(select)} FROM executable_setups {where} ORDER BY COALESCE(executable_ts, signal_created_ts, 0) DESC"
+                rows.extend([dict(r) for r in (cur.execute(q, tuple(params)).fetchall() or [])])
+            if _pf_table_exists(cur, 'generated_setups'):
+                cols = _pf_table_cols(cur, 'generated_setups')
+                where = "WHERE user_id=?"
+                params = [uid]
+                if cutoff > 0:
+                    where += " AND COALESCE(created_ts, 0)>=?"
+                    params.append(float(cutoff))
+                select = [
+                    _pf_col_expr(cols, 'created_ts', '0', 'ts'),
+                    "0 AS signal_created_ts",
+                    ("UPPER(COALESCE(source,'')) AS source" if 'source' in cols else "'' AS source"),
+                    _pf_col_expr(cols, 'session', "''", 'session'),
+                    _pf_col_expr(cols, 'setup_id', "''", 'setup_id'),
+                    _pf_col_expr(cols, 'symbol', "''", 'symbol'),
+                    _pf_col_expr(cols, 'market_symbol', "''", 'market_symbol'),
+                    _pf_col_expr(cols, 'side', "''", 'side'),
+                    _pf_col_expr(cols, 'conf', '0', 'conf'),
+                    _pf_col_expr(cols, 'fut_vol_usd', '0', 'fut_vol_usd'),
+                    _pf_col_expr(cols, 'ch24', '0', 'ch24'),
+                    _pf_col_expr(cols, 'ch4', '0', 'ch4'),
+                    _pf_col_expr(cols, 'ch1', '0', 'ch1'),
+                    _pf_col_expr(cols, 'ch15', '0', 'ch15'),
+                    _pf_col_expr(cols, 'engine', "''", 'engine'),
+                    "'' AS details_json",
+                    _pf_col_expr(cols, 'quality_score', '0', 'quality_score'),
+                    _pf_col_expr(cols, 'family_id', "''", 'family_id'),
+                    _pf_col_expr(cols, 'entry', '0', 'entry'),
+                    _pf_col_expr(cols, 'sl', '0', 'sl'),
+                    _pf_col_expr(cols, 'tp', '0', 'tp'),
+                    _pf_col_expr(cols, 'alt_target_a', '0', 'alt_target_a'),
+                    _pf_col_expr(cols, 'alt_target_b', '0', 'alt_target_b'),
+                    _pf_col_expr(cols, 'entry_reason', "''", 'entry_reason'),
+                ]
+                q = f"SELECT {', '.join(select)} FROM generated_setups {where} ORDER BY COALESCE(created_ts, 0) DESC"
+                rows.extend([dict(r) for r in (cur.execute(q, tuple(params)).fetchall() or [])])
+    except Exception:
+        rows = list(rows or [])
+
+    dedup: dict[str, dict] = {}
+    for r in sorted(rows, key=lambda x: float(x.get('ts') or x.get('signal_created_ts') or 0.0), reverse=True):
+        try:
+            sid = str(r.get('setup_id') or '').strip()
+            if not sid:
+                sid = _setup_identity_key(r.get('symbol'), r.get('side'), r.get('entry'), r.get('sl'), r.get('tp'), r.get('engine'))
+            if not sid or sid in dedup:
+                continue
+            if not _setup_volume_ok(float(r.get('fut_vol_usd') or 0.0)):
+                continue
+            dedup[sid] = dict(r)
+        except Exception:
+            continue
+    return list(dedup.values())
+
+
+def _pf_setup_meta_by_setup_id(setup_id: str) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    try:
+        payload = _signal_setup_eval_payload(sid) or {}
+        if payload:
+            return dict(payload)
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            for table, ts_col in (('executable_setups', 'executable_ts'), ('generated_setups', 'created_ts')):
+                if not _pf_table_exists(cur, table):
+                    continue
+                cols = _pf_table_cols(cur, table)
+                if 'setup_id' not in cols:
+                    continue
+                select_cols = ', '.join([c for c in cols if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', c)])
+                order_col = ts_col if ts_col in cols else ('created_ts' if 'created_ts' in cols else 'rowid')
+                row = cur.execute(f"SELECT {select_cols} FROM {table} WHERE setup_id=? ORDER BY {order_col} DESC LIMIT 1", (sid,)).fetchone()
+                if row:
+                    return dict(row)
+    except Exception:
+        return {}
+    return {}
+
+
+def _pf_setup_family_reason(row: dict, trade: dict | None = None) -> tuple[str, str]:
+    data = dict(row or {})
+    if trade:
+        for k in ('family_id', 'engine', 'session'):
+            if not data.get(k) and (trade or {}).get(k):
+                data[k] = (trade or {}).get(k)
+    try:
+        fam = _setup_audit_family_from_row(data) or '-'
+    except Exception:
+        fam = str(data.get('family_id') or data.get('engine') or '-')
+    try:
+        reason = _setup_audit_reason_from_row(data) or ''
+    except Exception:
+        reason = ''
+    if not reason:
+        engine = str(data.get('engine') or (trade or {}).get('engine') or '').upper().strip()
+        sess = str(data.get('session') or (trade or {}).get('session') or '').upper().strip()
+        reason = ' / '.join([x for x in (fam, f'Engine {engine}' if engine else '', sess) if x and x != '-']) or '-'
+    return str(fam or '-'), str(reason or '-')
+
+
+def _pf_setup_ohlcv_result(row: dict, horizon_hours: int = 24, allow_network: bool = True) -> tuple[str, float | None]:
+    """Price-path TP/SL resolver for setup audit. Returns TP, SL or OPEN.
+
+    This is independent from AutoTrade/Bybit positions. It evaluates the setup's
+    own entry/SL/TP against market candles after the setup timestamp.
+    """
+    try:
+        sid = str((row or {}).get('setup_id') or '').strip()
+        # Prefer persisted price-outcome if a background evaluator has already decided it.
+        try:
+            if sid:
+                out0 = db_get_outcome(sid) or {}
+                oc0 = str((out0 or {}).get('outcome') or '').upper().strip()
+                hts = float((out0 or {}).get('hit_ts') or 0.0) if (out0 or {}).get('hit_ts') is not None else None
+                if oc0 in {'TP', 'WIN', 'WIN_TP', 'TP1', 'TP2', 'TP3'}:
+                    return 'TP', hts
+                if oc0 in {'SL', 'LOSS', 'LOSE'}:
+                    return 'SL', hts
+        except Exception:
+            pass
+        side = str((row or {}).get('side') or '').upper().strip()
+        symbol_raw = str((row or {}).get('symbol') or '').upper().strip()
+        base = symbol_raw[:-4] if symbol_raw.endswith('USDT') else symbol_raw
+        market_symbol = str((row or {}).get('market_symbol') or '').strip() or _market_symbol_from_base(base)
+        entry = float((row or {}).get('entry') or 0.0)
+        sl = float((row or {}).get('sl') or 0.0)
+        tp = float(_resolve_single_tp(entry, sl, (row or {}).get('tp'), (row or {}).get('alt_target_a'), (row or {}).get('alt_target_b'), side) or 0.0)
+        created_ts = float((row or {}).get('signal_created_ts') or (row or {}).get('ts') or (row or {}).get('created_ts') or 0.0)
+        if side not in {'BUY', 'SELL'} or not market_symbol or entry <= 0 or sl <= 0 or tp <= 0:
+            return 'OPEN', None
+        now_ts = float(time.time())
+        horizon_end = min(now_ts, created_ts + float(max(1, int(horizon_hours or 24))) * 3600.0) if created_ts > 0 else now_ts
+        since_ms = int(max(0.0, (created_ts or (now_ts - float(horizon_hours or 24) * 3600.0)) - 900.0) * 1000)
+        until_ms = int((horizon_end + 60.0) * 1000)
+        tf = '5m' if int(horizon_hours or 24) <= 72 else '15m'
+        limit = max(120, min(1000, int((horizon_end - (since_ms / 1000.0)) / (300 if tf == '5m' else 900)) + 20))
+        candles = []
+        try:
+            candles = _ohlcv_best_effort_cached(market_symbol, tf, limit) or []
+            candles = [c for c in candles if int(c[0]) >= since_ms and int(c[0]) <= until_ms]
+        except Exception:
+            candles = []
+        if allow_network and not candles:
+            try:
+                candles = fetch_ohlcv_paged(market_symbol, tf, since_ms=since_ms, until_ms=until_ms, limit=min(1000, max(200, limit))) or []
+            except Exception:
+                candles = []
+        candles = sorted(candles or [], key=lambda c: int(c[0]))
+        for c in candles:
+            try:
+                ts_sec = float(c[0]) / 1000.0
+                hi = float(c[2]); lo = float(c[3])
+                if side == 'BUY':
+                    hit_tp = hi >= tp
+                    hit_sl = lo <= sl
+                else:
+                    hit_tp = lo <= tp
+                    hit_sl = hi >= sl
+                if hit_tp and hit_sl:
+                    # Same candle ambiguity: do not invent a result.
+                    return 'OPEN', None
+                if hit_tp:
+                    try:
+                        if sid:
+                            db_upsert_outcome(sid, 'TP', 'TP', ts_sec, int(horizon_hours or 24), note='setup_audit_price_path')
+                    except Exception:
+                        pass
+                    return 'TP', ts_sec
+                if hit_sl:
+                    try:
+                        if sid:
+                            db_upsert_outcome(sid, 'SL', 'SL', ts_sec, int(horizon_hours or 24), note='setup_audit_price_path')
+                    except Exception:
+                        pass
+                    return 'SL', ts_sec
+            except Exception:
+                continue
+        px = _setup_audit_current_price_for_row(row)
+        if px > 0:
+            if side == 'BUY':
+                if px >= tp:
+                    return 'TP', now_ts
+                if px <= sl:
+                    return 'SL', now_ts
+            else:
+                if px <= tp:
+                    return 'TP', now_ts
+                if px >= sl:
+                    return 'SL', now_ts
+        return 'OPEN', None
+    except Exception:
+        return 'OPEN', None
+
+
+def _setup_audit_price_result_from_row(row: dict, horizon_hours: int = 24) -> str:
+    # Backward-compatible return values expected by older helpers.
+    res, _ts = _pf_setup_ohlcv_result(row, horizon_hours=horizon_hours, allow_network=True)
+    if res == 'TP':
+        return 'WIN'
+    if res == 'SL':
+        return 'LOSE'
+    return 'OPEN'
+
+
+def _pf_setup_result_label(row: dict, horizon_hours: int = 24, allow_network: bool = True) -> str:
+    res, _ts = _pf_setup_ohlcv_result(row, horizon_hours=horizon_hours, allow_network=allow_network)
+    return res if res in {'TP', 'SL'} else 'OPEN'
+
+
+def _pf_setup_rr(row: dict) -> float:
+    try:
+        side = str((row or {}).get('side') or '').upper().strip()
+        entry = float((row or {}).get('entry') or 0.0)
+        sl = float((row or {}).get('sl') or 0.0)
+        tp = float(_resolve_single_tp(entry, sl, (row or {}).get('tp'), (row or {}).get('alt_target_a'), (row or {}).get('alt_target_b'), side) or 0.0)
+        risk = abs(entry - sl)
+        return abs(tp - entry) / risk if risk > 0 and tp > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
+    # New semantics: /setup_audit [hours], no display limit. Old /setup_audit 20 24 remains accepted.
+    uid = int(uid or 0)
+    hours = max(1, min(720, int(hours or 24)))
+    cache_key = f"setup_audit_table:{uid}:{hours}"
+    try:
+        if cache_valid(cache_key, PF_SETUP_AUDIT_REPORT_CACHE_TTL_SEC):
+            val = cache_get(cache_key)
+            if isinstance(val, str) and val.strip():
+                return val
+    except Exception:
+        pass
+    rows = _pf_setup_rows(uid, hours=hours, all_history=False)
+    if not rows:
+        return f"🧪 Setup Audit\n{HDR}\nNo setups above ${_setup_min_volume_floor_usd()/1e6:.0f}M volume in the last {hours}h."
+    table_rows = []
+    fetch_budget = int(PF_SETUP_AUDIT_MAX_SYNC_FETCH_ROWS)
+    for r in rows:
+        try:
+            allow_fetch = fetch_budget > 0
+            result = _pf_setup_result_label(r, horizon_hours=hours, allow_network=allow_fetch)
+            if allow_fetch:
+                fetch_budget -= 1
+            fam, reason = _pf_setup_family_reason(r)
+            setup_id = str(r.get('setup_id') or '-')
+            side = str(r.get('side') or '-').upper()
+            sym = _pf_short_symbol(r.get('symbol'))
+            vol_m = float(r.get('fut_vol_usd') or 0.0) / 1e6
+            moves = f"24h {_pf_pct(r.get('ch24'))}, 4h {_pf_pct(r.get('ch4'))}, 1h {_pf_pct(r.get('ch1'))}, 15m {_pf_pct(r.get('ch15'))}"
+            table_rows.append([
+                setup_id,
+                f"{side} {sym}",
+                int(float(r.get('conf') or 0.0)),
+                f"{vol_m:.1f}M",
+                str(fam or '-')[:22],
+                str(reason or '-')[:46],
+                moves,
+                result,
+            ])
+        except Exception:
+            continue
+    lines = [
+        "🧪 Setup Audit — price-based",
+        HDR,
+        f"Window: last {hours}h | Rows: {len(table_rows)} | Min vol: ${_setup_min_volume_floor_usd()/1e6:.0f}M",
+        "Result source: actual market price path after setup time, independent from AutoTrade/Bybit positions.",
+        "",
+        _pf_table(table_rows, ["Setup ID", "Type", "Conf", "Vol", "Family", "Enter reason", "Moves", "Result"]),
+    ]
+    out = "\n".join(lines)
+    try:
+        cache_set(cache_key, out)
+    except Exception:
+        pass
+    return out
+
+
+async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    hours = 24
+    # Back-compatible parsing: /setup_audit 48 => 48h; /setup_audit 20 24 => old style means 24h.
+    try:
+        args = list(context.args or [])
+        if len(args) >= 2 and str(args[1]).replace('.', '', 1).isdigit():
+            hours = int(float(args[1]))
+        elif len(args) >= 1 and str(args[0]).replace('.', '', 1).isdigit():
+            hours = int(float(args[0]))
+    except Exception:
+        hours = 24
+    try:
+        text = await to_thread_heavy(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), 0, int(hours), timeout=45)
+    except asyncio.TimeoutError:
+        text = "⚠️ /setup_audit is still resolving price outcomes. Try again shortly."
+    except Exception as e:
+        text = f"❌ setup_audit failed: {type(e).__name__}: {e}"
+    await send_long_message(update, text, parse_mode=None, disable_web_page_preview=True)
+
+
+def _pf_autotrade_pnl_by_setup_id(uid: int) -> dict[str, float]:
+    out: dict[str, float] = defaultdict(float)
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            if not _pf_table_exists(cur, 'autotrade_trades'):
+                return {}
+            for r in cur.execute("SELECT setup_id, pnl_usdt FROM autotrade_trades WHERE uid=? AND COALESCE(setup_id,'')<>'' AND UPPER(COALESCE(status,''))='CLOSED'", (int(uid),)).fetchall() or []:
+                out[str(r['setup_id'])] += float(r['pnl_usdt'] or 0.0)
+    except Exception:
+        pass
+    return dict(out)
+
+
+def _setup_audit_overall_text(uid: int) -> str:
+    uid = int(uid or 0)
+    cache_key = f"setup_audit_overall:{uid}"
+    try:
+        if cache_valid(cache_key, PF_SETUP_AUDIT_REPORT_CACHE_TTL_SEC):
+            val = cache_get(cache_key)
+            if isinstance(val, str) and val.strip():
+                return val
+    except Exception:
+        pass
+    rows = _pf_setup_rows(uid, hours=None, all_history=True)
+    if not rows:
+        return f"📊 Setup Audit Overall\n{HDR}\nNo generated setup rows found yet."
+    pnl_by_sid = _pf_autotrade_pnl_by_setup_id(uid)
+    by_family: dict[str, dict] = {}
+    by_session: Counter = Counter()
+    recent_cutoff = float(time.time()) - float(PF_SETUP_AUDIT_OVERALL_RECENT_FETCH_HOURS) * 3600.0
+    for r in rows:
+        try:
+            fam, reason = _pf_setup_family_reason(r)
+            fam = fam or '-'
+            d = by_family.setdefault(fam, {'family': fam, 'setups': 0, 'tp': 0, 'sl': 0, 'open': 0, 'pnl': 0.0, 'r': 0.0, 'conf_sum': 0.0, 'vol_sum': 0.0, 'sessions': Counter(), 'reasons': Counter()})
+            d['setups'] += 1
+            d['conf_sum'] += float(r.get('conf') or 0.0)
+            d['vol_sum'] += float(r.get('fut_vol_usd') or 0.0)
+            sess = str(r.get('session') or '-').upper().strip() or '-'
+            d['sessions'][sess] += 1
+            by_session[sess] += 1
+            if reason:
+                d['reasons'][str(reason)[:32]] += 1
+            sid = str(r.get('setup_id') or '').strip()
+            allow_fetch = float(r.get('ts') or r.get('signal_created_ts') or 0.0) >= recent_cutoff
+            res = _pf_setup_result_label(r, horizon_hours=720, allow_network=allow_fetch)
+            if res == 'TP':
+                d['tp'] += 1
+                d['r'] += max(0.0, _pf_setup_rr(r)) or 1.0
+            elif res == 'SL':
+                d['sl'] += 1
+                d['r'] -= 1.0
+            else:
+                d['open'] += 1
+            d['pnl'] += float(pnl_by_sid.get(sid, 0.0) or 0.0)
+        except Exception:
+            continue
+    table_rows = []
+    for fam, d in sorted(by_family.items(), key=lambda kv: (float(kv[1].get('r') or 0.0), int(kv[1].get('setups') or 0)), reverse=True):
+        setups = int(d.get('setups') or 0)
+        decided = int(d.get('tp') or 0) + int(d.get('sl') or 0)
+        wr = (int(d.get('tp') or 0) / decided * 100.0) if decided > 0 else 0.0
+        avg_conf = float(d.get('conf_sum') or 0.0) / setups if setups else 0.0
+        avg_vol = float(d.get('vol_sum') or 0.0) / setups / 1e6 if setups else 0.0
+        top_sess = ','.join([f"{s}:{n}" for s, n in (d.get('sessions') or Counter()).most_common(3)])
+        top_reason = (d.get('reasons') or Counter()).most_common(1)
+        table_rows.append([
+            fam[:24], setups, int(d.get('tp') or 0), int(d.get('sl') or 0), int(d.get('open') or 0),
+            f"{wr:.1f}%", f"{float(d.get('pnl') or 0.0):+.2f}", f"{float(d.get('r') or 0.0):+.2f}",
+            f"{avg_conf:.0f}", f"{avg_vol:.1f}M", top_sess or '-', (top_reason[0][0] if top_reason else '-')[:34]
+        ])
+    session_rows = [[s, n] for s, n in by_session.most_common()]
+    lines = [
+        "📊 Setup Audit Overall — family performance",
+        HDR,
+        f"Total generated setup rows: {len(rows)} | Min vol: ${_setup_min_volume_floor_usd()/1e6:.0f}M",
+        "TP/SL/Open are price-path outcomes from setup entry/SL/TP. PnL is actual AutoTrade PnL where a setup was traded; Total R is theoretical setup quality score.",
+        "",
+        _pf_table(table_rows, ["Family", "Setups", "TP", "SL", "Open", "WR", "PnL USDT", "Total R", "AvgConf", "AvgVol", "Sessions", "Top reason"]),
+        "",
+        "Session setup count",
+        _pf_table(session_rows, ["Session", "Setups"]),
+    ]
+    out = "\n".join(lines)
+    try:
+        cache_set(cache_key, out)
+    except Exception:
+        pass
+    return out
+
+
+async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    try:
+        text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=75)
+    except asyncio.TimeoutError:
+        text = "⚠️ /setup_audit_overall is still rebuilding. Try again shortly."
+    except Exception as e:
+        text = f"❌ /setup_audit_overall failed: {type(e).__name__}: {e}"
+    await send_long_message(update, text, parse_mode=None, disable_web_page_preview=True)
+
+
+def _pf_autotrade_result_label(row: dict, is_open: bool = False) -> str:
+    if is_open:
+        return 'OPEN'
+    try:
+        txt = (str(row.get('result_path') or '') + ' ' + str(row.get('result_label') or '') + ' ' + str(row.get('close_reason') or '') + ' ' + str(row.get('outcome') or '')).upper()
+        if 'TP' in txt or 'TAKE' in txt or 'WIN' in txt:
+            return 'TP'
+        if 'SL' in txt or 'STOP' in txt or 'LOSS' in txt or 'LOSE' in txt:
+            return 'SL'
+        pnl = row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl')
+        if pnl is not None:
+            return 'TP' if float(pnl or 0.0) > 0 else 'SL'
+    except Exception:
+        pass
+    return 'UNKNOWN'
+
+
+def _pf_trade_reason(row: dict) -> str:
+    try:
+        sid = str((row or {}).get('setup_id') or '').strip()
+        meta = _pf_setup_meta_by_setup_id(sid) if sid else {}
+        fam, reason = _pf_setup_family_reason(meta or row, trade=row)
+        engine = str((row or {}).get('engine') or (meta or {}).get('engine') or '').upper().strip()
+        sess = str((row or {}).get('session') or (meta or {}).get('session') or '').upper().strip()
+        parts = []
+        if fam and fam != '-':
+            parts.append(fam)
+        if engine:
+            parts.append(f"E{engine}" if len(engine) == 1 else engine)
+        if sess:
+            parts.append(sess)
+        if reason and reason not in parts:
+            parts.append(reason)
+        return ' / '.join(parts)[:48] if parts else '-'
+    except Exception:
+        return '-'
+
+
+def _pf_dedupe_closed_rows(rows: list[dict]) -> list[dict]:
+    out = []
+    seen = set()
+    for r in rows or []:
+        try:
+            sid = str((r or {}).get('setup_id') or '').strip()
+            tid = str((r or {}).get('trade_id') or '').strip()
+            sym = str(_bybit_linear_symbol((r or {}).get('symbol') or '')).upper()
+            side = str((r or {}).get('side') or '').upper().strip()
+            cts = int(float((r or {}).get('closed_ts') or 0.0) // 60)
+            pnl = round(float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0), 2)
+            if sid:
+                key = ('sid', sid, cts)
+            elif tid and not tid.startswith(('exchange::', 'report::', 'prov::')):
+                key = ('tid', tid)
+            else:
+                key = ('event', sym, side, cts, pnl)
+            if key in seen:
+                continue
+            seen.add(key)
+            # Suppress duplicate near-zero exchange fragments when the same symbol/side/minute already exists.
+            if abs(pnl) < 0.05:
+                alt_key = ('frag', sym, side, cts)
+                if alt_key in seen:
+                    continue
+                seen.add(alt_key)
+            out.append(dict(r or {}))
+        except Exception:
+            continue
+    return out
+
+
+def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
+    owner_uid = int(owner_uid)
+    lookback_h = int(clamp(int(lookback_h or 24), 1, 720))
+    cache_key = f"autotrade_report_text_v2:{owner_uid}:{lookback_h}"
+    try:
+        if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
+            cached = cache_get(cache_key)
+            if isinstance(cached, str) and cached.strip():
+                return cached
+    except Exception:
+        pass
+    _autotrade_migrate_tables()
+    now_ts = float(time.time())
+    start_ts = now_ts - float(lookback_h) * 3600.0
+    table_rows = []
+    total_open = 0.0
+    total_closed = 0.0
+
+    # OPEN live positions from Bybit, matched/adopted to bot journal where possible.
+    try:
+        open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
+        bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(owner_uid, positions=open_positions, fallback_unmatched_as_owned=True)
+    except Exception:
+        bot_positions, external_positions = [], []
+    for p, tr in (bot_positions or []):
+        try:
+            pnl = float(_pos_unreal_pnl(p) or 0.0)
+            total_open += pnl
+            sid = str((tr or {}).get('setup_id') or '-') or '-'
+            table_rows.append([
+                'OPEN',
+                _pf_short_symbol(_pos_symbol(p)),
+                str(_pos_side_text(p) or (tr or {}).get('side') or '-').upper(),
+                sid,
+                'OPEN',
+                _pf_trade_reason(tr or {}),
+                f"{pnl:+.2f}",
+            ])
+        except Exception:
+            continue
+
+    # CLOSED positions from journal/exchange reconstruction, no display cap.
+    try:
+        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=max(1000, int(PF_AUTOTRADE_REPORT_MAX_ROWS))) or []
+    except Exception:
+        closed_rows = []
+    closed_rows = _pf_dedupe_closed_rows(closed_rows)
+    for row in closed_rows:
+        try:
+            pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
+            total_closed += pnl
+            sid = str(row.get('setup_id') or '-') or '-'
+            table_rows.append([
+                'CLOSED',
+                _pf_short_symbol(row.get('symbol')),
+                str(row.get('side') or '-').upper(),
+                sid,
+                _pf_autotrade_result_label(row, is_open=False),
+                _pf_trade_reason(row),
+                f"{pnl:+.2f}",
+            ])
+        except Exception:
+            continue
+
+    lines = [
+        "📒 AutoTrade Report — table",
+        HDR,
+        f"Window: last {lookback_h}h (Melbourne) | Rows: {len(table_rows)}",
+        "Source: live Bybit open positions + AutoTrade/exchange closed journal.",
+        "",
+        _pf_table(table_rows, ["Status", "Symbol", "Type", "Setup ID", "Result", "Entrance reason", "PnL"]),
+        "",
+        f"Open PnL: {total_open:+.2f} USDT",
+        f"Closed PnL: {total_closed:+.2f} USDT",
+        f"Total PnL: {(total_open + total_closed):+.2f} USDT",
+    ]
+    if external_positions:
+        lines.append(f"Ignored manual/external live positions: {len(external_positions)}")
+    out = "\n".join(lines)
+    try:
+        cache_set(cache_key, out)
+        # Keep legacy cache key too so timeout fallback still has the new table format.
+        cache_set(f"autotrade_report_text:{owner_uid}:{lookback_h}", out)
+    except Exception:
+        pass
+    return out
+
+
+# Help/admin globals patched after overriding commands.
+try:
+    ADMIN_HELP_DESCRIPTIONS.pop('signal_report', None)
+    ADMIN_HELP_DESCRIPTIONS.pop('signal_report_overall', None)
+    ADMIN_HELP_DESCRIPTIONS['setup_audit_overall'] = 'Overall setup-family audit: generated count, TP/SL/open, WR, PnL/R, sessions and reason summary'
+    ADMIN_HELP_GROUPS = [(title, [c for c in cmds if c not in {'signal_report', 'signal_report_overall'}]) for title, cmds in ADMIN_HELP_GROUPS]
+    if not any('setup_audit_overall' in cmds for _title, cmds in ADMIN_HELP_GROUPS):
+        ADMIN_HELP_GROUPS.append(("📊 SETUP AUDIT / FAMILY REPORTS", ['setup_audit', 'setup_audit_overall']))
+    HELP_TEXT_ADMIN = build_help_text_admin()
+    try:
+        KNOWN_COMMANDS = sorted(set([c for c in KNOWN_COMMANDS if c not in {'signal_report', 'signal_report_overall'}] + ['setup_audit_overall']))
+    except Exception:
+        pass
+except Exception:
+    pass
 
 if __name__ == "__main__":
     main()
