@@ -1584,9 +1584,9 @@ EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FU
 # ✅ Production scan breadth + loosened trigger only for screen (NOT email)
 # Hard API-load guard: live setup generation must never fan out across hundreds of symbols.
 # The active scan universe is capped to the top symbols by true futures volume.
-SCAN_SYMBOL_LIMIT = int(os.environ.get("SCAN_SYMBOL_LIMIT", "40") or 40)
-BIGMOVE_SYMBOL_LIMIT = int(os.environ.get("BIGMOVE_SYMBOL_LIMIT", "30") or 30)
-MAX_OHLCV_LIMIT = int(os.environ.get("MAX_OHLCV_LIMIT", "50") or 50)
+SCAN_SYMBOL_LIMIT = int(os.environ.get("SCAN_SYMBOL_LIMIT", "28") or 28)
+BIGMOVE_SYMBOL_LIMIT = int(os.environ.get("BIGMOVE_SYMBOL_LIMIT", "22") or 22)
+MAX_OHLCV_LIMIT = int(os.environ.get("MAX_OHLCV_LIMIT", "35") or 35)
 MAX_STALE_SCAN_SEC = int(os.environ.get("MAX_STALE_SCAN_SEC", "120") or 120)
 SCREEN_UNIVERSE_N = int(os.environ.get("SCREEN_UNIVERSE_N", str(SCAN_SYMBOL_LIMIT)) or SCAN_SYMBOL_LIMIT)
 SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
@@ -9133,13 +9133,24 @@ def _live_trade_runtime_busy(window_sec: int | None = None) -> bool:
 
 
 def _ohlcv_timeframe_cooling(*timeframes: str) -> bool:
-    """Compatibility shim: no global OHLCV circuit breaker.
+    """Return True when Bybit OHLCV is in a short circuit-breaker cooldown.
 
-    Rate limits are now isolated per symbol+timeframe in fetch_ohlcv(). Returning False
-    here prevents one Bybit 10006 on a single coin from freezing the whole executable
-    pipeline, /screen, email, and Big-Move engine.
+    A few 10006/rate-limit responses usually mean the account/IP is temporarily
+    throttled, not that a single symbol is bad.  Keep stale/cache usable, but stop
+    new cold OHLCV pulls briefly so /screen, email setup generation, Big-Move and
+    AutoTrade do not hammer Bybit immediately after deploy or during overlapping jobs.
     """
-    return False
+    try:
+        now_ts = float(time.time())
+        if float(globals().get('_OHLCV_GLOBAL_COOL_UNTIL', 0.0) or 0.0) > now_ts:
+            return True
+        tfs = [str(x or '').lower().strip() for x in (timeframes or []) if str(x or '').strip()]
+        if not tfs:
+            return False
+        tf_map = globals().get('_OHLCV_TF_RATE_LIMIT_UNTIL', {}) or {}
+        return any(float(tf_map.get(tf, 0.0) or 0.0) > now_ts for tf in tfs)
+    except Exception:
+        return False
 
 def _admin_status_cached_text(name: str, fresh_ttl: float | None = None, stale_ttl: float | None = None) -> tuple[str | None, bool]:
     fresh = _admin_status_cache_get(name, ttl=(fresh_ttl if fresh_ttl is not None else HEAVY_ADMIN_CACHE_TTL_SEC))
@@ -18481,6 +18492,7 @@ _OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 # Legacy placeholders kept for compatibility only. Live fetching now uses per-symbol cooldowns.
 _OHLCV_GLOBAL_COOL_UNTIL = 0.0
 _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
+_OHLCV_RATE_LIMIT_RECENT: list[float] = []
 _OHLCV_LAST_KEY: Dict[str, str] = {}
 _OHLCV_INFLIGHT: Dict[str, threading.Event] = {}
 _OHLCV_INFLIGHT_LOCK = threading.Lock()
@@ -18489,14 +18501,14 @@ _OHLCV_PAGED_CACHE_LOCK = threading.Lock()
 OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MIN_SEC = float(os.getenv("OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MIN_SEC", "60") or 60)
 OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MAX_SEC = float(os.getenv("OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MAX_SEC", "120") or 120)
 OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "90") or 90)
-OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "120") or 120)
+OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "300") or 300)
 OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "1.5") or 1.5)
 OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") or 120)
 # Cold-start / cold-cache protection. Keep very short so Render restarts can rebuild quickly.
 PROCESS_START_TS = float(time.time())
-OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "0") or 0)
-OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "180") or 180)
-OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.05") or 0.05)
+OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "90") or 90)
+OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "45") or 45)
+OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.20") or 0.20)
 _OHLCV_RATE_LIMIT_HITS_TOTAL = 0
 _OHLCV_STALE_USAGE_TOTAL = 0
 _SCAN_TF_PHASE = 0
@@ -18787,13 +18799,13 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     Singleton + TTL cached OHLCV fetch with production-safe API load controls.
 
     Current live rules:
-    - hard cap candle requests to MAX_OHLCV_LIMIT (default 50)
+    - hard cap candle requests to MAX_OHLCV_LIMIT (default 35)
     - no global cooldown; rate limits cool only the affected symbol+timeframe
     - cooldown duration is bounded to 60–120s
     - non-active timeframe phases prefer cache/stale data to stagger 15m/1h/4h refreshes
     - stale cache is always preferred over hammering Bybit
     """
-    global _OHLCV_RATE_LIMIT_HITS_TOTAL, _OHLCV_STALE_USAGE_TOTAL
+    global _OHLCV_RATE_LIMIT_HITS_TOTAL, _OHLCV_STALE_USAGE_TOTAL, _OHLCV_GLOBAL_COOL_UNTIL
     try:
         req_limit = int(limit or MAX_OHLCV_LIMIT)
     except Exception:
@@ -18891,13 +18903,32 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
             jitter = float(abs(hash(symtf_key)) % int(max(1, cd_max - cd_min + 1)))
             cd = min(cd_max, cd_min + jitter)
             _OHLCV_RATE_LIMIT_UNTIL[symtf_key] = now_ts + cd
-            warn_key = f'{symtf_key}:rate_limit'
+            # Timeframe-level backoff: one 10006 usually means new cold pulls for
+            # this candle stream should pause briefly, not keep trying the next 20 symbols.
+            tf_cd = min(max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 90.0), cd), 180.0)
+            try:
+                _OHLCV_TF_RATE_LIMIT_UNTIL[str(tf_key)] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(str(tf_key), 0.0) or 0.0), now_ts + tf_cd)
+            except Exception:
+                pass
+            # Escalate to a short global OHLCV breaker if several symbols hit Bybit limits
+            # in the same burst. This is especially important after Render redeploy.
+            try:
+                _OHLCV_RATE_LIMIT_RECENT.append(now_ts)
+                cutoff = now_ts - 45.0
+                del _OHLCV_RATE_LIMIT_RECENT[:max(0, len(_OHLCV_RATE_LIMIT_RECENT) - 50)]
+                recent_hits = [x for x in _OHLCV_RATE_LIMIT_RECENT if float(x or 0.0) >= cutoff]
+                _OHLCV_RATE_LIMIT_RECENT[:] = recent_hits
+                if len(recent_hits) >= 3:
+                    _OHLCV_GLOBAL_COOL_UNTIL = max(float(_OHLCV_GLOBAL_COOL_UNTIL or 0.0), now_ts + min(max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 90.0), cd), 180.0))
+            except Exception:
+                pass
+            warn_key = f'{tf_key}:rate_limit'
             if float(_OHLCV_RATE_LIMIT_WARN_UNTIL.get(warn_key) or 0.0) <= now_ts:
-                _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(10.0, float(OHLCV_WARN_SUPPRESS_SEC or 120.0))
+                _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(60.0, float(OHLCV_WARN_SUPPRESS_SEC or 300.0))
                 try:
                     logger.info(
-                        'fetch_ohlcv rate-limited for %s %s x%s; symbol cooling %ss and using stale cache if available',
-                        symbol_u, tf_key, req_limit, int(cd),
+                        'fetch_ohlcv rate-limited for %s %s x%s; pausing cold OHLCV pulls for this timeframe ~%ss and using stale cache',
+                        symbol_u, tf_key, req_limit, int(tf_cd),
                     )
                 except Exception:
                     pass
@@ -44135,7 +44166,7 @@ def main():
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
-            first=max(120, min(240, interval_sec // 2)),
+            first=max(240, min(360, interval_sec)),
             name="alert_job",
             job_kwargs={
                 "max_instances": 1,
@@ -44147,7 +44178,7 @@ def main():
         app.job_queue.run_repeating(
             screen_cache_warmup_job,
             interval=int(SCREEN_CACHE_WARMUP_INTERVAL_SEC),
-            first=max(20, min(60, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
+            first=max(180, min(300, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
             name="screen_cache_warmup_job",
             job_kwargs={
                 "max_instances": 1,
@@ -44160,7 +44191,7 @@ def main():
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
             interval=max(int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 150), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 45),
-            first=90,
+            first=180,
             name="autotrade_exit_guardian_job",
             job_kwargs={
                 "max_instances": 1,
@@ -44173,7 +44204,7 @@ def main():
         app.job_queue.run_repeating(
             autotrade_job,
             interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 10),
-            first=120,
+            first=180,
             name="autotrade_job",
             job_kwargs={
                 "max_instances": 1,
