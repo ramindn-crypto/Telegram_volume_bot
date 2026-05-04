@@ -36325,6 +36325,210 @@ def _setup_audit_price_result_from_row(row: dict, horizon_hours: int = 24) -> st
     return _setup_audit_result_label(_setup_audit_price_result_payload(row, horizon_hours=horizon_hours).get('result'))
 
 
+def _setup_audit_tf_seconds(timeframe: str) -> int:
+    try:
+        tf = str(timeframe or '').strip().lower()
+        if tf.endswith('m'):
+            return max(60, int(float(tf[:-1])) * 60)
+        if tf.endswith('h'):
+            return max(3600, int(float(tf[:-1])) * 3600)
+    except Exception:
+        pass
+    return 300
+
+
+def _setup_audit_market_symbol_for_row(row: dict) -> str:
+    try:
+        rr = _setup_audit_payload_from_row(row)
+        ms = str(rr.get('market_symbol') or '').strip()
+        if ms:
+            return ms
+        sym = str(rr.get('symbol') or '').upper().strip()
+        base = sym[:-4] if sym.endswith('USDT') else sym
+        return str(_market_symbol_from_base(base) or '').strip()
+    except Exception:
+        return ''
+
+
+def _setup_audit_preload_ohlcv(rows: list[dict], hours: int = 24, timeframe: str | None = None) -> dict:
+    """Fetch one OHLCV window per symbol for /setup_audit.
+
+    The old audit evaluated each setup independently and usually fell back to cached
+    tickers, which left many rows as OPEN. This grouped loader makes the command
+    check the real post-setup price path while avoiding one exchange call per row.
+    """
+    out: dict[str, list] = {}
+    try:
+        tf = str(timeframe or os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
+        now_ts = float(time.time())
+        by_symbol: dict[str, list[dict]] = {}
+        for raw in (rows or []):
+            try:
+                rr = _setup_audit_payload_from_row(raw)
+                ms = _setup_audit_market_symbol_for_row(rr)
+                created_ts = float(rr.get('created_ts') or rr.get('ts') or rr.get('signal_created_ts') or 0.0)
+                if not ms or created_ts <= 0:
+                    continue
+                by_symbol.setdefault(ms, []).append(rr)
+            except Exception:
+                continue
+        for ms, items in by_symbol.items():
+            try:
+                min_created = min(float(x.get('created_ts') or x.get('ts') or x.get('signal_created_ts') or now_ts) for x in items)
+                max_end = max(min(now_ts, float(x.get('created_ts') or x.get('ts') or x.get('signal_created_ts') or now_ts) + float(hours) * 3600.0) for x in items)
+                # Buffer one candle before and after so a setup created inside a candle can still be evaluated.
+                buf = _setup_audit_tf_seconds(tf) + 60
+                since_ms = int(max(0.0, min_created - buf) * 1000)
+                until_ms = int(min(now_ts + 60.0, max_end + buf) * 1000)
+                candles = fetch_ohlcv_paged(ms, tf, since_ms=since_ms, until_ms=until_ms, limit=1000) or []
+                if candles:
+                    out[ms] = sorted(candles, key=lambda c: c[0])
+                    # Also update the general cache for later commands.
+                    try:
+                        _ohlcv_update_superset_cache(ms, tf, out[ms])
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _setup_audit_payload_result_from_candles(row: dict, candles: list, horizon_hours: int = 24, timeframe: str = '5m') -> dict:
+    try:
+        rr = _setup_audit_payload_from_row(row)
+        side = str(rr.get('side') or '').upper().strip()
+        entry = float(rr.get('entry') or 0.0)
+        sl = float(rr.get('sl') or 0.0)
+        tp = float(rr.get('tp') or 0.0)
+        created_ts = float(rr.get('created_ts') or rr.get('ts') or rr.get('signal_created_ts') or 0.0)
+        if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0 or created_ts <= 0:
+            return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'missing_or_invalid_setup_levels'}
+        tf_sec = _setup_audit_tf_seconds(timeframe)
+        now_ts = float(time.time())
+        horizon_end = min(now_ts, created_ts + float(max(1, int(horizon_hours or 24))) * 3600.0)
+        filt = []
+        for c in (candles or []):
+            try:
+                ts_s = float(c[0]) / 1000.0
+                # Include the candle that contains the setup timestamp.
+                if ts_s + tf_sec < created_ts - 5:
+                    continue
+                if ts_s > horizon_end + tf_sec:
+                    continue
+                filt.append(c)
+            except Exception:
+                continue
+        if not filt:
+            return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'no_price_candles'}
+        res = _signal_hit_order_from_candles(side, sl, tp, filt) or {}
+        canon = _setup_audit_result_label(res.get('outcome') or res.get('result'))
+        note = str(res.get('note') or '')
+        # If coarse candles crossed both TP and SL in the same bar, do a 1m targeted check.
+        if canon == 'OPEN' and 'same_candle' in note.lower():
+            try:
+                ms = _setup_audit_market_symbol_for_row(rr)
+                since_ms = int(max(0.0, created_ts - 90.0) * 1000)
+                until_ms = int(min(now_ts + 60.0, horizon_end + 90.0) * 1000)
+                c1 = fetch_ohlcv_paged(ms, '1m', since_ms=since_ms, until_ms=until_ms, limit=1000) or []
+                if c1:
+                    r1 = _signal_hit_order_from_candles(side, sl, tp, sorted(c1, key=lambda x: x[0])) or {}
+                    c1canon = _setup_audit_result_label(r1.get('outcome') or r1.get('result'))
+                    if c1canon in {'TP', 'SL'}:
+                        r1['result'] = c1canon
+                        r1['note'] = str(r1.get('note') or '') or 'resolved_1m_after_ambiguous_coarse_candle'
+                        return r1
+            except Exception:
+                pass
+        return {
+            'result': canon,
+            'hit_level': str(res.get('hit_level') or (canon if canon in {'TP', 'SL'} else '')).upper().strip(),
+            'hit_ts': res.get('hit_ts'),
+            'best_level': res.get('best_level'),
+            'best_ts': res.get('best_ts'),
+            'note': note or f'resolved_{timeframe}' if canon in {'TP', 'SL'} else (note or 'horizon_not_hit'),
+        }
+    except Exception as exc:
+        return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'candles_eval_error:{type(exc).__name__}'}
+
+
+def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, candles_by_symbol: dict | None = None, audit_timeframe: str = '5m', actual_pnl_usdt: float = 0.0) -> dict:
+    """Authoritative result resolver for /setup_audit.
+
+    Priority:
+    1) already-decided cached TP/SL result;
+    2) grouped OHLCV price path after setup time;
+    3) full evaluator if enabled/forced by env;
+    4) current-price fallback.
+    OPEN is never trusted from cache because it can change during the 24h window.
+    """
+    try:
+        rr = _setup_audit_payload_from_row(row)
+        sid = str(rr.get('setup_id') or '').strip()
+        cached = _setup_audit_cached_result(sid, horizon_hours, allow_open_fresh_sec=0) if sid else {}
+        if cached and _setup_audit_result_label(cached.get('result')) in {'TP', 'SL'}:
+            return {'result': _setup_audit_result_label(cached.get('result')), 'hit_level': cached.get('hit_level'), 'hit_ts': cached.get('hit_ts'), 'note': cached.get('note') or 'cached_decided_result'}
+
+        # Existing signal outcome table can be a decided source if background sync already resolved it.
+        try:
+            if sid:
+                out0 = db_get_outcome(sid) or {}
+                oc0 = _setup_audit_result_label((out0 or {}).get('outcome'))
+                if oc0 in {'TP', 'SL'}:
+                    return {'result': oc0, 'hit_level': oc0, 'hit_ts': (out0 or {}).get('hit_ts'), 'note': 'signal_outcome_decided'}
+        except Exception:
+            pass
+
+        ms = _setup_audit_market_symbol_for_row(rr)
+        candles = (candles_by_symbol or {}).get(ms) or []
+        if candles:
+            ev = _setup_audit_payload_result_from_candles(rr, candles, horizon_hours=horizon_hours, timeframe=audit_timeframe)
+            if _setup_audit_result_label(ev.get('result')) in {'TP', 'SL'}:
+                try:
+                    _setup_audit_upsert_result(int(user_id or 0), rr, ev, int(horizon_hours), actual_pnl_usdt=actual_pnl_usdt)
+                except Exception:
+                    pass
+                return ev
+            last_ev = ev
+        else:
+            last_ev = {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'no_grouped_candles'}
+
+        allow_heavy = str(os.environ.get('SETUP_AUDIT_HEAVY_EVAL', '0')).strip().lower() in {'1', 'true', 'yes', 'on'}
+        # Only do targeted heavy fallback for rows where grouped candles were missing or ambiguous.
+        if allow_heavy and str(last_ev.get('note') or '').lower() in {'no_grouped_candles', 'no_price_candles'}:
+            try:
+                tmp = evaluate_signal_hit_order(rr, horizon_hours=int(horizon_hours), timeframe=str(audit_timeframe or '5m'))
+                canon = _setup_audit_result_label((tmp or {}).get('outcome') or (tmp or {}).get('result'))
+                if canon in {'TP', 'SL'}:
+                    ev = dict(tmp or {})
+                    ev['result'] = canon
+                    try:
+                        _setup_audit_upsert_result(int(user_id or 0), rr, ev, int(horizon_hours), actual_pnl_usdt=actual_pnl_usdt)
+                    except Exception:
+                        pass
+                    return ev
+            except Exception:
+                pass
+
+        # Last live/current price fallback. It catches active rows that just crossed TP/SL.
+        quick = _setup_audit_result_from_cached_price_moves(rr, horizon_hours=horizon_hours)
+        canon = _setup_audit_result_label(quick)
+        if canon in {'TP', 'SL'}:
+            ev = {'result': canon, 'hit_level': canon, 'hit_ts': None, 'note': 'current_price_or_cached_outcome'}
+        else:
+            ev = dict(last_ev or {})
+            ev['result'] = 'OPEN'
+            ev.setdefault('note', 'not_hit_in_horizon')
+        try:
+            _setup_audit_upsert_result(int(user_id or 0), rr, ev, int(horizon_hours), actual_pnl_usdt=actual_pnl_usdt)
+        except Exception:
+            pass
+        return ev
+    except Exception as exc:
+        return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'setup_audit_resolve_error:{type(exc).__name__}'}
+
+
 def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts: float = 0.0) -> dict:
     out = {}
     try:
@@ -36431,32 +36635,33 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0) -> 
 
 
 def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
-    """Table-form setup audit for every generated setup in the selected window.
+    """Compact setup audit: Symbol / Type / Conf / Family / Result only.
 
-    Result source is independent price-path evaluation: actual OHLCV after the setup
-    timestamp is checked to see whether TP or SL was touched first.
+    The result is calculated from the price path after the setup timestamp and is
+    independent from AutoTrade positions.
     """
     limit = max(0, int(limit or 0))  # 0 = no artificial row limit
     hours = max(1, min(8760, int(hours or 24)))
     rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit)
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not rows:
-        return f"🧪 <b>Setup Audit</b>\n{HDR}\nNo setups above ${min_vol_m:.0f}M volume in the last {hours}h."
+        return f"🧪 Setup Audit\n{HDR}\nNo setups above ${min_vol_m:.0f}M volume in the last {hours}h."
 
+    audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
+    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=hours, timeframe=audit_tf)
     actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+
     table_rows = []
     tp_n = sl_n = open_n = 0
-    net_r_total = 0.0
-    for i, r in enumerate(rows, 1):
+    for r in rows:
         sid = str(r.get('setup_id') or '').strip()
         side = str(r.get('side') or '').upper().strip()
         sym = str(r.get('symbol') or '').upper().strip()
         if sym.endswith('USDT'):
             sym = sym[:-4]
-        fam = _setup_audit_family_from_row(r)
-        reason = _setup_audit_reason_from_row(r)
+        family_code = _setup_audit_family_display(r, compact=True)
         actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
-        ev = _setup_audit_price_result_payload(r, horizon_hours=hours, user_id=int(uid), force=False, actual_pnl_usdt=actual_pnl)
+        ev = _setup_audit_resolve_result(r, horizon_hours=hours, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
         result = _setup_audit_result_label(ev.get('result'))
         if result == 'TP':
             tp_n += 1
@@ -36464,20 +36669,11 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
             sl_n += 1
         else:
             open_n += 1
-        net_r = _setup_audit_net_r_for_result(r, result)
-        net_r_total += float(net_r or 0.0)
         table_rows.append([
-            i,
-            sid,
-            f"{side} {sym}",
+            sym,
+            side,
             int(float(r.get('conf') or 0.0)),
-            f"{float(r.get('fut_vol_usd') or 0.0) / 1e6:.1f}M",
-            _setup_audit_short_text(_setup_audit_family_display(r, compact=True), 10),
-            _setup_audit_short_text(reason, 44),
-            f"{float(r.get('ch24') or 0.0):+.0f}",
-            f"{float(r.get('ch4') or 0.0):+.0f}",
-            f"{float(r.get('ch1') or 0.0):+.0f}",
-            f"{float(r.get('ch15') or 0.0):+.1f}",
+            family_code,
             result,
         ])
 
@@ -36487,20 +36683,21 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
     except Exception:
         now_txt = ''
-    header_lines = [
-        "🧪 <b>Setup Audit</b>",
-        HDR,
-        f"Window: <b>last {hours}h</b> | Rows: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
-        f"Price result: <b>TP={tp_n}</b> | <b>SL={sl_n}</b> | <b>OPEN={open_n}</b> | WR: <b>{wr:.1f}%</b> | NetR: <b>{net_r_total:+.2f}</b>",
-        "Result is independent from AutoTrade: actual price path after setup time decides TP/SL/OPEN.",
-    ]
+
     table = tabulate(
         table_rows,
-        headers=['#', 'Setup ID', 'Type/Symbol', 'Conf', 'Vol', 'Family', 'Enter reason', '24h', '4h', '1h', '15m', 'Result'],
+        headers=['Symbol', 'Type', 'Conf', 'Family', 'Result'],
         tablefmt='plain',
-        colalign=('right', 'left', 'left', 'right', 'right', 'left', 'left', 'right', 'right', 'right', 'right', 'left'),
+        colalign=('left', 'left', 'right', 'left', 'left'),
     )
-    return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
+    header_lines = [
+        "🧪 Setup Audit",
+        HDR,
+        f"Window: last {hours}h (Melbourne) | Rows: {len(rows)} | Min vol: ${min_vol_m:.0f}M" + (f" | Now: {now_txt}" if now_txt else ""),
+        f"Price result: TP={tp_n} | SL={sl_n} | OPEN={open_n} | WR={wr:.1f}% | TF={audit_tf}",
+        "Result source: post-setup price path, independent from AutoTrade.",
+    ]
+    return "\n".join(header_lines) + "\n" + table
 
 
 
@@ -36528,7 +36725,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await to_thread_heavy(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=90)
     except Exception as e:
         text = f"❌ setup_audit failed: {type(e).__name__}: {e}"
-    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await send_long_message(update, text, parse_mode=None, disable_web_page_preview=True)
 
 
 def _setup_audit_overall_text(uid: int) -> str:
