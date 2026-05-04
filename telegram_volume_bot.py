@@ -1584,9 +1584,9 @@ EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FU
 # ✅ Production scan breadth + loosened trigger only for screen (NOT email)
 # Hard API-load guard: live setup generation must never fan out across hundreds of symbols.
 # The active scan universe is capped to the top symbols by true futures volume.
-SCAN_SYMBOL_LIMIT = int(os.environ.get("SCAN_SYMBOL_LIMIT", "28") or 28)
-BIGMOVE_SYMBOL_LIMIT = int(os.environ.get("BIGMOVE_SYMBOL_LIMIT", "22") or 22)
-MAX_OHLCV_LIMIT = int(os.environ.get("MAX_OHLCV_LIMIT", "35") or 35)
+SCAN_SYMBOL_LIMIT = int(os.environ.get("SCAN_SYMBOL_LIMIT", "40") or 40)
+BIGMOVE_SYMBOL_LIMIT = int(os.environ.get("BIGMOVE_SYMBOL_LIMIT", "30") or 30)
+MAX_OHLCV_LIMIT = int(os.environ.get("MAX_OHLCV_LIMIT", "50") or 50)
 MAX_STALE_SCAN_SEC = int(os.environ.get("MAX_STALE_SCAN_SEC", "120") or 120)
 SCREEN_UNIVERSE_N = int(os.environ.get("SCREEN_UNIVERSE_N", str(SCAN_SYMBOL_LIMIT)) or SCAN_SYMBOL_LIMIT)
 SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
@@ -3576,6 +3576,22 @@ def _pos_take_profit(p: dict) -> float:
         return 0.0
 
 
+def _pos_native_stop_loss(p: dict) -> float:
+    """Position-level Bybit stopLoss only; does not accept standalone Conditional SL orders."""
+    try:
+        return float((p or {}).get("stopLoss") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _pos_native_take_profit(p: dict) -> float:
+    """Position-level Bybit takeProfit only; does not accept standalone Conditional TP orders."""
+    try:
+        return float((p or {}).get("takeProfit") or 0.0)
+    except Exception:
+        return 0.0
+
+
 def _price_close_enough(a: float, b: float, rel_tol: float = 0.002, abs_tol: float = 1e-8) -> bool:
     try:
         a = float(a or 0.0)
@@ -3939,48 +3955,28 @@ def _autotrade_build_tp_order_slices(symbol: str, tp_targets: list[float], base_
 
 
 def _autotrade_place_reduce_only_tp_order_slice(symbol: str, side: str, idx: int, tp_price: float, qty_i: float) -> dict:
+    """DISABLED for AutoTrade exit protection.
+
+    Older builds used /v5/order/create reduce-only trigger orders for TP. Bybit shows
+    those rows as standalone ``Conditional`` orders with TP/SL = --/--, which created
+    the 14-orders-for-5-positions problem. AutoTrade exits must now be attached only
+    through /v5/position/trading-stop in Full mode so every position has native
+    position-level TP/SL protection.
+    """
     try:
         sym = _bybit_linear_symbol(symbol)
-        side_u = str(side or '').upper().strip()
-        if side_u not in {'BUY', 'SELL'}:
-            return {'idx': int(idx or 0), 'tp': float(tp_price or 0.0), 'qty': float(qty_i or 0.0), 'ok': False, 'retMsg': 'bad_side'}
-        tp_px = _round_price_to_tick(sym, float(tp_price or 0.0), rounding=ROUND_HALF_UP)
-        if tp_px <= 0:
-            tp_px = float(tp_price or 0.0)
-        close_side = 'Sell' if side_u == 'BUY' else 'Buy'
-        if _bybit_has_matching_tp_exit(sym, close_side.upper(), tp_px):
-            return {'idx': int(idx or 0), 'tp': float(tp_px), 'qty': float(qty_i or 0.0), 'ok': True, 'retCode': 0, 'retMsg': 'already_present', 'existing': True}
-        filt = _bybit_get_instr_filters(sym)
-        qty_step = filt.get('qtyStep')
-        trigger_direction = 1 if side_u == 'BUY' else 2
-        link_id = f"pf_tp_{int(idx or 0)}_{sym}_{int(time.time()*1000)%100000000}_{uuid.uuid4().hex[:6]}"[:36]
-        payload = {
-            'category': 'linear',
-            'symbol': sym,
-            'side': close_side,
-            'orderType': 'Market',
-            'qty': _fmt_qty(float(qty_i or 0.0), qty_step),
-            'triggerPrice': str(float(tp_px)),
-            'triggerDirection': int(trigger_direction),
-            'triggerBy': str(AUTOTRADE_LIVE_TP_TRIGGER_BY),
-            'timeInForce': 'IOC',
-            'reduceOnly': True,
-            'closeOnTrigger': True,
-            'positionIdx': 0,
-            'orderLinkId': link_id,
-        }
-        res = _bybit_v5_request('POST', '/v5/order/create', payload)
         return {
             'idx': int(idx or 0),
-            'tp': float(tp_px),
+            'tp': float(tp_price or 0.0),
             'qty': float(qty_i or 0.0),
-            'ok': int((res or {}).get('retCode', -1)) == 0,
-            'retCode': (res or {}).get('retCode'),
-            'retMsg': (res or {}).get('retMsg'),
-            'order_payload': payload,
+            'ok': False,
+            'retCode': 0,
+            'retMsg': 'disabled_full_position_tpsl_only_no_conditional_orders',
+            'symbol': sym,
+            'placement': 'disabled_conditional_tp',
         }
     except Exception as e:
-        return {'idx': int(idx or 0), 'tp': float(tp_price or 0.0), 'qty': float(qty_i or 0.0), 'ok': False, 'retMsg': f'{type(e).__name__}: {e}'}
+        return {'idx': int(idx or 0), 'tp': float(tp_price or 0.0), 'qty': float(qty_i or 0.0), 'ok': False, 'retMsg': f'{type(e).__name__}: {e}', 'placement': 'disabled_conditional_tp'}
 
 
 def _autotrade_place_reduce_only_tp_orders(symbol: str, side: str, tp_targets: list[float], base_qty: float, tp_fraction: float | None = None) -> list[dict]:
@@ -4084,73 +4080,35 @@ def _autotrade_place_partial_tpsl_pair_slice(symbol: str, side: str, idx: int, t
 
 
 def _autotrade_place_confirmed_tp_orders(symbol: str, side: str, tp_targets: list[float], base_qty: float, stop_loss: float, tp_fraction: float | None = None) -> list[dict]:
-    """Attach exactly two visible exchange TP targets using native Partial TP/SL pairs.
+    """Single-TP live exit attach policy: Full-position TP/SL only.
 
-    Bybit's full-position SL mode was intermittently coexisting without any visible TP attachments.
-    The reliable path for the UI and the actual exchange state is to create two Partial TP/SL pairs,
-    each with the same stop-loss and its own TP slice size.
+    PulseFutures now keeps all live exits as Bybit position-level TP/SL rows.
+    It must NOT create standalone reduce-only Conditional orders for AutoTrade exits,
+    because those show as separate Conditional rows in Bybit and create confusing extra
+    orders. One open position should have exactly one TP and one SL attached to the
+    entire position.
     """
-    results: list[dict] = []
     try:
         want = _dedupe_price_targets([float(x or 0.0) for x in (tp_targets or []) if float(x or 0.0) > 0])
-        if len(want) != 2 or float(base_qty or 0.0) <= 0 or float(stop_loss or 0.0) <= 0:
-            return [{'idx': 0, 'tp': 0.0, 'qty': float(base_qty or 0.0), 'ok': False, 'retMsg': 'invalid_tp_layout'}]
-
-        slices = _autotrade_build_tp_order_slices(symbol, want, base_qty, tp_fraction=tp_fraction)
-        good_slices = [x for x in (slices or []) if bool(x.get('ok')) and float(x.get('qty') or 0.0) > 0 and float(x.get('tp') or 0.0) > 0]
-        if len(good_slices) != 2:
-            bad_reason = '; '.join(str(x.get('reason') or 'qty_invalid') for x in (slices or [])) or 'qty_invalid'
-            return [{'idx': 0, 'tp': 0.0, 'qty': float(base_qty or 0.0), 'ok': False, 'retMsg': f'invalid_tp_slices:{bad_reason}'}]
-
-        _autotrade_cancel_reduce_only_tp_orders(symbol, side=side)
-        _autotrade_clear_position_full_tp_sl(symbol, side=side)
-        time.sleep(0.20)
-
-        for item in good_slices:
-            results.append(
-                _autotrade_place_partial_tpsl_pair_slice(
-                    symbol,
-                    side,
-                    int(item.get('idx') or 0),
-                    float(item.get('tp') or 0.0),
-                    float(stop_loss or 0.0),
-                    float(item.get('qty') or 0.0),
-                )
-            )
-
-        ok_tp, missing = _autotrade_confirm_tp_targets_present(symbol, side, want, wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 3.5), step_sec=AUTOTRADE_TP_CONFIRM_STEP_SEC)
-        sl_ok = False
-        try:
-            sl_ok = _bybit_has_open_sl_order_at(symbol, float(stop_loss or 0.0), side=side)
-            if not sl_ok:
-                sl_qty = _bybit_sum_open_exit_qty_at(symbol, float(stop_loss or 0.0), side=side, kind='sl')
-                sl_ok = bool(sl_qty >= max(0.0, float(base_qty or 0.0) * 0.90))
-        except Exception:
-            sl_ok = False
-        if not sl_ok:
-            try:
-                sl_ok = bool(ok_tp and any(bool((x or {}).get('ok')) and str((x or {}).get('placement') or '') == 'partial_pair' for x in (results or [])))
-            except Exception:
-                sl_ok = False
-
-        if (not ok_tp) and AUTOTRADE_TP_FALLBACK_TO_PARTIAL_TPSL:
-            secondary = _autotrade_place_reduce_only_tp_orders(symbol, side, want, base_qty, tp_fraction=tp_fraction)
-            results.extend(secondary or [])
-            ok_tp, missing = _autotrade_confirm_tp_targets_present(symbol, side, want, wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 3.5), step_sec=AUTOTRADE_TP_CONFIRM_STEP_SEC)
-
-        if (not ok_tp) or (not sl_ok):
-            results.append({
-                'idx': 0,
-                'tp': 0.0,
-                'qty': float(base_qty or 0.0),
-                'ok': False,
-                'retMsg': 'tp_or_sl_not_confirmed_on_exchange',
-                'missing_targets': list(missing or []),
-                'sl_ok': bool(sl_ok),
-            })
-        return results
+        tp = float((want[-1] if want else 0.0) or 0.0)
+        if tp <= 0 or float(stop_loss or 0.0) <= 0:
+            return [{'idx': 1, 'tp': float(tp or 0.0), 'qty': float(base_qty or 0.0), 'ok': False, 'retMsg': 'invalid_full_position_tpsl'}]
+        res = _autotrade_apply_position_tp_sl(symbol, float(stop_loss or 0.0), tp, side=side)
+        ok, detail = _autotrade_confirm_position_full_tpsl(symbol, side, float(stop_loss or 0.0), tp, wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 3.0))
+        cleanup = _autotrade_cancel_legacy_conditional_exit_orders(symbol, side=side)
+        return [{
+            'idx': 1,
+            'tp': float(tp),
+            'qty': float(base_qty or 0.0),
+            'ok': bool(ok),
+            'retCode': (res or {}).get('retCode'),
+            'retMsg': (res or {}).get('retMsg'),
+            'placement': 'position_full_tpsl',
+            'confirm': detail,
+            'legacy_conditional_cancelled': int(cleanup or 0),
+        }]
     except Exception as e:
-        return [{'idx': 0, 'tp': 0.0, 'qty': float(base_qty or 0.0), 'ok': False, 'retMsg': f'{type(e).__name__}: {e}'}]
+        return [{'idx': 1, 'tp': 0.0, 'qty': float(base_qty or 0.0), 'ok': False, 'retMsg': f'{type(e).__name__}: {e}', 'placement': 'position_full_tpsl'}]
 
 
 def _autotrade_cancel_reduce_only_tp_orders(symbol: str, side: str | None = None, keep_stop_price: float | None = None) -> int:
@@ -4188,6 +4146,201 @@ def _autotrade_cancel_reduce_only_tp_orders(symbol: str, side: str | None = None
             continue
     return count
 
+
+
+
+def _bybit_invalidate_live_order_position_cache(symbol: str | None = None) -> None:
+    """Drop short Bybit open-order/position caches after exit-order mutations."""
+    try:
+        sym = _bybit_linear_symbol(symbol) if symbol else ''
+        keys = [
+            'bybit_open_positions_linear',
+            'bybit_open_orders_linear:ALL',
+        ]
+        if sym:
+            keys.append(f'bybit_open_orders_linear:{sym}')
+        for k in keys:
+            try:
+                cache_delete(k)
+            except Exception:
+                try:
+                    _CACHE.pop(str(k), None)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _autotrade_order_is_legacy_conditional_exit(order: dict) -> bool:
+    """True only for standalone Conditional exit orders created by older bot builds.
+
+    We intentionally do NOT cancel native Bybit TP/SL rows (stopOrderType
+    TakeProfit/StopLoss/tpsl), because the user wants those. The main target is
+    the old pf_tp_* reduce-only trigger order that appears in Bybit as
+    'Conditional' with TP/SL shown as --/--.
+    """
+    try:
+        if not _bybit_order_active(order):
+            return False
+        if not _bybit_order_reduce_only(order):
+            return False
+        link = str((order or {}).get('orderLinkId') or '').lower().strip()
+        if link.startswith(('pf_tp_', 'pf_sl_', 'pf_cond_', 'pf_exit_')):
+            return True
+        txt = _bybit_order_kind_text(order)
+        # Native/position-level protection orders must remain.
+        native_words = ('takeprofit', 'stoploss', 'partialtakeprofit', 'partialstoploss', 'tpsl', 'tp/sl')
+        if any(w in txt for w in native_words):
+            return False
+        trig = float((order or {}).get('triggerPrice') or (order or {}).get('trigger_price') or (order or {}).get('stopOrderPrice') or 0.0)
+        if trig <= 0:
+            return False
+        # If it is a reduce-only triggered market/conditional close without native
+        # TP/SL metadata, it is a legacy standalone Conditional exit.
+        order_type = str((order or {}).get('orderType') or '').upper().strip()
+        return order_type in {'MARKET', 'LIMIT', ''}
+    except Exception:
+        return False
+
+
+def _autotrade_cancel_legacy_conditional_exit_orders(symbol: str, side: str | None = None) -> int:
+    """Cancel old standalone Conditional exit rows for a symbol/side.
+
+    This is the cleanup that converts the account back to the desired shape:
+    only position-level TP/SL rows, no separate Conditional close orders.
+    """
+    count = 0
+    sym = _bybit_linear_symbol(symbol)
+    close_side = ''
+    side_u = str(side or '').upper().strip()
+    if side_u == 'BUY':
+        close_side = 'SELL'
+    elif side_u == 'SELL':
+        close_side = 'BUY'
+    try:
+        for o in list(_bybit_get_open_orders_linear(sym) or []):
+            try:
+                if _bybit_linear_symbol(str((o or {}).get('symbol') or '')) != sym:
+                    continue
+                if not _bybit_order_matches_close_side(o, close_side):
+                    continue
+                if not _autotrade_order_is_legacy_conditional_exit(o):
+                    continue
+                oid = str((o or {}).get('orderId') or '')
+                if not oid:
+                    continue
+                res = _bybit_v5_request('POST', '/v5/order/cancel', {'category': 'linear', 'symbol': sym, 'orderId': oid})
+                if int((res or {}).get('retCode', -1)) == 0:
+                    count += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if count:
+        _bybit_invalidate_live_order_position_cache(sym)
+    return int(count)
+
+
+
+
+def _autotrade_cancel_all_legacy_conditional_exit_orders(max_items: int = 80, max_cancel: int | None = None) -> int:
+    """Cancel old bot-created standalone Conditional exit orders across the account.
+
+    These are the rows shown by Bybit as ``Conditional`` with TP/SL = --/--.
+    Native position-level TP/SL rows are explicitly excluded by
+    _autotrade_order_is_legacy_conditional_exit().
+    """
+    count = 0
+    try:
+        max_n = max(1, int(max_cancel if max_cancel is not None else (max_items or 80)))
+    except Exception:
+        max_n = 80
+    try:
+        for o in list(_bybit_get_open_orders_linear(None) or []):
+            if count >= max_n:
+                break
+            try:
+                if not _autotrade_order_is_legacy_conditional_exit(o):
+                    continue
+                sym = _bybit_linear_symbol(str((o or {}).get('symbol') or ''))
+                oid = str((o or {}).get('orderId') or '')
+                if not sym or not oid:
+                    continue
+                res = _bybit_v5_request('POST', '/v5/order/cancel', {'category': 'linear', 'symbol': sym, 'orderId': oid})
+                if int((res or {}).get('retCode', -1)) == 0:
+                    count += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if count:
+        _bybit_invalidate_live_order_position_cache(None)
+    return int(count)
+
+
+def _autotrade_confirm_position_full_tpsl(symbol: str, side: str, stop_loss: float, take_profit: float, wait_sec: float = 3.0, step_sec: float = 0.30) -> tuple[bool, dict]:
+    """Confirm Full-position TP/SL from the live position fields, not standalone orders."""
+    sym = _bybit_linear_symbol(symbol)
+    side_u = str(side or '').upper().strip()
+    sl_target = float(stop_loss or 0.0)
+    tp_target = float(take_profit or 0.0)
+    detail = {'symbol': sym, 'side': side_u, 'want_sl': sl_target, 'want_tp': tp_target, 'live_sl': 0.0, 'live_tp': 0.0}
+    try:
+        deadline = time.time() + max(0.2, float(wait_sec or 0.0))
+        while True:
+            _bybit_invalidate_live_order_position_cache(sym)
+            p = _autotrade_find_live_position(sym, side=side_u)
+            # Confirm ONLY native position-level TP/SL. Do not allow standalone
+            # Conditional orders to satisfy this check.
+            live_sl = float(_pos_native_stop_loss(p) or 0.0) if p else 0.0
+            live_tp = float(_pos_native_take_profit(p) or 0.0) if p else 0.0
+            detail.update({'live_sl': float(live_sl), 'live_tp': float(live_tp), 'position_found': bool(p)})
+            sl_ok = bool(sl_target > 0 and live_sl > 0 and _price_close_enough(live_sl, sl_target, rel_tol=0.0020))
+            tp_ok = bool(tp_target > 0 and live_tp > 0 and _price_close_enough(live_tp, tp_target, rel_tol=0.0020))
+            if sl_ok and tp_ok:
+                detail.update({'sl_ok': True, 'tp_ok': True})
+                return True, detail
+            if time.time() >= deadline:
+                detail.update({'sl_ok': bool(sl_ok), 'tp_ok': bool(tp_ok)})
+                return False, detail
+            time.sleep(max(0.05, float(step_sec or 0.2)))
+    except Exception as exc:
+        detail.update({'error': f'{type(exc).__name__}: {exc}', 'sl_ok': False, 'tp_ok': False})
+        return False, detail
+
+
+def _autotrade_attach_position_full_tpsl_and_cleanup(symbol: str, side: str, stop_loss: float, take_profit: float, live_pos: dict | None = None) -> dict:
+    """Authoritative live exit attach path: Full-position TP/SL + legacy conditional cleanup."""
+    out = {
+        'symbol': _bybit_linear_symbol(symbol),
+        'side': str(side or '').upper().strip(),
+        'placement': 'position_full_tpsl',
+        'apply_res': {},
+        'confirm': {},
+        'legacy_conditional_cancelled': 0,
+        'ok': False,
+    }
+    try:
+        # First remove old standalone pf_tp/pf_cond rows so the Bybit Orders page
+        # does not show extra Conditional exits. Then apply the wanted native TP/SL.
+        out['legacy_conditional_cancelled_before'] = _autotrade_cancel_legacy_conditional_exit_orders(symbol, side=side)
+        res = _autotrade_apply_position_tp_sl(symbol, float(stop_loss or 0.0), float(take_profit or 0.0), side=side, live_pos=live_pos)
+        out['apply_res'] = res or {}
+        _bybit_invalidate_live_order_position_cache(symbol)
+        ok, detail = _autotrade_confirm_position_full_tpsl(symbol, side, float(stop_loss or 0.0), float(take_profit or 0.0), wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 3.0))
+        out['confirm'] = detail or {}
+        # Clean again after attach in case older code left an order hidden behind cache.
+        out['legacy_conditional_cancelled_after'] = _autotrade_cancel_legacy_conditional_exit_orders(symbol, side=side)
+        out['legacy_conditional_cancelled'] = int(out.get('legacy_conditional_cancelled_before') or 0) + int(out.get('legacy_conditional_cancelled_after') or 0)
+        # Reconfirm after cleanup to ensure we did not disturb the native TP/SL.
+        ok2, detail2 = _autotrade_confirm_position_full_tpsl(symbol, side, float(stop_loss or 0.0), float(take_profit or 0.0), wait_sec=1.2)
+        out['confirm_after_cleanup'] = detail2 or {}
+        out['ok'] = bool(ok and ok2)
+        return out
+    except Exception as exc:
+        out['error'] = f'{type(exc).__name__}: {exc}'
+        out['ok'] = False
+        return out
 
 def _autotrade_wait_live_position(symbol: str, side: str, wait_sec: float = 4.0, step_sec: float = 0.35):
     deadline = time.time() + max(0.2, float(wait_sec or 0.0))
@@ -4325,6 +4478,11 @@ def _autotrade_apply_position_tp_sl(symbol: str, stop_loss: float, take_profit: 
                 try:
                     out['positionIdx_used'] = int(pos_idx)
                     out['request_payload'] = payload
+                    out['placement'] = 'position_full_tpsl'
+                except Exception:
+                    pass
+                try:
+                    _bybit_invalidate_live_order_position_cache(sym)
                 except Exception:
                     pass
                 return out
@@ -4373,7 +4531,23 @@ def _autotrade_clear_position_full_tp_sl(symbol: str, side: str | None = None, l
 
 
 def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None) -> dict:
-    result = {'checked': False, 'sl_fixed': False, 'tp_fixed': False, 'tp_order_fixed': False, 'be_applied': False, 'symbol': '', 'side': ''}
+    """Repair AutoTrade exits using native Full-position TP/SL only.
+
+    This intentionally does NOT create or accept standalone Conditional reduce-only
+    orders. If an old pf_tp/pf_cond conditional row exists, it is cancelled after the
+    position-level TP/SL is attached/confirmed.
+    """
+    result = {
+        'checked': False,
+        'sl_fixed': False,
+        'tp_fixed': False,
+        'tp_order_fixed': False,
+        'be_applied': False,
+        'symbol': '',
+        'side': '',
+        'placement': 'position_full_tpsl',
+        'legacy_conditional_cancelled': 0,
+    }
     try:
         if str(_autotrade_runtime_mode()).lower() != 'live':
             return result
@@ -4393,42 +4567,53 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         entry = float(_pos_entry(pos) or trade_row.get('entry') or 0.0)
         target_sl = float(trade_row.get('sl') or 0.0)
         target_tp = float(_resolve_single_tp(entry, target_sl, trade_row.get('tp'), trade_row.get('alt_target_a'), trade_row.get('alt_target_b'), side) or 0.0)
-        live_qty = abs(float(_pos_size(pos) or trade_row.get('qty') or 0.0))
+        if target_sl <= 0 or target_tp <= 0:
+            result['pending_missing'] = ['SL' if target_sl <= 0 else '', 'TP' if target_tp <= 0 else '']
+            result['pending_missing'] = [x for x in result['pending_missing'] if x]
+            return result
 
-        current_sl = float(_pos_stop(pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0)
-        current_tp = float(_pos_take_profit(pos) or 0.0)
-        tp_order_ok = bool(target_tp > 0 and (_bybit_has_open_tp_order_at(sym, target_tp, side=side) or _bybit_sum_open_exit_qty_at(sym, target_tp, side=side, kind='tp') >= max(0.0, live_qty * 0.90)))
-        sl_order_ok = bool(target_sl > 0 and (_bybit_has_open_sl_order_at(sym, target_sl, side=side) or _bybit_sum_open_exit_qty_at(sym, target_sl, side=side, kind='sl') >= max(0.0, live_qty * 0.90)))
-        sl_ok = bool(target_sl > 0 and ((current_sl > 0 and _price_close_enough(current_sl, target_sl, rel_tol=0.0020)) or sl_order_ok))
-        tp_ok = bool(target_tp > 0 and ((current_tp > 0 and _price_close_enough(current_tp, target_tp, rel_tol=0.0020)) or tp_order_ok))
+        native_sl = float(_pos_native_stop_loss(pos) or 0.0)
+        native_tp = float(_pos_native_take_profit(pos) or 0.0)
+        native_sl_ok = bool(native_sl > 0 and _price_close_enough(native_sl, target_sl, rel_tol=0.0020))
+        native_tp_ok = bool(native_tp > 0 and _price_close_enough(native_tp, target_tp, rel_tol=0.0020))
+        result.update({
+            'wanted_sl': float(target_sl),
+            'wanted_tp': float(target_tp),
+            'native_sl_before': float(native_sl or 0.0),
+            'native_tp_before': float(native_tp or 0.0),
+            'native_sl_ok_before': bool(native_sl_ok),
+            'native_tp_ok_before': bool(native_tp_ok),
+        })
 
-        if not sl_ok and target_sl > 0:
-            result['sl_apply_res'] = _autotrade_apply_position_tp_sl(sym, target_sl, 0.0)
-            time.sleep(0.30)
-            pos = _autotrade_find_live_position(sym, side=side) or pos
-            current_sl = float(_pos_stop(pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0)
-            sl_order_ok = bool(_bybit_has_open_sl_order_at(sym, target_sl, side=side) or _bybit_sum_open_exit_qty_at(sym, target_sl, side=side, kind='sl') >= max(0.0, live_qty * 0.90))
-            sl_ok = bool((current_sl > 0 and _price_close_enough(current_sl, target_sl, rel_tol=0.0020)) or sl_order_ok)
+        # Always cleanup legacy standalone Conditional exits for this symbol/side.
+        # If native TP/SL is already correct, this still reduces Orders count.
+        cancelled_before = _autotrade_cancel_legacy_conditional_exit_orders(sym, side=side)
 
-        if not tp_ok and target_tp > 0 and live_qty > 0:
-            try:
-                _autotrade_cancel_reduce_only_tp_orders(sym, side=side, keep_stop_price=target_sl)
-            except Exception:
-                pass
-            tp_place = _autotrade_place_reduce_only_tp_order_slice(sym, side, 1, target_tp, live_qty)
-            result['tp_order_results'] = [tp_place]
-            ok_conf, missing = _autotrade_confirm_tp_targets_present(sym, side, [target_tp], wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 3.0), step_sec=AUTOTRADE_TP_CONFIRM_STEP_SEC)
-            result['missing_tp_after_repair'] = list(missing or [])
-            tp_order_ok = bool(ok_conf or _bybit_has_open_tp_order_at(sym, target_tp, side=side) or _bybit_sum_open_exit_qty_at(sym, target_tp, side=side, kind='tp') >= max(0.0, live_qty * 0.90))
-            current_tp = float(_pos_take_profit(pos) or 0.0)
-            tp_ok = bool((current_tp > 0 and _price_close_enough(current_tp, target_tp, rel_tol=0.0020)) or tp_order_ok)
-            result['tp_order_fixed'] = bool(tp_order_ok)
+        attach_res = {}
+        if not (native_sl_ok and native_tp_ok):
+            attach_res = _autotrade_attach_position_full_tpsl_and_cleanup(sym, side, target_sl, target_tp, live_pos=pos)
+        else:
+            attach_res = {
+                'ok': True,
+                'placement': 'position_full_tpsl',
+                'reason': 'native_full_tpsl_already_correct',
+                'legacy_conditional_cancelled_before': int(cancelled_before or 0),
+            }
+            # Run one more cleanup after a fresh order snapshot in case cache hid old rows.
+            attach_res['legacy_conditional_cancelled_after'] = _autotrade_cancel_legacy_conditional_exit_orders(sym, side=side)
+            attach_res['legacy_conditional_cancelled'] = int(attach_res.get('legacy_conditional_cancelled_before') or 0) + int(attach_res.get('legacy_conditional_cancelled_after') or 0)
 
-        result['sl_fixed'] = bool(sl_ok)
-        result['tp_fixed'] = bool(tp_ok or result.get('tp_order_fixed'))
-        result['pending_missing'] = [name for name, flag in (('SL', not sl_ok), ('TP', not (tp_ok or result.get('tp_order_fixed')))) if bool(flag)]
+        result['attach_res'] = attach_res
+        result['legacy_conditional_cancelled'] = int(cancelled_before or 0) + int((attach_res or {}).get('legacy_conditional_cancelled') or 0)
+        ok, confirm = _autotrade_confirm_position_full_tpsl(sym, side, target_sl, target_tp, wait_sec=1.5)
+        result['confirm'] = confirm or {}
+        result['sl_fixed'] = bool(ok and (confirm or {}).get('sl_ok'))
+        result['tp_fixed'] = bool(ok and (confirm or {}).get('tp_ok'))
+        result['tp_order_fixed'] = False
+        result['pending_missing'] = [name for name, flag in (('SL', not result['sl_fixed']), ('TP', not result['tp_fixed'])) if bool(flag)]
         return result
-    except Exception:
+    except Exception as exc:
+        result['error'] = f'{type(exc).__name__}: {exc}'
         return result
 
 def _ts_seconds_from_any(value) -> float:
@@ -7798,37 +7983,31 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'qty': float(qty_for_db or 0.0),
         }
 
-        sl_res = _autotrade_apply_position_tp_sl(sym, sl_for_order, live_final_tp, side=side, live_pos=final_pos)
-        time.sleep(0.35)
-        final_pos = _autotrade_find_live_position(sym, side=side) or final_pos
-        sl_live = float(_pos_stop(final_pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0) if final_pos else 0.0
-        sl_ok = bool(sl_for_order > 0 and ((sl_live > 0 and _price_close_enough(sl_live, sl_for_order, rel_tol=0.0020)) or _bybit_has_open_sl_order_at(sym, sl_for_order, side=side)))
-
-        try:
-            _autotrade_cancel_reduce_only_tp_orders(sym, side=side, keep_stop_price=sl_for_order)
-        except Exception:
-            pass
-        tp_order_res = _autotrade_place_reduce_only_tp_order_slice(sym, side, 1, live_final_tp, qty_for_db)
-        tp_conf_ok, tp_missing = _autotrade_confirm_tp_targets_present(sym, side, [live_final_tp], wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 3.0), step_sec=AUTOTRADE_TP_CONFIRM_STEP_SEC)
-        tp_ok = bool(tp_conf_ok or _bybit_has_open_tp_order_at(sym, live_final_tp, side=side) or _bybit_sum_open_exit_qty_at(sym, live_final_tp, side=side, kind='tp') >= max(0.0, qty_for_db * 0.90))
+        # Authoritative exit policy: native Full-position TP/SL only.
+        # Do NOT create standalone reduce-only Conditional TP orders.
+        full_tpsl_res = _autotrade_attach_position_full_tpsl_and_cleanup(
+            sym,
+            side,
+            float(sl_for_order or 0.0),
+            float(live_final_tp or 0.0),
+            live_pos=final_pos,
+        )
+        sl_ok = bool(((full_tpsl_res.get('confirm_after_cleanup') or full_tpsl_res.get('confirm') or {}).get('sl_ok')))
+        tp_ok = bool(((full_tpsl_res.get('confirm_after_cleanup') or full_tpsl_res.get('confirm') or {}).get('tp_ok')))
 
         repair_res = {}
         if not (sl_ok and tp_ok):
             repair_res = _autotrade_repair_live_exit_protection(int(uid), trade_row_live, live_pos=final_pos)
-            time.sleep(0.30)
-            final_pos = _autotrade_find_live_position(sym, side=side) or final_pos
-            sl_live = float(_pos_stop(final_pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0) if final_pos else 0.0
-            sl_ok = bool(sl_for_order > 0 and ((sl_live > 0 and _price_close_enough(sl_live, sl_for_order, rel_tol=0.0020)) or _bybit_has_open_sl_order_at(sym, sl_for_order, side=side)))
-            tp_ok = bool(_bybit_has_open_tp_order_at(sym, live_final_tp, side=side) or _bybit_sum_open_exit_qty_at(sym, live_final_tp, side=side, kind='tp') >= max(0.0, qty_for_db * 0.90))
+            sl_ok = bool((repair_res.get('confirm_after_cleanup') or repair_res.get('attach_res', {}).get('confirm_after_cleanup') or repair_res.get('attach_res', {}).get('confirm') or {}).get('sl_ok') or repair_res.get('sl_fixed'))
+            tp_ok = bool((repair_res.get('confirm_after_cleanup') or repair_res.get('attach_res', {}).get('confirm_after_cleanup') or repair_res.get('attach_res', {}).get('confirm') or {}).get('tp_ok') or repair_res.get('tp_fixed'))
 
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
             'trade_id': str(trade_id),
-            'sl_apply_res': sl_res,
-            'tp_order_res': tp_order_res,
-            'tp_confirm_missing': list(tp_missing or []),
+            'exit_attach_res': full_tpsl_res,
             'repair_res': repair_res,
             'sl_stack_ok': bool(sl_ok),
             'tp_stack_ok': bool(tp_ok),
+            'exit_policy': 'position_full_tpsl_only_no_conditional_orders',
         })
 
         suffix = ' corrected_for_post_fill_risk' if corrected else ''
@@ -9133,24 +9312,13 @@ def _live_trade_runtime_busy(window_sec: int | None = None) -> bool:
 
 
 def _ohlcv_timeframe_cooling(*timeframes: str) -> bool:
-    """Return True when Bybit OHLCV is in a short circuit-breaker cooldown.
+    """Compatibility shim: no global OHLCV circuit breaker.
 
-    A few 10006/rate-limit responses usually mean the account/IP is temporarily
-    throttled, not that a single symbol is bad.  Keep stale/cache usable, but stop
-    new cold OHLCV pulls briefly so /screen, email setup generation, Big-Move and
-    AutoTrade do not hammer Bybit immediately after deploy or during overlapping jobs.
+    Rate limits are now isolated per symbol+timeframe in fetch_ohlcv(). Returning False
+    here prevents one Bybit 10006 on a single coin from freezing the whole executable
+    pipeline, /screen, email, and Big-Move engine.
     """
-    try:
-        now_ts = float(time.time())
-        if float(globals().get('_OHLCV_GLOBAL_COOL_UNTIL', 0.0) or 0.0) > now_ts:
-            return True
-        tfs = [str(x or '').lower().strip() for x in (timeframes or []) if str(x or '').strip()]
-        if not tfs:
-            return False
-        tf_map = globals().get('_OHLCV_TF_RATE_LIMIT_UNTIL', {}) or {}
-        return any(float(tf_map.get(tf, 0.0) or 0.0) > now_ts for tf in tfs)
-    except Exception:
-        return False
+    return False
 
 def _admin_status_cached_text(name: str, fresh_ttl: float | None = None, stale_ttl: float | None = None) -> tuple[str | None, bool]:
     fresh = _admin_status_cache_get(name, ttl=(fresh_ttl if fresh_ttl is not None else HEAVY_ADMIN_CACHE_TTL_SEC))
@@ -18492,7 +18660,6 @@ _OHLCV_TF_RATE_LIMIT_UNTIL: Dict[str, float] = {}
 # Legacy placeholders kept for compatibility only. Live fetching now uses per-symbol cooldowns.
 _OHLCV_GLOBAL_COOL_UNTIL = 0.0
 _OHLCV_RATE_LIMIT_WARN_UNTIL: Dict[str, float] = {}
-_OHLCV_RATE_LIMIT_RECENT: list[float] = []
 _OHLCV_LAST_KEY: Dict[str, str] = {}
 _OHLCV_INFLIGHT: Dict[str, threading.Event] = {}
 _OHLCV_INFLIGHT_LOCK = threading.Lock()
@@ -18501,14 +18668,14 @@ _OHLCV_PAGED_CACHE_LOCK = threading.Lock()
 OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MIN_SEC = float(os.getenv("OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MIN_SEC", "60") or 60)
 OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MAX_SEC = float(os.getenv("OHLCV_SYMBOL_RATE_LIMIT_COOLDOWN_MAX_SEC", "120") or 120)
 OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC = float(os.getenv("OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC", "90") or 90)
-OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "300") or 300)
+OHLCV_WARN_SUPPRESS_SEC = float(os.getenv("OHLCV_WARN_SUPPRESS_SEC", "120") or 120)
 OHLCV_INFLIGHT_WAIT_SEC = float(os.getenv("OHLCV_INFLIGHT_WAIT_SEC", "1.5") or 1.5)
 OHLCV_PAGED_CACHE_TTL_SEC = float(os.getenv("OHLCV_PAGED_CACHE_TTL_SEC", "120") or 120)
 # Cold-start / cold-cache protection. Keep very short so Render restarts can rebuild quickly.
 PROCESS_START_TS = float(time.time())
-OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "90") or 90)
-OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "45") or 45)
-OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.20") or 0.20)
+OHLCV_BOOT_GRACE_SEC = float(os.getenv("OHLCV_BOOT_GRACE_SEC", "0") or 0)
+OHLCV_COLD_FETCH_BURST_PER_MIN = int(os.getenv("OHLCV_COLD_FETCH_BURST_PER_MIN", "180") or 180)
+OHLCV_COLD_FETCH_MIN_INTERVAL_SEC = float(os.getenv("OHLCV_COLD_FETCH_MIN_INTERVAL_SEC", "0.05") or 0.05)
 _OHLCV_RATE_LIMIT_HITS_TOTAL = 0
 _OHLCV_STALE_USAGE_TOTAL = 0
 _SCAN_TF_PHASE = 0
@@ -18799,13 +18966,13 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
     Singleton + TTL cached OHLCV fetch with production-safe API load controls.
 
     Current live rules:
-    - hard cap candle requests to MAX_OHLCV_LIMIT (default 35)
+    - hard cap candle requests to MAX_OHLCV_LIMIT (default 50)
     - no global cooldown; rate limits cool only the affected symbol+timeframe
     - cooldown duration is bounded to 60–120s
     - non-active timeframe phases prefer cache/stale data to stagger 15m/1h/4h refreshes
     - stale cache is always preferred over hammering Bybit
     """
-    global _OHLCV_RATE_LIMIT_HITS_TOTAL, _OHLCV_STALE_USAGE_TOTAL, _OHLCV_GLOBAL_COOL_UNTIL
+    global _OHLCV_RATE_LIMIT_HITS_TOTAL, _OHLCV_STALE_USAGE_TOTAL
     try:
         req_limit = int(limit or MAX_OHLCV_LIMIT)
     except Exception:
@@ -18903,32 +19070,13 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
             jitter = float(abs(hash(symtf_key)) % int(max(1, cd_max - cd_min + 1)))
             cd = min(cd_max, cd_min + jitter)
             _OHLCV_RATE_LIMIT_UNTIL[symtf_key] = now_ts + cd
-            # Timeframe-level backoff: one 10006 usually means new cold pulls for
-            # this candle stream should pause briefly, not keep trying the next 20 symbols.
-            tf_cd = min(max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 90.0), cd), 180.0)
-            try:
-                _OHLCV_TF_RATE_LIMIT_UNTIL[str(tf_key)] = max(float(_OHLCV_TF_RATE_LIMIT_UNTIL.get(str(tf_key), 0.0) or 0.0), now_ts + tf_cd)
-            except Exception:
-                pass
-            # Escalate to a short global OHLCV breaker if several symbols hit Bybit limits
-            # in the same burst. This is especially important after Render redeploy.
-            try:
-                _OHLCV_RATE_LIMIT_RECENT.append(now_ts)
-                cutoff = now_ts - 45.0
-                del _OHLCV_RATE_LIMIT_RECENT[:max(0, len(_OHLCV_RATE_LIMIT_RECENT) - 50)]
-                recent_hits = [x for x in _OHLCV_RATE_LIMIT_RECENT if float(x or 0.0) >= cutoff]
-                _OHLCV_RATE_LIMIT_RECENT[:] = recent_hits
-                if len(recent_hits) >= 3:
-                    _OHLCV_GLOBAL_COOL_UNTIL = max(float(_OHLCV_GLOBAL_COOL_UNTIL or 0.0), now_ts + min(max(float(OHLCV_GLOBAL_RATE_LIMIT_COOLDOWN_SEC or 90.0), cd), 180.0))
-            except Exception:
-                pass
-            warn_key = f'{tf_key}:rate_limit'
+            warn_key = f'{symtf_key}:rate_limit'
             if float(_OHLCV_RATE_LIMIT_WARN_UNTIL.get(warn_key) or 0.0) <= now_ts:
-                _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(60.0, float(OHLCV_WARN_SUPPRESS_SEC or 300.0))
+                _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(10.0, float(OHLCV_WARN_SUPPRESS_SEC or 120.0))
                 try:
                     logger.info(
-                        'fetch_ohlcv rate-limited for %s %s x%s; pausing cold OHLCV pulls for this timeframe ~%ss and using stale cache',
-                        symbol_u, tf_key, req_limit, int(tf_cd),
+                        'fetch_ohlcv rate-limited for %s %s x%s; symbol cooling %ss and using stale cache if available',
+                        symbol_u, tf_key, req_limit, int(cd),
                     )
                 except Exception:
                     pass
@@ -31828,11 +31976,11 @@ KNOWN_COMMANDS = sorted(set([
     "health", "health_sys",
 
     # AutoTrade (admin)
-    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
+    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_fix_exits", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
-    "setup_audit_overall", "email_decision", "adaptive_status",
+    "signal_report", "signal_report_overall", "email_decision", "adaptive_status",
     "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
@@ -32370,12 +32518,14 @@ ADMIN_HELP_DESCRIPTIONS = {
     "lessons_learned": "Cached latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
-    "setup_audit": "Admin-only setup audit table for the selected window: setup ID, conf, volume, family/reason, moves and price-based TP/SL result",
+    "setup_audit": "Admin-only setup quality audit: setup id, buy/short, symbol, volume, family/engine, result, and generated reason",
     "setup_quality": "Alias of /setup_audit",
-    "setup_audit_overall": "Overall setup-family audit: generated count, TP/SL/open, WR, PnL/R and session/family usefulness",
+    "signal_report": "Recent emailed setup outcomes",
+    "signal_report_overall": "Overall emailed-signal outcome summary (WR, R, session split)",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
+    "autotrade_fix_exits": "Force native Full TP/SL on all live AutoTrade positions and cancel legacy Conditional exit orders",
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
@@ -32417,10 +32567,10 @@ ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("⚖️ RISK / DAY RESET", ["dailycap", "dailycapAT", "dayrisk_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
+    ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SETUP AUDIT / FAMILY REPORTS", ["setup_audit", "setup_audit_overall"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
+    ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
 ]
@@ -36559,7 +36709,9 @@ def _autotrade_live_position_status(uid: int, live_pos: dict, trade_row: dict | 
             lifecycle_row = {}
 
     visible_tp_targets = _autotrade_visible_tp_targets(sym, side, open_orders=open_orders)
-    current_sl = float(_pos_stop(live_pos) or _bybit_detect_open_sl_price(sym, side=side) or 0.0)
+    # Status reports must reflect native position-level TP/SL only. Standalone
+    # Conditional rows are intentionally not counted as valid AutoTrade protection.
+    current_sl = float(_pos_native_stop_loss(live_pos) or 0.0)
     current_qty = abs(float(_pos_size(live_pos) or 0.0))
     entry_live = float(_pos_entry(live_pos) or trade_row.get('entry') or 0.0)
     pnl = float(_pos_unreal_pnl(live_pos) or 0.0)
@@ -36573,8 +36725,9 @@ def _autotrade_live_position_status(uid: int, live_pos: dict, trade_row: dict | 
 
     tp_hit = bool(float((lifecycle_row or {}).get('tp_hit_ts') or 0.0) > 0.0 or float((lifecycle_row or {}).get('alt_target_a_hit_ts') or 0.0) > 0.0)
     sl_hit = bool(float((lifecycle_row or {}).get('sl_hit_ts') or 0.0) > 0.0)
-    tp_order_live = bool(expected_tp > 0 and ((float(_pos_take_profit(live_pos) or 0.0) > 0 and _price_close_enough(float(_pos_take_profit(live_pos) or 0.0), expected_tp, rel_tol=0.0020)) or _bybit_has_open_tp_order_at(sym, expected_tp, side=side)))
-    sl_order_live = bool(current_sl > 0 or (expected_sl > 0 and _bybit_has_open_sl_order_at(sym, expected_sl, side=side)))
+    native_tp_live = float(_pos_native_take_profit(live_pos) or 0.0)
+    tp_order_live = bool(expected_tp > 0 and native_tp_live > 0 and _price_close_enough(native_tp_live, expected_tp, rel_tol=0.0020))
+    sl_order_live = bool(expected_sl > 0 and current_sl > 0 and _price_close_enough(current_sl, expected_sl, rel_tol=0.0020))
 
     missing_sl = bool(expected_sl > 0 and not sl_order_live and not sl_hit)
     missing_tp = bool(expected_tp > 0 and not tp_hit and not tp_order_live)
@@ -43374,9 +43527,9 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
     except Exception:
         budget = 10.0
     try:
-        max_items = int(os.getenv('AUTOTRADE_GUARDIAN_MAX_ITEMS', '3') or 3)
+        max_items = int(os.getenv('AUTOTRADE_GUARDIAN_MAX_ITEMS', '10') or 10)
     except Exception:
-        max_items = 3
+        max_items = 10
 
     def _budget_left() -> bool:
         try:
@@ -43385,6 +43538,15 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
             return False
 
     try:
+        # First remove legacy standalone Conditional exit rows left by older builds.
+        # This also clears orphan pf_tp/pf_cond orders for symbols that no longer have a position.
+        try:
+            cancelled_orphans = _autotrade_cancel_all_legacy_conditional_exit_orders(max_cancel=50)
+            if int(cancelled_orphans or 0) > 0:
+                repaired.append({'checked': True, 'placement': 'legacy_conditional_cleanup', 'legacy_conditional_cancelled': int(cancelled_orphans or 0)})
+        except Exception:
+            pass
+
         live_positions = list(_bybit_get_open_positions_linear() or [])
         journal_open = list(_autotrade_db_open_trades(int(uid)) or [])
         if not live_positions or not journal_open:
@@ -43428,10 +43590,21 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
                 break
             try:
                 rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
-                if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp_order_fixed', 'be_applied')):
+                if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp_order_fixed', 'be_applied', 'legacy_conditional_cancelled')):
                     repaired.append(rr)
             except Exception:
                 continue
+
+        # Final account-level cleanup for old bot-created Conditional TP rows,
+        # including orphan rows left behind after a position closed. Native TP/SL
+        # rows are not cancelled by this helper.
+        if _budget_left():
+            try:
+                cancelled = _autotrade_cancel_all_legacy_conditional_exit_orders(max_items=80)
+                if cancelled:
+                    repaired.append({'checked': True, 'placement': 'cleanup_only', 'legacy_conditional_cancelled': int(cancelled)})
+            except Exception:
+                pass
     except Exception:
         return repaired
     return repaired
@@ -43491,6 +43664,46 @@ async def autotrade_exit_guardian_job(context: ContextTypes.DEFAULT_TYPE):
         _hb_touch('autotrade_guardian', ok=False, error=f"{type(e).__name__}: {e}", details='guardian_error')
         logger.exception('autotrade_exit_guardian_job crashed: %s', e)
 
+
+
+
+async def autotrade_fix_exits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force-clean AutoTrade exits: native Full TP/SL only, no legacy Conditional orders."""
+    try:
+        uid = int(update.effective_user.id)
+        if not is_admin_user(uid):
+            await update.message.reply_text("⛔ Admin only.")
+            return
+        owner = int(AUTOTRADE_OWNER_UID or uid or 0)
+        if owner <= 0:
+            await update.message.reply_text("❌ AUTOTRADE_OWNER_UID is not configured.")
+            return
+        if str(_autotrade_runtime_mode()).lower() != 'live':
+            await update.message.reply_text("ℹ️ AutoTrade is not in live mode; no Bybit exit cleanup required.")
+            return
+        await update.message.reply_text("🔧 Fixing live exits now: Full TP/SL only, cancelling legacy Conditional exit orders...")
+        try:
+            repaired = await to_thread_autotrade(_autotrade_monitor_live_exit_protection, owner, timeout=max(20, int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 15) + 10))
+        except asyncio.TimeoutError:
+            await update.message.reply_text("⚠️ Exit cleanup timed out. The guardian will continue cleaning on the next cycle.")
+            return
+        repaired = list(repaired or [])
+        cancelled = sum(int((r or {}).get('legacy_conditional_cancelled') or 0) for r in repaired if isinstance(r, dict))
+        fixed = sum(1 for r in repaired if isinstance(r, dict) and (bool(r.get('sl_fixed')) or bool(r.get('tp_fixed')) or bool(r.get('ok'))))
+        lines = [
+            "✅ AutoTrade exit cleanup finished",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"Positions checked/fixed: {fixed}",
+            f"Legacy Conditional orders cancelled: {cancelled}",
+            "Policy: native position-level Full TP/SL only",
+            "Expected Bybit view: TP/SL rows, not Conditional rows.",
+        ]
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        try:
+            await update.message.reply_text(f"❌ /autotrade_fix_exits failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
 
 
 
@@ -44072,8 +44285,9 @@ def main():
     app.add_handler(CommandHandler("report_weekly", report_weekly_cmd, block=False))
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
-    # /signal_report removed: replaced by /setup_audit and /setup_audit_overall
-    # /signal_report_overall removed: replaced by /setup_audit_overall
+    app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
+    app.add_handler(CommandHandler("signbal_report", signal_report_cmd, block=False))
+    app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
@@ -44093,7 +44307,6 @@ def main():
     app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
-    app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
 
     app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
@@ -44121,6 +44334,7 @@ def main():
     app.add_handler(CommandHandler("trade_lifecycle", trade_lifecycle_cmd, block=False))
     app.add_handler(CommandHandler("trade_lifecycle_detail", trade_lifecycle_detail_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_fix_exits", autotrade_fix_exits_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
@@ -44166,7 +44380,7 @@ def main():
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
-            first=max(240, min(360, interval_sec)),
+            first=max(120, min(240, interval_sec // 2)),
             name="alert_job",
             job_kwargs={
                 "max_instances": 1,
@@ -44178,7 +44392,7 @@ def main():
         app.job_queue.run_repeating(
             screen_cache_warmup_job,
             interval=int(SCREEN_CACHE_WARMUP_INTERVAL_SEC),
-            first=max(180, min(300, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
+            first=max(20, min(60, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
             name="screen_cache_warmup_job",
             job_kwargs={
                 "max_instances": 1,
@@ -44191,7 +44405,7 @@ def main():
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
             interval=max(int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 150), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 45),
-            first=180,
+            first=90,
             name="autotrade_exit_guardian_job",
             job_kwargs={
                 "max_instances": 1,
@@ -44204,7 +44418,7 @@ def main():
         app.job_queue.run_repeating(
             autotrade_job,
             interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 10),
-            first=180,
+            first=120,
             name="autotrade_job",
             job_kwargs={
                 "max_instances": 1,
@@ -44988,728 +45202,6 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 # ==========================================================
 # END SIGNAL QUALITY GATE ENGINE
 # ==========================================================
-
-
-# =========================================================
-# FINAL PATCH — SETUP AUDIT / AUTOTRADE REPORT REWORK
-# - /setup_audit = unlimited 24h table, price-based and independent from Bybit positions
-# - /setup_audit_overall = family/session performance summary from all generated setups
-# - /autotrade_report = unlimited table for open + closed exchange/journal positions
-# - /signal_report and /signal_report_overall are intentionally removed from handlers/help
-# =========================================================
-
-PF_SETUP_AUDIT_MAX_SYNC_FETCH_ROWS = int(os.environ.get("PF_SETUP_AUDIT_MAX_SYNC_FETCH_ROWS", "80") or 80)
-PF_SETUP_AUDIT_OVERALL_RECENT_FETCH_HOURS = int(os.environ.get("PF_SETUP_AUDIT_OVERALL_RECENT_FETCH_HOURS", "48") or 48)
-PF_SETUP_AUDIT_REPORT_CACHE_TTL_SEC = int(os.environ.get("PF_SETUP_AUDIT_REPORT_CACHE_TTL_SEC", "20") or 20)
-PF_AUTOTRADE_REPORT_MAX_ROWS = int(os.environ.get("PF_AUTOTRADE_REPORT_MAX_ROWS", "10000") or 10000)
-
-
-def _pf_table(rows: list[list], headers: list[str]) -> str:
-    try:
-        if not rows:
-            return "(none)"
-        return tabulate(rows, headers=headers, tablefmt="simple", stralign="left", numalign="right")
-    except Exception:
-        try:
-            all_rows = [headers] + rows
-            widths = [max(len(str(r[i])) if i < len(r) else 0 for r in all_rows) for i in range(len(headers))]
-            out = []
-            out.append(" | ".join(str(headers[i]).ljust(widths[i]) for i in range(len(headers))))
-            out.append("-+-".join("-" * widths[i] for i in range(len(headers))))
-            for r in rows:
-                out.append(" | ".join(str(r[i] if i < len(r) else "").ljust(widths[i]) for i in range(len(headers))))
-            return "\n".join(out)
-        except Exception:
-            return "\n".join([" | ".join(map(str, headers))] + [" | ".join(map(str, r)) for r in rows])
-
-
-def _pf_short_symbol(symbol: str) -> str:
-    try:
-        s = str(symbol or '').upper().replace('/USDT:USDT', '').replace('/USDT', '').replace(':USDT', '')
-        if s.endswith('USDT'):
-            s = s[:-4]
-        return s or '-'
-    except Exception:
-        return str(symbol or '-') or '-'
-
-
-def _pf_pct(v) -> str:
-    try:
-        return f"{float(v or 0.0):+.0f}%"
-    except Exception:
-        return "+0%"
-
-
-def _pf_usd(v) -> str:
-    try:
-        return f"{float(v or 0.0):+.2f}"
-    except Exception:
-        return "0.00"
-
-
-def _pf_num(v, digits: int = 2) -> str:
-    try:
-        return f"{float(v or 0.0):.{int(digits)}f}"
-    except Exception:
-        return "0.00"
-
-
-def _pf_table_exists(cur, table: str) -> bool:
-    try:
-        return cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (str(table),)).fetchone() is not None
-    except Exception:
-        return False
-
-
-def _pf_table_cols(cur, table: str) -> set[str]:
-    try:
-        return {str(r[1]) for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
-    except Exception:
-        return set()
-
-
-def _pf_col_expr(cols: set[str], name: str, default_sql: str = "NULL", alias: str | None = None) -> str:
-    alias = alias or name
-    if name in cols:
-        return f"{name} AS {alias}"
-    return f"{default_sql} AS {alias}"
-
-
-def _pf_setup_rows(uid: int, hours: int | None = 24, all_history: bool = False) -> list[dict]:
-    """All generated/executable setup rows for the owner/admin audit lane.
-
-    This deliberately reads setup databases only. It does not require any Bybit
-    position to exist, so /setup_audit stays independent from AutoTrade.
-    """
-    uid = int(uid or 0)
-    cutoff = 0.0 if all_history or hours is None else float(time.time()) - float(max(1, int(hours))) * 3600.0
-    rows: list[dict] = []
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            if _pf_table_exists(cur, 'executable_setups'):
-                cols = _pf_table_cols(cur, 'executable_setups')
-                where = "WHERE user_id=?"
-                params: list = [uid]
-                if cutoff > 0:
-                    where += " AND COALESCE(executable_ts, signal_created_ts, 0)>=?"
-                    params.append(float(cutoff))
-                select = [
-                    _pf_col_expr(cols, 'executable_ts', '0', 'ts'),
-                    _pf_col_expr(cols, 'signal_created_ts', '0', 'signal_created_ts'),
-                    "'EXEC' AS source",
-                    _pf_col_expr(cols, 'session', "''", 'session'),
-                    _pf_col_expr(cols, 'setup_id', "''", 'setup_id'),
-                    _pf_col_expr(cols, 'symbol', "''", 'symbol'),
-                    _pf_col_expr(cols, 'market_symbol', "''", 'market_symbol'),
-                    _pf_col_expr(cols, 'side', "''", 'side'),
-                    _pf_col_expr(cols, 'conf', '0', 'conf'),
-                    _pf_col_expr(cols, 'fut_vol_usd', '0', 'fut_vol_usd'),
-                    _pf_col_expr(cols, 'ch24', '0', 'ch24'),
-                    _pf_col_expr(cols, 'ch4', '0', 'ch4'),
-                    _pf_col_expr(cols, 'ch1', '0', 'ch1'),
-                    _pf_col_expr(cols, 'ch15', '0', 'ch15'),
-                    _pf_col_expr(cols, 'engine', "''", 'engine'),
-                    _pf_col_expr(cols, 'details_json', "''", 'details_json'),
-                    _pf_col_expr(cols, 'quality_score', '0', 'quality_score'),
-                    _pf_col_expr(cols, 'family_id', "''", 'family_id'),
-                    _pf_col_expr(cols, 'entry', '0', 'entry'),
-                    _pf_col_expr(cols, 'sl', '0', 'sl'),
-                    _pf_col_expr(cols, 'tp', '0', 'tp'),
-                    _pf_col_expr(cols, 'alt_target_a', '0', 'alt_target_a'),
-                    _pf_col_expr(cols, 'alt_target_b', '0', 'alt_target_b'),
-                    _pf_col_expr(cols, 'entry_reason', "''", 'entry_reason'),
-                ]
-                q = f"SELECT {', '.join(select)} FROM executable_setups {where} ORDER BY COALESCE(executable_ts, signal_created_ts, 0) DESC"
-                rows.extend([dict(r) for r in (cur.execute(q, tuple(params)).fetchall() or [])])
-            if _pf_table_exists(cur, 'generated_setups'):
-                cols = _pf_table_cols(cur, 'generated_setups')
-                where = "WHERE user_id=?"
-                params = [uid]
-                if cutoff > 0:
-                    where += " AND COALESCE(created_ts, 0)>=?"
-                    params.append(float(cutoff))
-                select = [
-                    _pf_col_expr(cols, 'created_ts', '0', 'ts'),
-                    "0 AS signal_created_ts",
-                    ("UPPER(COALESCE(source,'')) AS source" if 'source' in cols else "'' AS source"),
-                    _pf_col_expr(cols, 'session', "''", 'session'),
-                    _pf_col_expr(cols, 'setup_id', "''", 'setup_id'),
-                    _pf_col_expr(cols, 'symbol', "''", 'symbol'),
-                    _pf_col_expr(cols, 'market_symbol', "''", 'market_symbol'),
-                    _pf_col_expr(cols, 'side', "''", 'side'),
-                    _pf_col_expr(cols, 'conf', '0', 'conf'),
-                    _pf_col_expr(cols, 'fut_vol_usd', '0', 'fut_vol_usd'),
-                    _pf_col_expr(cols, 'ch24', '0', 'ch24'),
-                    _pf_col_expr(cols, 'ch4', '0', 'ch4'),
-                    _pf_col_expr(cols, 'ch1', '0', 'ch1'),
-                    _pf_col_expr(cols, 'ch15', '0', 'ch15'),
-                    _pf_col_expr(cols, 'engine', "''", 'engine'),
-                    "'' AS details_json",
-                    _pf_col_expr(cols, 'quality_score', '0', 'quality_score'),
-                    _pf_col_expr(cols, 'family_id', "''", 'family_id'),
-                    _pf_col_expr(cols, 'entry', '0', 'entry'),
-                    _pf_col_expr(cols, 'sl', '0', 'sl'),
-                    _pf_col_expr(cols, 'tp', '0', 'tp'),
-                    _pf_col_expr(cols, 'alt_target_a', '0', 'alt_target_a'),
-                    _pf_col_expr(cols, 'alt_target_b', '0', 'alt_target_b'),
-                    _pf_col_expr(cols, 'entry_reason', "''", 'entry_reason'),
-                ]
-                q = f"SELECT {', '.join(select)} FROM generated_setups {where} ORDER BY COALESCE(created_ts, 0) DESC"
-                rows.extend([dict(r) for r in (cur.execute(q, tuple(params)).fetchall() or [])])
-    except Exception:
-        rows = list(rows or [])
-
-    dedup: dict[str, dict] = {}
-    for r in sorted(rows, key=lambda x: float(x.get('ts') or x.get('signal_created_ts') or 0.0), reverse=True):
-        try:
-            sid = str(r.get('setup_id') or '').strip()
-            if not sid:
-                sid = _setup_identity_key(r.get('symbol'), r.get('side'), r.get('entry'), r.get('sl'), r.get('tp'), r.get('engine'))
-            if not sid or sid in dedup:
-                continue
-            if not _setup_volume_ok(float(r.get('fut_vol_usd') or 0.0)):
-                continue
-            dedup[sid] = dict(r)
-        except Exception:
-            continue
-    return list(dedup.values())
-
-
-def _pf_setup_meta_by_setup_id(setup_id: str) -> dict:
-    sid = str(setup_id or '').strip()
-    if not sid:
-        return {}
-    try:
-        payload = _signal_setup_eval_payload(sid) or {}
-        if payload:
-            return dict(payload)
-    except Exception:
-        pass
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            for table, ts_col in (('executable_setups', 'executable_ts'), ('generated_setups', 'created_ts')):
-                if not _pf_table_exists(cur, table):
-                    continue
-                cols = _pf_table_cols(cur, table)
-                if 'setup_id' not in cols:
-                    continue
-                select_cols = ', '.join([c for c in cols if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', c)])
-                order_col = ts_col if ts_col in cols else ('created_ts' if 'created_ts' in cols else 'rowid')
-                row = cur.execute(f"SELECT {select_cols} FROM {table} WHERE setup_id=? ORDER BY {order_col} DESC LIMIT 1", (sid,)).fetchone()
-                if row:
-                    return dict(row)
-    except Exception:
-        return {}
-    return {}
-
-
-def _pf_setup_family_reason(row: dict, trade: dict | None = None) -> tuple[str, str]:
-    data = dict(row or {})
-    if trade:
-        for k in ('family_id', 'engine', 'session'):
-            if not data.get(k) and (trade or {}).get(k):
-                data[k] = (trade or {}).get(k)
-    try:
-        fam = _setup_audit_family_from_row(data) or '-'
-    except Exception:
-        fam = str(data.get('family_id') or data.get('engine') or '-')
-    try:
-        reason = _setup_audit_reason_from_row(data) or ''
-    except Exception:
-        reason = ''
-    if not reason:
-        engine = str(data.get('engine') or (trade or {}).get('engine') or '').upper().strip()
-        sess = str(data.get('session') or (trade or {}).get('session') or '').upper().strip()
-        reason = ' / '.join([x for x in (fam, f'Engine {engine}' if engine else '', sess) if x and x != '-']) or '-'
-    return str(fam or '-'), str(reason or '-')
-
-
-def _pf_setup_ohlcv_result(row: dict, horizon_hours: int = 24, allow_network: bool = True) -> tuple[str, float | None]:
-    """Price-path TP/SL resolver for setup audit. Returns TP, SL or OPEN.
-
-    This is independent from AutoTrade/Bybit positions. It evaluates the setup's
-    own entry/SL/TP against market candles after the setup timestamp.
-    """
-    try:
-        sid = str((row or {}).get('setup_id') or '').strip()
-        # Prefer persisted price-outcome if a background evaluator has already decided it.
-        try:
-            if sid:
-                out0 = db_get_outcome(sid) or {}
-                oc0 = str((out0 or {}).get('outcome') or '').upper().strip()
-                hts = float((out0 or {}).get('hit_ts') or 0.0) if (out0 or {}).get('hit_ts') is not None else None
-                if oc0 in {'TP', 'WIN', 'WIN_TP', 'TP1', 'TP2', 'TP3'}:
-                    return 'TP', hts
-                if oc0 in {'SL', 'LOSS', 'LOSE'}:
-                    return 'SL', hts
-        except Exception:
-            pass
-        side = str((row or {}).get('side') or '').upper().strip()
-        symbol_raw = str((row or {}).get('symbol') or '').upper().strip()
-        base = symbol_raw[:-4] if symbol_raw.endswith('USDT') else symbol_raw
-        market_symbol = str((row or {}).get('market_symbol') or '').strip() or _market_symbol_from_base(base)
-        entry = float((row or {}).get('entry') or 0.0)
-        sl = float((row or {}).get('sl') or 0.0)
-        tp = float(_resolve_single_tp(entry, sl, (row or {}).get('tp'), (row or {}).get('alt_target_a'), (row or {}).get('alt_target_b'), side) or 0.0)
-        created_ts = float((row or {}).get('signal_created_ts') or (row or {}).get('ts') or (row or {}).get('created_ts') or 0.0)
-        if side not in {'BUY', 'SELL'} or not market_symbol or entry <= 0 or sl <= 0 or tp <= 0:
-            return 'OPEN', None
-        now_ts = float(time.time())
-        horizon_end = min(now_ts, created_ts + float(max(1, int(horizon_hours or 24))) * 3600.0) if created_ts > 0 else now_ts
-        since_ms = int(max(0.0, (created_ts or (now_ts - float(horizon_hours or 24) * 3600.0)) - 900.0) * 1000)
-        until_ms = int((horizon_end + 60.0) * 1000)
-        tf = '5m' if int(horizon_hours or 24) <= 72 else '15m'
-        limit = max(120, min(1000, int((horizon_end - (since_ms / 1000.0)) / (300 if tf == '5m' else 900)) + 20))
-        candles = []
-        try:
-            candles = _ohlcv_best_effort_cached(market_symbol, tf, limit) or []
-            candles = [c for c in candles if int(c[0]) >= since_ms and int(c[0]) <= until_ms]
-        except Exception:
-            candles = []
-        if allow_network and not candles:
-            try:
-                candles = fetch_ohlcv_paged(market_symbol, tf, since_ms=since_ms, until_ms=until_ms, limit=min(1000, max(200, limit))) or []
-            except Exception:
-                candles = []
-        candles = sorted(candles or [], key=lambda c: int(c[0]))
-        for c in candles:
-            try:
-                ts_sec = float(c[0]) / 1000.0
-                hi = float(c[2]); lo = float(c[3])
-                if side == 'BUY':
-                    hit_tp = hi >= tp
-                    hit_sl = lo <= sl
-                else:
-                    hit_tp = lo <= tp
-                    hit_sl = hi >= sl
-                if hit_tp and hit_sl:
-                    # Same candle ambiguity: do not invent a result.
-                    return 'OPEN', None
-                if hit_tp:
-                    try:
-                        if sid:
-                            db_upsert_outcome(sid, 'TP', 'TP', ts_sec, int(horizon_hours or 24), note='setup_audit_price_path')
-                    except Exception:
-                        pass
-                    return 'TP', ts_sec
-                if hit_sl:
-                    try:
-                        if sid:
-                            db_upsert_outcome(sid, 'SL', 'SL', ts_sec, int(horizon_hours or 24), note='setup_audit_price_path')
-                    except Exception:
-                        pass
-                    return 'SL', ts_sec
-            except Exception:
-                continue
-        px = _setup_audit_current_price_for_row(row)
-        if px > 0:
-            if side == 'BUY':
-                if px >= tp:
-                    return 'TP', now_ts
-                if px <= sl:
-                    return 'SL', now_ts
-            else:
-                if px <= tp:
-                    return 'TP', now_ts
-                if px >= sl:
-                    return 'SL', now_ts
-        return 'OPEN', None
-    except Exception:
-        return 'OPEN', None
-
-
-def _setup_audit_price_result_from_row(row: dict, horizon_hours: int = 24) -> str:
-    # Backward-compatible return values expected by older helpers.
-    res, _ts = _pf_setup_ohlcv_result(row, horizon_hours=horizon_hours, allow_network=True)
-    if res == 'TP':
-        return 'WIN'
-    if res == 'SL':
-        return 'LOSE'
-    return 'OPEN'
-
-
-def _pf_setup_result_label(row: dict, horizon_hours: int = 24, allow_network: bool = True) -> str:
-    res, _ts = _pf_setup_ohlcv_result(row, horizon_hours=horizon_hours, allow_network=allow_network)
-    return res if res in {'TP', 'SL'} else 'OPEN'
-
-
-def _pf_setup_rr(row: dict) -> float:
-    try:
-        side = str((row or {}).get('side') or '').upper().strip()
-        entry = float((row or {}).get('entry') or 0.0)
-        sl = float((row or {}).get('sl') or 0.0)
-        tp = float(_resolve_single_tp(entry, sl, (row or {}).get('tp'), (row or {}).get('alt_target_a'), (row or {}).get('alt_target_b'), side) or 0.0)
-        risk = abs(entry - sl)
-        return abs(tp - entry) / risk if risk > 0 and tp > 0 else 0.0
-    except Exception:
-        return 0.0
-
-
-def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
-    # New semantics: /setup_audit [hours], no display limit. Old /setup_audit 20 24 remains accepted.
-    uid = int(uid or 0)
-    hours = max(1, min(720, int(hours or 24)))
-    cache_key = f"setup_audit_table:{uid}:{hours}"
-    try:
-        if cache_valid(cache_key, PF_SETUP_AUDIT_REPORT_CACHE_TTL_SEC):
-            val = cache_get(cache_key)
-            if isinstance(val, str) and val.strip():
-                return val
-    except Exception:
-        pass
-    rows = _pf_setup_rows(uid, hours=hours, all_history=False)
-    if not rows:
-        return f"🧪 Setup Audit\n{HDR}\nNo setups above ${_setup_min_volume_floor_usd()/1e6:.0f}M volume in the last {hours}h."
-    table_rows = []
-    fetch_budget = int(PF_SETUP_AUDIT_MAX_SYNC_FETCH_ROWS)
-    for r in rows:
-        try:
-            allow_fetch = fetch_budget > 0
-            result = _pf_setup_result_label(r, horizon_hours=hours, allow_network=allow_fetch)
-            if allow_fetch:
-                fetch_budget -= 1
-            fam, reason = _pf_setup_family_reason(r)
-            setup_id = str(r.get('setup_id') or '-')
-            side = str(r.get('side') or '-').upper()
-            sym = _pf_short_symbol(r.get('symbol'))
-            vol_m = float(r.get('fut_vol_usd') or 0.0) / 1e6
-            moves = f"24h {_pf_pct(r.get('ch24'))}, 4h {_pf_pct(r.get('ch4'))}, 1h {_pf_pct(r.get('ch1'))}, 15m {_pf_pct(r.get('ch15'))}"
-            table_rows.append([
-                setup_id,
-                f"{side} {sym}",
-                int(float(r.get('conf') or 0.0)),
-                f"{vol_m:.1f}M",
-                str(fam or '-')[:22],
-                str(reason or '-')[:46],
-                moves,
-                result,
-            ])
-        except Exception:
-            continue
-    lines = [
-        "🧪 Setup Audit — price-based",
-        HDR,
-        f"Window: last {hours}h | Rows: {len(table_rows)} | Min vol: ${_setup_min_volume_floor_usd()/1e6:.0f}M",
-        "Result source: actual market price path after setup time, independent from AutoTrade/Bybit positions.",
-        "",
-        _pf_table(table_rows, ["Setup ID", "Type", "Conf", "Vol", "Family", "Enter reason", "Moves", "Result"]),
-    ]
-    out = "\n".join(lines)
-    try:
-        cache_set(cache_key, out)
-    except Exception:
-        pass
-    return out
-
-
-async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = int(update.effective_user.id)
-    if not is_admin_user(uid):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    hours = 24
-    # Back-compatible parsing: /setup_audit 48 => 48h; /setup_audit 20 24 => old style means 24h.
-    try:
-        args = list(context.args or [])
-        if len(args) >= 2 and str(args[1]).replace('.', '', 1).isdigit():
-            hours = int(float(args[1]))
-        elif len(args) >= 1 and str(args[0]).replace('.', '', 1).isdigit():
-            hours = int(float(args[0]))
-    except Exception:
-        hours = 24
-    try:
-        text = await to_thread_heavy(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), 0, int(hours), timeout=45)
-    except asyncio.TimeoutError:
-        text = "⚠️ /setup_audit is still resolving price outcomes. Try again shortly."
-    except Exception as e:
-        text = f"❌ setup_audit failed: {type(e).__name__}: {e}"
-    await send_long_message(update, text, parse_mode=None, disable_web_page_preview=True)
-
-
-def _pf_autotrade_pnl_by_setup_id(uid: int) -> dict[str, float]:
-    out: dict[str, float] = defaultdict(float)
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            if not _pf_table_exists(cur, 'autotrade_trades'):
-                return {}
-            for r in cur.execute("SELECT setup_id, pnl_usdt FROM autotrade_trades WHERE uid=? AND COALESCE(setup_id,'')<>'' AND UPPER(COALESCE(status,''))='CLOSED'", (int(uid),)).fetchall() or []:
-                out[str(r['setup_id'])] += float(r['pnl_usdt'] or 0.0)
-    except Exception:
-        pass
-    return dict(out)
-
-
-def _setup_audit_overall_text(uid: int) -> str:
-    uid = int(uid or 0)
-    cache_key = f"setup_audit_overall:{uid}"
-    try:
-        if cache_valid(cache_key, PF_SETUP_AUDIT_REPORT_CACHE_TTL_SEC):
-            val = cache_get(cache_key)
-            if isinstance(val, str) and val.strip():
-                return val
-    except Exception:
-        pass
-    rows = _pf_setup_rows(uid, hours=None, all_history=True)
-    if not rows:
-        return f"📊 Setup Audit Overall\n{HDR}\nNo generated setup rows found yet."
-    pnl_by_sid = _pf_autotrade_pnl_by_setup_id(uid)
-    by_family: dict[str, dict] = {}
-    by_session: Counter = Counter()
-    recent_cutoff = float(time.time()) - float(PF_SETUP_AUDIT_OVERALL_RECENT_FETCH_HOURS) * 3600.0
-    for r in rows:
-        try:
-            fam, reason = _pf_setup_family_reason(r)
-            fam = fam or '-'
-            d = by_family.setdefault(fam, {'family': fam, 'setups': 0, 'tp': 0, 'sl': 0, 'open': 0, 'pnl': 0.0, 'r': 0.0, 'conf_sum': 0.0, 'vol_sum': 0.0, 'sessions': Counter(), 'reasons': Counter()})
-            d['setups'] += 1
-            d['conf_sum'] += float(r.get('conf') or 0.0)
-            d['vol_sum'] += float(r.get('fut_vol_usd') or 0.0)
-            sess = str(r.get('session') or '-').upper().strip() or '-'
-            d['sessions'][sess] += 1
-            by_session[sess] += 1
-            if reason:
-                d['reasons'][str(reason)[:32]] += 1
-            sid = str(r.get('setup_id') or '').strip()
-            allow_fetch = float(r.get('ts') or r.get('signal_created_ts') or 0.0) >= recent_cutoff
-            res = _pf_setup_result_label(r, horizon_hours=720, allow_network=allow_fetch)
-            if res == 'TP':
-                d['tp'] += 1
-                d['r'] += max(0.0, _pf_setup_rr(r)) or 1.0
-            elif res == 'SL':
-                d['sl'] += 1
-                d['r'] -= 1.0
-            else:
-                d['open'] += 1
-            d['pnl'] += float(pnl_by_sid.get(sid, 0.0) or 0.0)
-        except Exception:
-            continue
-    table_rows = []
-    for fam, d in sorted(by_family.items(), key=lambda kv: (float(kv[1].get('r') or 0.0), int(kv[1].get('setups') or 0)), reverse=True):
-        setups = int(d.get('setups') or 0)
-        decided = int(d.get('tp') or 0) + int(d.get('sl') or 0)
-        wr = (int(d.get('tp') or 0) / decided * 100.0) if decided > 0 else 0.0
-        avg_conf = float(d.get('conf_sum') or 0.0) / setups if setups else 0.0
-        avg_vol = float(d.get('vol_sum') or 0.0) / setups / 1e6 if setups else 0.0
-        top_sess = ','.join([f"{s}:{n}" for s, n in (d.get('sessions') or Counter()).most_common(3)])
-        top_reason = (d.get('reasons') or Counter()).most_common(1)
-        table_rows.append([
-            fam[:24], setups, int(d.get('tp') or 0), int(d.get('sl') or 0), int(d.get('open') or 0),
-            f"{wr:.1f}%", f"{float(d.get('pnl') or 0.0):+.2f}", f"{float(d.get('r') or 0.0):+.2f}",
-            f"{avg_conf:.0f}", f"{avg_vol:.1f}M", top_sess or '-', (top_reason[0][0] if top_reason else '-')[:34]
-        ])
-    session_rows = [[s, n] for s, n in by_session.most_common()]
-    lines = [
-        "📊 Setup Audit Overall — family performance",
-        HDR,
-        f"Total generated setup rows: {len(rows)} | Min vol: ${_setup_min_volume_floor_usd()/1e6:.0f}M",
-        "TP/SL/Open are price-path outcomes from setup entry/SL/TP. PnL is actual AutoTrade PnL where a setup was traded; Total R is theoretical setup quality score.",
-        "",
-        _pf_table(table_rows, ["Family", "Setups", "TP", "SL", "Open", "WR", "PnL USDT", "Total R", "AvgConf", "AvgVol", "Sessions", "Top reason"]),
-        "",
-        "Session setup count",
-        _pf_table(session_rows, ["Session", "Setups"]),
-    ]
-    out = "\n".join(lines)
-    try:
-        cache_set(cache_key, out)
-    except Exception:
-        pass
-    return out
-
-
-async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = int(update.effective_user.id)
-    if not is_admin_user(uid):
-        await update.message.reply_text("⛔ Admin only.")
-        return
-    try:
-        text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=75)
-    except asyncio.TimeoutError:
-        text = "⚠️ /setup_audit_overall is still rebuilding. Try again shortly."
-    except Exception as e:
-        text = f"❌ /setup_audit_overall failed: {type(e).__name__}: {e}"
-    await send_long_message(update, text, parse_mode=None, disable_web_page_preview=True)
-
-
-def _pf_autotrade_result_label(row: dict, is_open: bool = False) -> str:
-    if is_open:
-        return 'OPEN'
-    try:
-        txt = (str(row.get('result_path') or '') + ' ' + str(row.get('result_label') or '') + ' ' + str(row.get('close_reason') or '') + ' ' + str(row.get('outcome') or '')).upper()
-        if 'TP' in txt or 'TAKE' in txt or 'WIN' in txt:
-            return 'TP'
-        if 'SL' in txt or 'STOP' in txt or 'LOSS' in txt or 'LOSE' in txt:
-            return 'SL'
-        pnl = row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl')
-        if pnl is not None:
-            return 'TP' if float(pnl or 0.0) > 0 else 'SL'
-    except Exception:
-        pass
-    return 'UNKNOWN'
-
-
-def _pf_trade_reason(row: dict) -> str:
-    try:
-        sid = str((row or {}).get('setup_id') or '').strip()
-        meta = _pf_setup_meta_by_setup_id(sid) if sid else {}
-        fam, reason = _pf_setup_family_reason(meta or row, trade=row)
-        engine = str((row or {}).get('engine') or (meta or {}).get('engine') or '').upper().strip()
-        sess = str((row or {}).get('session') or (meta or {}).get('session') or '').upper().strip()
-        parts = []
-        if fam and fam != '-':
-            parts.append(fam)
-        if engine:
-            parts.append(f"E{engine}" if len(engine) == 1 else engine)
-        if sess:
-            parts.append(sess)
-        if reason and reason not in parts:
-            parts.append(reason)
-        return ' / '.join(parts)[:48] if parts else '-'
-    except Exception:
-        return '-'
-
-
-def _pf_dedupe_closed_rows(rows: list[dict]) -> list[dict]:
-    out = []
-    seen = set()
-    for r in rows or []:
-        try:
-            sid = str((r or {}).get('setup_id') or '').strip()
-            tid = str((r or {}).get('trade_id') or '').strip()
-            sym = str(_bybit_linear_symbol((r or {}).get('symbol') or '')).upper()
-            side = str((r or {}).get('side') or '').upper().strip()
-            cts = int(float((r or {}).get('closed_ts') or 0.0) // 60)
-            pnl = round(float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0), 2)
-            if sid:
-                key = ('sid', sid, cts)
-            elif tid and not tid.startswith(('exchange::', 'report::', 'prov::')):
-                key = ('tid', tid)
-            else:
-                key = ('event', sym, side, cts, pnl)
-            if key in seen:
-                continue
-            seen.add(key)
-            # Suppress duplicate near-zero exchange fragments when the same symbol/side/minute already exists.
-            if abs(pnl) < 0.05:
-                alt_key = ('frag', sym, side, cts)
-                if alt_key in seen:
-                    continue
-                seen.add(alt_key)
-            out.append(dict(r or {}))
-        except Exception:
-            continue
-    return out
-
-
-def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
-    owner_uid = int(owner_uid)
-    lookback_h = int(clamp(int(lookback_h or 24), 1, 720))
-    cache_key = f"autotrade_report_text_v2:{owner_uid}:{lookback_h}"
-    try:
-        if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
-            cached = cache_get(cache_key)
-            if isinstance(cached, str) and cached.strip():
-                return cached
-    except Exception:
-        pass
-    _autotrade_migrate_tables()
-    now_ts = float(time.time())
-    start_ts = now_ts - float(lookback_h) * 3600.0
-    table_rows = []
-    total_open = 0.0
-    total_closed = 0.0
-
-    # OPEN live positions from Bybit, matched/adopted to bot journal where possible.
-    try:
-        open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
-        bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(owner_uid, positions=open_positions, fallback_unmatched_as_owned=True)
-    except Exception:
-        bot_positions, external_positions = [], []
-    for p, tr in (bot_positions or []):
-        try:
-            pnl = float(_pos_unreal_pnl(p) or 0.0)
-            total_open += pnl
-            sid = str((tr or {}).get('setup_id') or '-') or '-'
-            table_rows.append([
-                'OPEN',
-                _pf_short_symbol(_pos_symbol(p)),
-                str(_pos_side_text(p) or (tr or {}).get('side') or '-').upper(),
-                sid,
-                'OPEN',
-                _pf_trade_reason(tr or {}),
-                f"{pnl:+.2f}",
-            ])
-        except Exception:
-            continue
-
-    # CLOSED positions from journal/exchange reconstruction, no display cap.
-    try:
-        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=max(1000, int(PF_AUTOTRADE_REPORT_MAX_ROWS))) or []
-    except Exception:
-        closed_rows = []
-    closed_rows = _pf_dedupe_closed_rows(closed_rows)
-    for row in closed_rows:
-        try:
-            pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
-            total_closed += pnl
-            sid = str(row.get('setup_id') or '-') or '-'
-            table_rows.append([
-                'CLOSED',
-                _pf_short_symbol(row.get('symbol')),
-                str(row.get('side') or '-').upper(),
-                sid,
-                _pf_autotrade_result_label(row, is_open=False),
-                _pf_trade_reason(row),
-                f"{pnl:+.2f}",
-            ])
-        except Exception:
-            continue
-
-    lines = [
-        "📒 AutoTrade Report — table",
-        HDR,
-        f"Window: last {lookback_h}h (Melbourne) | Rows: {len(table_rows)}",
-        "Source: live Bybit open positions + AutoTrade/exchange closed journal.",
-        "",
-        _pf_table(table_rows, ["Status", "Symbol", "Type", "Setup ID", "Result", "Entrance reason", "PnL"]),
-        "",
-        f"Open PnL: {total_open:+.2f} USDT",
-        f"Closed PnL: {total_closed:+.2f} USDT",
-        f"Total PnL: {(total_open + total_closed):+.2f} USDT",
-    ]
-    if external_positions:
-        lines.append(f"Ignored manual/external live positions: {len(external_positions)}")
-    out = "\n".join(lines)
-    try:
-        cache_set(cache_key, out)
-        # Keep legacy cache key too so timeout fallback still has the new table format.
-        cache_set(f"autotrade_report_text:{owner_uid}:{lookback_h}", out)
-    except Exception:
-        pass
-    return out
-
-
-# Help/admin globals patched after overriding commands.
-try:
-    ADMIN_HELP_DESCRIPTIONS.pop('signal_report', None)
-    ADMIN_HELP_DESCRIPTIONS.pop('signal_report_overall', None)
-    ADMIN_HELP_DESCRIPTIONS['setup_audit_overall'] = 'Overall setup-family audit: generated count, TP/SL/open, WR, PnL/R, sessions and reason summary'
-    ADMIN_HELP_GROUPS = [(title, [c for c in cmds if c not in {'signal_report', 'signal_report_overall'}]) for title, cmds in ADMIN_HELP_GROUPS]
-    if not any('setup_audit_overall' in cmds for _title, cmds in ADMIN_HELP_GROUPS):
-        ADMIN_HELP_GROUPS.append(("📊 SETUP AUDIT / FAMILY REPORTS", ['setup_audit', 'setup_audit_overall']))
-    HELP_TEXT_ADMIN = build_help_text_admin()
-    try:
-        KNOWN_COMMANDS = sorted(set([c for c in KNOWN_COMMANDS if c not in {'signal_report', 'signal_report_overall'}] + ['setup_audit_overall']))
-    except Exception:
-        pass
-except Exception:
-    pass
 
 if __name__ == "__main__":
     main()
