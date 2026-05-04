@@ -31980,7 +31980,7 @@ KNOWN_COMMANDS = sorted(set([
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
-    "signal_report", "signal_report_overall", "email_decision", "adaptive_status",
+    "setup_audit_overall", "email_decision", "adaptive_status",
     "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
@@ -32520,8 +32520,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
     "setup_audit": "Admin-only setup quality audit: setup id, buy/short, symbol, volume, family/engine, result, and generated reason",
     "setup_quality": "Alias of /setup_audit",
-    "signal_report": "Recent emailed setup outcomes",
-    "signal_report_overall": "Overall emailed-signal outcome summary (WR, R, session split)",
+    "setup_audit_overall": "Overall family-level setup audit summary across all generated setups",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
@@ -32567,9 +32566,9 @@ ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
     ("⚖️ RISK / DAY RESET", ["dailycap", "dailycapAT", "dayrisk_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
-    ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit"]),
+    ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SIGNALS / REPORTS", ["signal_report", "signal_report_overall"]),
+    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
@@ -35683,67 +35682,6 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             break
     return setups
 
-async def signal_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/signal_report [hours] — canonical 2-TP summary for recently emailed setups."""
-    uid = update.effective_user.id
-    user = get_user(uid) or {}
-    lookback_h = 24
-    try:
-        if context.args and str(context.args[0]).strip():
-            lookback_h = int(float(context.args[0]))
-    except Exception:
-        lookback_h = 24
-    lookback_h = int(clamp(lookback_h, 1, 168))
-    ts_from = float(time.time() - lookback_h * 3600.0)
-    emailed = db_list_emailed_setups(uid, ts_from)
-    if not emailed:
-        await update.message.reply_text(f"No emailed setups found in the last {lookback_h}h.")
-        return
-
-    def _eval_all():
-        for _e in (emailed or []):
-            try:
-                sid = str((_e or {}).get('setup_id') or '').strip()
-                if sid:
-                    _signal_outcome_sync_for_setup(int(uid), sid, force=True)
-            except Exception:
-                continue
-        return _signal_report_resolve_rows(int(uid), emailed, user=user)
-
-    rows, hidden_untracked_open = await to_thread_heavy(_eval_all, timeout=120)
-    stats = _canonical_wr_stats(rows)
-    counts = stats.get('counts') or Counter()
-    life_uid = int(AUTOTRADE_OWNER_UID or uid) if is_admin_user(uid) else int(uid)
-    try:
-        lifecycle_recent = await to_thread_heavy(_trade_lifecycle_recent_analytics, life_uid, lookback_h, 'ALL', False, timeout=120)
-    except Exception:
-        lifecycle_recent = {}
-    header = [
-        f"📊 Signal Report (last {lookback_h}h)",
-        HDR,
-        f"Total: {len(rows)} | Decided: {int(stats.get('decided') or 0)} | TP wins: {int(stats.get('wins') or 0)} | Losses: {int(stats.get('losses') or 0)} | Win rate: {float(stats.get('win_rate') or 0.0):.1f}%",
-        f"TP: {int(counts.get('TP',0))} | SL: {int(counts.get('SL',0))} | Open: {int(counts.get('OPEN',0))} | None: {int(counts.get('None',0))}",
-        HDR,
-    ]
-    life_lines = _trade_lifecycle_analytics_lines(lifecycle_recent, heading=f"Exchange-backed lifecycle ({lookback_h}h)", include_sessions=True, include_engines=True, include_buckets=False, include_symbols=True, include_signs=True, max_signs=2)
-    table_rows = [[r['session'], r['time'], r['trade'], r['confidence'], _display_signal_outcome(r.get('outcome'))] for r in rows]
-    table = tabulate(table_rows, headers=['Session','Time','Trade','Confidence','Outcome'], tablefmt='plain', colalign=('left','left','left','right','left'))
-    sess_lines = ['Session breakdown:']
-    for sname, c in sorted((stats.get('by_session') or {}).items(), key=lambda kv: kv[0]):
-        sess_lines.append(f"• {sname}: total {int(c.get('total') or 0)} | decided {int(c.get('decided') or 0)} | WR {float(c.get('win_rate') or 0.0):.1f}% | TP {int(c.get('tp') or 0)} SL {int(c.get('sl') or 0)} OPEN {int(c.get('open') or 0)} None {int(c.get('untracked') or 0)}")
-    if int(hidden_untracked_open or 0) > 0:
-        sess_lines.append(f"• Hidden untracked rows: {int(hidden_untracked_open)} (no current live Bybit/autotrade match)")
-    body_text = '\n'.join(header + life_lines + sess_lines)
-    msg = html.escape(body_text) + "\n<pre>" + html.escape(table) + "</pre>"
-    await send_long_message(update, msg, parse_mode=ParseMode.HTML)
-
-
-
-
-
-
-
-
 def _setup_audit_family_from_row(row: dict) -> str:
     """Return a readable family/engine name for setup audit."""
     try:
@@ -35945,36 +35883,351 @@ def _setup_audit_result_from_cached_price_moves(row: dict, horizon_hours: int = 
         return 'OPEN'
 
 
+
+
+def _setup_audit_migrate() -> None:
+    """Persistent setup-audit result store.
+
+    This is separate from autotrade_trades on purpose: /setup_audit is a price-path
+    audit of every generated setup, whether or not Bybit ever opened a position.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS setup_audit_results (
+                setup_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL DEFAULT 0,
+                created_ts REAL NOT NULL DEFAULT 0,
+                evaluated_ts REAL NOT NULL DEFAULT 0,
+                horizon_hours INTEGER NOT NULL DEFAULT 24,
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                session TEXT NOT NULL DEFAULT '',
+                family TEXT NOT NULL DEFAULT '',
+                engine TEXT NOT NULL DEFAULT '',
+                conf INTEGER NOT NULL DEFAULT 0,
+                fut_vol_usd REAL NOT NULL DEFAULT 0,
+                entry REAL NOT NULL DEFAULT 0,
+                sl REAL NOT NULL DEFAULT 0,
+                tp REAL NOT NULL DEFAULT 0,
+                ch24 REAL NOT NULL DEFAULT 0,
+                ch4 REAL NOT NULL DEFAULT 0,
+                ch1 REAL NOT NULL DEFAULT 0,
+                ch15 REAL NOT NULL DEFAULT 0,
+                result TEXT NOT NULL DEFAULT 'OPEN',
+                hit_level TEXT NOT NULL DEFAULT '',
+                hit_ts REAL,
+                net_r REAL NOT NULL DEFAULT 0,
+                actual_pnl_usdt REAL NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT '',
+                entry_reason TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_setup_audit_results_user_created ON setup_audit_results(user_id, created_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_setup_audit_results_family ON setup_audit_results(family, result)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _setup_audit_short_text(value, max_len: int = 44) -> str:
+    try:
+        txt = str(value or '').replace('\n', ' ').replace('\r', ' ').strip()
+        txt = re.sub(r'\s+', ' ', txt)
+        if len(txt) <= int(max_len):
+            return txt
+        return txt[:max(1, int(max_len) - 1)] + '…'
+    except Exception:
+        return ''
+
+
+def _setup_audit_result_label(value: str) -> str:
+    v = str(value or '').upper().strip()
+    if v in {'TP', 'WIN', 'WIN_TP', 'HIT_TP_WIN'}:
+        return 'TP'
+    if v in {'SL', 'LOSS', 'LOSE', 'HIT_SL_LOSS'}:
+        return 'SL'
+    return 'OPEN'
+
+
+def _setup_audit_net_r_for_result(row: dict, result: str) -> float:
+    try:
+        side = str((row or {}).get('side') or '').upper().strip()
+        entry = float((row or {}).get('entry') or 0.0)
+        sl = float((row or {}).get('sl') or 0.0)
+        tp = float((row or {}).get('tp') or 0.0)
+        if tp <= 0:
+            tp = float(_resolve_single_tp(entry, sl, (row or {}).get('tp'), (row or {}).get('alt_target_a'), (row or {}).get('alt_target_b'), side) or 0.0)
+        risk = abs(entry - sl)
+        if entry <= 0 or sl <= 0 or tp <= 0 or risk <= 0:
+            return 0.0
+        res = _setup_audit_result_label(result)
+        if res == 'SL':
+            return -1.0
+        if res == 'TP':
+            reward = (tp - entry) if side == 'BUY' else (entry - tp)
+            return float(reward / risk) if reward > 0 else 0.0
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def _setup_audit_find_row_by_setup_id(setup_id: str) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            try:
+                row = cur.execute("""
+                    SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
+                           fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
+                           COALESCE(family_id, '') AS family_id, entry, sl, tp, alt_target_a, alt_target_b
+                    FROM executable_setups
+                    WHERE setup_id=?
+                    ORDER BY executable_ts DESC
+                    LIMIT 1
+                """, (sid,)).fetchone()
+                if row:
+                    return dict(row)
+            except Exception:
+                pass
+            try:
+                cols = {r[1] for r in cur.execute('PRAGMA table_info(generated_setups)').fetchall()}
+                market_expr = 'market_symbol' if 'market_symbol' in cols else "'' AS market_symbol"
+                reason_expr = 'entry_reason' if 'entry_reason' in cols else "'' AS entry_reason"
+                alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
+                alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
+                row = cur.execute(f"""
+                    SELECT created_ts AS ts, 0 AS signal_created_ts, UPPER(source) AS source, session, setup_id, symbol, {market_expr}, side, conf,
+                           fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
+                           COALESCE(family_id, '') AS family_id, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
+                    FROM generated_setups
+                    WHERE setup_id=?
+                    ORDER BY created_ts DESC
+                    LIMIT 1
+                """, (sid,)).fetchone()
+                if row:
+                    return dict(row)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return {}
+
+
+def _setup_audit_merge_trade_setup_row(trade_row: dict | None) -> dict:
+    row = dict(trade_row or {})
+    sid = str(row.get('setup_id') or '').strip()
+    if sid:
+        setup_row = _setup_audit_find_row_by_setup_id(sid)
+        if setup_row:
+            merged = dict(setup_row)
+            # Keep real trade fields where they are more authoritative for report display.
+            for k, v in row.items():
+                if k in {'trade_id', 'uid', 'opened_ts', 'closed_ts', 'pnl_usdt', 'pnl', 'status', 'qty', 'note'}:
+                    merged[k] = v
+                elif not str(merged.get(k) or '').strip():
+                    merged[k] = v
+            return merged
+    return row
+
+
+def _setup_audit_payload_from_row(row: dict) -> dict:
+    out = dict(row or {})
+    try:
+        out['setup_id'] = str(out.get('setup_id') or '').strip()
+        out['symbol'] = _bybit_linear_symbol(str(out.get('symbol') or ''))
+        out['market_symbol'] = str(out.get('market_symbol') or '').strip() or _market_symbol_from_base(out.get('symbol'))
+        out['side'] = _norm_trade_side(str(out.get('side') or ''))
+        created = float(out.get('first_seen_ts') or out.get('signal_created_ts') or out.get('created_ts') or out.get('ts') or out.get('opened_ts') or 0.0)
+        out['created_ts'] = float(created or 0.0)
+        out['entry'] = float(out.get('entry') or 0.0)
+        out['sl'] = float(out.get('sl') or 0.0)
+        out['tp'] = float(_resolve_single_tp(out['entry'], out['sl'], out.get('tp'), out.get('alt_target_a'), out.get('alt_target_b'), out.get('side')) or 0.0)
+        out['alt_target_a'] = 0.0
+        out['alt_target_b'] = 0.0
+    except Exception:
+        pass
+    return out
+
+
+def _setup_audit_cached_result(setup_id: str, horizon_hours: int, allow_open_fresh_sec: int = 240) -> dict:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return {}
+    try:
+        _setup_audit_migrate()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute("SELECT * FROM setup_audit_results WHERE setup_id=? LIMIT 1", (sid,)).fetchone()
+            if not row:
+                return {}
+            d = dict(row)
+            result = _setup_audit_result_label(d.get('result'))
+            if result in {'TP', 'SL'}:
+                return d
+            # OPEN can change while the horizon is still alive; reuse only a very recent OPEN.
+            age = float(time.time()) - float(d.get('evaluated_ts') or 0.0)
+            if int(d.get('horizon_hours') or 0) == int(horizon_hours) and age <= max(30, int(allow_open_fresh_sec)):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _setup_audit_upsert_result(user_id: int, row: dict, result_payload: dict, horizon_hours: int, actual_pnl_usdt: float = 0.0) -> None:
+    try:
+        _setup_audit_migrate()
+        rr = dict(row or {})
+        sid = str(rr.get('setup_id') or '').strip()
+        if not sid:
+            return
+        result = _setup_audit_result_label((result_payload or {}).get('result') or (result_payload or {}).get('outcome'))
+        hit_level = str((result_payload or {}).get('hit_level') or (result if result in {'TP', 'SL'} else '')).upper().strip()
+        hit_ts = (result_payload or {}).get('hit_ts')
+        try:
+            hit_ts_v = float(hit_ts) if hit_ts is not None else None
+        except Exception:
+            hit_ts_v = None
+        side = str(rr.get('side') or '').upper().strip()
+        entry = float(rr.get('entry') or 0.0)
+        sl = float(rr.get('sl') or 0.0)
+        tp = float(rr.get('tp') or 0.0)
+        if tp <= 0:
+            tp = float(_resolve_single_tp(entry, sl, rr.get('tp'), rr.get('alt_target_a'), rr.get('alt_target_b'), side) or 0.0)
+        fam = _setup_audit_family_from_row(rr)
+        reason = _setup_audit_reason_from_row(rr)
+        created_ts = float(rr.get('first_seen_ts') or rr.get('signal_created_ts') or rr.get('created_ts') or rr.get('ts') or 0.0)
+        net_r = _setup_audit_net_r_for_result({**rr, 'tp': tp}, result)
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""INSERT OR REPLACE INTO setup_audit_results
+                (setup_id, user_id, created_ts, evaluated_ts, horizon_hours, symbol, side, session, family, engine, conf, fut_vol_usd,
+                 entry, sl, tp, ch24, ch4, ch1, ch15, result, hit_level, hit_ts, net_r, actual_pnl_usdt, source, entry_reason, note)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    sid, int(user_id), float(created_ts or 0.0), float(time.time()), int(horizon_hours),
+                    str(_bybit_linear_symbol(rr.get('symbol') or '')).upper(), side, str(rr.get('session') or '').upper().strip(),
+                    str(fam or ''), str(rr.get('engine') or '').upper().strip(), int(float(rr.get('conf') or 0.0)), float(rr.get('fut_vol_usd') or 0.0),
+                    float(entry or 0.0), float(sl or 0.0), float(tp or 0.0), float(rr.get('ch24') or 0.0), float(rr.get('ch4') or 0.0),
+                    float(rr.get('ch1') or 0.0), float(rr.get('ch15') or 0.0), result, hit_level, hit_ts_v, float(net_r or 0.0),
+                    float(actual_pnl_usdt or 0.0), str(rr.get('source') or '').upper().strip(), str(reason or ''), str((result_payload or {}).get('note') or '')[:240],
+                )
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _setup_audit_price_result_payload(row: dict, horizon_hours: int = 24, user_id: int = 0, force: bool = False, actual_pnl_usdt: float = 0.0) -> dict:
+    """Price-path result independent of AutoTrade.
+
+    Uses the setup's entry/SL/TP and historical Bybit candles to decide which level
+    was touched first. It never treats an AutoTrade close as proof unless the same
+    price path independently resolves to TP/SL.
+    """
+    try:
+        row = _setup_audit_payload_from_row(row)
+        sid = str(row.get('setup_id') or '').strip()
+        horizon_hours = int(max(1, min(int(horizon_hours or 24), 8760)))
+        if sid and not force:
+            cached = _setup_audit_cached_result(sid, horizon_hours)
+            if cached:
+                return {'result': _setup_audit_result_label(cached.get('result')), 'hit_level': cached.get('hit_level'), 'hit_ts': cached.get('hit_ts'), 'note': cached.get('note') or 'cached_setup_audit_result'}
+        if not sid or not row.get('market_symbol') or float(row.get('entry') or 0.0) <= 0 or float(row.get('sl') or 0.0) <= 0 or float(row.get('tp') or 0.0) <= 0:
+            res = {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'missing_or_invalid_setup_levels'}
+        else:
+            best = None
+            for tf in ('1m', '5m', '15m'):
+                try:
+                    tmp = evaluate_signal_hit_order(row, horizon_hours=horizon_hours, timeframe=tf)
+                except Exception as exc:
+                    tmp = {'outcome': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'eval_error_{tf}:{type(exc).__name__}'}
+                canon = _setup_audit_result_label((tmp or {}).get('outcome'))
+                if canon in {'TP', 'SL'}:
+                    best = dict(tmp or {})
+                    best['result'] = canon
+                    break
+                if best is None:
+                    best = dict(tmp or {})
+            if not isinstance(best, dict):
+                best = {'outcome': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'no_price_data'}
+            res = {
+                'result': _setup_audit_result_label(best.get('result') or best.get('outcome')),
+                'hit_level': str(best.get('hit_level') or '').upper().strip(),
+                'hit_ts': best.get('hit_ts'),
+                'best_level': best.get('best_level'),
+                'best_ts': best.get('best_ts'),
+                'note': str(best.get('note') or 'price_path_eval'),
+            }
+        try:
+            _setup_audit_upsert_result(int(user_id or 0), row, res, horizon_hours, actual_pnl_usdt=actual_pnl_usdt)
+        except Exception:
+            pass
+        return res
+    except Exception as exc:
+        return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'setup_audit_error:{type(exc).__name__}'}
+
+
 def _setup_audit_price_result_from_row(row: dict, horizon_hours: int = 24) -> str:
     """Backward-compatible wrapper used by /setup_audit."""
-    return _setup_audit_result_from_cached_price_moves(row, horizon_hours=horizon_hours)
+    return _setup_audit_result_label(_setup_audit_price_result_payload(row, horizon_hours=horizon_hours).get('result'))
 
 
-def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
-    """Fast, admin-readable setup audit.
+def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts: float = 0.0) -> dict:
+    out = {}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            q = "SELECT setup_id, SUM(COALESCE(pnl_usdt,0)) AS pnl FROM autotrade_trades WHERE uid=? AND setup_id IS NOT NULL AND setup_id<>'' AND closed_ts IS NOT NULL"
+            params = [int(user_id)]
+            if float(start_ts or 0.0) > 0:
+                q += " AND closed_ts>=?"
+                params.append(float(start_ts))
+            if float(end_ts or 0.0) > 0:
+                q += " AND closed_ts<?"
+                params.append(float(end_ts))
+            q += " GROUP BY setup_id"
+            for r in cur.execute(q, tuple(params)).fetchall() or []:
+                out[str(r['setup_id'] or '').strip()] = float(r['pnl'] or 0.0)
+    except Exception:
+        pass
+    return out
 
-    Output is HTML formatted for Telegram. It intentionally avoids live OHLCV
-    calls so the command stays instant and does not compete with production
-    scanning/email/autotrade jobs.
-    """
-    limit = max(1, min(30, int(limit or 15)))
-    hours = max(1, min(168, int(hours or 24)))
-    cutoff = float(time.time()) - float(hours) * 3600.0
-    rows = []
+
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0) -> list[dict]:
+    cutoff = 0.0
+    if hours is not None and int(hours or 0) > 0:
+        cutoff = float(time.time()) - float(int(hours)) * 3600.0
+    rows: list[dict] = []
+    lim_clause = ''
+    params_extra = []
+    if int(limit or 0) > 0:
+        lim_clause = ' LIMIT ?'
+        params_extra = [int(limit) * 6]
     try:
         with sqlite3.connect(DB_PATH) as con:
             con.row_factory = sqlite3.Row
             cur = con.cursor()
             try:
-                cur.execute("""
+                params = [int(uid)]
+                where = "WHERE user_id=?"
+                if cutoff > 0:
+                    where += " AND executable_ts>=?"
+                    params.append(float(cutoff))
+                cur.execute(f"""
                     SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
                            COALESCE(family_id, '') AS family_id, entry, sl, tp, alt_target_a, alt_target_b
                     FROM executable_setups
-                    WHERE user_id=? AND executable_ts>=?
-                    ORDER BY executable_ts DESC
-                    LIMIT ?
-                """, (int(uid), cutoff, int(limit * 4)))
+                    {where}
+                    ORDER BY executable_ts DESC{lim_clause}
+                """, tuple(params + params_extra))
                 rows.extend([dict(r) for r in (cur.fetchall() or [])])
             except Exception:
                 pass
@@ -35984,22 +36237,26 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
                 reason_expr = 'entry_reason' if 'entry_reason' in cols else "'' AS entry_reason"
                 alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
                 alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
+                params = [int(uid)]
+                where = "WHERE user_id=?"
+                if cutoff > 0:
+                    where += " AND created_ts>=?"
+                    params.append(float(cutoff))
                 cur.execute(f"""
                     SELECT created_ts AS ts, 0 AS signal_created_ts, UPPER(source) AS source, session, setup_id, symbol, {market_expr}, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
                            COALESCE(family_id, '') AS family_id, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
                     FROM generated_setups
-                    WHERE user_id=? AND created_ts>=?
-                    ORDER BY created_ts DESC
-                    LIMIT ?
-                """, (int(uid), cutoff, int(limit * 4)))
+                    {where}
+                    ORDER BY created_ts DESC{lim_clause}
+                """, tuple(params + params_extra))
                 rows.extend([dict(r) for r in (cur.fetchall() or [])])
             except Exception:
                 pass
-    except Exception as e:
-        return f"❌ <b>setup_audit error</b>: {html.escape(type(e).__name__)}: {html.escape(str(e))}"
+    except Exception:
+        return []
 
-    dedup = {}
+    dedup: dict[str, dict] = {}
     for r in sorted(rows, key=lambda x: float(x.get('ts') or 0.0), reverse=True):
         sid = str(r.get('setup_id') or '').strip()
         if not sid or sid in dedup:
@@ -36010,131 +36267,84 @@ def _setup_audit_text(uid: int, limit: int = 15, hours: int = 24) -> str:
         except Exception:
             continue
         dedup[sid] = r
+    final = list(dedup.values())
+    if int(limit or 0) > 0:
+        final = final[:int(limit)]
+    return final
 
-    # Preserve a useful origin time for repeated scanner rows. The setup_id can
-    # change every refresh, so the latest DB row time alone is not always the
-    # true first time this opportunity appeared. Use signal_created_ts when it
-    # exists; otherwise group similar symbol/side/entry structures and show the
-    # earliest observed timestamp in the selected window.
-    first_seen = {}
-    try:
-        for _r in rows:
-            try:
-                _sym = str(_r.get('symbol') or '').upper().strip()
-                _side = str(_r.get('side') or '').upper().strip()
-                _fam = _setup_audit_family_from_row(_r)
-                _entry = round(float(_r.get('entry') or 0.0), 6)
-                _sl = round(float(_r.get('sl') or 0.0), 6)
-                _tp = round(float(_r.get('tp') or 0.0), 6)
-                _key = (_sym, _side, _fam, _entry, _sl, _tp)
-                _ts = float(_r.get('signal_created_ts') or _r.get('ts') or 0.0)
-                if _ts > 0 and (_key not in first_seen or _ts < first_seen[_key]):
-                    first_seen[_key] = _ts
-            except Exception:
-                continue
-    except Exception:
-        first_seen = {}
 
-    final = list(dedup.values())[:limit]
-    for _r in final:
-        try:
-            _key = (
-                str(_r.get('symbol') or '').upper().strip(),
-                str(_r.get('side') or '').upper().strip(),
-                _setup_audit_family_from_row(_r),
-                round(float(_r.get('entry') or 0.0), 6),
-                round(float(_r.get('sl') or 0.0), 6),
-                round(float(_r.get('tp') or 0.0), 6),
-            )
-            _sig_ts = float(_r.get('signal_created_ts') or 0.0)
-            _r['first_seen_ts'] = float(_sig_ts or first_seen.get(_key) or _r.get('ts') or 0.0)
-        except Exception:
-            pass
+def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
+    """Table-form setup audit for every generated setup in the selected window.
+
+    Result source is independent price-path evaluation: actual OHLCV after the setup
+    timestamp is checked to see whether TP or SL was touched first.
+    """
+    limit = max(0, int(limit or 0))  # 0 = no artificial row limit
+    hours = max(1, min(8760, int(hours or 24)))
+    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit)
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
-    if not final:
-        return f"🧪 <b>Setup Audit</b>\n{HDR}\nNo recent setups above ${min_vol_m:.0f}M volume in the last {hours}h."
+    if not rows:
+        return f"🧪 <b>Setup Audit</b>\n{HDR}\nNo setups above ${min_vol_m:.0f}M volume in the last {hours}h."
 
-    try:
-        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        now_txt = ''
-
-    def _audit_ts_txt(r: dict) -> str:
-        try:
-            ts = float(r.get('first_seen_ts') or r.get('signal_created_ts') or r.get('ts') or 0.0)
-            if ts > 0:
-                return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
-        except Exception:
-            pass
-        return '-'
-
-    def _audit_last_seen_txt(r: dict) -> str:
-        try:
-            ts = float(r.get('ts') or 0.0)
-            if ts > 0:
-                return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%H:%M')
-        except Exception:
-            pass
-        return '-'
-
-    def _result_badge(result: str) -> str:
-        rr = str(result or '').upper().strip()
-        if rr == 'WIN':
-            return '✅ <b>WIN</b>'
-        if rr in {'LOSE', 'LOSS', 'SL'}:
-            return '❌ <b>LOSE</b>'
-        return '🟡 <b>OPEN</b>'
-
-    def _side_badge(side: str) -> str:
-        return '🟢 <b>BUY</b>' if str(side).upper() == 'BUY' else '🔴 <b>SELL</b>'
-
-    lines = [
-        "🧪 <b>Setup Audit</b>",
-        HDR,
-        f"Window: <b>last {hours}h</b> | Rows: <b>{len(final)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
-        "Result is price-based: TP first = WIN, SL first = LOSE, otherwise OPEN.",
-        HDR,
-    ]
-
-    for i, r in enumerate(final, start=1):
+    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+    table_rows = []
+    tp_n = sl_n = open_n = 0
+    net_r_total = 0.0
+    for i, r in enumerate(rows, 1):
         sid = str(r.get('setup_id') or '').strip()
         side = str(r.get('side') or '').upper().strip()
         sym = str(r.get('symbol') or '').upper().strip()
         if sym.endswith('USDT'):
             sym = sym[:-4]
-        vol_m = float(r.get('fut_vol_usd') or 0.0) / 1e6
         fam = _setup_audit_family_from_row(r)
         reason = _setup_audit_reason_from_row(r)
-        result = _setup_audit_price_result_from_row(r, horizon_hours=hours)
-        conf = int(float(r.get('conf') or 0.0))
-        src = str(r.get('source') or '-').upper().strip()
-        session = str(r.get('session') or '-').upper().strip()
-        entry = float(r.get('entry') or 0.0)
-        sl = float(r.get('sl') or 0.0)
-        tp = float(r.get('tp') or 0.0)
-        if tp <= 0:
-            try:
-                tp = float(_resolve_single_tp(entry, sl, r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)
-            except Exception:
-                tp = 0.0
-        ch24 = float(r.get('ch24') or 0.0)
-        ch4 = float(r.get('ch4') or 0.0)
-        ch1 = float(r.get('ch1') or 0.0)
-        ch15 = float(r.get('ch15') or 0.0)
-
-        lines.extend([
-            f"{i}) <b>{html.escape(sid)}</b>",
-            f"   {_side_badge(side)} <b>{html.escape(sym)}</b> | Conf: <b>{conf}</b> | Result: {_result_badge(result)}",
-            f"   Volume: <b>{vol_m:.1f}M</b> | Family: <b>{html.escape(fam)}</b>",
-            f"   Reason to enter: {html.escape(reason)}",
-            f"   Entry: <code>{fmt_price(entry)}</code> | SL: <code>{fmt_price(sl)}</code> | TP: <code>{fmt_price(tp)}</code>",
-            f"   Moves: 24H {ch24:+.0f}% | 4H {ch4:+.0f}% | 1H {ch1:+.0f}% | 15m {ch15:+.1f}%",
-            f"   Source: {html.escape(src)} / {html.escape(session)} | First seen: {html.escape(_audit_ts_txt(r))} | Last logged: {html.escape(_audit_last_seen_txt(r))}",
+        actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
+        ev = _setup_audit_price_result_payload(r, horizon_hours=hours, user_id=int(uid), force=False, actual_pnl_usdt=actual_pnl)
+        result = _setup_audit_result_label(ev.get('result'))
+        if result == 'TP':
+            tp_n += 1
+        elif result == 'SL':
+            sl_n += 1
+        else:
+            open_n += 1
+        net_r = _setup_audit_net_r_for_result(r, result)
+        net_r_total += float(net_r or 0.0)
+        table_rows.append([
+            i,
+            sid,
+            f"{side} {sym}",
+            int(float(r.get('conf') or 0.0)),
+            f"{float(r.get('fut_vol_usd') or 0.0) / 1e6:.1f}M",
+            _setup_audit_short_text(fam, 22),
+            _setup_audit_short_text(reason, 44),
+            f"{float(r.get('ch24') or 0.0):+.0f}",
+            f"{float(r.get('ch4') or 0.0):+.0f}",
+            f"{float(r.get('ch1') or 0.0):+.0f}",
+            f"{float(r.get('ch15') or 0.0):+.1f}",
+            result,
         ])
-        if i != len(final):
-            lines.append("──────────────────")
 
-    return "\n".join(lines)
+    decided = tp_n + sl_n
+    wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
+    try:
+        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        now_txt = ''
+    header_lines = [
+        "🧪 <b>Setup Audit</b>",
+        HDR,
+        f"Window: <b>last {hours}h</b> | Rows: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
+        f"Price result: <b>TP={tp_n}</b> | <b>SL={sl_n}</b> | <b>OPEN={open_n}</b> | WR: <b>{wr:.1f}%</b> | NetR: <b>{net_r_total:+.2f}</b>",
+        "Result is independent from AutoTrade: actual price path after setup time decides TP/SL/OPEN.",
+    ]
+    table = tabulate(
+        table_rows,
+        headers=['#', 'Setup ID', 'Type/Symbol', 'Conf', 'Vol', 'Family', 'Enter reason', '24h', '4h', '1h', '15m', 'Result'],
+        tablefmt='plain',
+        colalign=('right', 'left', 'left', 'right', 'right', 'left', 'left', 'right', 'right', 'right', 'right', 'left'),
+    )
+    return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
+
 
 
 async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -36142,21 +36352,120 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(uid):
         await update.message.reply_text("⛔ Admin only.")
         return
-    limit = 15
+    limit = 0  # 0 = unlimited rows in the selected window
     hours = 24
     try:
-        if context.args:
-            if str(context.args[0]).isdigit():
-                limit = int(context.args[0])
-            if len(context.args) > 1 and str(context.args[1]).isdigit():
-                hours = int(context.args[1])
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if len(args) == 1:
+            if args[0].lower() in {'all', 'unlimited', 'full'}:
+                limit = 0
+            elif args[0].isdigit():
+                hours = int(args[0])
+        elif len(args) >= 2:
+            limit = 0 if args[0].lower() in {'all', 'unlimited', 'full', '0'} else int(float(args[0]))
+            hours = int(float(args[1]))
     except Exception:
-        pass
+        limit = 0
+        hours = 24
     try:
-        text = await to_thread_fast(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=10)
+        text = await to_thread_heavy(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=90)
     except Exception as e:
-        text = f"❌ setup_audit failed: {type(e).__name__}. Try /setup_audit 8 24."
+        text = f"❌ setup_audit failed: {type(e).__name__}. Try /setup_audit or /setup_audit 24."
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+def _setup_audit_overall_text(uid: int) -> str:
+    """Overall family-level setup audit summary across all stored setup rows."""
+    rows = _setup_audit_load_rows(int(uid), hours=None, limit=0)
+    min_vol_m = _setup_min_volume_floor_usd() / 1e6
+    if not rows:
+        return f"📊 <b>Setup Audit Overall</b>\n{HDR}\nNo setup rows found above ${min_vol_m:.0f}M volume."
+    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid))
+    fam_stats: dict[str, dict] = {}
+    for r in rows:
+        fam = _setup_audit_family_from_row(r) or '-'
+        sid = str(r.get('setup_id') or '').strip()
+        actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
+        ev = _setup_audit_price_result_payload(r, horizon_hours=24, user_id=int(uid), force=False, actual_pnl_usdt=actual_pnl)
+        result = _setup_audit_result_label(ev.get('result'))
+        item = fam_stats.setdefault(fam, {'total': 0, 'tp': 0, 'sl': 0, 'open': 0, 'net_r': 0.0, 'pnl': 0.0, 'conf_sum': 0.0, 'vol_sum': 0.0, 'sessions': Counter()})
+        item['total'] += 1
+        item['tp'] += 1 if result == 'TP' else 0
+        item['sl'] += 1 if result == 'SL' else 0
+        item['open'] += 1 if result == 'OPEN' else 0
+        item['net_r'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
+        item['pnl'] += float(actual_pnl or 0.0)
+        item['conf_sum'] += float(r.get('conf') or 0.0)
+        item['vol_sum'] += float(r.get('fut_vol_usd') or 0.0) / 1e6
+        sess = str(r.get('session') or '-').upper().strip() or '-'
+        item['sessions'][sess] += 1
+
+    table_rows = []
+    total_setups = total_tp = total_sl = total_open = 0
+    total_r = total_pnl = 0.0
+    for fam, st in sorted(fam_stats.items(), key=lambda kv: (float(kv[1].get('net_r') or 0.0), int(kv[1].get('tp') or 0), int(kv[1].get('total') or 0)), reverse=True):
+        total = int(st.get('total') or 0)
+        tp = int(st.get('tp') or 0)
+        sl = int(st.get('sl') or 0)
+        op = int(st.get('open') or 0)
+        decided = tp + sl
+        wr = (tp / decided * 100.0) if decided > 0 else 0.0
+        avg_conf = float(st.get('conf_sum') or 0.0) / total if total else 0.0
+        avg_vol = float(st.get('vol_sum') or 0.0) / total if total else 0.0
+        top_sess = '-'
+        try:
+            if st.get('sessions'):
+                top_sess = st['sessions'].most_common(1)[0][0]
+        except Exception:
+            top_sess = '-'
+        total_setups += total
+        total_tp += tp
+        total_sl += sl
+        total_open += op
+        total_r += float(st.get('net_r') or 0.0)
+        total_pnl += float(st.get('pnl') or 0.0)
+        table_rows.append([
+            _setup_audit_short_text(fam, 28),
+            total,
+            tp,
+            sl,
+            op,
+            f"{wr:.1f}%",
+            f"{float(st.get('net_r') or 0.0):+.2f}",
+            f"{float(st.get('pnl') or 0.0):+.2f}",
+            f"{avg_conf:.0f}",
+            f"{avg_vol:.1f}M",
+            top_sess,
+        ])
+    decided_total = total_tp + total_sl
+    wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
+    header = [
+        "📊 <b>Setup Audit Overall</b>",
+        HDR,
+        f"Families: <b>{len(fam_stats)}</b> | Setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
+        f"Total NetR: <b>{total_r:+.2f}</b> | Total PnL: <b>{total_pnl:+.2f} USDT</b>",
+        "PnL is actual AutoTrade PnL when a setup was traded; NetR is the price-based setup result for every setup.",
+    ]
+    table = tabulate(
+        table_rows,
+        headers=['Family', 'Setups', 'TP', 'SL', 'OPEN', 'WR', 'NetR', 'Total PnL', 'AvgConf', 'AvgVol', 'TopSess'],
+        tablefmt='plain',
+        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'),
+    )
+    return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
+
+
+async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    try:
+        text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=180)
+    except Exception as e:
+        text = f"❌ setup_audit_overall failed: {type(e).__name__}: {e}"
+    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
 
 async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/setups_log [n] [screen|email|all] — view recently generated setups."""
@@ -36349,41 +36658,6 @@ def _signal_report_overall_cached_text(target_uid: int, ttl_sec: int = 900) -> s
     except Exception:
         return None
     return None
-
-async def signal_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/signal_report_overall — overall single-TP summary with live sync and instant cached fallback."""
-    uid = update.effective_user.id
-    target_uid = int(AUTOTRADE_OWNER_UID or uid) if is_admin_user(uid) else int(uid)
-    force = False
-    try:
-        force = bool(context.args and str(context.args[0]).strip().lower() in {'force', 'refresh', 'now'})
-    except Exception:
-        force = False
-    cached = None if force else _signal_report_overall_cached_text(target_uid, ttl_sec=900)
-    if cached:
-        await send_long_message(update, cached + "\n\n⏳ Refreshing the latest outcomes in the background…", parse_mode=None)
-        try:
-            _safe_create_task(to_thread_bg(_signal_report_overall_text_build, target_uid, True, timeout=300), 'signal_report_overall_refresh')
-        except Exception:
-            pass
-        return
-    try:
-        text_out = await to_thread_heavy(_signal_report_overall_text_build, target_uid, True, timeout=90)
-    except asyncio.TimeoutError:
-        stale = _signal_report_overall_cached_text(target_uid, ttl_sec=86400)
-        if stale:
-            await send_long_message(update, stale + "\n\n⏳ Heavy outcome sync is still running; showing the latest cached snapshot.", parse_mode=None)
-            try:
-                _safe_create_task(to_thread_bg(_signal_report_overall_text_build, target_uid, True, timeout=300), 'signal_report_overall_refresh')
-            except Exception:
-                pass
-            return
-        await update.message.reply_text('⚠️ /signal_report_overall sync is still running. Try again shortly.')
-        return
-    except Exception as e:
-        await update.message.reply_text(f"❌ /signal_report_overall failed: {type(e).__name__}: {e}")
-        return
-    await send_long_message(update, str(text_out or ''), parse_mode=None)
 
 def _autotrade_checkbox(flag: bool) -> str:
     return '✅' if bool(flag) else '—'
@@ -36846,7 +37120,11 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
     owner_uid = int(owner_uid)
     start_ts = float(start_ts or 0.0)
     end_ts = float(end_ts or 0.0)
-    limit = int(max(1, min(int(limit or 80), 200)))
+    limit = int(limit or 0)
+    if limit <= 0:
+        limit = 100000
+    else:
+        limit = int(max(1, min(int(limit), 100000)))
 
     try:
         sync_days = max(14, int(math.ceil(float(lookback_h or 24) / 24.0)) + 5)
@@ -37079,7 +37357,8 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
             continue
 
     out.sort(key=lambda r: float((r or {}).get('closed_ts') or 0.0), reverse=True)
-    return out[:limit]
+    return out if int(limit or 0) >= 100000 else out[:limit]
+
 
 def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     owner_uid = int(owner_uid)
@@ -37094,55 +37373,105 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         pass
 
     _autotrade_migrate_tables()
-    lines = ["📒 AutoTrade Journal", HDR, f"Window: last {lookback_h}h (Melbourne)"]
+    now_ts = float(time.time())
+    start_ts = now_ts - float(lookback_h) * 3600.0
 
     open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
     bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(owner_uid, positions=open_positions, fallback_unmatched_as_owned=True)
-
-    lines.extend([SEP, 'Open positions'])
-    if not bot_positions:
-        lines.append('• None')
-    else:
-        total_u = 0.0
-        for i, (p, tr) in enumerate(bot_positions, 1):
-            total_u += float(_pos_unreal_pnl(p) or 0.0)
-            lines.append(_autotrade_render_open_position_compact_line(tr, live_pos=p, index=i))
-        lines.append(f"Total open PnL: {total_u:+.2f} USDT")
-    if external_positions:
-        lines.append(f"Ignored unmatched live positions: {len(external_positions)}")
-
-    lines.extend([SEP, 'Closed positions'])
-    now_ts = float(time.time())
-    start_ts = now_ts - float(lookback_h) * 3600.0
-    closed_rows = []
     try:
-        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=40) or []
+        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=0) or []
     except Exception:
         closed_rows = []
 
-    if not closed_rows:
-        lines.append('• None in this window')
-    else:
-        total_closed = 0.0
-        show_n = min(len(closed_rows), 16)
-        for idx, row in enumerate(closed_rows[:show_n], 1):
-            try:
-                total_closed += float(row.get('pnl_usdt') or 0.0)
-            except Exception:
-                pass
-            lines.extend(_autotrade_render_closed_lifecycle_row_compact(row, index=idx))
-            if idx != show_n:
-                lines.append(SEP)
-        lines.append(f"Total closed PnL: {total_closed:+.2f} USDT")
-        if len(closed_rows) > show_n:
-            lines.append(f"Showing first {show_n} of {len(closed_rows)} closed trades in this window.")
+    table_rows = []
+    total_open = 0.0
+    total_closed = 0.0
 
-    out = "\n".join(lines)
+    def _row_reason(row: dict) -> str:
+        try:
+            fam = _setup_audit_family_from_row(row)
+            eng = str((row or {}).get('engine') or '').upper().strip()
+            reason = _setup_audit_reason_from_row(row)
+            parts = []
+            if fam and fam != '-':
+                parts.append(fam)
+            if eng:
+                parts.append(f"ENG-{eng}" if len(eng) == 1 else eng)
+            if reason:
+                parts.append(reason)
+            return _setup_audit_short_text(' | '.join(parts), 54)
+        except Exception:
+            return '-'
+
+    idx = 1
+    for p, tr in (bot_positions or []):
+        row = _setup_audit_merge_trade_setup_row(tr)
+        sid = str(row.get('setup_id') or tr.get('setup_id') or '').strip()
+        side = str(row.get('side') or _pos_side_text(p) or '').upper().strip()
+        sym = str(row.get('symbol') or _pos_symbol(p) or '').upper().strip()
+        if sym.endswith('USDT'):
+            sym_disp = sym[:-4]
+        else:
+            sym_disp = sym
+        pnl = float(_pos_unreal_pnl(p) or 0.0)
+        total_open += pnl
+        ev = _setup_audit_price_result_payload(row, horizon_hours=lookback_h, user_id=int(owner_uid), force=False, actual_pnl_usdt=0.0) if sid else {'result': 'OPEN'}
+        result = _setup_audit_result_label(ev.get('result'))
+        table_rows.append([idx, 'OPEN', sid or '-', sym_disp, side or '-', result, _row_reason(row), f"{pnl:+.2f}"])
+        idx += 1
+
+    for r in (closed_rows or []):
+        row = _setup_audit_merge_trade_setup_row(r)
+        sid = str(row.get('setup_id') or r.get('setup_id') or '').strip()
+        side = str(row.get('side') or r.get('side') or '').upper().strip()
+        sym = str(row.get('symbol') or r.get('symbol') or '').upper().strip()
+        if sym.endswith('USDT'):
+            sym_disp = sym[:-4]
+        else:
+            sym_disp = sym or '-'
+        try:
+            pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
+        except Exception:
+            pnl = 0.0
+        total_closed += pnl
+        ev = _setup_audit_price_result_payload(row, horizon_hours=lookback_h, user_id=int(owner_uid), force=False, actual_pnl_usdt=pnl) if sid else {}
+        result = _setup_audit_result_label(ev.get('result')) if ev else _setup_audit_result_label(_autotrade_report_friendly_close_reason(row))
+        if result == 'OPEN':
+            # Fallback to real closed-position outcome if price data is temporarily unavailable.
+            result = _setup_audit_result_label(_autotrade_report_friendly_close_reason(row))
+        table_rows.append([idx, 'CLOSED', sid or '-', sym_disp, side or '-', result, _row_reason(row), f"{pnl:+.2f}"])
+        idx += 1
+
+    try:
+        now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        now_txt = ''
+    lines = [
+        "📒 <b>AutoTrade Journal</b>",
+        HDR,
+        f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
+        f"Rows: <b>{len(table_rows)}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
+    ]
+    if external_positions:
+        lines.append(f"Ignored unmatched manual/external live positions: <b>{len(external_positions)}</b>")
+    if not table_rows:
+        lines.append(SEP)
+        lines.append("No AutoTrade open/closed rows found in this window.")
+        out = "\n".join(lines)
+    else:
+        table = tabulate(
+            table_rows,
+            headers=['#', 'State', 'Setup ID', 'Symbol', 'Type', 'Result', 'Entrance reason / family / engine', 'PnL'],
+            tablefmt='plain',
+            colalign=('right', 'left', 'left', 'left', 'left', 'left', 'left', 'right'),
+        )
+        out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
     try:
         cache_set(cache_key, out)
     except Exception:
         pass
     return out
+
 
 def _autotrade_report_overall_text_cached(owner: int) -> str:
     owner = int(owner)
@@ -37334,7 +37663,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(f"❌ /autotrade_report failed: {type(e).__name__}: {e}")
             return
 
-    await send_long_message(update, text_out, parse_mode=None)
+    await send_long_message(update, text_out, parse_mode=ParseMode.HTML)
 
 def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     """Journal-first reconciliation stats for performance reporting."""
@@ -44285,9 +44614,6 @@ def main():
     app.add_handler(CommandHandler("report_weekly", report_weekly_cmd, block=False))
     app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
     app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
-    app.add_handler(CommandHandler("signal_report", signal_report_cmd, block=False))
-    app.add_handler(CommandHandler("signbal_report", signal_report_cmd, block=False))
-    app.add_handler(CommandHandler("signal_report_overall", signal_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("health", health_cmd, block=False))
     app.add_handler(CommandHandler("reset", reset_cmd, block=False))
     app.add_handler(CommandHandler("restore", restore_cmd, block=False))
@@ -44307,6 +44633,7 @@ def main():
     app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
 
     app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
