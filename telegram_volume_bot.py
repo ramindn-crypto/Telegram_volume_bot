@@ -4403,13 +4403,13 @@ def _autotrade_attach_position_full_tpsl_and_cleanup(symbol: str, side: str, sto
         res = _autotrade_apply_position_tp_sl(symbol, float(stop_loss or 0.0), float(take_profit or 0.0), side=side, live_pos=live_pos)
         out['apply_res'] = res or {}
         _bybit_invalidate_live_order_position_cache(symbol)
-        ok, detail = _autotrade_confirm_position_full_tpsl(symbol, side, float(stop_loss or 0.0), float(take_profit or 0.0), wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 3.0))
+        ok, detail = _autotrade_confirm_position_full_tpsl(symbol, side, float(stop_loss or 0.0), float(take_profit or 0.0), wait_sec=max(AUTOTRADE_TP_CONFIRM_WAIT_SEC, 8.0))
         out['confirm'] = detail or {}
         # Clean again after attach in case older code left an order hidden behind cache.
         out['legacy_conditional_cancelled_after'] = _autotrade_cancel_legacy_conditional_exit_orders(symbol, side=side)
         out['legacy_conditional_cancelled'] = int(out.get('legacy_conditional_cancelled_before') or 0) + int(out.get('legacy_conditional_cancelled_after') or 0)
         # Reconfirm after cleanup to ensure we did not disturb the native TP/SL.
-        ok2, detail2 = _autotrade_confirm_position_full_tpsl(symbol, side, float(stop_loss or 0.0), float(take_profit or 0.0), wait_sec=1.2)
+        ok2, detail2 = _autotrade_confirm_position_full_tpsl(symbol, side, float(stop_loss or 0.0), float(take_profit or 0.0), wait_sec=4.0)
         out['confirm_after_cleanup'] = detail2 or {}
         out['ok'] = bool(ok and ok2)
         return out
@@ -6959,8 +6959,16 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
 
+        source_kind_u = str(getattr(s, "source_kind", "") or "").lower().strip()
+        family_u = str(getattr(s, "family_id", "") or getattr(s, "engine", "") or "").upper().strip()
+        # Rows that were already EMAILED are the authoritative execution lane.
+        # Do not re-run the volatile live scanner gates here; that caused a real email
+        # to be visible on /screen while AutoTrade later selected "no_setups".
+        # We still enforce structural safety below: volume, prices, side, confidence and RR.
         has_rich_exec_snapshot = bool(
-            str(getattr(s, "engine", "") or "").strip()
+            source_kind_u not in {'emailed_setups', 'recent_email_cache', 'recent_email_lane'}
+            and family_u not in {'F8', 'F8_BIGMOVE_CONT', 'BIGMOVE', 'BIG_MOVE'}
+            and str(getattr(s, "engine", "") or "").strip()
             and float(getattr(s, "quality_score", 0.0) or 0.0) > 0.0
         )
         if has_rich_exec_snapshot:
@@ -8165,6 +8173,18 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         })
 
         suffix = ' corrected_for_post_fill_risk' if corrected else ''
+        if not (sl_ok and tp_ok):
+            # Bybit can lag before position-level TP/SL fields become visible.
+            # Reconfirm once more before flattening to avoid open-then-immediate-close
+            # false negatives like the reported ZEC case.
+            try:
+                grace_ok, grace_detail = _autotrade_confirm_position_full_tpsl(sym, side, float(sl_for_order or 0.0), float(live_final_tp or 0.0), wait_sec=8.0, step_sec=0.5)
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'exit_attach_grace_confirm': grace_detail})
+                if grace_ok:
+                    sl_ok = True
+                    tp_ok = True
+            except Exception:
+                pass
         if not (sl_ok and tp_ok):
             close_res = _autotrade_force_close_live_position(sym, side, qty=qty_for_db)
             try:
@@ -12271,7 +12291,7 @@ BIGMOVE_SIGNAL_TP2_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP2_RR", str(BIGMOV
 # Best-practice implementation: adaptive 15m ATR stop, fixed 2R target, hard capped
 # to the user's requested 10% SL / 20% TP envelope. If ATR is unavailable, the
 # fallback is exactly 10% SL and 20% TP.
-BIGMOVE_AUTOTRADE_ENABLED = env_bool("BIGMOVE_AUTOTRADE_ENABLED", False)
+BIGMOVE_AUTOTRADE_ENABLED = env_bool("BIGMOVE_AUTOTRADE_ENABLED", True)
 BIGMOVE_AUTOTRADE_ATR_TIMEFRAME = str(os.environ.get("BIGMOVE_AUTOTRADE_ATR_TIMEFRAME", "15m") or "15m").strip() or "15m"
 BIGMOVE_AUTOTRADE_ATR_MULT = float(os.environ.get("BIGMOVE_AUTOTRADE_ATR_MULT", "2.2") or 2.2)
 BIGMOVE_AUTOTRADE_SL_MIN_PCT = float(os.environ.get("BIGMOVE_AUTOTRADE_SL_MIN_PCT", "3.0") or 3.0)
@@ -13144,10 +13164,13 @@ def _bigmove_autotrade_price_plan(candidate: dict, best_fut: dict | None = None)
 
 
 def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None = None, session_name: str = '') -> Optional[Setup]:
-    """Convert a confirmed Big-Move email row into a single-TP executable Setup."""
+    """Convert a confirmed Big-Move email row into a single-TP executable Setup.
+
+    This conversion is used for BOTH /screen/executable audit visibility and live
+    AutoTrade. Therefore it must not be disabled when a user temporarily turns
+    BigMove AutoTrade off; the alert still needs a real setup row.
+    """
     try:
-        if not bool(BIGMOVE_AUTOTRADE_ENABLED):
-            return None
         c = dict(candidate or {})
         sym = str(c.get('symbol') or '').upper().strip()
         if not sym:
@@ -13262,12 +13285,8 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                 'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
             }
             return
-        try:
-            if caller_uid != owner_uid and not is_admin_user(caller_uid):
-                return
-        except Exception:
-            if caller_uid != owner_uid:
-                return
+        # The confirmed Big-Move email is an authorized bot action. Route it to
+        # AUTOTRADE_OWNER_UID even when the alert recipient uid differs from owner.
         if not _autotrade_allowed_session(sess):
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
                 'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
@@ -13286,13 +13305,9 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                 return
         except Exception:
             pass
-        if AUTOTRADE_EXEC_LOCK.locked():
-            _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
-                'reason': 'autotrade_exec_lock_busy_after_bigmove_email', 'session': sess,
-                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
-            }
-            return
+        # Do not silently skip a just-emailed BigMove setup because the scheduled
+        # AutoTrade job is holding the lock for a few seconds. Wait briefly instead;
+        # the setup is also persisted so the next scheduled run can pick it up.
 
         setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(candidates or []), best_fut or {}, sess, timeout=8)
         if not setup_list:
@@ -42935,6 +42950,102 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 return {"status": "ERROR", "reasons": [f"{type(e).__name__}: {e}"]}
 
 
+        async def _record_bigmove_email_delivery_side_effects(uid: int, session_name: str, filtered: list, best_fut_snapshot: dict | None = None, tag: str = 'bigmove') -> list:
+            """Mirror confirmed Big-Move alert email into setup/executable/screen lanes.
+
+            Big-Move alert emails are independent from the normal setup-email builder, but
+            operationally they must still create F8 setup rows so /screen, /setup_audit,
+            /autotrade_last, and AutoTrade all see the exact same opportunity.
+            """
+            try:
+                owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+            except Exception:
+                owner_uid = 0
+            sess_u = str(session_name or _bigmove_autotrade_session_name()).upper().strip()
+            if sess_u not in {'ASIA', 'LON', 'NY'}:
+                sess_u = _bigmove_autotrade_session_name()
+            setups = []
+            try:
+                setups = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(filtered or []), best_fut_snapshot or {}, sess_u, timeout=8)
+            except Exception as exc:
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_build', status='error', session=sess_u, mode='bigmove', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
+                except Exception:
+                    pass
+                setups = []
+            if not setups:
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_build', status='empty', session=sess_u, mode='bigmove', details={'candidates': len(filtered or []), 'tag': str(tag or '')})
+                except Exception:
+                    pass
+                return []
+            now_ts = float(time.time())
+            target_uids = []
+            for tu in (int(uid or 0), owner_uid):
+                try:
+                    if int(tu) > 0 and int(tu) not in target_uids:
+                        target_uids.append(int(tu))
+                except Exception:
+                    pass
+            for stp in list(setups or []):
+                try:
+                    setattr(stp, 'email_logged_ts', now_ts)
+                    setattr(stp, 'emailed_ts', now_ts)
+                    setattr(stp, 'source_kind', 'emailed_setups')
+                    setattr(stp, 'source_session', sess_u)
+                    setattr(stp, 'created_ts', float(getattr(stp, 'created_ts', 0.0) or now_ts))
+                except Exception:
+                    pass
+            for tuid in target_uids:
+                try:
+                    _persist_executable_candidates(int(tuid), sess_u, list(setups or []), source_kind='emailed_setups', mode='bigmove_email')
+                except Exception:
+                    pass
+                for stp in list(setups or []):
+                    sid = str(getattr(stp, 'setup_id', '') or getattr(stp, 'id', '') or '')
+                    try:
+                        db_mark_emailed_setup(int(tuid), sid, sess_u, now_ts)
+                    except Exception:
+                        pass
+                    try:
+                        db_mark_executable_setup(int(tuid), sid, sess_u, now_ts, s=stp, source_kind='emailed_setups', state='executable_pending')
+                    except Exception:
+                        pass
+                    try:
+                        db_log_generated_setup(int(tuid), 'bigmove_email', sess_u, stp)
+                    except Exception:
+                        pass
+                    try:
+                        _cache_recent_emailed_setup(int(tuid), stp, session=sess_u, emailed_ts=now_ts, source_kind='recent_email_cache')
+                    except Exception:
+                        pass
+                    try:
+                        _mark_emailed_setup_identity(int(tuid), stp, emailed_ts=now_ts)
+                    except Exception:
+                        pass
+                try:
+                    up_list, dn_list = compute_directional_lists(best_fut_snapshot or {})
+                    market_txt = _screen_market_context_table(best_fut_snapshot or {}, leaders=up_list, losers=dn_list)
+                    screen_body = "\n".join([
+                        "", "*Top Trade Setups*", SEP,
+                        "_Showing latest Big-Move/F8 setup email while the live scan refreshes._",
+                        _screen_format_setup_cards(list(setups or []), int(tuid), sess_u),
+                        "", market_txt or "",
+                    ]).strip()
+                    screen_kb = [(str(getattr(_s, 'symbol', '') or '').upper(), str(getattr(_s, 'setup_id', '') or getattr(_s, 'id', '') or '')) for _s in list(setups or [])[:_screen_display_limit()]]
+                    _screen_cache_put(f"uid:{int(tuid)}::{sess_u}", screen_body, screen_kb, ts=now_ts, allow_empty_overwrite=True)
+                except Exception:
+                    pass
+                try:
+                    cache_delete(f"autotrade_db_setups:{int(tuid)}:{sess_u}:12:5")
+                except Exception:
+                    pass
+            try:
+                db_log_setup_pipeline_event(int(uid), stage='bigmove_email_delivery_side_effects', status='ok', session=sess_u, mode='bigmove', details={'setups': len(setups or []), 'target_uids': target_uids, 'tag': str(tag or '')})
+            except Exception:
+                pass
+            return list(setups or [])
+
         async def _send_bigmove_payload_for_user(uid: int, tz, tag: str = 'pre_session') -> None:
             """Build and send one user's Big-Move email without waiting behind setup scans.
 
@@ -42996,10 +43107,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
                         except Exception:
                             pass
+                    bm_sess = _bigmove_autotrade_session_name()
+                    try:
+                        await _record_bigmove_email_delivery_side_effects(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
+                    except Exception:
+                        pass
                     try:
                         owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready() and (int(uid) == owner_uid_for_bm_at or is_admin_user(int(uid))):
-                            bm_sess = _bigmove_autotrade_session_name()
+                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
                             _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
                                 "status": "QUEUED",
                                 "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -43729,10 +43844,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             mark_bigmove_emailed(uid, c["symbol"], c["direction"])
                         except Exception:
                             pass
+                    bm_sess = _bigmove_autotrade_session_name()
+                    try:
+                        await _record_bigmove_email_delivery_side_effects(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred")
+                    except Exception:
+                        pass
                     try:
                         owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready() and (int(uid) == owner_uid_for_bm_at or is_admin_user(int(uid))):
-                            bm_sess = _bigmove_autotrade_session_name()
+                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
                             _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
                                 "status": "QUEUED",
                                 "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -45403,13 +45522,9 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 'mode': str(_autotrade_runtime_mode()).lower(),
             }
             return
-        # Only the owner or an admin signal feed may trigger owner autotrade.
-        try:
-            if caller_uid != owner_uid and not is_admin_user(caller_uid):
-                return
-        except Exception:
-            if caller_uid != owner_uid:
-                return
+        # The email itself is already an authorized bot action.  Always route the
+        # exact emailed setup batch into AUTOTRADE_OWNER_UID so email, /screen and
+        # AutoTrade cannot diverge when the recipient uid differs from the owner uid.
         if not _autotrade_allowed_session(sess):
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
                 'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
@@ -45428,26 +45543,21 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 return
         except Exception:
             pass
-        if AUTOTRADE_EXEC_LOCK.locked():
-            _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
-                'reason': 'autotrade_exec_lock_busy_after_email', 'session': sess,
-                'mode': str(_autotrade_runtime_mode()).lower(),
-            }
-            return
+        # Do not silently skip a just-emailed setup because the scheduled
+        # AutoTrade job is briefly running. Queue by waiting for the shared lock.
         async with AUTOTRADE_EXEC_LOCK:
             # Force selected emailed setups into the owner's executable lane and clear stale empty cache.
             try:
                 if chosen_list:
                     for _s in list(chosen_list or []):
                         try:
-                            setattr(_s, 'source_kind', 'executable_setups')
+                            setattr(_s, 'source_kind', 'emailed_setups')
                             setattr(_s, 'source_session', sess)
                             if not float(getattr(_s, 'created_ts', 0.0) or 0.0):
                                 setattr(_s, 'created_ts', time.time())
                         except Exception:
                             pass
-                    await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'executable_setups', 'email_autotrade_immediate', timeout=5)
+                    await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
                         cache_delete(f"autotrade_db_setups:{owner_uid}:{sess}:12:5")
                     except Exception:
