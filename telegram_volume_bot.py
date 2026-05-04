@@ -422,6 +422,7 @@ AUTOTRADE_CFG_LEVERAGE_KEY = 'leverage'
 AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
 AUTOTRADE_CFG_MODE_KEY = 'mode'
 AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
+AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY = 'max_trades_per_day'  # AutoTrade-only daily count cap; independent from /limits maxtrades
 AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY = 'max_entry_drift_pct'
 AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY = 'liq_buffer_pct'
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
@@ -491,6 +492,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_ISOLATED_KEY: 1 if bool(AUTOTRADE_ISOLATED) else 0,
         AUTOTRADE_CFG_MODE_KEY: str(AUTOTRADE_MODE or 'paper').strip().lower(),
         AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(_autotrade_runtime_max_open_trades()),
+        AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: int(_autotrade_runtime_max_trades_per_day()),
         AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT),
         AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY: float(AUTOTRADE_LIQ_BUFFER_PCT),
     }
@@ -538,6 +540,22 @@ def _autotrade_runtime_max_open_trades() -> int:
         except Exception:
             val = 1
     return max(1, int(val))
+
+
+def _autotrade_runtime_max_trades_per_day() -> int:
+    """AutoTrade-only daily trade count cap.
+
+    0 means unlimited. This is intentionally separate from the user's /limits
+    maxtrades value, which is for manual journal/risk workflows only.
+    """
+    try:
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, AUTOTRADE_MAX_TRADES_PER_DAY) or AUTOTRADE_MAX_TRADES_PER_DAY))
+    except Exception:
+        try:
+            val = int(AUTOTRADE_MAX_TRADES_PER_DAY)
+        except Exception:
+            val = 0
+    return max(0, int(val))
 
 
 def _autotrade_runtime_max_entry_drift_pct() -> float:
@@ -593,6 +611,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_DAILY_RISK_CAP_MODE': str(mode_txt or 'PCT').upper(),
         'AUTOTRADE_MODE': str(_autotrade_runtime_mode()).lower(),
         'AUTOTRADE_MAX_OPEN_TRADES': int(_autotrade_runtime_max_open_trades()),
+        'AUTOTRADE_MAX_TRADES_PER_DAY': int(_autotrade_runtime_max_trades_per_day()),
         'AUTOTRADE_MAX_ENTRY_DRIFT_PCT': float(_autotrade_runtime_max_entry_drift_pct()),
         'AUTOTRADE_LEVERAGE': int(_autotrade_runtime_leverage()),
         'AUTOTRADE_LIQ_BUFFER_PCT': float(_autotrade_runtime_liq_buffer_pct()),
@@ -2752,6 +2771,9 @@ AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT"
 AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "3") or 3)
 # Open-trade count cap for commercial/live safety.
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "1") or 1)
+# AutoTrade-only daily trade count cap. 0 = unlimited.
+# This is deliberately independent from /limits maxtrades, which remains manual-only.
+AUTOTRADE_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_MAX_TRADES_PER_DAY", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
 EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
@@ -7396,7 +7418,7 @@ def _autotrade_should_try_next_after_skip(reason: str) -> bool:
         return False
     hard_stop_tokens = (
         'daily_risk_cap_reached', 'daily_cap_reached', 'daily_remaining_risk_zero',
-        'max_open_trades_reached', 'max_trades_day_reached', 'autotrade_not_ready',
+        'max_open_trades_reached', 'max_trades_day_reached', 'max_autotrade_trades_day_reached', 'autotrade_not_ready',
         'session_not_allowed', 'trade_window_block', 'equity_unavailable',
         'per_trade_risk_zero', 'open_risk_cap_reached', 'autotrade_exec_lock_busy',
     )
@@ -7623,8 +7645,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         live_open_count = int(mday.get('open_positions_now') or 0)
     except Exception:
         live_open_count = 0
+    # AutoTrade daily count cap is controlled only by /autotrade_config.
+    # Do NOT use the manual /limits maxtrades value here.
     try:
-        max_trades_day = int((get_user(uid) or {}).get('max_trades_day') or 0)
+        max_trades_day = int(_autotrade_runtime_max_trades_per_day() or 0)
     except Exception:
         max_trades_day = 0
     try:
@@ -7634,9 +7658,9 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if max_trades_day > 0 and opened_today_count >= max_trades_day:
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'reject_reason': 'max_trades_day_reached',
+                'reject_reason': 'max_autotrade_trades_day_reached',
                 'opened_today_count': int(opened_today_count),
-                'max_trades_day': int(max_trades_day),
+                'max_autotrade_trades_per_day': int(max_trades_day),
             })
         except Exception:
             pass
@@ -7645,11 +7669,11 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 int(uid),
                 setup_id,
                 state=_admin_setup_state_from_reason('risk_cap'),
-                last_reason=f'max_trades_day_reached ({opened_today_count}/{max_trades_day})',
+                last_reason=f'max_autotrade_trades_day_reached ({opened_today_count}/{max_trades_day})',
             )
         except Exception:
             pass
-        return (False, 'max_trades_day_reached')
+        return (False, 'max_autotrade_trades_day_reached')
     if int(_autotrade_runtime_max_open_trades()) > 0 and live_open_count >= int(_autotrade_runtime_max_open_trades()):
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'max_open_trades_reached', 'open_positions_now': int(live_open_count)})
@@ -11300,6 +11324,24 @@ def db_init():
     except Exception:
         pass
 
+    # Ver12: ensure signal rows keep family/session metadata for BigMove/F8 and screen/audit sync.
+    try:
+        cur.execute("PRAGMA table_info(signals)")
+        s_cols = {r[1] for r in cur.fetchall()}
+        for _col, _ddl in {
+            'family_id': "TEXT NOT NULL DEFAULT ''",
+            'family_version': "TEXT NOT NULL DEFAULT ''",
+            'regime_id': "TEXT NOT NULL DEFAULT ''",
+            'regime_primary': "TEXT NOT NULL DEFAULT ''",
+            'allocator_plan_id': "TEXT NOT NULL DEFAULT ''",
+            'param_set_id': "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if _col not in s_cols:
+                cur.execute(f"ALTER TABLE signals ADD COLUMN {_col} {_ddl}")
+                s_cols.add(_col)
+    except Exception:
+        pass
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS emailed_setups (
         user_id INTEGER NOT NULL,
@@ -12280,7 +12322,7 @@ BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") o
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
 BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0)
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
-BIGMOVE_COOLDOWN_SEC = 60 * 60  # 1 hour
+BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "0") or 0)  # Ver12: default OFF for sharp F8 BigMove alerts
 BIGMOVE_FAMILY_ID = "F8_BIGMOVE_CONT"
 BIGMOVE_FAMILY_NAME = "Big Move Continuation"
 BIGMOVE_SIGNAL_FINAL_RR = float(os.environ.get("BIGMOVE_SIGNAL_FINAL_RR", "1.8") or 1.8)
@@ -12325,7 +12367,15 @@ BIGMOVE_CONFIRM_COLD_FETCH_MAX = int(os.environ.get("BIGMOVE_CONFIRM_COLD_FETCH_
 BIGMOVE_LAST_CLOSED_15M_CACHE_TTL_SEC = int(os.environ.get("BIGMOVE_LAST_CLOSED_15M_CACHE_TTL_SEC", "90") or 90)
 
 def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
+    """BigMove/F8 duplicate guard.
+
+    Ver12 default: no cooldown for F8 BigMove alerts. They are sharp, event-based
+    opportunities, so a repeated confirmed move should be allowed unless the admin
+    explicitly sets BIGMOVE_COOLDOWN_SEC > 0 in Render.
+    """
     try:
+        if int(BIGMOVE_COOLDOWN_SEC or 0) <= 0:
+            return False
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
             cur.execute(
@@ -12336,7 +12386,7 @@ def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
             if not row:
                 return False
             last_ts = float(row[0] or 0.0)
-            return (time.time() - last_ts) < BIGMOVE_COOLDOWN_SEC
+            return (time.time() - last_ts) < float(BIGMOVE_COOLDOWN_SEC or 0)
     except Exception:
         return False
 
@@ -17479,7 +17529,9 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
                     COALESCE(x.pullback_bypass_hot, 0) AS pullback_bypass_hot,
                     COALESCE(x.pullback_ema_dist_pct, 0) AS pullback_ema_dist_pct,
                     COALESCE(x.ema_support_period, 0) AS ema_support_period,
-                    COALESCE(x.ema_support_dist_pct, 0) AS ema_support_dist_pct
+                    COALESCE(x.ema_support_dist_pct, 0) AS ema_support_dist_pct,
+                    COALESCE(NULLIF(x.family_id,''), NULLIF(s.family_id,''), '') AS family_id,
+                    COALESCE(NULLIF(x.source_kind,''), 'emailed_setups') AS source_kind
                 FROM emailed_setups e
                 LEFT JOIN signals s ON s.setup_id = e.setup_id
                 LEFT JOIN executable_setups x ON x.user_id = e.user_id AND x.setup_id = e.setup_id
@@ -17541,8 +17593,10 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
                 executable_ts=float(row.get('emailed_ts') or 0.0),
                 email_logged_ts=float(row.get('emailed_ts') or 0.0),
                 generated_logged_ts=float(row.get('signal_created_ts') or 0.0),
-                source_kind='emailed_setups',
+                source_kind=str(row.get('source_kind') or 'emailed_setups'),
                 source_session=str(row.get('session') or ''),
+                family_id=str(row.get('family_id') or ''),
+                family_version=str(row.get('family_version') or RESEARCH_FAMILY_VERSION),
             )
             out.append(item)
             if len(out) >= int(limit):
@@ -33000,7 +33054,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "trade_id_reset": "Reset your own Trade ID numbering",
     "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
     "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
-    "autotrade_config": "Show or set persistent AutoTrade runtime config: risk, caps, mode, max opens, leverage, isolated",
+    "autotrade_config": "Show/set AutoTrade runtime config: risk, caps, mode, max open, max trades/day, leverage, isolated",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
@@ -34076,6 +34130,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
             f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
+            f"AUTOTRADE_MAX_TRADES_PER_DAY = {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0))} (0 = unlimited)",
             f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
             f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
@@ -34086,6 +34141,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
             "• /autotrade_config AUTOTRADE_MODE live",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 3",
+            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 20   (0 = unlimited)",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 0.8",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
@@ -34104,7 +34160,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     value_raw = " ".join(context.args[1:]).strip()
     if key not in {
         'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT',
-        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED'
+        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -34127,6 +34183,12 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_MAX_OPEN_TRADES':
             val = max(1, int(float(value_raw)))
             _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, val)
+        elif key == 'AUTOTRADE_MAX_TRADES_PER_DAY':
+            # 0 = unlimited. This is AutoTrade-only and intentionally not capped by /limits.
+            val = max(0, int(float(value_raw)))
+            if val > 500:
+                raise ValueError('max AutoTrade trades/day must be 0..500 (0 = unlimited)')
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, val)
         elif key == 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT':
             val = max(0.0, float(value_raw))
             _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, val)
@@ -34219,7 +34281,8 @@ async def limits_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/limits maxtrades 5\n"
             f"/limits emailcap 0\n"
             f"/limits emailgap 60\n"
-            f"/limits emaildaycap 0\n"
+            f"/limits emaildaycap 0\n\n"
+            f"Note: maxtrades is manual-trading only. AutoTrade uses /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY.\n"
         )
         return
 
@@ -36567,7 +36630,8 @@ def _setup_audit_unique_key(row: dict) -> str:
             sym = sym[:-4]
         side = str(rr.get('side') or '').upper().strip()
         fam = _setup_audit_family_code(rr)
-        key = f'{bucket}|{sym}|{side}|{fam}'
+        sess = str(rr.get('session') or rr.get('source_session') or '').upper().strip() or 'NOSESSION'
+        key = f'{bucket}|{sess}|{sym}|{side}|{fam}'
         if bool(globals().get('SETUP_AUDIT_DEDUP_INCLUDE_LEVELS', False)):
             entry = float(rr.get('entry') or 0.0)
             sl = float(rr.get('sl') or 0.0)
@@ -37396,7 +37460,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
             nohit_n += 1
         else:
             open_n += 1
-        table_rows.append([sym, side, int(float(r.get('conf') or 0.0)), family_code, result])
+        sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+        table_rows.append([sym, side, sess_row, int(float(r.get('conf') or 0.0)), family_code, result])
 
     decided = tp_n + sl_n + nohit_n
     wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
@@ -37415,9 +37480,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = max(0, len(table_rows) - len(display_rows))
     table = tabulate(
         display_rows,
-        headers=['Symbol', 'Type', 'Conf', 'Family', 'Result'],
+        headers=['Symbol', 'Type', 'Session', 'Conf', 'Family', 'Result'],
         tablefmt='rounded_grid',
-        colalign=('left', 'center', 'right', 'center', 'center'),
+        colalign=('left', 'center', 'center', 'right', 'center', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
@@ -37426,6 +37491,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
+        "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = still inside the result horizon.",
     ]
     if hidden_rows > 0:
         header_lines.append(f"Showing first {len(display_rows)} rows only; {hidden_rows} hidden. Use /setup_audit rows <n> <hours> to show more.")
@@ -37487,13 +37553,16 @@ def _setup_audit_overall_text(uid: int) -> str:
     # historical candles by symbol so old setups are checked against their real
     # post-setup path instead of the current ticker only.
     candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
-    fam_stats: dict[str, dict] = {}
+    fam_stats: dict[tuple[str, str], dict] = {}
+    fam_codes_seen: set[str] = set()
     for r in rows:
         fam = _setup_audit_family_code(r)
+        fam_codes_seen.add(fam)
+        sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
         sid = str(r.get('setup_id') or '').strip()
         ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=0.0)
         result = _setup_audit_result_label(ev.get('result'))
-        item = fam_stats.setdefault(fam, {'total': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0})
+        item = fam_stats.setdefault((fam, sess_row), {'family': fam, 'session': sess_row, 'total': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0})
         item['total'] += 1
         item['tp'] += 1 if result == 'TP' else 0
         item['sl'] += 1 if result == 'SL' else 0
@@ -37502,7 +37571,9 @@ def _setup_audit_overall_text(uid: int) -> str:
 
     table_rows = []
     total_setups = total_tp = total_sl = total_nohit = total_open = 0
-    for fam, st in sorted(fam_stats.items(), key=lambda kv: (int(kv[1].get('total') or 0), str(kv[0])), reverse=True):
+    for (_fam_key, _sess_key), st in sorted(fam_stats.items(), key=lambda kv: (int(kv[1].get('total') or 0), str(kv[1].get('family') or ''), str(kv[1].get('session') or '')), reverse=True):
+        fam = str(st.get('family') or _fam_key or '-')
+        sess_row = str(st.get('session') or _sess_key or '-')
         total = int(st.get('total') or 0)
         tp = int(st.get('tp') or 0)
         sl = int(st.get('sl') or 0)
@@ -37515,7 +37586,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         total_sl += sl
         total_nohit += nohit
         total_open += op
-        table_rows.append([fam, total, tp, sl, nohit, op, f"{wr:.1f}%"])
+        table_rows.append([fam, sess_row, total, tp, sl, nohit, op, f"{wr:.1f}%"])
     decided_total = total_tp + total_sl + total_nohit
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
     win = _setup_audit_window_summary(rows)
@@ -37524,16 +37595,17 @@ def _setup_audit_overall_text(uid: int) -> str:
     header = [
         "📊 <b>Setup Audit Overall</b>",
         HDR,
-        f"Families: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
+        f"Families: <b>{len(fam_codes_seen or [])}</b> | Family/session rows: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Duration: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
+        "NOHIT = horizon expired with no TP/SL; OPEN = still inside the result horizon.",
     ]
     table = tabulate(
         table_rows,
-        headers=['Family', 'Setups', 'TP', 'SL', 'NOHIT', 'OPEN', 'WR'],
+        headers=['Family', 'Session', 'Setups', 'TP', 'SL', 'NOHIT', 'OPEN', 'WR'],
         tablefmt='rounded_grid',
-        colalign=('center', 'right', 'right', 'right', 'right', 'right', 'right'),
+        colalign=('center', 'center', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -38446,7 +38518,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
 def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v5pretty:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v6merged:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -38511,6 +38583,35 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         total_closed += pnl
         table_rows.append([_sym_display(row, r.get('symbol') or ''), side, _family_for_report(row), f"{pnl:+.2f}"])
 
+    # Merge duplicate rows so one Telegram row represents one symbol, while totals still
+    # use all underlying open/closed trade rows in the requested window.
+    raw_row_count = len(table_rows)
+    grouped: dict[str, dict] = {}
+    for sym, side, fam, pnl_txt in list(table_rows or []):
+        try:
+            key = str(sym or '-').upper().strip() or '-'
+            item = grouped.setdefault(key, {'symbol': key, 'sides': set(), 'families': set(), 'pnl': 0.0, 'count': 0})
+            if str(side or '').strip() and str(side or '').strip() != '-':
+                item['sides'].add(str(side or '').upper().strip())
+            if str(fam or '').strip() and str(fam or '').strip() != '-':
+                item['families'].add(str(fam or '').upper().strip())
+            item['pnl'] += float(str(pnl_txt).replace('+','').replace(',','') or 0.0)
+            item['count'] += 1
+        except Exception:
+            continue
+    merged_rows = []
+    for item in sorted(grouped.values(), key=lambda x: abs(float(x.get('pnl') or 0.0)), reverse=True):
+        sides = sorted(list(item.get('sides') or []))
+        fams = sorted(list(item.get('families') or []))
+        merged_rows.append([
+            item.get('symbol') or '-',
+            sides[0] if len(sides) == 1 else ('MIXED' if sides else '-'),
+            fams[0] if len(fams) == 1 else (','.join(fams[:3]) + ('+' if len(fams) > 3 else '') if fams else 'F0'),
+            int(item.get('count') or 0),
+            f"{float(item.get('pnl') or 0.0):+.2f}",
+        ])
+    table_rows = merged_rows
+
     try:
         now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
     except Exception:
@@ -38519,7 +38620,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         "📒 <b>AutoTrade Journal</b>",
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
-        f"Rows: <b>{len(table_rows)}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
+        f"Symbols: <b>{len(table_rows)}</b> | Underlying rows: <b>{raw_row_count}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
     ]
     if external_positions:
         lines.append(f"Ignored unmatched manual/external live positions: <b>{len(external_positions)}</b>")
@@ -38536,9 +38637,9 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         hidden_rows = max(0, len(table_rows) - len(display_rows))
         table = tabulate(
             display_rows,
-            headers=['Symbol', 'Type', 'Family', 'PnL'],
+            headers=['Symbol', 'Type', 'Family', 'Rows', 'PnL'],
             tablefmt='rounded_grid',
-            colalign=('left', 'center', 'center', 'right'),
+            colalign=('left', 'center', 'center', 'right', 'right'),
         )
         if hidden_rows > 0:
             lines.append(f"Showing first <b>{len(display_rows)}</b> rows only; <b>{hidden_rows}</b> hidden.")
@@ -38967,14 +39068,40 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     ready = _autotrade_ready()
     sess_allowed = (sess != 'NONE') and _autotrade_allowed_session(sess)
     try:
-        snap = await to_thread_fast(_accounting_snapshot_cached, owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
+        snap = await to_thread_fast(_accounting_snapshot_cached, owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, force_refresh=True, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
     except Exception:
-        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
+        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, force_refresh=True)
     equity = float(snap.get('equity') or 0.0)
     try:
-        mday = await to_thread_fast(_autotrade_day_risk_metrics_cached, int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
+        mday = await to_thread_fast(_autotrade_day_risk_metrics_cached, int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, force_refresh=True, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
     except Exception:
-        mday = _autotrade_day_risk_metrics_cached(int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC)
+        mday = _autotrade_day_risk_metrics_cached(int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, force_refresh=True)
+    # Ver12: debug closed/PnL should match /autotrade_report. The quick risk snapshot
+    # can miss exchange-derived/provisional closes, so reconcile against the same report rows.
+    try:
+        _start_utc, _end_utc = _admin_today_window_utc(uid=int(owner), user=user)
+        _closed_report_rows = _autotrade_closed_report_rows(int(owner), float(_start_utc.timestamp()), float(_end_utc.timestamp()), lookback_h=24, limit=0) or []
+        _closed_report_pnl = float(sum(float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0) for r in _closed_report_rows))
+        if len(_closed_report_rows) > int(snap.get('positions_closed_today', 0) or 0) or abs(_closed_report_pnl) > abs(float(snap.get('pnl_today') or 0.0)):
+            snap['positions_closed_today'] = int(len(_closed_report_rows))
+            snap['closed_today_rows'] = list(_closed_report_rows)
+            snap['pnl_today'] = float(_closed_report_pnl)
+            mday['closed_today_count'] = int(len(_closed_report_rows))
+            mday['closed_today_rows'] = list(_closed_report_rows)
+            mday['realized_pnl_today'] = float(_closed_report_pnl)
+            mday['realized_loss_today'] = float(sum(abs(float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0)) for r in _closed_report_rows if float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0) < 0.0))
+            # Recalculate daily used with realised PnL credit/debit.
+            _raw_used = max(0.0, float(snap.get('live_open_risk_charged_today') or snap.get('current_day_open_risk') or 0.0) - float(_closed_report_pnl))
+            _used_eff, _reset_credit = _risk_day_reset_effective_used(int(owner), user, _raw_used)
+            snap['used_today'] = float(_used_eff)
+            snap['used_today_raw'] = float(_raw_used)
+            snap['risk_reset_credit'] = float(_reset_credit)
+            _cap = float(snap.get('cap') or 0.0)
+            if _cap > 0:
+                snap['remaining_today'] = max(0.0, _cap - float(_used_eff))
+    except Exception:
+        pass
+
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
     email_gate = _email_runtime_limits_snapshot(int(owner), user)
 
@@ -39050,7 +39177,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         SEP,
         f"EquityAT: ${equity:.2f}",
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
-        f"Opened today (AT): {int(snap.get('positions_opened_today', 0) or 0)} | Closed today (AT): {int(snap.get('positions_closed_today', 0) or 0)} | Open now (AT): {int(snap.get('open_positions_now', 0) or 0)}",
+        f"Opened today (AT): {int(snap.get('positions_opened_today', 0) or 0)}/{('∞' if int(_autotrade_runtime_max_trades_per_day() or 0) <= 0 else int(_autotrade_runtime_max_trades_per_day()))} | Closed today (AT): {int(snap.get('positions_closed_today', 0) or 0)} | Open now (AT): {int(snap.get('open_positions_now', 0) or 0)}",
         f"Open risk now (AT): ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         (f"Ignored unmatched live positions (AT): {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
         f"Realised net today (AT): ${float(snap.get('pnl_today') or 0.0):+.2f}",
@@ -40669,15 +40796,20 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
             emoji = "🟢" if side == "BUY" else "🔴"
             typ = _setup_display_label(s)
             block = []
+            fam_code = _setup_audit_family_code(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '')
+            is_bigmove = (fam_code == 'F8') or str(sid).upper().startswith(('BMAT-', 'BIGMOVE-')) or 'BIGMOVE' in str(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '').upper()
             block.append(f"{emoji} *{side} — {sym}*")
-            block.append(f"`{sid}` | Conf: `{conf}`")
+            block.append(f"`{sid}` | Conf: `{conf}` | Family: `{'F8 BigMove' if is_bigmove else fam_code}`")
             try:
                 sk = str(getattr(s, 'source_kind', '') or '').lower().strip()
                 email_ts = float(getattr(s, 'email_logged_ts', 0.0) or getattr(s, 'emailed_ts', 0.0) or 0.0)
                 if sk in {'emailed_setups', 'recent_email_cache', 'recent_email_lane'} or email_ts > 0:
                     when_txt = _screen_ts_label(email_ts) if email_ts > 0 else ''
-                    block.append(f"📩 *Emailed at {when_txt}*" if when_txt else "📩 *Emailed*")
-                elif symbol_recently_emailed(uid, sym, side, session):
+                    if is_bigmove:
+                        block.append(f"⚡ *BigMove/F8 emailed at {when_txt}*" if when_txt else "⚡ *BigMove/F8 emailed*")
+                    else:
+                        block.append(f"📩 *Setup emailed at {when_txt}*" if when_txt else "📩 *Setup emailed*")
+                elif (not is_bigmove) and symbol_recently_emailed(uid, sym, side, session):
                     block.append("📩 *Email cooldown active*")
             except Exception:
                 pass
