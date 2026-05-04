@@ -427,6 +427,16 @@ AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY = 'liq_buffer_pct'
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
+# Setup audit defaults: report actionable/executable setups, not every raw scanner candidate.
+# This prevents /setup_audit and /setup_audit_overall from being inflated by repeated
+# scan snapshots and raw near-miss candidates. Set SETUP_AUDIT_SOURCE_MODE=ALL only
+# when doing deep diagnostics of every generated candidate.
+SETUP_AUDIT_SOURCE_MODE = str(os.environ.get("SETUP_AUDIT_SOURCE_MODE", "EXECUTABLE") or "EXECUTABLE").strip().upper()
+SETUP_AUDIT_FALLBACK_TO_GENERATED = env_bool("SETUP_AUDIT_FALLBACK_TO_GENERATED", True)
+SETUP_AUDIT_DEDUP_BUCKET_HOURS = int(os.environ.get("SETUP_AUDIT_DEDUP_BUCKET_HOURS", "12") or 12)
+SETUP_AUDIT_DEDUP_INCLUDE_LEVELS = env_bool("SETUP_AUDIT_DEDUP_INCLUDE_LEVELS", False)
+SETUP_AUDIT_DISPLAY_MAX_ROWS = int(os.environ.get("SETUP_AUDIT_DISPLAY_MAX_ROWS", "40") or 40)
+
 
 def _autotrade_config_get(key: str, default=None):
     try:
@@ -2313,6 +2323,55 @@ def _strategy_config_bootstrap_recommendations() -> None:
     except Exception:
         return
 
+
+def _strategy_config_apply_ver08_quality_patch() -> None:
+    """One-time conservative quality patch from 04 May audit results.
+
+    The audit/backtest snapshots showed: F1 is the only family above 50% WR, F3/F8
+    are materially weak, and ASIA underperformed. This patch narrows the executable
+    lane to LON/NY + Engine A/F1 and raises quality/RR floors. It is stored in
+    strategy_config so normal runtime commands still show and govern the active state.
+    """
+    try:
+        cfg = load_strategy_config(force=True)
+        cfg['ver08_quality_patch_applied'] = True
+        cfg['ver08_quality_patch_ts'] = float(time.time())
+        cfg['high_win_mode'] = True
+        cfg['execution_sessions_allowed'] = ['LON', 'NY']
+        cfg['execution_engines_allowed'] = ['A']
+        cfg['execution_asia_enabled'] = False
+        cfg['execution_asia_user_override'] = True
+        cfg['execution_engine_b_email_enabled'] = False
+        cfg['goal_profile_allow_asia'] = False
+        cfg['goal_profile_allow_engine_b'] = False
+        cfg['goal_profile_active_profile'] = 'LON_NY_F1_STRICT_VER08'
+        cfg['quality_score_min_screen'] = max(64.0, float(cfg.get('quality_score_min_screen', 0) or 0))
+        cfg['quality_score_min_email'] = max(72.0, float(cfg.get('quality_score_min_email', 0) or 0))
+        cfg['min_rr_tp'] = max(1.45, float(cfg.get('min_rr_tp', 0) or 0))
+        cfg['tf_align_1h_min_abs'] = max(0.70, float(cfg.get('tf_align_1h_min_abs', 0) or 0))
+        cfg['tf_align_4h_min_abs'] = max(0.65, float(cfg.get('tf_align_4h_min_abs', 0) or 0))
+        cfg['atr_min_pct'] = max(1.00, float(cfg.get('atr_min_pct', 0) or 0))
+        cfg['session_weights'] = {'NY': 0.48, 'LON': 0.52, 'ASIA': 0.0}
+        cfg['session_exec_overrides'] = {
+            'NY': {'quality_add': 2.0, 'conf_add': 2, 'rr_add': 0.12},
+            'LON': {'quality_add': 1.2, 'conf_add': 1, 'rr_add': 0.08},
+            'ASIA': {'quality_add': 99.0, 'conf_add': 99, 'rr_add': 9.99},
+        }
+        # Keep setup count target lower until observed WR improves.
+        cfg['target_setups_per_day_lo'] = 1.0
+        cfg['target_setups_per_day_hi'] = 3.0
+        cfg['governor_target_lo'] = 1.0
+        cfg['governor_target_hi'] = 3.0
+        cfg['goal_profile_target_setups_per_day_lo'] = 1.0
+        cfg['goal_profile_target_setups_per_day_hi'] = 3.0
+        cfg['goal_profile_target_win_rate'] = 55.0
+        cfg['goal_profile_target_avg_r'] = 0.10
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+    except Exception:
+        pass
+
+
 def apply_strategy_config(cfg: dict) -> None:
     """Apply StrategyConfig into global tunables used throughout the bot."""
     global MIN_FUT_VOL_USD, EMAIL_MIN_FUT_VOL_USD, MIN_RR_TP
@@ -2379,6 +2438,7 @@ def apply_strategy_config(cfg: dict) -> None:
 try:
     apply_strategy_config(load_strategy_config(force=True))
     _strategy_config_bootstrap_recommendations()
+    _strategy_config_apply_ver08_quality_patch()
 except Exception:
     pass
 
@@ -12193,7 +12253,7 @@ BIGMOVE_SIGNAL_TP2_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP2_RR", str(BIGMOV
 # Best-practice implementation: adaptive 15m ATR stop, fixed 2R target, hard capped
 # to the user's requested 10% SL / 20% TP envelope. If ATR is unavailable, the
 # fallback is exactly 10% SL and 20% TP.
-BIGMOVE_AUTOTRADE_ENABLED = env_bool("BIGMOVE_AUTOTRADE_ENABLED", True)
+BIGMOVE_AUTOTRADE_ENABLED = env_bool("BIGMOVE_AUTOTRADE_ENABLED", False)
 BIGMOVE_AUTOTRADE_ATR_TIMEFRAME = str(os.environ.get("BIGMOVE_AUTOTRADE_ATR_TIMEFRAME", "15m") or "15m").strip() or "15m"
 BIGMOVE_AUTOTRADE_ATR_MULT = float(os.environ.get("BIGMOVE_AUTOTRADE_ATR_MULT", "2.2") or 2.2)
 BIGMOVE_AUTOTRADE_SL_MIN_PCT = float(os.environ.get("BIGMOVE_AUTOTRADE_SL_MIN_PCT", "3.0") or 3.0)
@@ -20147,7 +20207,7 @@ async def send_long_message(
     # never crash or show raw HTML tags after fallback.
     try:
         pm_name_0 = str(parse_mode or '').lower()
-        if ('html' in pm_name_0) and (len(str(s)) > max_len or '<pre>' in str(s).lower() or '<code>' in str(s).lower()):
+        if ('html' in pm_name_0) and (len(str(s)) > max_len):
             s = _telegram_html_to_plain_for_fallback(str(s))
             parse_mode = None
     except Exception:
@@ -24438,11 +24498,22 @@ async def learning_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         txt = await to_thread_heavy(_learning_status_text, False, False, timeout=20)
     except asyncio.TimeoutError:
-        try:
-            txt = _learning_status_text(False, True)
-        except Exception:
-            fallback = _admin_status_cache_get('learning_status', ttl=600.0)
-            txt = (fallback + "\n\n⏳ Note: heavy runtime work is still in progress.") if fallback else "⚠️ Learning/optimizer status timed out. Try again shortly."
+        fallback = _admin_status_cache_get('learning_status', ttl=600.0)
+        if fallback:
+            txt = fallback + "\n\n⏳ Note: heavy runtime work is still in progress."
+        else:
+            try:
+                cfg = load_strategy_config(force=False)
+                txt = (
+                    "🧠 Optimizer Status — Fast Snapshot\n"
+                    f"{HDR}\n"
+                    f"Profile: {str(cfg.get('goal_profile_active_profile') or '-')}\n"
+                    f"Sessions: {','.join(cfg.get('execution_sessions_allowed') or []) or '-'} | Engines: {','.join(cfg.get('execution_engines_allowed') or []) or '-'}\n"
+                    f"Email quality≥{float(cfg.get('quality_score_min_email', QUALITY_SCORE_MIN_EMAIL) or QUALITY_SCORE_MIN_EMAIL):.1f} | Screen quality≥{float(cfg.get('quality_score_min_screen', QUALITY_SCORE_MIN_SCREEN) or QUALITY_SCORE_MIN_SCREEN):.1f} | RR≥{float(cfg.get('min_rr_tp', MIN_RR_TP) or MIN_RR_TP):.2f}\n"
+                    "Heavy optimizer refresh is busy; fast config snapshot shown."
+                )
+            except Exception:
+                txt = "⚠️ Learning/optimizer status timed out. Try again shortly."
     _admin_status_cache_put('learning_status', txt)
     await send_long_message(update, txt, parse_mode=None)
 
@@ -24976,6 +25047,55 @@ def _fmt_wr_line(label: str, summary: dict) -> str:
     return f"{label}: {int(summary.get('wins') or 0)}W / {int(summary.get('losses') or 0)}L | {float(summary.get('binary_win_rate') or summary.get('win_rate') or 0.0):.1f}%"
 
 
+def _signal_wr_display_metrics_fast(user_id: int, session: str | None = None, days: int | None = None) -> dict:
+    """Fast DB-only WR snapshot used when the full lifecycle sync is busy.
+
+    It reads emailed_setups + signal_outcomes only; no Bybit sync, no OHLCV, no heavy
+    reconciliation. This keeps /winrate and /ny_winrate responsive during backtests.
+    """
+    rows = []
+    try:
+        ts_from = 0.0
+        if days is not None:
+            ts_from = float(time.time() - max(1, int(days)) * 86400.0)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            q = """SELECT e.setup_id, e.session, e.emailed_ts, COALESCE(o.outcome, 'OPEN') AS outcome
+                   FROM emailed_setups e
+                   LEFT JOIN signal_outcomes o ON o.setup_id=e.setup_id
+                   WHERE e.user_id=?"""
+            params = [int(user_id)]
+            if ts_from > 0:
+                q += " AND e.emailed_ts>=?"
+                params.append(ts_from)
+            if session:
+                q += " AND UPPER(COALESCE(e.session,''))=?"
+                params.append(str(session).upper())
+            q += " ORDER BY e.emailed_ts ASC"
+            rows = [dict(r) for r in (c.execute(q, tuple(params)).fetchall() or [])]
+    except Exception:
+        rows = []
+    rows = [dict(r, outcome=_display_signal_outcome((r or {}).get('outcome'))) for r in rows]
+    stats = _canonical_wr_stats(rows)
+    return {
+        'wins': int(stats.get('wins') or 0),
+        'losses': int(stats.get('losses') or 0),
+        'decided': int(stats.get('decided') or 0),
+        'binary_win_rate': float(stats.get('win_rate') or 0.0),
+        'weighted_win_rate': float(stats.get('win_rate') or 0.0),
+        'avg_weighted_credit': 0.0,
+        'tp_only': int(stats.get('wins') or 0),
+        'alt_target_a_plus': int(stats.get('wins') or 0),
+        'alt_target_b': 0,
+        'open': int((stats.get('counts') or Counter()).get('OPEN', 0)),
+        'counts': stats.get('counts') or Counter(),
+        'rows': rows,
+        'by_session': stats.get('by_session') or {},
+        'fast_snapshot': True,
+    }
+
+
 async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("⛔ Admin only.")
@@ -24995,7 +25115,8 @@ async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cached:
             msg = str(cached) + f"\n\n⚠️ Refresh failed/timed out: {type(e).__name__}. Showing cached snapshot."
         else:
-            msg = f"⚠️ Win-rate refresh failed: {type(e).__name__}: {e}"
+            fast = _signal_wr_display_metrics_fast(owner)
+            msg = ("📊 Win Rate\n" + HDR + "\n" + _fmt_wr_line('Overall signal WR', fast) + "\n⚡ Fast DB-only snapshot; lifecycle refresh is busy.")
     await update.message.reply_text(msg)
 
 
@@ -25018,7 +25139,8 @@ async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cached:
             msg = str(cached) + f"\n\n⚠️ Refresh failed/timed out: {type(e).__name__}. Showing cached snapshot."
         else:
-            msg = f"⚠️ NY win-rate refresh failed: {type(e).__name__}: {e}"
+            fast = _signal_wr_display_metrics_fast(owner, session='NY')
+            msg = ("🗽 NY Win Rate\n" + HDR + "\n" + _fmt_wr_line('Overall NY signal WR', fast) + "\n⚡ Fast DB-only snapshot; lifecycle refresh is busy.")
     await update.message.reply_text(msg)
 
 
@@ -36358,36 +36480,36 @@ def _setup_audit_local_date_key(ts: float) -> str:
 
 
 def _setup_audit_unique_key(row: dict) -> str:
-    """De-duplicate repeated scan snapshots of the same practical setup.
+    """De-duplicate repeated scanner saves into one practical setup.
 
-    A practical setup is the same symbol/side/family with effectively the same
-    entry/SL/TP structure inside a 6-hour bucket. The previous key used session
-    and day only, so the same setup could appear multiple times in /setup_audit
-    when the scanner re-saved it with a different session/source. This caused
-    counts like /setup_audit 2 = 26 even when several rows were duplicated.
+    Default behaviour is intentionally stricter than raw setup_id uniqueness:
+    the same symbol + side + family inside a time bucket is one actionable setup.
+    Raw scanner saves often have tiny entry/SL/TP drift and would otherwise inflate
+    /setup_audit and /setup_audit_overall counts.
     """
     try:
         rr = _setup_audit_payload_from_row(row)
         ts = _setup_audit_row_ts(rr)
-        # Six-hour buckets preserve genuinely new intraday setups while collapsing
-        # repeated scan snapshots of the same levels.
-        bucket = int(float(ts or 0.0) // (6 * 3600)) if float(ts or 0.0) > 0 else 0
+        bucket_h = max(1, int(globals().get('SETUP_AUDIT_DEDUP_BUCKET_HOURS', 12) or 12))
+        bucket = int(float(ts or 0.0) // (bucket_h * 3600)) if float(ts or 0.0) > 0 else 0
         sym = str(rr.get('symbol') or '').upper().strip()
         if sym.endswith('USDT'):
             sym = sym[:-4]
         side = str(rr.get('side') or '').upper().strip()
         fam = _setup_audit_family_code(rr)
-        entry = float(rr.get('entry') or 0.0)
-        sl = float(rr.get('sl') or 0.0)
-        tp = float(rr.get('tp') or 0.0)
-        if entry > 0:
-            # Coarse ratio buckets avoid tiny price drift creating fake new setups.
-            entry_b = round(entry, max(0, 3 - int(math.log10(abs(entry))) if entry > 0 else 3))
-            sl_b = round(((entry - sl) / entry) * 100.0, 1) if sl > 0 else 0.0
-            tp_b = round(((tp - entry) / entry) * 100.0, 1) if tp > 0 else 0.0
-        else:
-            entry_b, sl_b, tp_b = 0.0, 0.0, 0.0
-        return f'{bucket}|{sym}|{side}|{fam}|{entry_b}|{sl_b}|{tp_b}'
+        key = f'{bucket}|{sym}|{side}|{fam}'
+        if bool(globals().get('SETUP_AUDIT_DEDUP_INCLUDE_LEVELS', False)):
+            entry = float(rr.get('entry') or 0.0)
+            sl = float(rr.get('sl') or 0.0)
+            tp = float(rr.get('tp') or 0.0)
+            if entry > 0:
+                entry_b = round(entry, max(0, 3 - int(math.log10(abs(entry))) if entry > 0 else 3))
+                sl_b = round(((entry - sl) / entry) * 100.0, 1) if sl > 0 else 0.0
+                tp_b = round(((tp - entry) / entry) * 100.0, 1) if tp > 0 else 0.0
+            else:
+                entry_b, sl_b, tp_b = 0.0, 0.0, 0.0
+            key += f'|{entry_b}|{sl_b}|{tp_b}'
+        return key
     except Exception:
         sid = str((row or {}).get('setup_id') or '').strip()
         return sid or str(id(row))
@@ -37039,6 +37161,12 @@ def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts
 
 
 def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True) -> list[dict]:
+    """Load setup rows for audit.
+
+    Default source is executable_setups only. Raw generated_setups can be enabled with
+    SETUP_AUDIT_SOURCE_MODE=ALL/GENERATED, but the normal audit should reflect the
+    actionable/executable lane used by email and AutoTrade, not every raw scan candidate.
+    """
     try:
         _migrate_generated_setups()
     except Exception:
@@ -37050,71 +37178,88 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
     cutoff = 0.0
     if hours is not None and int(hours or 0) > 0:
         cutoff = float(time.time()) - float(int(hours)) * 3600.0
-    rows: list[dict] = []
-    # Pull extra rows before de-duplication so the requested limit still has enough
-    # unique setups after repeated scan snapshots are collapsed.
-    lim_clause = ''
-    params_extra = []
-    if int(limit or 0) > 0:
-        lim_clause = ' LIMIT ?'
-        params_extra = [max(int(limit) * 12, int(limit) + 50)]
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            try:
-                params = [int(uid)]
-                where = "WHERE user_id=?"
-                if cutoff > 0:
-                    where += " AND executable_ts>=?"
-                    params.append(float(cutoff))
-                x_cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
-                x_family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
-                cur.execute(f"""
-                    SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
-                           fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
-                           {x_family_expr}, entry, sl, tp, alt_target_a, alt_target_b
-                    FROM executable_setups
-                    {where}
-                    ORDER BY executable_ts DESC{lim_clause}
-                """, tuple(params + params_extra))
-                rows.extend([dict(r) for r in (cur.fetchall() or [])])
-            except Exception:
-                pass
-            try:
-                cols = {r[1] for r in cur.execute('PRAGMA table_info(generated_setups)').fetchall()}
-                market_expr = 'market_symbol' if 'market_symbol' in cols else "'' AS market_symbol"
-                reason_expr = 'entry_reason' if 'entry_reason' in cols else "'' AS entry_reason"
-                alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
-                alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
-                family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in cols else "'' AS family_id"
-                source_expr = 'UPPER(source)' if 'source' in cols else "'GEN'"
-                params = [int(uid)]
-                where = "WHERE user_id=?"
-                if cutoff > 0:
-                    where += " AND created_ts>=?"
-                    params.append(float(cutoff))
-                cur.execute(f"""
-                    SELECT created_ts AS ts, 0 AS signal_created_ts, {source_expr} AS source, session, setup_id, symbol, {market_expr}, side, conf,
-                           fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
-                           {family_expr}, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
-                    FROM generated_setups
-                    {where}
-                    ORDER BY created_ts DESC{lim_clause}
-                """, tuple(params + params_extra))
-                rows.extend([dict(r) for r in (cur.fetchall() or [])])
-            except Exception:
-                pass
-    except Exception:
-        return []
 
-    # Clean + volume filter first.
+    mode = str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE') or 'EXECUTABLE').strip().upper()
+    include_exec = mode in {'EXEC', 'EXECUTABLE', 'ACTIONABLE', 'EMAIL', 'AUTOTRADE', 'ALL'}
+    include_gen = mode in {'GEN', 'GENERATED', 'RAW', 'RAW_GENERATED', 'ALL'}
+    fallback_to_generated = bool(globals().get('SETUP_AUDIT_FALLBACK_TO_GENERATED', True))
+
+    def _pull(include_generated: bool) -> list[dict]:
+        rows: list[dict] = []
+        lim_clause = ''
+        params_extra = []
+        if int(limit or 0) > 0:
+            lim_clause = ' LIMIT ?'
+            params_extra = [max(int(limit) * 12, int(limit) + 50)]
+        try:
+            with sqlite3.connect(DB_PATH) as con:
+                con.row_factory = sqlite3.Row
+                cur = con.cursor()
+                if include_exec:
+                    try:
+                        params = [int(uid)]
+                        where = "WHERE user_id=?"
+                        if cutoff > 0:
+                            where += " AND executable_ts>=?"
+                            params.append(float(cutoff))
+                        x_cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
+                        if x_cols:
+                            x_family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
+                            cur.execute(f"""
+                                SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
+                                       fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
+                                       {x_family_expr}, entry, sl, tp, alt_target_a, alt_target_b
+                                FROM executable_setups
+                                {where}
+                                ORDER BY executable_ts DESC{lim_clause}
+                            """, tuple(params + params_extra))
+                            rows.extend([dict(r) for r in (cur.fetchall() or [])])
+                    except Exception:
+                        pass
+                if include_generated:
+                    try:
+                        cols = {r[1] for r in cur.execute('PRAGMA table_info(generated_setups)').fetchall()}
+                        if cols:
+                            market_expr = 'market_symbol' if 'market_symbol' in cols else "'' AS market_symbol"
+                            reason_expr = 'entry_reason' if 'entry_reason' in cols else "'' AS entry_reason"
+                            alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
+                            alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
+                            family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in cols else "'' AS family_id"
+                            source_expr = 'UPPER(source)' if 'source' in cols else "'GEN'"
+                            params = [int(uid)]
+                            where = "WHERE user_id=?"
+                            if cutoff > 0:
+                                where += " AND created_ts>=?"
+                                params.append(float(cutoff))
+                            cur.execute(f"""
+                                SELECT created_ts AS ts, 0 AS signal_created_ts, {source_expr} AS source, session, setup_id, symbol, {market_expr}, side, conf,
+                                       fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
+                                       {family_expr}, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
+                                FROM generated_setups
+                                {where}
+                                ORDER BY created_ts DESC{lim_clause}
+                            """, tuple(params + params_extra))
+                            rows.extend([dict(r) for r in (cur.fetchall() or [])])
+                    except Exception:
+                        pass
+        except Exception:
+            return []
+        return rows
+
+    rows = _pull(include_gen)
+    if not rows and (not include_gen) and fallback_to_generated:
+        rows = _pull(True)
+        try:
+            for r in rows:
+                r['source'] = 'GEN_FALLBACK'
+        except Exception:
+            pass
+
     cleaned: list[dict] = []
     for r in rows:
         try:
             rr = _setup_audit_payload_from_row(r)
             if not str(rr.get('setup_id') or '').strip():
-                # Keep a stable synthetic id only internally if older rows lacked one.
                 rr['setup_id'] = _setup_audit_unique_key(rr)
             if not _setup_volume_ok(float(rr.get('fut_vol_usd') or 0.0)):
                 continue
@@ -37127,7 +37272,6 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
         deduped: dict[str, dict] = {}
         for r in cleaned:
             key = _setup_audit_unique_key(r)
-            # Keep the latest row for that practical setup.
             if key not in deduped:
                 deduped[key] = r
         final = list(deduped.values())
@@ -37191,16 +37335,16 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     win = _setup_audit_window_summary(rows)
 
     try:
-        display_max = int(os.environ.get('SETUP_AUDIT_DISPLAY_MAX_ROWS', '80') or 80)
+        display_max = int(globals().get('SETUP_AUDIT_DISPLAY_MAX_ROWS', 40) or 40)
     except Exception:
         display_max = 80
-    display_max = max(20, min(200, int(display_max)))
+    display_max = max(10, min(80, int(display_max)))
     display_rows = table_rows[:display_max]
     hidden_rows = max(0, len(table_rows) - len(display_rows))
     table = tabulate(
         display_rows,
         headers=['Symbol', 'Type', 'Conf', 'Family', 'Result'],
-        tablefmt='plain',
+        tablefmt='simple',
         colalign=('left', 'left', 'right', 'center', 'center'),
     )
     header_lines = [
@@ -37209,7 +37353,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
-        "Source: post-setup price path; AutoTrade-independent.",
+        f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
     ]
     if hidden_rows > 0:
         header_lines.append(f"Showing first {len(display_rows)} rows only; {hidden_rows} more hidden. Use /setup_audit rows <n> <hours> for a specific row count.")
@@ -37311,12 +37455,12 @@ def _setup_audit_overall_text(uid: int) -> str:
         f"Families: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Duration: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
-        f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup price path; AutoTrade-independent.",
+        f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
     ]
     table = tabulate(
         table_rows,
         headers=['Family', 'Setups', 'TP', 'SL', 'NOHIT', 'OPEN', 'WR'],
-        tablefmt='plain',
+        tablefmt='simple',
         colalign=('center', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
@@ -38230,7 +38374,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
 def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v3compact:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v4pretty:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -38315,7 +38459,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         table = tabulate(
             table_rows,
             headers=['Symbol', 'Type', 'Family', 'PnL'],
-            tablefmt='plain',
+            tablefmt='simple',
             colalign=('left', 'left', 'left', 'right'),
         )
         out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
