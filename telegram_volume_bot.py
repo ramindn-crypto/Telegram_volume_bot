@@ -7718,6 +7718,34 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         if actual_risk > (allowed_risk_usd * 1.0005):
             return (False, 'risk_cap_enforcement_failed')
     actual_risk_pct = _risk_pct_from_amount(float(equity), float(actual_risk))
+
+    # Hard per-trade risk cap from /autotrade_config for ALL families, including
+    # immediate Big-Move (F8) AutoTrades. Dynamic risk and family-specific logic may
+    # reduce risk, but they are never allowed to size above this configured cap.
+    try:
+        hard_cap_pct = max(0.0, float(_autotrade_risk_per_trade_pct() or 0.0))
+        hard_cap_usd = float(_risk_amount_from_pct(float(equity), float(hard_cap_pct)) or 0.0)
+        if hard_cap_usd > 0 and float(actual_risk) > (float(hard_cap_usd) * 1.0005):
+            try:
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                    'reject_reason': 'per_trade_risk_pct_exceeded',
+                    'hard_cap_pct': float(hard_cap_pct),
+                    'hard_cap_usd': float(hard_cap_usd),
+                    'risk_actual_usd': float(actual_risk),
+                    'risk_actual_pct': float(actual_risk_pct),
+                    'family_id': str(getattr(s, 'family_id', '') or ''),
+                })
+            except Exception:
+                pass
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'per_trade_risk_pct_exceeded actual={actual_risk_pct:.2f}% cap={hard_cap_pct:.2f}%')
+            except Exception:
+                pass
+            return (False, 'per_trade_risk_pct_exceeded')
+    except Exception:
+        pass
+
     if math.isfinite(remaining_risk) and (used_total_before + actual_risk) > (daily_cap * 1.0005):
         try:
             _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason='daily_cap_would_be_exceeded_by_new_trade')
@@ -13033,7 +13061,7 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
             pullback_ready=True,
             pullback_bypass_hot=True,
             leader_base_override=True,
-            engine='',  # Keep DB structural gate simple; family_id carries Big-Move identity.
+            engine='F8',  # Big-Move family; quality_score=0 keeps DB structural gate simple.
             is_trailing_alt_target_b=False,
             created_ts=float(time.time()),
             family_id=BIGMOVE_FAMILY_ID,
@@ -13053,6 +13081,9 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
         setattr(s, 'bigmove_sl_pct', float(plan.get('sl_pct') or 0.0))
         setattr(s, 'bigmove_tp_pct', float(plan.get('tp_pct') or 0.0))
         setattr(s, 'bigmove_rr', float(plan.get('rr') or BIGMOVE_AUTOTRADE_RR))
+        # No separate Big-Move risk setting: F8 must use the same /autotrade_config
+        # AUTOTRADE_RISK_PER_TRADE_PCT, open cap, and daily cap as every other family.
+        setattr(s, 'risk_source', 'autotrade_config')
         setattr(s, 'why', f"Confirmed Big-Move alert {str(c.get('direction') or '').upper()} | SL {float(plan.get('sl_pct') or 0.0):.2f}% ({plan.get('sl_model')}) | TP {float(plan.get('tp_pct') or 0.0):.2f}% (~{float(plan.get('rr') or BIGMOVE_AUTOTRADE_RR):.2f}R)")
         return _research_finalize_setup(s, session_name=session_name)
     except Exception:
@@ -32537,9 +32568,9 @@ ADMIN_HELP_DESCRIPTIONS = {
     "lessons_learned": "Cached latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
-    "setup_audit": "Admin-only setup quality audit: setup id, buy/short, symbol, volume, family/engine, result, and generated reason",
+    "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; shows Symbol, Type, Conf, Family, Result",
     "setup_quality": "Alias of /setup_audit",
-    "setup_audit_overall": "Overall family-level setup audit summary across all generated setups",
+    "setup_audit_overall": "Overall family summary with start/end/duration, avg setups/day, and Family/Setups/TP/SL/OPEN/WR",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
@@ -36069,6 +36100,113 @@ def _setup_audit_short_text(value, max_len: int = 44) -> str:
         return ''
 
 
+def _setup_audit_result_horizon_hours() -> int:
+    """How long after each setup to check for TP/SL in audit reports.
+
+    The selected /setup_audit window filters which setups are shown. The result
+    horizon stays fixed (default 24h) so "/setup_audit 1" means: show setups
+    generated in the last 1 hour, then check each setup's post-entry price path
+    up to the normal 24h result window (or until now).
+    """
+    try:
+        return max(1, min(168, int(float(os.environ.get('SETUP_AUDIT_RESULT_HOURS', '24') or 24))))
+    except Exception:
+        return 24
+
+
+def _setup_audit_family_code(row_or_family) -> str:
+    """Compact family label: F1, F2, ... F8."""
+    try:
+        if isinstance(row_or_family, dict):
+            return _setup_audit_family_display(row_or_family, compact=True)
+        s = str(row_or_family or '').upper().replace('-', '_').strip()
+        m = re.search(r'\b(F[0-9]+)\b', s)
+        if m:
+            return m.group(1)
+        return _setup_family_id_to_code(s) if s else '-'
+    except Exception:
+        return '-'
+
+
+def _setup_audit_row_ts(row: dict) -> float:
+    try:
+        return float((row or {}).get('ts') or (row or {}).get('created_ts') or (row or {}).get('signal_created_ts') or (row or {}).get('executable_ts') or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _setup_audit_local_date_key(ts: float) -> str:
+    try:
+        if float(ts or 0.0) <= 0:
+            return 'unknown_date'
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d')
+    except Exception:
+        return 'unknown_date'
+
+
+def _setup_audit_unique_key(row: dict) -> str:
+    """De-duplicate repeated scan snapshots of the same practical setup.
+
+    generated_setups/executable_setups can contain the same symbol/family every
+    few minutes while it remains valid. Audit commands should count/show the
+    practical setup once per day/session/symbol/side/family, otherwise /setup_audit 1
+    can show 30+ rows even when only a handful of distinct setups existed.
+    """
+    try:
+        rr = _setup_audit_payload_from_row(row)
+        ts = _setup_audit_row_ts(rr)
+        day = _setup_audit_local_date_key(ts)
+        sym = str(rr.get('symbol') or '').upper().strip()
+        if sym.endswith('USDT'):
+            sym = sym[:-4]
+        side = str(rr.get('side') or '').upper().strip()
+        fam = _setup_audit_family_code(rr)
+        sess = str(rr.get('session') or '').upper().strip() or '-'
+        return f'{day}|{sess}|{sym}|{side}|{fam}'
+    except Exception:
+        sid = str((row or {}).get('setup_id') or '').strip()
+        return sid or str(id(row))
+
+
+def _setup_audit_window_summary(rows: list[dict]) -> dict:
+    try:
+        ts_vals = sorted([_setup_audit_row_ts(r) for r in (rows or []) if _setup_audit_row_ts(r) > 0])
+        if not ts_vals:
+            return {'start_ts': 0.0, 'end_ts': 0.0, 'duration_days': 0.0, 'avg_daily': 0.0, 'start_txt': '-', 'end_txt': '-'}
+        start_ts, end_ts = float(ts_vals[0]), float(ts_vals[-1])
+        duration_days = max(1.0 / 24.0, ((end_ts - start_ts) / 86400.0) if end_ts > start_ts else (1.0 / 24.0))
+        avg_daily = float(len(rows or [])) / duration_days if duration_days > 0 else 0.0
+        start_txt = datetime.fromtimestamp(start_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        end_txt = datetime.fromtimestamp(end_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        return {'start_ts': start_ts, 'end_ts': end_ts, 'duration_days': duration_days, 'avg_daily': avg_daily, 'start_txt': start_txt, 'end_txt': end_txt}
+    except Exception:
+        return {'start_ts': 0.0, 'end_ts': 0.0, 'duration_days': 0.0, 'avg_daily': 0.0, 'start_txt': '-', 'end_txt': '-'}
+
+
+def _setup_audit_help_text() -> str:
+    return (
+        "🧪 <b>Setup Audit Guide</b>\n"
+        f"{HDR}\n"
+        "<b>Purpose</b>: check generated setups against the real post-setup price path, independent from AutoTrade.\n\n"
+        "<b>Commands</b>\n"
+        "• <code>/setup_audit</code> — unique setups from the last 24h.\n"
+        "• <code>/setup_audit 1</code> — unique setups generated in the last 1h.\n"
+        "• <code>/setup_audit 6</code> — unique setups generated in the last 6h.\n"
+        "• <code>/setup_audit 24</code> — unique setups generated in the last 24h.\n"
+        "• <code>/setup_audit 48</code> — unique setups generated in the last 48h.\n"
+        "• <code>/setup_audit overall</code> — same as <code>/setup_audit_overall</code>.\n"
+        "• <code>/setup_audit h</code> or <code>/setup_audit help</code> — this guide.\n\n"
+        "<b>Columns</b>\n"
+        "• Symbol — coin.\n"
+        "• Type — BUY/SELL.\n"
+        "• Conf — setup confidence.\n"
+        "• Family — compact family code, e.g. F1/F2/F3/F8.\n"
+        "• Result — TP, SL, or OPEN.\n\n"
+        "<b>Important</b>: the hour argument filters setup generation time only. "
+        "TP/SL checking uses the configured result horizon (default 24h)."
+    )
+
+
 def _setup_audit_result_label(value: str) -> str:
     v = str(value or '').upper().strip()
     if v in {'TP', 'WIN', 'WIN_TP', 'HIT_TP_WIN'}:
@@ -36551,7 +36689,7 @@ def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts
     return out
 
 
-def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0) -> list[dict]:
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True) -> list[dict]:
     try:
         _migrate_generated_setups()
     except Exception:
@@ -36564,11 +36702,13 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0) -> 
     if hours is not None and int(hours or 0) > 0:
         cutoff = float(time.time()) - float(int(hours)) * 3600.0
     rows: list[dict] = []
+    # Pull extra rows before de-duplication so the requested limit still has enough
+    # unique setups after repeated scan snapshots are collapsed.
     lim_clause = ''
     params_extra = []
     if int(limit or 0) > 0:
         lim_clause = ' LIMIT ?'
-        params_extra = [int(limit) * 6]
+        params_extra = [max(int(limit) * 12, int(limit) + 50)]
     try:
         with sqlite3.connect(DB_PATH) as con:
             con.row_factory = sqlite3.Row
@@ -36598,15 +36738,17 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0) -> 
                 reason_expr = 'entry_reason' if 'entry_reason' in cols else "'' AS entry_reason"
                 alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
                 alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
+                family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in cols else "'' AS family_id"
+                source_expr = 'UPPER(source)' if 'source' in cols else "'GEN'"
                 params = [int(uid)]
                 where = "WHERE user_id=?"
                 if cutoff > 0:
                     where += " AND created_ts>=?"
                     params.append(float(cutoff))
                 cur.execute(f"""
-                    SELECT created_ts AS ts, 0 AS signal_created_ts, UPPER(source) AS source, session, setup_id, symbol, {market_expr}, side, conf,
+                    SELECT created_ts AS ts, 0 AS signal_created_ts, {source_expr} AS source, session, setup_id, symbol, {market_expr}, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
-                           COALESCE(family_id, '') AS family_id, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
+                           {family_expr}, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
                     FROM generated_setups
                     {where}
                     ORDER BY created_ts DESC{lim_clause}
@@ -36617,38 +36759,56 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0) -> 
     except Exception:
         return []
 
-    dedup: dict[str, dict] = {}
-    for r in sorted(rows, key=lambda x: float(x.get('ts') or 0.0), reverse=True):
-        sid = str(r.get('setup_id') or '').strip()
-        if not sid or sid in dedup:
-            continue
+    # Clean + volume filter first.
+    cleaned: list[dict] = []
+    for r in rows:
         try:
-            if not _setup_volume_ok(float(r.get('fut_vol_usd') or 0.0)):
+            rr = _setup_audit_payload_from_row(r)
+            if not str(rr.get('setup_id') or '').strip():
+                # Keep a stable synthetic id only internally if older rows lacked one.
+                rr['setup_id'] = _setup_audit_unique_key(rr)
+            if not _setup_volume_ok(float(rr.get('fut_vol_usd') or 0.0)):
                 continue
+            cleaned.append(rr)
         except Exception:
             continue
-        dedup[sid] = r
-    final = list(dedup.values())
+
+    cleaned = sorted(cleaned, key=lambda x: _setup_audit_row_ts(x), reverse=True)
+    if bool(dedup):
+        deduped: dict[str, dict] = {}
+        for r in cleaned:
+            key = _setup_audit_unique_key(r)
+            # Keep the latest row for that practical setup.
+            if key not in deduped:
+                deduped[key] = r
+        final = list(deduped.values())
+    else:
+        seen_sid: set[str] = set()
+        final = []
+        for r in cleaned:
+            sid = str(r.get('setup_id') or '').strip()
+            if sid and sid in seen_sid:
+                continue
+            if sid:
+                seen_sid.add(sid)
+            final.append(r)
     if int(limit or 0) > 0:
         final = final[:int(limit)]
     return final
 
 
 def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
-    """Compact setup audit: Symbol / Type / Conf / Family / Result only.
-
-    The result is calculated from the price path after the setup timestamp and is
-    independent from AutoTrade positions.
-    """
-    limit = max(0, int(limit or 0))  # 0 = no artificial row limit
+    """Compact setup audit: Symbol / Type / Conf / Family / Result only."""
+    limit = max(0, int(limit or 0))
     hours = max(1, min(8760, int(hours or 24)))
-    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit)
+    result_horizon = _setup_audit_result_horizon_hours()
+    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit, dedup=True)
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not rows:
-        return f"🧪 Setup Audit\n{HDR}\nNo setups above ${min_vol_m:.0f}M volume in the last {hours}h."
+        return f"🧪 <b>Setup Audit</b>\n{HDR}\nNo unique setups above ${min_vol_m:.0f}M volume in the last {hours}h.\n\nUse <code>/setup_audit h</code> for the guide."
 
     audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
-    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=hours, timeframe=audit_tf)
+    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
     actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
 
     table_rows = []
@@ -36659,9 +36819,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         sym = str(r.get('symbol') or '').upper().strip()
         if sym.endswith('USDT'):
             sym = sym[:-4]
-        family_code = _setup_audit_family_display(r, compact=True)
+        family_code = _setup_audit_family_code(r)
         actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
-        ev = _setup_audit_resolve_result(r, horizon_hours=hours, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
+        ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
         result = _setup_audit_result_label(ev.get('result'))
         if result == 'TP':
             tp_n += 1
@@ -36669,13 +36829,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
             sl_n += 1
         else:
             open_n += 1
-        table_rows.append([
-            sym,
-            side,
-            int(float(r.get('conf') or 0.0)),
-            family_code,
-            result,
-        ])
+        table_rows.append([sym, side, int(float(r.get('conf') or 0.0)), family_code, result])
 
     decided = tp_n + sl_n
     wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
@@ -36683,22 +36837,23 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
     except Exception:
         now_txt = ''
+    win = _setup_audit_window_summary(rows)
 
     table = tabulate(
         table_rows,
         headers=['Symbol', 'Type', 'Conf', 'Family', 'Result'],
-        tablefmt='plain',
-        colalign=('left', 'left', 'right', 'left', 'left'),
+        tablefmt='github',
+        colalign=('left', 'left', 'right', 'center', 'center'),
     )
     header_lines = [
-        "🧪 Setup Audit",
+        "🧪 <b>Setup Audit</b>",
         HDR,
-        f"Window: last {hours}h (Melbourne) | Rows: {len(rows)} | Min vol: ${min_vol_m:.0f}M" + (f" | Now: {now_txt}" if now_txt else ""),
-        f"Price result: TP={tp_n} | SL={sl_n} | OPEN={open_n} | WR={wr:.1f}% | TF={audit_tf}",
-        "Result source: post-setup price path, independent from AutoTrade.",
+        f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
+        f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
+        "Source: post-setup price path; AutoTrade-independent.",
     ]
-    return "\n".join(header_lines) + "\n" + table
-
+    return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
 async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -36706,105 +36861,100 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_user(uid):
         await update.message.reply_text("⛔ Admin only.")
         return
-    limit = 0  # 0 = unlimited rows in the selected window
+    limit = 0
     hours = 24
     try:
         args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and args[0].lower() in {'h', 'help', '?', 'guide'}:
+            await send_long_message(update, _setup_audit_help_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        if args and args[0].lower() in {'overall', 'alltime', 'all-time'}:
+            text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=180)
+            await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        # Primary/simple usage: /setup_audit 1 means last 1 hour, not 1 row.
+        # Optional advanced usage: /setup_audit rows 20 24 OR /setup_audit limit 20 24.
         if len(args) == 1:
-            if args[0].lower() in {'all', 'unlimited', 'full'}:
+            if args[0].isdigit() or re.fullmatch(r'\d+(\.\d+)?', args[0]):
+                hours = int(float(args[0]))
+            elif args[0].lower() in {'all', 'unlimited', 'full'}:
                 limit = 0
-            elif args[0].isdigit():
-                hours = int(args[0])
         elif len(args) >= 2:
-            limit = 0 if args[0].lower() in {'all', 'unlimited', 'full', '0'} else int(float(args[0]))
-            hours = int(float(args[1]))
+            if args[0].lower() in {'rows', 'row', 'limit', 'n'}:
+                limit = int(float(args[1]))
+                if len(args) >= 3:
+                    hours = int(float(args[2]))
+            else:
+                # Backward compatible: /setup_audit <limit> <hours>
+                limit = 0 if args[0].lower() in {'all', 'unlimited', 'full', '0'} else int(float(args[0]))
+                hours = int(float(args[1]))
     except Exception:
         limit = 0
         hours = 24
     try:
-        text = await to_thread_heavy(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=90)
+        text = await to_thread_heavy(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=120)
     except Exception as e:
-        text = f"❌ setup_audit failed: {type(e).__name__}: {e}"
-    await send_long_message(update, text, parse_mode=None, disable_web_page_preview=True)
+        text = f"❌ setup_audit failed: {type(e).__name__}: {html.escape(str(e))}"
+    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 def _setup_audit_overall_text(uid: int) -> str:
     """Overall family-level setup audit summary across all stored setup rows."""
-    rows = _setup_audit_load_rows(int(uid), hours=None, limit=0)
+    rows = _setup_audit_load_rows(int(uid), hours=None, limit=0, dedup=True)
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not rows:
-        return f"📊 <b>Setup Audit Overall</b>\n{HDR}\nNo setup rows found above ${min_vol_m:.0f}M volume."
-    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid))
+        return f"📊 <b>Setup Audit Overall</b>\n{HDR}\nNo unique setup rows found above ${min_vol_m:.0f}M volume."
+
+    result_horizon = _setup_audit_result_horizon_hours()
+    audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
+    # Overall is the command where stale OPEN counts were most wrong. Force grouped
+    # historical candles by symbol so old setups are checked against their real
+    # post-setup path instead of the current ticker only.
+    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
     fam_stats: dict[str, dict] = {}
     for r in rows:
-        fam = _setup_audit_family_from_row(r) or '-'
+        fam = _setup_audit_family_code(r)
         sid = str(r.get('setup_id') or '').strip()
-        actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
-        ev = _setup_audit_price_result_payload(r, horizon_hours=24, user_id=int(uid), force=False, actual_pnl_usdt=actual_pnl)
+        ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=0.0)
         result = _setup_audit_result_label(ev.get('result'))
-        item = fam_stats.setdefault(fam, {'total': 0, 'tp': 0, 'sl': 0, 'open': 0, 'net_r': 0.0, 'pnl': 0.0, 'conf_sum': 0.0, 'vol_sum': 0.0, 'sessions': Counter()})
+        item = fam_stats.setdefault(fam, {'total': 0, 'tp': 0, 'sl': 0, 'open': 0})
         item['total'] += 1
         item['tp'] += 1 if result == 'TP' else 0
         item['sl'] += 1 if result == 'SL' else 0
         item['open'] += 1 if result == 'OPEN' else 0
-        item['net_r'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
-        item['pnl'] += float(actual_pnl or 0.0)
-        item['conf_sum'] += float(r.get('conf') or 0.0)
-        item['vol_sum'] += float(r.get('fut_vol_usd') or 0.0) / 1e6
-        sess = str(r.get('session') or '-').upper().strip() or '-'
-        item['sessions'][sess] += 1
 
     table_rows = []
     total_setups = total_tp = total_sl = total_open = 0
-    total_r = total_pnl = 0.0
-    for fam, st in sorted(fam_stats.items(), key=lambda kv: (float(kv[1].get('net_r') or 0.0), int(kv[1].get('tp') or 0), int(kv[1].get('total') or 0)), reverse=True):
+    for fam, st in sorted(fam_stats.items(), key=lambda kv: (int(kv[1].get('total') or 0), str(kv[0])), reverse=True):
         total = int(st.get('total') or 0)
         tp = int(st.get('tp') or 0)
         sl = int(st.get('sl') or 0)
         op = int(st.get('open') or 0)
         decided = tp + sl
         wr = (tp / decided * 100.0) if decided > 0 else 0.0
-        avg_conf = float(st.get('conf_sum') or 0.0) / total if total else 0.0
-        avg_vol = float(st.get('vol_sum') or 0.0) / total if total else 0.0
-        top_sess = '-'
-        try:
-            if st.get('sessions'):
-                top_sess = st['sessions'].most_common(1)[0][0]
-        except Exception:
-            top_sess = '-'
         total_setups += total
         total_tp += tp
         total_sl += sl
         total_open += op
-        total_r += float(st.get('net_r') or 0.0)
-        total_pnl += float(st.get('pnl') or 0.0)
-        table_rows.append([
-            _setup_audit_short_text(fam, 28),
-            total,
-            tp,
-            sl,
-            op,
-            f"{wr:.1f}%",
-            f"{float(st.get('net_r') or 0.0):+.2f}",
-            f"{float(st.get('pnl') or 0.0):+.2f}",
-            f"{avg_conf:.0f}",
-            f"{avg_vol:.1f}M",
-            top_sess,
-        ])
+        table_rows.append([fam, total, tp, sl, op, f"{wr:.1f}%"])
     decided_total = total_tp + total_sl
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
+    win = _setup_audit_window_summary(rows)
+    dur_days = float(win.get('duration_days') or 0.0)
+    avg_daily = float(win.get('avg_daily') or 0.0)
     header = [
         "📊 <b>Setup Audit Overall</b>",
         HDR,
-        f"Families: <b>{len(fam_stats)}</b> | Setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
-        f"Total NetR: <b>{total_r:+.2f}</b> | Total PnL: <b>{total_pnl:+.2f} USDT</b>",
-        "PnL is actual AutoTrade PnL when a setup was traded; NetR is the price-based setup result for every setup.",
+        f"Families: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
+        f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        f"Duration: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup price path; AutoTrade-independent.",
     ]
     table = tabulate(
         table_rows,
-        headers=['Family', 'Setups', 'TP', 'SL', 'OPEN', 'WR', 'NetR', 'Total PnL', 'AvgConf', 'AvgVol', 'TopSess'],
-        tablefmt='plain',
-        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'),
+        headers=['Family', 'Setups', 'TP', 'SL', 'OPEN', 'WR'],
+        tablefmt='github',
+        colalign=('center', 'right', 'right', 'right', 'right', 'right'),
     )
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -36815,9 +36965,9 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("⛔ Admin only.")
         return
     try:
-        text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=180)
+        text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
     except Exception as e:
-        text = f"❌ setup_audit_overall failed: {type(e).__name__}: {e}"
+        text = f"❌ setup_audit_overall failed: {type(e).__name__}: {html.escape(str(e))}"
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
