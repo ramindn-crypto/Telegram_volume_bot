@@ -7935,6 +7935,56 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
         final_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=5.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
         qty_for_db = abs(float((_pos_size(final_pos) if final_pos else filled_qty) or qty))
+        if final_pos is not None:
+            try:
+                final_entry_for_risk = float(_pos_entry(final_pos) or filled_entry or price_ref)
+                final_risk = _autotrade_true_risk_usd(final_entry_for_risk, sl_for_order, qty_for_db, contract_size)
+                hard_cap_pct_live = max(0.0, float(_autotrade_risk_per_trade_pct() or 0.0))
+                hard_cap_usd_live = float(_risk_amount_from_pct(float(equity), float(hard_cap_pct_live)) or 0.0)
+                final_cap_usd = min(float(allowed_risk_usd), float(hard_cap_usd_live or allowed_risk_usd))
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'final_live_risk_usd': float(final_risk), 'final_live_risk_cap_usd': float(final_cap_usd)})
+                if final_cap_usd > 0 and final_risk > (final_cap_usd * 1.0005):
+                    allowed_qty_live = _autotrade_qty_from_risk(final_entry_for_risk, sl_for_order, equity, risk_usd=final_cap_usd, contract_size=contract_size)
+                    allowed_qty_live, allowed_reason_live = _round_qty_down(sym, allowed_qty_live, final_entry_for_risk)
+                    reduce_qty_live = max(0.0, float(qty_for_db) - float(allowed_qty_live or 0.0)) if allowed_qty_live and allowed_qty_live > 0 else float(qty_for_db)
+                    reduce_qty_live, reduce_reason_live = _round_qty_down(sym, reduce_qty_live, final_entry_for_risk)
+                    if reduce_qty_live and reduce_qty_live > 0:
+                        reduce_payload_live = {
+                            'category': 'linear',
+                            'symbol': sym,
+                            'side': 'Sell' if side == 'BUY' else 'Buy',
+                            'orderType': 'Market',
+                            'qty': _fmt_qty(reduce_qty_live, qty_step),
+                            'timeInForce': 'IOC',
+                            'reduceOnly': True,
+                            'closeOnTrigger': True,
+                        }
+                        reduce_res_live = _bybit_v5_request('POST', '/v5/order/create', reduce_payload_live)
+                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({'final_risk_reduce_payload': reduce_payload_live, 'final_risk_reduce_res': reduce_res_live})
+                        if int((reduce_res_live or {}).get('retCode', -1)) != 0:
+                            err = f"{(reduce_res_live or {}).get('retCode')} {(reduce_res_live or {}).get('retMsg')}"
+                            _autotrade_exec_mark(reserved_keys, 'FAILED', f'final_risk_cap_reduce_failed:{err}')
+                            return (False, f'final_risk_cap_reduce_failed ({err})')
+                        corrected = True
+                        final_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=3.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or final_pos
+                        qty_for_db = abs(float((_pos_size(final_pos) if final_pos else max(0.0, float(qty_for_db) - float(reduce_qty_live))) or 0.0))
+                        final_entry_for_risk = float((_pos_entry(final_pos) if final_pos else final_entry_for_risk) or final_entry_for_risk)
+                        final_risk = _autotrade_true_risk_usd(final_entry_for_risk, sl_for_order, qty_for_db, contract_size)
+                    if final_cap_usd > 0 and final_risk > (final_cap_usd * 1.0005):
+                        close_res = _autotrade_force_close_live_position(sym, side, qty_for_db)
+                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'final_per_trade_risk_pct_exceeded_closed', 'risk_close_res': close_res})
+                        _autotrade_exec_mark(reserved_keys, 'FAILED', 'final_per_trade_risk_pct_exceeded')
+                        try:
+                            _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason=f'final_per_trade_risk_pct_exceeded actual={_risk_pct_from_amount(float(equity), float(final_risk)):.2f}% cap={hard_cap_pct_live:.2f}%')
+                        except Exception:
+                            pass
+                        return (False, 'final_per_trade_risk_pct_exceeded_closed')
+            except Exception as exc:
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'final_risk_cap_check_error': f'{type(exc).__name__}: {exc}'})
+                except Exception:
+                    pass
         if final_pos is None:
             try:
                 _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_position_visibility_pending_for_sltp_attach'})
@@ -36017,8 +36067,10 @@ def _setup_audit_result_from_cached_price_moves(row: dict, horizon_hours: int = 
                 hit_tp = lo <= tp
                 hit_sl = hi >= sl
             if hit_tp and hit_sl:
-                # Same candle ambiguity: keep OPEN rather than producing a false result.
-                return 'OPEN'
+                # Same-candle ambiguity in cached/coarse data: be conservative for audit.
+                # The grouped evaluator tries 1m first; this fallback should not leave
+                # an old resolved setup as OPEN forever.
+                return 'LOSE'
             if hit_tp:
                 return 'WIN'
             if hit_sl:
@@ -36037,6 +36089,11 @@ def _setup_audit_result_from_cached_price_moves(row: dict, horizon_hours: int = 
                     return 'WIN'
                 if px >= sl:
                     return 'LOSE'
+        try:
+            if created_ts > 0 and float(time.time()) >= (float(created_ts) + float(max(1, int(horizon_hours or 24))) * 3600.0 - 60.0):
+                return 'NOHIT'
+        except Exception:
+            pass
         return 'OPEN'
     except Exception:
         return 'OPEN'
@@ -36147,22 +36204,34 @@ def _setup_audit_local_date_key(ts: float) -> str:
 def _setup_audit_unique_key(row: dict) -> str:
     """De-duplicate repeated scan snapshots of the same practical setup.
 
-    generated_setups/executable_setups can contain the same symbol/family every
-    few minutes while it remains valid. Audit commands should count/show the
-    practical setup once per day/session/symbol/side/family, otherwise /setup_audit 1
-    can show 30+ rows even when only a handful of distinct setups existed.
+    A practical setup is the same symbol/side/family with effectively the same
+    entry/SL/TP structure inside a 6-hour bucket. The previous key used session
+    and day only, so the same setup could appear multiple times in /setup_audit
+    when the scanner re-saved it with a different session/source. This caused
+    counts like /setup_audit 2 = 26 even when several rows were duplicated.
     """
     try:
         rr = _setup_audit_payload_from_row(row)
         ts = _setup_audit_row_ts(rr)
-        day = _setup_audit_local_date_key(ts)
+        # Six-hour buckets preserve genuinely new intraday setups while collapsing
+        # repeated scan snapshots of the same levels.
+        bucket = int(float(ts or 0.0) // (6 * 3600)) if float(ts or 0.0) > 0 else 0
         sym = str(rr.get('symbol') or '').upper().strip()
         if sym.endswith('USDT'):
             sym = sym[:-4]
         side = str(rr.get('side') or '').upper().strip()
         fam = _setup_audit_family_code(rr)
-        sess = str(rr.get('session') or '').upper().strip() or '-'
-        return f'{day}|{sess}|{sym}|{side}|{fam}'
+        entry = float(rr.get('entry') or 0.0)
+        sl = float(rr.get('sl') or 0.0)
+        tp = float(rr.get('tp') or 0.0)
+        if entry > 0:
+            # Coarse ratio buckets avoid tiny price drift creating fake new setups.
+            entry_b = round(entry, max(0, 3 - int(math.log10(abs(entry))) if entry > 0 else 3))
+            sl_b = round(((entry - sl) / entry) * 100.0, 1) if sl > 0 else 0.0
+            tp_b = round(((tp - entry) / entry) * 100.0, 1) if tp > 0 else 0.0
+        else:
+            entry_b, sl_b, tp_b = 0.0, 0.0, 0.0
+        return f'{bucket}|{sym}|{side}|{fam}|{entry_b}|{sl_b}|{tp_b}'
     except Exception:
         sid = str((row or {}).get('setup_id') or '').strip()
         return sid or str(id(row))
@@ -36201,7 +36270,8 @@ def _setup_audit_help_text() -> str:
         "• Type — BUY/SELL.\n"
         "• Conf — setup confidence.\n"
         "• Family — compact family code, e.g. F1/F2/F3/F8.\n"
-        "• Result — TP, SL, or OPEN.\n\n"
+        "• Result — TP, SL, NOHIT, or OPEN.\n"
+        "  OPEN means still inside the result horizon. NOHIT means the horizon expired without TP or SL.\n\n"
         "<b>Important</b>: the hour argument filters setup generation time only. "
         "TP/SL checking uses the configured result horizon (default 24h)."
     )
@@ -36209,10 +36279,12 @@ def _setup_audit_help_text() -> str:
 
 def _setup_audit_result_label(value: str) -> str:
     v = str(value or '').upper().strip()
-    if v in {'TP', 'WIN', 'WIN_TP', 'HIT_TP_WIN'}:
+    if v in {'TP', 'WIN', 'WIN_TP', 'TP1', 'TP2', 'TP3', 'HIT_TP_WIN'}:
         return 'TP'
     if v in {'SL', 'LOSS', 'LOSE', 'HIT_SL_LOSS'}:
         return 'SL'
+    if v in {'NOHIT', 'NO_HIT', 'TIMEOUT', 'EXPIRED', 'HORIZON_EXPIRED_NO_HIT', 'NO_TP_SL'}:
+        return 'NOHIT'
     return 'OPEN'
 
 
@@ -36336,7 +36408,7 @@ def _setup_audit_cached_result(setup_id: str, horizon_hours: int, allow_open_fre
                 return {}
             d = dict(row)
             result = _setup_audit_result_label(d.get('result'))
-            if result in {'TP', 'SL'}:
+            if result in {'TP', 'SL', 'NOHIT'}:
                 return d
             # OPEN can change while the horizon is still alive; reuse only a very recent OPEN.
             age = float(time.time()) - float(d.get('evaluated_ts') or 0.0)
@@ -36413,7 +36485,7 @@ def _setup_audit_price_result_payload(row: dict, horizon_hours: int = 24, user_i
             # This keeps /setup_audit responsive and independent from autotrade even when
             # Bybit rate-limits historical 1m/5m requests.
             quick_result = _setup_audit_result_from_cached_price_moves(row, horizon_hours=horizon_hours)
-            if _setup_audit_result_label(quick_result) in {'TP', 'SL'}:
+            if _setup_audit_result_label(quick_result) in {'TP', 'SL', 'NOHIT'}:
                 res = {
                     'result': _setup_audit_result_label(quick_result),
                     'hit_level': _setup_audit_result_label(quick_result),
@@ -36579,13 +36651,20 @@ def _setup_audit_payload_result_from_candles(row: dict, candles: list, horizon_h
                         return r1
             except Exception:
                 pass
+        if canon == 'OPEN':
+            try:
+                if float(time.time()) >= (float(created_ts) + float(max(1, int(horizon_hours or 24))) * 3600.0 - 60.0):
+                    canon = 'NOHIT'
+                    note = note or 'horizon_expired_no_tp_or_sl'
+            except Exception:
+                pass
         return {
             'result': canon,
             'hit_level': str(res.get('hit_level') or (canon if canon in {'TP', 'SL'} else '')).upper().strip(),
             'hit_ts': res.get('hit_ts'),
             'best_level': res.get('best_level'),
             'best_ts': res.get('best_ts'),
-            'note': note or f'resolved_{timeframe}' if canon in {'TP', 'SL'} else (note or 'horizon_not_hit'),
+            'note': (note or f'resolved_{timeframe}') if canon in {'TP', 'SL'} else (note or 'horizon_not_hit'),
         }
     except Exception as exc:
         return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'candles_eval_error:{type(exc).__name__}'}
@@ -36605,7 +36684,7 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
         rr = _setup_audit_payload_from_row(row)
         sid = str(rr.get('setup_id') or '').strip()
         cached = _setup_audit_cached_result(sid, horizon_hours, allow_open_fresh_sec=0) if sid else {}
-        if cached and _setup_audit_result_label(cached.get('result')) in {'TP', 'SL'}:
+        if cached and _setup_audit_result_label(cached.get('result')) in {'TP', 'SL', 'NOHIT'}:
             return {'result': _setup_audit_result_label(cached.get('result')), 'hit_level': cached.get('hit_level'), 'hit_ts': cached.get('hit_ts'), 'note': cached.get('note') or 'cached_decided_result'}
 
         # Existing signal outcome table can be a decided source if background sync already resolved it.
@@ -36622,7 +36701,7 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
         candles = (candles_by_symbol or {}).get(ms) or []
         if candles:
             ev = _setup_audit_payload_result_from_candles(rr, candles, horizon_hours=horizon_hours, timeframe=audit_timeframe)
-            if _setup_audit_result_label(ev.get('result')) in {'TP', 'SL'}:
+            if _setup_audit_result_label(ev.get('result')) in {'TP', 'SL', 'NOHIT'}:
                 try:
                     _setup_audit_upsert_result(int(user_id or 0), rr, ev, int(horizon_hours), actual_pnl_usdt=actual_pnl_usdt)
                 except Exception:
@@ -36654,10 +36733,13 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
         canon = _setup_audit_result_label(quick)
         if canon in {'TP', 'SL'}:
             ev = {'result': canon, 'hit_level': canon, 'hit_ts': None, 'note': 'current_price_or_cached_outcome'}
+        elif canon == 'NOHIT':
+            ev = {'result': 'NOHIT', 'hit_level': '', 'hit_ts': None, 'note': 'horizon_expired_no_tp_or_sl'}
         else:
             ev = dict(last_ev or {})
-            ev['result'] = 'OPEN'
-            ev.setdefault('note', 'not_hit_in_horizon')
+            ev['result'] = _setup_audit_result_label(ev.get('result'))
+            if ev['result'] == 'OPEN':
+                ev.setdefault('note', 'not_hit_in_horizon')
         try:
             _setup_audit_upsert_result(int(user_id or 0), rr, ev, int(horizon_hours), actual_pnl_usdt=actual_pnl_usdt)
         except Exception:
@@ -36812,7 +36894,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
 
     table_rows = []
-    tp_n = sl_n = open_n = 0
+    tp_n = sl_n = nohit_n = open_n = 0
     for r in rows:
         sid = str(r.get('setup_id') or '').strip()
         side = str(r.get('side') or '').upper().strip()
@@ -36827,11 +36909,13 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
             tp_n += 1
         elif result == 'SL':
             sl_n += 1
+        elif result == 'NOHIT':
+            nohit_n += 1
         else:
             open_n += 1
         table_rows.append([sym, side, int(float(r.get('conf') or 0.0)), family_code, result])
 
-    decided = tp_n + sl_n
+    decided = tp_n + sl_n + nohit_n
     wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
     try:
         now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
@@ -36842,7 +36926,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     table = tabulate(
         table_rows,
         headers=['Symbol', 'Type', 'Conf', 'Family', 'Result'],
-        tablefmt='github',
+        tablefmt='plain',
         colalign=('left', 'left', 'right', 'center', 'center'),
     )
     header_lines = [
@@ -36850,7 +36934,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         HDR,
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
+        f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         "Source: post-setup price path; AutoTrade-independent.",
     ]
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
@@ -36917,27 +37001,30 @@ def _setup_audit_overall_text(uid: int) -> str:
         sid = str(r.get('setup_id') or '').strip()
         ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=0.0)
         result = _setup_audit_result_label(ev.get('result'))
-        item = fam_stats.setdefault(fam, {'total': 0, 'tp': 0, 'sl': 0, 'open': 0})
+        item = fam_stats.setdefault(fam, {'total': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0})
         item['total'] += 1
         item['tp'] += 1 if result == 'TP' else 0
         item['sl'] += 1 if result == 'SL' else 0
+        item['nohit'] += 1 if result == 'NOHIT' else 0
         item['open'] += 1 if result == 'OPEN' else 0
 
     table_rows = []
-    total_setups = total_tp = total_sl = total_open = 0
+    total_setups = total_tp = total_sl = total_nohit = total_open = 0
     for fam, st in sorted(fam_stats.items(), key=lambda kv: (int(kv[1].get('total') or 0), str(kv[0])), reverse=True):
         total = int(st.get('total') or 0)
         tp = int(st.get('tp') or 0)
         sl = int(st.get('sl') or 0)
+        nohit = int(st.get('nohit') or 0)
         op = int(st.get('open') or 0)
-        decided = tp + sl
+        decided = tp + sl + nohit
         wr = (tp / decided * 100.0) if decided > 0 else 0.0
         total_setups += total
         total_tp += tp
         total_sl += sl
+        total_nohit += nohit
         total_open += op
-        table_rows.append([fam, total, tp, sl, op, f"{wr:.1f}%"])
-    decided_total = total_tp + total_sl
+        table_rows.append([fam, total, tp, sl, nohit, op, f"{wr:.1f}%"])
+    decided_total = total_tp + total_sl + total_nohit
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
     win = _setup_audit_window_summary(rows)
     dur_days = float(win.get('duration_days') or 0.0)
@@ -36945,16 +37032,16 @@ def _setup_audit_overall_text(uid: int) -> str:
     header = [
         "📊 <b>Setup Audit Overall</b>",
         HDR,
-        f"Families: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
+        f"Families: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Duration: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup price path; AutoTrade-independent.",
     ]
     table = tabulate(
         table_rows,
-        headers=['Family', 'Setups', 'TP', 'SL', 'OPEN', 'WR'],
-        tablefmt='github',
-        colalign=('center', 'right', 'right', 'right', 'right', 'right'),
+        headers=['Family', 'Setups', 'TP', 'SL', 'NOHIT', 'OPEN', 'WR'],
+        tablefmt='plain',
+        colalign=('center', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
