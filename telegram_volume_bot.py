@@ -433,9 +433,14 @@ SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", 
 # when doing deep diagnostics of every generated candidate.
 SETUP_AUDIT_SOURCE_MODE = str(os.environ.get("SETUP_AUDIT_SOURCE_MODE", "EXECUTABLE") or "EXECUTABLE").strip().upper()
 SETUP_AUDIT_FALLBACK_TO_GENERATED = env_bool("SETUP_AUDIT_FALLBACK_TO_GENERATED", True)
-SETUP_AUDIT_DEDUP_BUCKET_HOURS = int(os.environ.get("SETUP_AUDIT_DEDUP_BUCKET_HOURS", "12") or 12)
+SETUP_AUDIT_DEDUP_BUCKET_HOURS = int(os.environ.get("SETUP_AUDIT_DEDUP_BUCKET_HOURS", "24") or 24)
+# LOCAL_DAY means one practical setup per symbol/side/family per Melbourne day.
+# This avoids inflated counts from repeated executable snapshots around UTC bucket boundaries.
+SETUP_AUDIT_DEDUP_MODE = str(os.environ.get("SETUP_AUDIT_DEDUP_MODE", "LOCAL_DAY") or "LOCAL_DAY").strip().upper()
 SETUP_AUDIT_DEDUP_INCLUDE_LEVELS = env_bool("SETUP_AUDIT_DEDUP_INCLUDE_LEVELS", False)
-SETUP_AUDIT_DISPLAY_MAX_ROWS = int(os.environ.get("SETUP_AUDIT_DISPLAY_MAX_ROWS", "40") or 40)
+# Keep the message short enough to preserve Telegram <pre> formatting.
+SETUP_AUDIT_DISPLAY_MAX_ROWS = int(os.environ.get("SETUP_AUDIT_DISPLAY_MAX_ROWS", "25") or 25)
+AUTOTRADE_REPORT_DISPLAY_MAX_ROWS = int(os.environ.get("AUTOTRADE_REPORT_DISPLAY_MAX_ROWS", "30") or 30)
 
 
 def _autotrade_config_get(key: str, default=None):
@@ -2040,12 +2045,14 @@ def _strategy_cfg_execution_sessions_allowed(cfg: dict | None) -> set[str]:
 
 def _strategy_cfg_execution_engines_allowed(cfg: dict | None) -> set[str]:
     try:
-        raw = (cfg or {}).get('execution_engines_allowed', ['A', 'B', 'C']) or ['A', 'B', 'C']
+        raw = (cfg or {}).get('execution_engines_allowed', ['A', 'B', 'C', 'F8']) or ['A', 'B', 'C', 'F8']
         out = {str(x).upper().strip() for x in raw if str(x).strip()}
-        cleaned = {x for x in out if x in {'A', 'B', 'C'}}
-        return cleaned or {'A', 'B', 'C'}
+        aliases = {'BIGMOVE': 'F8', 'BIG_MOVE': 'F8', 'BIGMOVE_CONT': 'F8', 'F8_BIGMOVE_CONT': 'F8'}
+        norm = {aliases.get(x, x) for x in out}
+        cleaned = {x for x in norm if x in {'A', 'B', 'C', 'F8'}}
+        return cleaned or {'A', 'B', 'C', 'F8'}
     except Exception:
-        return {'A', 'B', 'C'}
+        return {'A', 'B', 'C', 'F8'}
 
 def _strategy_cfg_preferred_trade_window(cfg: dict | None) -> tuple[str, str]:
     try:
@@ -2325,52 +2332,61 @@ def _strategy_config_bootstrap_recommendations() -> None:
 
 
 def _strategy_config_apply_ver08_quality_patch() -> None:
-    """One-time conservative quality patch from 04 May audit results.
+    """Ver09 balanced quality patch from 04 May audit results.
 
-    The audit/backtest snapshots showed: F1 is the only family above 50% WR, F3/F8
-    are materially weak, and ASIA underperformed. This patch narrows the executable
-    lane to LON/NY + Engine A/F1 and raises quality/RR floors. It is stored in
-    strategy_config so normal runtime commands still show and govern the active state.
+    Ver08 was intentionally very strict (LON/NY + Engine A only). After reviewing
+    the next command outputs, that was too narrow and it also risked blocking the
+    newly-added Big-Move engine. Ver09 keeps Big-Move/F8 active, keeps Engine B
+    available, removes only the weakest current executor (F3/Engine C), and uses
+    higher volume/quality/RR gates to reduce bad setups without killing flow.
     """
     try:
         cfg = load_strategy_config(force=True)
-        cfg['ver08_quality_patch_applied'] = True
-        cfg['ver08_quality_patch_ts'] = float(time.time())
-        cfg['high_win_mode'] = True
-        cfg['execution_sessions_allowed'] = ['LON', 'NY']
-        cfg['execution_engines_allowed'] = ['A']
-        cfg['execution_asia_enabled'] = False
-        cfg['execution_asia_user_override'] = True
-        cfg['execution_engine_b_email_enabled'] = False
-        cfg['goal_profile_allow_asia'] = False
-        cfg['goal_profile_allow_engine_b'] = False
-        cfg['goal_profile_active_profile'] = 'LON_NY_F1_STRICT_VER08'
-        cfg['quality_score_min_screen'] = max(64.0, float(cfg.get('quality_score_min_screen', 0) or 0))
-        cfg['quality_score_min_email'] = max(72.0, float(cfg.get('quality_score_min_email', 0) or 0))
-        cfg['min_rr_tp'] = max(1.45, float(cfg.get('min_rr_tp', 0) or 0))
-        cfg['tf_align_1h_min_abs'] = max(0.70, float(cfg.get('tf_align_1h_min_abs', 0) or 0))
-        cfg['tf_align_4h_min_abs'] = max(0.65, float(cfg.get('tf_align_4h_min_abs', 0) or 0))
-        cfg['atr_min_pct'] = max(1.00, float(cfg.get('atr_min_pct', 0) or 0))
-        cfg['session_weights'] = {'NY': 0.48, 'LON': 0.52, 'ASIA': 0.0}
+        cfg['ver09_quality_patch_applied'] = True
+        cfg['ver09_quality_patch_ts'] = float(time.time())
+        # Balanced, not F1-only. Keep all sessions available, but make ASIA stricter.
+        cfg['high_win_mode'] = False
+        cfg['execution_sessions_allowed'] = ['ASIA', 'LON', 'NY']
+        # A=F1 pullback, B=F2 momentum, F8=Big-Move continuation.
+        # C/F3 is excluded from executable/email/autotrade until it proves better.
+        cfg['execution_engines_allowed'] = ['A', 'B', 'F8']
+        cfg['execution_asia_enabled'] = True
+        cfg['execution_asia_user_override'] = False
+        cfg['execution_engine_b_email_enabled'] = True
+        cfg['goal_profile_allow_asia'] = True
+        cfg['goal_profile_allow_engine_b'] = True
+        cfg['goal_profile_active_profile'] = 'BALANCED_A_B_F8_VER09'
+
+        # Quality floors: reduce raw noise, but avoid the too-tight Ver08 1-3/day profile.
+        cfg['min_fut_vol_usd'] = max(15_000_000.0, float(cfg.get('min_fut_vol_usd', 0) or 0.0))
+        cfg['quality_score_min_screen'] = max(63.0, float(cfg.get('quality_score_min_screen', 0) or 0.0))
+        cfg['quality_score_min_email'] = 70.0
+        cfg['min_rr_tp'] = 1.35
+        cfg['tf_align_1h_min_abs'] = max(0.70, float(cfg.get('tf_align_1h_min_abs', 0) or 0.0))
+        cfg['tf_align_4h_min_abs'] = max(0.60, float(cfg.get('tf_align_4h_min_abs', 0) or 0.0))
+        cfg['atr_min_pct'] = max(0.95, float(cfg.get('atr_min_pct', 0) or 0.0))
+
+        # Session weighting: LON/NY are preferred, ASIA can still produce only strong setups.
+        cfg['session_weights'] = {'NY': 0.45, 'LON': 0.45, 'ASIA': 0.10}
         cfg['session_exec_overrides'] = {
-            'NY': {'quality_add': 2.0, 'conf_add': 2, 'rr_add': 0.12},
-            'LON': {'quality_add': 1.2, 'conf_add': 1, 'rr_add': 0.08},
-            'ASIA': {'quality_add': 99.0, 'conf_add': 99, 'rr_add': 9.99},
+            'NY': {'quality_add': 1.0, 'conf_add': 1, 'rr_add': 0.06},
+            'LON': {'quality_add': 0.5, 'conf_add': 1, 'rr_add': 0.04},
+            'ASIA': {'quality_add': 4.0, 'conf_add': 3, 'rr_add': 0.22},
         }
-        # Keep setup count target lower until observed WR improves.
-        cfg['target_setups_per_day_lo'] = 1.0
-        cfg['target_setups_per_day_hi'] = 3.0
-        cfg['governor_target_lo'] = 1.0
-        cfg['governor_target_hi'] = 3.0
-        cfg['goal_profile_target_setups_per_day_lo'] = 1.0
-        cfg['goal_profile_target_setups_per_day_hi'] = 3.0
-        cfg['goal_profile_target_win_rate'] = 55.0
+
+        # Commercial target: enough signals to learn from, but not the raw 100+/day noise.
+        cfg['target_setups_per_day_lo'] = 3.0
+        cfg['target_setups_per_day_hi'] = 5.0
+        cfg['governor_target_lo'] = 3.0
+        cfg['governor_target_hi'] = 5.0
+        cfg['goal_profile_target_setups_per_day_lo'] = 3.0
+        cfg['goal_profile_target_setups_per_day_hi'] = 5.0
+        cfg['goal_profile_target_win_rate'] = 52.0
         cfg['goal_profile_target_avg_r'] = 0.10
         save_strategy_config(cfg)
         apply_strategy_config(cfg)
     except Exception:
         pass
-
 
 def apply_strategy_config(cfg: dict) -> None:
     """Apply StrategyConfig into global tunables used throughout the bot."""
@@ -8613,6 +8629,8 @@ def _family_id_from_engine(engine: str, setup: Any | None = None) -> str:
         return 'F2_MOMENTUM_IGNITION'
     if eng == 'C':
         return 'F3_IMPULSE_BASE_CONT'
+    if eng in {'F8', 'BIGMOVE', 'BIG_MOVE', 'F8_BIGMOVE_CONT'}:
+        return 'F8_BIGMOVE_CONT'
     try:
         rid = str(getattr(setup, 'family_id', '') or '').strip()
         if rid:
@@ -25076,6 +25094,29 @@ def _signal_wr_display_metrics_fast(user_id: int, session: str | None = None, da
             rows = [dict(r) for r in (c.execute(q, tuple(params)).fetchall() or [])]
     except Exception:
         rows = []
+    # Prefer AutoTrade journal outcome/PnL when the emailed setup was actually traded.
+    try:
+        setup_ids = [str((r or {}).get('setup_id') or '').strip() for r in rows if str((r or {}).get('setup_id') or '').strip()]
+        trade_by_setup = {}
+        if setup_ids:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                for i in range(0, len(setup_ids), 200):
+                    batch = setup_ids[i:i+200]
+                    q = "SELECT * FROM autotrade_trades WHERE uid=? AND setup_id IN (%s) ORDER BY COALESCE(closed_ts, opened_ts, 0) DESC" % ','.join(['?']*len(batch))
+                    for tr in c.execute(q, tuple([int(user_id)] + batch)).fetchall() or []:
+                        d = dict(tr)
+                        sid = str(d.get('setup_id') or '').strip()
+                        if sid and sid not in trade_by_setup:
+                            trade_by_setup[sid] = d
+        for r in rows:
+            sid = str((r or {}).get('setup_id') or '').strip()
+            tr = trade_by_setup.get(sid)
+            if tr:
+                r['outcome'] = _canon_outcome_from_autotrade_trade(tr)
+    except Exception:
+        pass
     rows = [dict(r, outcome=_display_signal_outcome((r or {}).get('outcome'))) for r in rows]
     stats = _canonical_wr_stats(rows)
     return {
@@ -25103,20 +25144,20 @@ async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
     cache_key = f"winrate_cmd:{owner}:ALL"
     try:
-        overall = await to_thread_heavy(_signal_wr_display_metrics, owner, timeout=max(5, int(FAST_ADMIN_COMMAND_TIMEOUT_SEC) + 4))
+        overall = await to_thread_fast(_signal_wr_display_metrics_fast, owner, timeout=5)
         msg = (
             "📊 Win Rate\n"
             f"{HDR}\n"
-            f"{_fmt_wr_line('Overall signal WR', overall)}"
+            f"{_fmt_wr_line('Overall signal WR', overall)}\n"
+            "Source: DB lifecycle snapshot (emailed setups + stored outcomes + AutoTrade journal)."
         )
         _admin_status_cache_put(cache_key, msg)
     except Exception as e:
         cached = _admin_status_cache_get(cache_key, ttl=900.0)
         if cached:
-            msg = str(cached) + f"\n\n⚠️ Refresh failed/timed out: {type(e).__name__}. Showing cached snapshot."
+            msg = str(cached) + f"\n\n⚠️ Refresh failed: {type(e).__name__}. Showing cached snapshot."
         else:
-            fast = _signal_wr_display_metrics_fast(owner)
-            msg = ("📊 Win Rate\n" + HDR + "\n" + _fmt_wr_line('Overall signal WR', fast) + "\n⚡ Fast DB-only snapshot; lifecycle refresh is busy.")
+            msg = f"⚠️ Win-rate snapshot failed: {type(e).__name__}: {e}"
     await update.message.reply_text(msg)
 
 
@@ -25127,20 +25168,20 @@ async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
     cache_key = f"winrate_cmd:{owner}:NY"
     try:
-        overall = await to_thread_heavy(_signal_wr_display_metrics, owner, session='NY', timeout=max(5, int(FAST_ADMIN_COMMAND_TIMEOUT_SEC) + 4))
+        overall = await to_thread_fast(_signal_wr_display_metrics_fast, owner, session='NY', timeout=5)
         msg = (
             "🗽 NY Win Rate\n"
             f"{HDR}\n"
-            f"{_fmt_wr_line('Overall NY signal WR', overall)}"
+            f"{_fmt_wr_line('Overall NY signal WR', overall)}\n"
+            "Source: DB lifecycle snapshot (emailed setups + stored outcomes + AutoTrade journal)."
         )
         _admin_status_cache_put(cache_key, msg)
     except Exception as e:
         cached = _admin_status_cache_get(cache_key, ttl=900.0)
         if cached:
-            msg = str(cached) + f"\n\n⚠️ Refresh failed/timed out: {type(e).__name__}. Showing cached snapshot."
+            msg = str(cached) + f"\n\n⚠️ Refresh failed: {type(e).__name__}. Showing cached snapshot."
         else:
-            fast = _signal_wr_display_metrics_fast(owner, session='NY')
-            msg = ("🗽 NY Win Rate\n" + HDR + "\n" + _fmt_wr_line('Overall NY signal WR', fast) + "\n⚡ Fast DB-only snapshot; lifecycle refresh is busy.")
+            msg = f"⚠️ NY win-rate snapshot failed: {type(e).__name__}: {e}"
     await update.message.reply_text(msg)
 
 
@@ -29332,8 +29373,12 @@ def is_executable_setup_eligible(
         except Exception:
             pass
         _engine_pre = str(getattr(s, "engine", "") or "").upper().strip()
+        _fam_pre = str(getattr(s, 'family_id', '') or _family_id_from_engine(_engine_pre, s)).upper().strip()
         if allowed_engines and _engine_pre and _engine_pre not in allowed_engines:
-            return (False, 'execution_profile_engine_disabled')
+            # Big-Move setups use engine=F8 in the alert/autotrade path. Treat F8 as
+            # its own allowed executor instead of blocking it as an unsupported engine.
+            if not (_fam_pre == globals().get('BIGMOVE_FAMILY_ID', 'F8_BIGMOVE_CONT') and 'F8' in allowed_engines):
+                return (False, 'execution_profile_engine_disabled')
 
         # Drought-recovery setups are generated from the current live ticker snapshot only
         # after the normal OHLCV engines fail. Do not let allocator shadow/probation state
@@ -29372,6 +29417,10 @@ def is_executable_setup_eligible(
 
         engine = str(getattr(s, "engine", "") or "").upper().strip()
         fam = str(getattr(s, 'family_id', '') or _family_id_from_engine(engine, s)).upper().strip()
+        # F8/Big-Move is evaluated through the momentum branch but has its own
+        # stricter family-specific gates below.
+        if fam == globals().get('BIGMOVE_FAMILY_ID', 'F8_BIGMOVE_CONT') and engine not in {'A', 'B', 'C'}:
+            engine = 'B'
         regime = str(getattr(s, 'regime', '') or '').upper()
         trend = str(getattr(s, 'trend', '') or '').upper()
         structure = str(getattr(s, 'structure', '') or '').upper()
@@ -36100,7 +36149,7 @@ def _setup_engine_to_family_id(engine: str, row: dict | None = None) -> str:
             return 'F6_VWAP_RECLAIM'
         if eng in {'F7', 'EXHAUSTION', 'EXHAUSTION_FAILURE'}:
             return 'F7_EXHAUSTION_FAILURE'
-        if 'BIGMOVE' in eng or 'BIG_MOVE' in eng:
+        if eng in {'F8', 'ENGINE_F8', 'BIGMOVE', 'BIG_MOVE', 'BIGMOVE_CONT', 'F8_BIGMOVE_CONT'} or 'BIGMOVE' in eng or 'BIG_MOVE' in eng:
             return 'F8_BIGMOVE_CONT'
         try:
             return _family_id_from_engine(eng, None)
@@ -36490,8 +36539,14 @@ def _setup_audit_unique_key(row: dict) -> str:
     try:
         rr = _setup_audit_payload_from_row(row)
         ts = _setup_audit_row_ts(rr)
-        bucket_h = max(1, int(globals().get('SETUP_AUDIT_DEDUP_BUCKET_HOURS', 12) or 12))
-        bucket = int(float(ts or 0.0) // (bucket_h * 3600)) if float(ts or 0.0) > 0 else 0
+        mode = str(globals().get('SETUP_AUDIT_DEDUP_MODE', 'LOCAL_DAY') or 'LOCAL_DAY').upper().strip()
+        if mode in {'DAY', 'DAILY', 'LOCAL_DAY', 'MELBOURNE_DAY'} and float(ts or 0.0) > 0:
+            bucket = _setup_audit_local_date_key(float(ts))
+        elif mode in {'NONE', 'SETUP_ID'}:
+            bucket = str(rr.get('setup_id') or int(float(ts or 0.0)))
+        else:
+            bucket_h = max(1, int(globals().get('SETUP_AUDIT_DEDUP_BUCKET_HOURS', 24) or 24))
+            bucket = int(float(ts or 0.0) // (bucket_h * 3600)) if float(ts or 0.0) > 0 else 0
         sym = str(rr.get('symbol') or '').upper().strip()
         if sym.endswith('USDT'):
             sym = sym[:-4]
@@ -37270,11 +37325,13 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
     cleaned = sorted(cleaned, key=lambda x: _setup_audit_row_ts(x), reverse=True)
     if bool(dedup):
         deduped: dict[str, dict] = {}
-        for r in cleaned:
+        # Keep the earliest actionable row within the practical setup key. Keeping
+        # the newest row turns repeated snapshots into fake OPENs and inflates counts.
+        for r in sorted(cleaned, key=lambda x: _setup_audit_row_ts(x)):
             key = _setup_audit_unique_key(r)
             if key not in deduped:
                 deduped[key] = r
-        final = list(deduped.values())
+        final = sorted(list(deduped.values()), key=lambda x: _setup_audit_row_ts(x), reverse=True)
     else:
         seen_sid: set[str] = set()
         final = []
@@ -37338,14 +37395,14 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         display_max = int(globals().get('SETUP_AUDIT_DISPLAY_MAX_ROWS', 40) or 40)
     except Exception:
         display_max = 80
-    display_max = max(10, min(80, int(display_max)))
+    display_max = max(10, min(50, int(display_max)))
     display_rows = table_rows[:display_max]
     hidden_rows = max(0, len(table_rows) - len(display_rows))
     table = tabulate(
         display_rows,
         headers=['Symbol', 'Type', 'Conf', 'Family', 'Result'],
-        tablefmt='simple',
-        colalign=('left', 'left', 'right', 'center', 'center'),
+        tablefmt='rounded_grid',
+        colalign=('left', 'center', 'right', 'center', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
@@ -37356,7 +37413,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
     ]
     if hidden_rows > 0:
-        header_lines.append(f"Showing first {len(display_rows)} rows only; {hidden_rows} more hidden. Use /setup_audit rows <n> <hours> for a specific row count.")
+        header_lines.append(f"Showing first {len(display_rows)} rows only; {hidden_rows} hidden. Use /setup_audit rows <n> <hours> to show more.")
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
@@ -37460,7 +37517,7 @@ def _setup_audit_overall_text(uid: int) -> str:
     table = tabulate(
         table_rows,
         headers=['Family', 'Setups', 'TP', 'SL', 'NOHIT', 'OPEN', 'WR'],
-        tablefmt='simple',
+        tablefmt='rounded_grid',
         colalign=('center', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
@@ -38374,7 +38431,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
 def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v4pretty:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v5pretty:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -38456,12 +38513,20 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         lines.append("No AutoTrade open/closed rows found in this window.")
         out = "\n".join(lines)
     else:
+        try:
+            max_rows = max(10, min(60, int(globals().get('AUTOTRADE_REPORT_DISPLAY_MAX_ROWS', 30) or 30)))
+        except Exception:
+            max_rows = 30
+        display_rows = table_rows[:max_rows]
+        hidden_rows = max(0, len(table_rows) - len(display_rows))
         table = tabulate(
-            table_rows,
+            display_rows,
             headers=['Symbol', 'Type', 'Family', 'PnL'],
-            tablefmt='simple',
-            colalign=('left', 'left', 'left', 'right'),
+            tablefmt='rounded_grid',
+            colalign=('left', 'center', 'center', 'right'),
         )
+        if hidden_rows > 0:
+            lines.append(f"Showing first <b>{len(display_rows)}</b> rows only; <b>{hidden_rows}</b> hidden.")
         out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
     try:
         cache_set(cache_key, out)
