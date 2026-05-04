@@ -18129,6 +18129,112 @@ def _signal_setup_eval_payload(setup_id: str) -> dict:
 
     return {}
 
+
+def _canon_outcome_from_autotrade_trade(trade: dict | None, live_pos: dict | None = None, exchange_events: list[dict] | None = None) -> str:
+    """Canonical TP/SL/OPEN/UNTRACKED resolver for AutoTrade rows.
+
+    Several reporting commands call this function (/winrate, /ny_winrate,
+    /signal_report, /signal_report_overall). Some patched builds referenced it
+    before it existed, which crashed those commands. This implementation is
+    intentionally defensive:
+      - CLOSED rows use explicit outcome/result_path first, then realised PnL.
+      - OPEN rows stay OPEN only if a current live position backs them, or no
+        close/PnL evidence exists yet.
+      - exchange closed-PnL events can resolve rows whose local journal did not
+        sync yet.
+      - unknown/zero-PnL closed rows become UNTRACKED, never fake OPEN.
+    """
+    try:
+        t = dict(trade or {})
+    except Exception:
+        t = {}
+    if not t:
+        return 'UNTRACKED'
+
+    def _f(v, default: float = 0.0) -> float:
+        try:
+            if v is None or str(v).strip() == '':
+                return float(default)
+            return float(v)
+        except Exception:
+            return float(default)
+
+    status = str(t.get('status') or '').upper().strip()
+    raw_outcome = str(t.get('outcome') or t.get('result') or '').upper().strip()
+    result_path = str(t.get('result_path') or '').upper().strip()
+    close_reason = str(t.get('close_reason') or t.get('note') or '').upper().strip()
+    closed_ts = _f(t.get('closed_ts'), 0.0)
+    opened_ts = _f(t.get('opened_ts'), 0.0)
+
+    # Prefer explicit lifecycle labels when present.
+    for raw in (raw_outcome, result_path, close_reason):
+        canon = _canon_signal_outcome_label(raw)
+        if canon in {'TP', 'SL'}:
+            return canon
+        raw_u = str(raw or '').upper().strip()
+        if raw_u in {'HIT_TP_WIN', 'TP_HIT', 'TAKE_PROFIT_HIT'} or 'TAKE_PROFIT' in raw_u or 'TP HIT' in raw_u or 'HIT TP' in raw_u:
+            return 'TP'
+        if raw_u in {'HIT_SL_LOSS', 'SL_HIT', 'STOP_LOSS_HIT'} or 'STOP_LOSS' in raw_u or 'SL HIT' in raw_u or 'HIT SL' in raw_u:
+            return 'SL'
+
+    # Realized PnL from the journal/provisional row.
+    pnl_marker = None
+    for key in ('pnl_usdt', 'pnl', 'closed_pnl', 'closedPnl', 'realised_pnl', 'realizedPnl'):
+        if key in t and t.get(key) is not None:
+            pnl_marker = _f(t.get(key), 0.0)
+            break
+    if pnl_marker is not None and abs(float(pnl_marker)) > 1e-9:
+        return 'TP' if float(pnl_marker) > 0 else 'SL'
+
+    # Closed-PnL events from Bybit are authoritative when the local journal has
+    # not been reconciled yet.
+    try:
+        events = list(exchange_events or [])
+        if events:
+            # Use events after the trade opened when possible.
+            usable = []
+            for ev in events:
+                ev_ts = _f((ev or {}).get('ts') or (ev or {}).get('closed_ts') or (ev or {}).get('updatedTime'), 0.0)
+                if opened_ts > 0 and ev_ts > 0 and ev_ts + 300.0 < opened_ts:
+                    continue
+                usable.append(ev)
+            net = 0.0
+            for ev in usable:
+                net += _f((ev or {}).get('pnl') if (ev or {}).get('pnl') is not None else (ev or {}).get('closedPnl'), 0.0)
+            if abs(net) > 1e-9:
+                return 'TP' if net > 0 else 'SL'
+    except Exception:
+        pass
+
+    # If Bybit still has the position open, report OPEN even if the DB is stale.
+    try:
+        if live_pos is not None and abs(float(_pos_size(live_pos) or 0.0)) > 0:
+            return 'OPEN'
+    except Exception:
+        pass
+
+    if status == 'OPEN':
+        # In live mode, a supposedly open local row without a current position is
+        # stale unless there is truly no close evidence yet. Keep very recent rows
+        # OPEN to allow for Bybit visibility lag; older rows become UNTRACKED so
+        # win-rate reports do not show false OPEN.
+        try:
+            if str(_autotrade_runtime_mode()).lower() == 'live':
+                age = float(time.time()) - opened_ts if opened_ts > 0 else 0.0
+                if age <= 20 * 60:
+                    return 'OPEN'
+                return 'UNTRACKED'
+        except Exception:
+            return 'UNTRACKED'
+        return 'OPEN'
+
+    if closed_ts > 0 or status == 'CLOSED':
+        # Closed, but no positive/negative proof. Do not call it OPEN.
+        return 'UNTRACKED'
+
+    # Unknown still-active paper/live rows.
+    return 'OPEN' if status in {'PENDING', 'ACTIVE', 'RUNNING'} else 'UNTRACKED'
+
 def _signal_outcome_sync_for_setup(user_id: int, setup_id: str, horizon_hours: int = 24, min_age_min: int = 25, force: bool = False) -> dict:
     sid = str(setup_id or '').strip()
     if not sid:
@@ -19985,6 +20091,25 @@ from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
 
 SAFE_CHUNK = 3800
 
+def _telegram_html_to_plain_for_fallback(value: str) -> str:
+    """Best-effort HTML-to-plain conversion for long Telegram admin reports.
+
+    Telegram rejects chunked HTML when a chunk splits inside <pre>/<b>/<code>.
+    Plain fallback should not show raw tags to the user.
+    """
+    try:
+        s = str(value or '')
+        s = re.sub(r'</(?:b|strong|i|em|code|pre)>', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'<(?:b|strong|i|em|code|pre)>', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'<br\s*/?>', '\n', s, flags=re.IGNORECASE)
+        s = re.sub(r'<[^>]+>', '', s)
+        return html.unescape(s)
+    except Exception:
+        try:
+            return str(value or '')
+        except Exception:
+            return ''
+
 async def send_long_message(
     update: Update,
     text: str,
@@ -20015,6 +20140,19 @@ async def send_long_message(
     if max_len < 500:
         max_len = 2000
 
+    requested_parse_mode = parse_mode
+
+    # Long HTML containing <pre>/<code>/<b> is fragile because Telegram parses each
+    # chunk independently. Convert to plain text before chunking so admin reports
+    # never crash or show raw HTML tags after fallback.
+    try:
+        pm_name_0 = str(parse_mode or '').lower()
+        if ('html' in pm_name_0) and (len(str(s)) > max_len or '<pre>' in str(s).lower() or '<code>' in str(s).lower()):
+            s = _telegram_html_to_plain_for_fallback(str(s))
+            parse_mode = None
+    except Exception:
+        pass
+
     chunks = []
     buf = ""
     for line in str(s).splitlines(True):
@@ -20038,7 +20176,6 @@ async def send_long_message(
     # contain code fences/JSON/tables and the text has to be chunked. Do not spend retry
     # time on entity parse failures; either send safe plain text up front for risky
     # multi-chunk code-block payloads, or immediately fall back to plain text.
-    requested_parse_mode = parse_mode
     try:
         pm_name = str(parse_mode or '').lower()
         if len(chunks) > 1 and '```' in str(s) and ('markdown' in pm_name):
@@ -20066,7 +20203,8 @@ async def send_long_message(
             else:
                 logger.warning("Telegram BadRequest (parse_mode=%s): %s | Falling back to plain text.", parse_mode, e)
             try:
-                await _send(None)
+                fallback_body = _telegram_html_to_plain_for_fallback(ch) if str(requested_parse_mode or '').lower().find('html') >= 0 else ch
+                await _send(None, fallback_body)
             except Exception as e2:
                 logger.warning("Telegram fallback send failed: %s", e2)
 
@@ -24435,7 +24573,7 @@ def _autotrade_trade_signal_outcome(trade: dict) -> str:
     try:
         return _canon_outcome_from_autotrade_trade(trade)
     except Exception:
-        return 'OPEN'
+        return 'UNTRACKED'
 
 
 def _weighted_rollup_from_outcomes(outcomes: list[tuple[str, str]]) -> dict:
@@ -24843,12 +24981,21 @@ async def winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
     owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
-    overall = _signal_wr_display_metrics(owner)
-    msg = (
-        "📊 Win Rate\n"
-        f"{HDR}\n"
-        f"{_fmt_wr_line('Overall signal WR', overall)}"
-    )
+    cache_key = f"winrate_cmd:{owner}:ALL"
+    try:
+        overall = await to_thread_heavy(_signal_wr_display_metrics, owner, timeout=max(5, int(FAST_ADMIN_COMMAND_TIMEOUT_SEC) + 4))
+        msg = (
+            "📊 Win Rate\n"
+            f"{HDR}\n"
+            f"{_fmt_wr_line('Overall signal WR', overall)}"
+        )
+        _admin_status_cache_put(cache_key, msg)
+    except Exception as e:
+        cached = _admin_status_cache_get(cache_key, ttl=900.0)
+        if cached:
+            msg = str(cached) + f"\n\n⚠️ Refresh failed/timed out: {type(e).__name__}. Showing cached snapshot."
+        else:
+            msg = f"⚠️ Win-rate refresh failed: {type(e).__name__}: {e}"
     await update.message.reply_text(msg)
 
 
@@ -24857,12 +25004,21 @@ async def ny_winrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
     owner = int(AUTOTRADE_OWNER_UID or update.effective_user.id)
-    overall = _signal_wr_display_metrics(owner, session='NY')
-    msg = (
-        "🗽 NY Win Rate\n"
-        f"{HDR}\n"
-        f"{_fmt_wr_line('Overall NY signal WR', overall)}"
-    )
+    cache_key = f"winrate_cmd:{owner}:NY"
+    try:
+        overall = await to_thread_heavy(_signal_wr_display_metrics, owner, session='NY', timeout=max(5, int(FAST_ADMIN_COMMAND_TIMEOUT_SEC) + 4))
+        msg = (
+            "🗽 NY Win Rate\n"
+            f"{HDR}\n"
+            f"{_fmt_wr_line('Overall NY signal WR', overall)}"
+        )
+        _admin_status_cache_put(cache_key, msg)
+    except Exception as e:
+        cached = _admin_status_cache_get(cache_key, ttl=900.0)
+        if cached:
+            msg = str(cached) + f"\n\n⚠️ Refresh failed/timed out: {type(e).__name__}. Showing cached snapshot."
+        else:
+            msg = f"⚠️ NY win-rate refresh failed: {type(e).__name__}: {e}"
     await update.message.reply_text(msg)
 
 
@@ -36310,6 +36466,102 @@ def _setup_audit_net_r_for_result(row: dict, result: str) -> float:
         return 0.0
 
 
+
+def _setup_audit_find_nearest_setup_row(symbol: str, side: str, ref_ts: float = 0.0, uid: int | None = None) -> dict:
+    """Best-effort family/setup metadata recovery for AutoTrade rows.
+
+    Older live/provisional AutoTrade rows sometimes have no setup_id/family_id,
+    which made /autotrade_report show F0 for everything. This looks up the
+    nearest generated/executable setup by symbol+side around the trade open time
+    and returns its metadata for reporting only.
+    """
+    try:
+        sym_full = _bybit_linear_symbol(symbol)
+        base = _symbol_base(sym_full)
+        sd = _norm_trade_side(side)
+        ref = float(ref_ts or 0.0)
+        if not base or sd not in {'BUY', 'SELL'}:
+            return {}
+        symbols = list(dict.fromkeys([base, sym_full, str(symbol or '').upper().strip()]))
+        # First pass: tight window around open; second pass: wider fallback.
+        windows = [(12 * 3600.0, 3 * 3600.0), (48 * 3600.0, 12 * 3600.0)]
+        best_rows: list[dict] = []
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            for before_s, after_s in windows:
+                lo = max(0.0, ref - before_s) if ref > 0 else 0.0
+                hi = (ref + after_s) if ref > 0 else float(time.time()) + 3600.0
+                # executable_setups
+                try:
+                    cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
+                    if cols:
+                        fam_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in cols else "'' AS family_id"
+                        q = f"""
+                            SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
+                                   fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
+                                   {fam_expr}, entry, sl, tp, alt_target_a, alt_target_b
+                            FROM executable_setups
+                            WHERE UPPER(side)=? AND UPPER(symbol) IN ({','.join(['?']*len(symbols))})
+                        """
+                        params = [sd] + symbols
+                        if uid is not None and 'user_id' in cols:
+                            q += " AND user_id=?"
+                            params.append(int(uid))
+                        if ref > 0:
+                            q += " AND executable_ts>=? AND executable_ts<=?"
+                            params.extend([lo, hi])
+                        q += " ORDER BY ABS(executable_ts-?) ASC LIMIT 8"
+                        params.append(ref if ref > 0 else time.time())
+                        best_rows.extend([dict(r) for r in cur.execute(q, tuple(params)).fetchall() or []])
+                except Exception:
+                    pass
+                # generated_setups
+                try:
+                    cols = {r[1] for r in cur.execute('PRAGMA table_info(generated_setups)').fetchall()}
+                    if cols:
+                        market_expr = 'market_symbol' if 'market_symbol' in cols else "'' AS market_symbol"
+                        reason_expr = 'entry_reason' if 'entry_reason' in cols else "'' AS entry_reason"
+                        alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
+                        alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
+                        fam_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in cols else "'' AS family_id"
+                        source_expr = 'UPPER(source)' if 'source' in cols else "'GEN'"
+                        q = f"""
+                            SELECT created_ts AS ts, 0 AS signal_created_ts, {source_expr} AS source, session, setup_id, symbol, {market_expr}, side, conf,
+                                   fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
+                                   {fam_expr}, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
+                            FROM generated_setups
+                            WHERE UPPER(side)=? AND UPPER(symbol) IN ({','.join(['?']*len(symbols))})
+                        """
+                        params = [sd] + symbols
+                        if uid is not None and 'user_id' in cols:
+                            q += " AND user_id=?"
+                            params.append(int(uid))
+                        if ref > 0:
+                            q += " AND created_ts>=? AND created_ts<=?"
+                            params.extend([lo, hi])
+                        q += " ORDER BY ABS(created_ts-?) ASC LIMIT 8"
+                        params.append(ref if ref > 0 else time.time())
+                        best_rows.extend([dict(r) for r in cur.execute(q, tuple(params)).fetchall() or []])
+                except Exception:
+                    pass
+                if best_rows:
+                    break
+        if not best_rows:
+            return {}
+        def _score(r: dict):
+            ts = float(r.get('ts') or r.get('signal_created_ts') or 0.0)
+            fam_ok = 0 if _setup_audit_family_display(r, compact=True) not in {'', '-', 'F0'} else 1
+            dt = abs(ts - ref) if ref > 0 and ts > 0 else 10**12
+            # Prefer setup created before or near the trade open, then nearest.
+            future_pen = 0 if (ref <= 0 or ts <= ref + 1800.0) else 1
+            return (fam_ok, future_pen, dt, -ts)
+        best_rows.sort(key=_score)
+        return dict(best_rows[0])
+    except Exception:
+        return {}
+
+
 def _setup_audit_find_row_by_setup_id(setup_id: str) -> dict:
     sid = str(setup_id or '').strip()
     if not sid:
@@ -36361,17 +36613,32 @@ def _setup_audit_find_row_by_setup_id(setup_id: str) -> dict:
 def _setup_audit_merge_trade_setup_row(trade_row: dict | None) -> dict:
     row = dict(trade_row or {})
     sid = str(row.get('setup_id') or '').strip()
+    setup_row = {}
     if sid:
         setup_row = _setup_audit_find_row_by_setup_id(sid)
-        if setup_row:
-            merged = dict(setup_row)
-            # Keep real trade fields where they are more authoritative for report display.
-            for k, v in row.items():
-                if k in {'trade_id', 'uid', 'opened_ts', 'closed_ts', 'pnl_usdt', 'pnl', 'status', 'qty', 'note'}:
-                    merged[k] = v
-                elif not str(merged.get(k) or '').strip():
-                    merged[k] = v
-            return merged
+    # Legacy/provisional rows often have no setup_id/family_id. Recover the
+    # family from the nearest setup by symbol+side+opened_ts so /autotrade_report
+    # does not show F0 for every closed trade.
+    if not setup_row:
+        try:
+            ref_ts = float(row.get('opened_ts') or row.get('created_ts') or row.get('closed_ts') or 0.0)
+            setup_row = _setup_audit_find_nearest_setup_row(
+                str(row.get('symbol') or ''),
+                str(row.get('side') or ''),
+                ref_ts=ref_ts,
+                uid=int(row.get('uid') or AUTOTRADE_OWNER_UID or 0) if (row.get('uid') or AUTOTRADE_OWNER_UID) else None,
+            )
+        except Exception:
+            setup_row = {}
+    if setup_row:
+        merged = dict(setup_row)
+        # Keep real trade fields where they are more authoritative for report display.
+        for k, v in row.items():
+            if k in {'trade_id', 'uid', 'opened_ts', 'closed_ts', 'pnl_usdt', 'pnl', 'status', 'qty', 'note', 'outcome'}:
+                merged[k] = v
+            elif not str(merged.get(k) or '').strip():
+                merged[k] = v
+        return merged
     return row
 
 
@@ -36923,8 +37190,15 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         now_txt = ''
     win = _setup_audit_window_summary(rows)
 
+    try:
+        display_max = int(os.environ.get('SETUP_AUDIT_DISPLAY_MAX_ROWS', '80') or 80)
+    except Exception:
+        display_max = 80
+    display_max = max(20, min(200, int(display_max)))
+    display_rows = table_rows[:display_max]
+    hidden_rows = max(0, len(table_rows) - len(display_rows))
     table = tabulate(
-        table_rows,
+        display_rows,
         headers=['Symbol', 'Type', 'Conf', 'Family', 'Result'],
         tablefmt='plain',
         colalign=('left', 'left', 'right', 'center', 'center'),
@@ -36937,6 +37211,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         "Source: post-setup price path; AutoTrade-independent.",
     ]
+    if hidden_rows > 0:
+        header_lines.append(f"Showing first {len(display_rows)} rows only; {hidden_rows} more hidden. Use /setup_audit rows <n> <hours> for a specific row count.")
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
