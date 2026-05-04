@@ -11198,6 +11198,19 @@ def db_init():
             'ema_support_dist_pct': "REAL NOT NULL DEFAULT 0",
             'source_kind': "TEXT NOT NULL DEFAULT 'executable_setups'",
             'details_json': "TEXT NOT NULL DEFAULT ''",
+            # Research/family metadata used by /autotrade_report and /setup_audit.
+            # Older production DBs missed these columns, so UPDATEs silently failed and
+            # reports fell back to generic text like "valid entry/SL/TP structure".
+            'family_id': "TEXT NOT NULL DEFAULT ''",
+            'family_version': "TEXT NOT NULL DEFAULT ''",
+            'regime_id': "TEXT NOT NULL DEFAULT ''",
+            'regime_primary': "TEXT NOT NULL DEFAULT ''",
+            'allocator_plan_id': "TEXT NOT NULL DEFAULT ''",
+            'param_set_id': "TEXT NOT NULL DEFAULT ''",
+            'family_score': "REAL NOT NULL DEFAULT 0",
+            'exec_score': "REAL NOT NULL DEFAULT 0",
+            'validation_state': "TEXT NOT NULL DEFAULT 'approved'",
+            'challenger_flag': "INTEGER NOT NULL DEFAULT 0",
         }
         for _col, _ddl in exec_add_cols.items():
             if _col not in x_cols:
@@ -17509,6 +17522,10 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
     con = None
     ts_now = float(time.time())
     try:
+        try:
+            s = _research_finalize_setup(s, session_name=str(session or getattr(s, 'session', '') or ''))
+        except Exception:
+            pass
         con = db_connect()
         cur = con.cursor()
         cur.execute(
@@ -17546,7 +17563,7 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
                        WHERE rowid = last_insert_rowid()
                 """,
                 (
-                    str(getattr(s, 'family_id', '') or ''),
+                    str(getattr(s, 'family_id', '') or _setup_engine_to_family_id(str(getattr(s, 'engine', '') or ''), {}) or ''),
                     str(getattr(s, 'regime_primary', '') or ''),
                     str(getattr(s, 'allocator_plan_id', '') or ''),
                     str(getattr(s, 'param_set_id', '') or ''),
@@ -17970,7 +17987,8 @@ def _signal_setup_eval_payload(setup_id: str) -> dict:
             cur = conn.cursor()
             row = cur.execute(
                 """SELECT setup_id, symbol, market_symbol, side, entry, sl, tp, alt_target_a, alt_target_b,
-                          COALESCE(NULLIF(signal_created_ts,0), executable_ts) AS created_ts, conf
+                          COALESCE(NULLIF(signal_created_ts,0), executable_ts) AS created_ts, conf,
+                          COALESCE(family_id, '') AS family_id, COALESCE(engine, '') AS engine, COALESCE(session, '') AS session
                    FROM executable_setups
                    WHERE setup_id=?
                    ORDER BY executable_ts DESC
@@ -18014,7 +18032,8 @@ def _signal_setup_eval_payload(setup_id: str) -> dict:
             wanted = {'symbol', 'side', 'created_ts', 'conf', 'entry', 'sl', 'tp', 'alt_target_a', 'alt_target_b', 'market_symbol'}
             if wanted.issubset(cols):
                 row = cur.execute(
-                    """SELECT setup_id, symbol, market_symbol, side, entry, sl, tp, alt_target_a, alt_target_b, created_ts, conf
+                    """SELECT setup_id, symbol, market_symbol, side, entry, sl, tp, alt_target_a, alt_target_b, created_ts, conf,
+                              COALESCE(family_id, '') AS family_id, COALESCE(engine, '') AS engine, COALESCE(session, '') AS session
                        FROM generated_setups
                        WHERE setup_id=?
                        ORDER BY created_ts DESC
@@ -35682,28 +35701,137 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
             break
     return setups
 
-def _setup_audit_family_from_row(row: dict) -> str:
-    """Return a readable family/engine name for setup audit."""
+def _setup_family_id_to_code(family_id: str) -> str:
+    """Compact family label for Telegram tables: F1, F2, ... F8."""
     try:
+        fam = str(family_id or '').strip().upper().replace('-', '_')
+        if not fam:
+            return '-'
+        m = re.match(r'^(F\d+)', fam)
+        if m:
+            return m.group(1)
+        if fam in {'A', 'ENGINE_A', 'PULLBACK', 'PULLBACK_CONT', 'PULLBACK_CONTINUATION'}:
+            return 'F1'
+        if fam in {'B', 'ENGINE_B', 'MOMENTUM', 'MOMENTUM_IGNITION'}:
+            return 'F2'
+        if fam in {'C', 'ENGINE_C', 'IMPULSE_BASE', 'IMPULSE_BASE_CONT'}:
+            return 'F3'
+        if 'BIGMOVE' in fam or 'BIG_MOVE' in fam:
+            return 'F8'
+        return fam
+    except Exception:
+        return '-'
+
+
+def _setup_engine_to_family_id(engine: str, row: dict | None = None) -> str:
+    """Best-effort engine→family mapping for legacy rows that missed family_id."""
+    try:
+        eng = str(engine or '').strip().upper().replace('-', '_')
+        if eng in {'A', 'ENGINE_A', 'PULLBACK', 'PULLBACK_CONT', 'PULLBACK_CONTINUATION'}:
+            return 'F1_PULLBACK_CONT'
+        if eng in {'B', 'ENGINE_B', 'MOMENTUM', 'MOMENTUM_IGNITION'}:
+            return 'F2_MOMENTUM_IGNITION'
+        if eng in {'C', 'ENGINE_C', 'IMPULSE_BASE', 'IMPULSE_BASE_CONT', 'PUMP_BASE'}:
+            return 'F3_IMPULSE_BASE_CONT'
+        if eng in {'F4', 'SWEEP', 'SWEEP_RECLAIM', 'BALANCE_REVERSAL'}:
+            return 'F4_SWEEP_RECLAIM'
+        if eng in {'F5', 'ORB', 'ORB_RETEST'}:
+            return 'F5_ORB_RETEST'
+        if eng in {'F6', 'VWAP', 'VWAP_RECLAIM'}:
+            return 'F6_VWAP_RECLAIM'
+        if eng in {'F7', 'EXHAUSTION', 'EXHAUSTION_FAILURE'}:
+            return 'F7_EXHAUSTION_FAILURE'
+        if 'BIGMOVE' in eng or 'BIG_MOVE' in eng:
+            return 'F8_BIGMOVE_CONT'
+        try:
+            return _family_id_from_engine(eng, None)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return ''
+
+
+def _setup_audit_family_from_row(row: dict) -> str:
+    """Return the canonical family id for setup audit/reporting."""
+    try:
+        rr = dict(row or {})
+        # 1) Direct DB fields.
         for key in ('family_id', 'family', 'engine_family'):
-            val = str((row or {}).get(key) or '').strip()
+            val = str(rr.get(key) or '').strip()
             if val:
-                return val.upper().replace('_', '-')
-        details = str((row or {}).get('details_json') or '').strip()
-        if details:
+                fam = val.upper().replace('-', '_')
+                # If a short code was persisted, expand where possible.
+                if fam == 'F1':
+                    return 'F1_PULLBACK_CONT'
+                if fam == 'F2':
+                    return 'F2_MOMENTUM_IGNITION'
+                if fam == 'F3':
+                    return 'F3_IMPULSE_BASE_CONT'
+                if fam == 'F4':
+                    return 'F4_SWEEP_RECLAIM'
+                if fam == 'F5':
+                    return 'F5_ORB_RETEST'
+                if fam == 'F6':
+                    return 'F6_VWAP_RECLAIM'
+                if fam == 'F7':
+                    return 'F7_EXHAUSTION_FAILURE'
+                if fam == 'F8':
+                    return 'F8_BIGMOVE_CONT'
+                return fam
+
+        # 2) details_json from executable/admin lifecycle. This is where modern setups
+        # store family_id when older DB schemas lack a dedicated column.
+        for raw_key in ('details_json', 'details', 'metadata_json'):
+            details = str(rr.get(raw_key) or '').strip()
+            if not details:
+                continue
             try:
                 obj = json.loads(details)
                 if isinstance(obj, dict):
-                    for key in ('family_id', 'family', 'engine_family', 'engine'):
+                    for key in ('family_id', 'family', 'engine_family'):
                         val = str(obj.get(key) or '').strip()
                         if val:
-                            return val.upper().replace('_', '-')
+                            return val.upper().replace('-', '_')
+                    eng2 = str(obj.get('engine') or '').strip()
+                    fam2 = _setup_engine_to_family_id(eng2, rr)
+                    if fam2 and fam2 != 'F0_UNKNOWN':
+                        return fam2
             except Exception:
                 pass
-        eng = str((row or {}).get('engine') or '').strip()
-        return eng.upper().replace('_', '-') if eng else '-'
+
+        # 3) Engine fallback for legacy/open rows.
+        eng = str(rr.get('engine') or '').strip()
+        fam = _setup_engine_to_family_id(eng, rr)
+        if fam and fam != 'F0_UNKNOWN':
+            return fam
+
+        # 4) Setup-id/name fallback for rare family-coded rows.
+        text = ' '.join(str(rr.get(k) or '') for k in ('setup_id', 'note', 'open_reason', 'close_reason')).upper()
+        m = re.search(r'\b(F[1-8])\b', text)
+        if m:
+            code = m.group(1)
+            return {
+                'F1': 'F1_PULLBACK_CONT',
+                'F2': 'F2_MOMENTUM_IGNITION',
+                'F3': 'F3_IMPULSE_BASE_CONT',
+                'F4': 'F4_SWEEP_RECLAIM',
+                'F5': 'F5_ORB_RETEST',
+                'F6': 'F6_VWAP_RECLAIM',
+                'F7': 'F7_EXHAUSTION_FAILURE',
+                'F8': 'F8_BIGMOVE_CONT',
+            }.get(code, code)
+        return 'F0_UNKNOWN'
     except Exception:
-        return '-'
+        return 'F0_UNKNOWN'
+
+
+def _setup_audit_family_display(row: dict, compact: bool = True) -> str:
+    """Display label used by /autotrade_report and /setup_audit."""
+    fam = _setup_audit_family_from_row(row)
+    if compact:
+        return _setup_family_id_to_code(fam)
+    return str(fam or 'F0_UNKNOWN').upper().replace('-', '_')
 
 
 def _setup_audit_reason_from_row(row: dict) -> str:
@@ -35981,10 +36109,12 @@ def _setup_audit_find_row_by_setup_id(setup_id: str) -> dict:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             try:
-                row = cur.execute("""
+                x_cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
+                x_family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
+                row = cur.execute(f"""
                     SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
-                           COALESCE(family_id, '') AS family_id, entry, sl, tp, alt_target_a, alt_target_b
+                           {x_family_expr}, entry, sl, tp, alt_target_a, alt_target_b
                     FROM executable_setups
                     WHERE setup_id=?
                     ORDER BY executable_ts DESC
@@ -36141,29 +36271,46 @@ def _setup_audit_price_result_payload(row: dict, horizon_hours: int = 24, user_i
         if not sid or not row.get('market_symbol') or float(row.get('entry') or 0.0) <= 0 or float(row.get('sl') or 0.0) <= 0 or float(row.get('tp') or 0.0) <= 0:
             res = {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'missing_or_invalid_setup_levels'}
         else:
-            best = None
-            for tf in ('1m', '5m', '15m'):
-                try:
-                    tmp = evaluate_signal_hit_order(row, horizon_hours=horizon_hours, timeframe=tf)
-                except Exception as exc:
-                    tmp = {'outcome': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'eval_error_{tf}:{type(exc).__name__}'}
-                canon = _setup_audit_result_label((tmp or {}).get('outcome'))
-                if canon in {'TP', 'SL'}:
-                    best = dict(tmp or {})
-                    best['result'] = canon
-                    break
-                if best is None:
-                    best = dict(tmp or {})
-            if not isinstance(best, dict):
-                best = {'outcome': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'no_price_data'}
-            res = {
-                'result': _setup_audit_result_label(best.get('result') or best.get('outcome')),
-                'hit_level': str(best.get('hit_level') or '').upper().strip(),
-                'hit_ts': best.get('hit_ts'),
-                'best_level': best.get('best_level'),
-                'best_ts': best.get('best_ts'),
-                'note': str(best.get('note') or 'price_path_eval'),
-            }
+            # Fast path: use existing outcome table + cached OHLCV/current ticker first.
+            # This keeps /setup_audit responsive and independent from autotrade even when
+            # Bybit rate-limits historical 1m/5m requests.
+            quick_result = _setup_audit_result_from_cached_price_moves(row, horizon_hours=horizon_hours)
+            if _setup_audit_result_label(quick_result) in {'TP', 'SL'}:
+                res = {
+                    'result': _setup_audit_result_label(quick_result),
+                    'hit_level': _setup_audit_result_label(quick_result),
+                    'hit_ts': None,
+                    'best_level': _setup_audit_result_label(quick_result),
+                    'best_ts': None,
+                    'note': 'fast_cached_price_path',
+                }
+            else:
+                best = None
+                allow_heavy = bool(force) or str(os.environ.get('SETUP_AUDIT_HEAVY_EVAL', '0')).strip().lower() in {'1', 'true', 'yes', 'on'}
+                if allow_heavy:
+                    # Use 15m first for speed; it still falls back internally if data is available.
+                    for tf in ('15m', '5m'):
+                        try:
+                            tmp = evaluate_signal_hit_order(row, horizon_hours=horizon_hours, timeframe=tf)
+                        except Exception as exc:
+                            tmp = {'outcome': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'eval_error_{tf}:{type(exc).__name__}'}
+                        canon = _setup_audit_result_label((tmp or {}).get('outcome'))
+                        if canon in {'TP', 'SL'}:
+                            best = dict(tmp or {})
+                            best['result'] = canon
+                            break
+                        if best is None:
+                            best = dict(tmp or {})
+                if not isinstance(best, dict):
+                    best = {'outcome': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'fast_no_hit_or_no_cached_price_data'}
+                res = {
+                    'result': _setup_audit_result_label(best.get('result') or best.get('outcome')),
+                    'hit_level': str(best.get('hit_level') or '').upper().strip(),
+                    'hit_ts': best.get('hit_ts'),
+                    'best_level': best.get('best_level'),
+                    'best_ts': best.get('best_ts'),
+                    'note': str(best.get('note') or 'price_path_eval'),
+                }
         try:
             _setup_audit_upsert_result(int(user_id or 0), row, res, horizon_hours, actual_pnl_usdt=actual_pnl_usdt)
         except Exception:
@@ -36201,6 +36348,14 @@ def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts
 
 
 def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0) -> list[dict]:
+    try:
+        _migrate_generated_setups()
+    except Exception:
+        pass
+    try:
+        _setup_audit_migrate()
+    except Exception:
+        pass
     cutoff = 0.0
     if hours is not None and int(hours or 0) > 0:
         cutoff = float(time.time()) - float(int(hours)) * 3600.0
@@ -36220,10 +36375,12 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0) -> 
                 if cutoff > 0:
                     where += " AND executable_ts>=?"
                     params.append(float(cutoff))
+                x_cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
+                x_family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
                 cur.execute(f"""
                     SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
-                           COALESCE(family_id, '') AS family_id, entry, sl, tp, alt_target_a, alt_target_b
+                           {x_family_expr}, entry, sl, tp, alt_target_a, alt_target_b
                     FROM executable_setups
                     {where}
                     ORDER BY executable_ts DESC{lim_clause}
@@ -36315,7 +36472,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
             f"{side} {sym}",
             int(float(r.get('conf') or 0.0)),
             f"{float(r.get('fut_vol_usd') or 0.0) / 1e6:.1f}M",
-            _setup_audit_short_text(fam, 22),
+            _setup_audit_short_text(_setup_audit_family_display(r, compact=True), 10),
             _setup_audit_short_text(reason, 44),
             f"{float(r.get('ch24') or 0.0):+.0f}",
             f"{float(r.get('ch4') or 0.0):+.0f}",
@@ -36370,7 +36527,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = await to_thread_heavy(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=90)
     except Exception as e:
-        text = f"❌ setup_audit failed: {type(e).__name__}. Try /setup_audit or /setup_audit 24."
+        text = f"❌ setup_audit failed: {type(e).__name__}: {e}"
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
@@ -37137,7 +37294,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
         sid = str(row.get('setup_id') or '').strip()
         payload = _signal_setup_eval_payload(sid) if sid else {}
         if payload:
-            for fld in ('symbol', 'side', 'entry', 'sl', 'tp', 'alt_target_a', 'alt_target_b', 'engine', 'session', 'conf', 'quality_score', 'atr_pct'):
+            for fld in ('symbol', 'side', 'entry', 'sl', 'tp', 'alt_target_a', 'alt_target_b', 'engine', 'session', 'conf', 'quality_score', 'atr_pct', 'family_id', 'regime_primary', 'allocator_plan_id', 'param_set_id'):
                 cur = row.get(fld)
                 if fld in {'entry', 'sl', 'tp', 'alt_target_a', 'alt_target_b', 'quality_score', 'atr_pct'}:
                     try:
@@ -37363,7 +37520,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
 def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v3compact:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -37373,6 +37530,10 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         pass
 
     _autotrade_migrate_tables()
+    try:
+        _migrate_generated_setups()
+    except Exception:
+        pass
     now_ts = float(time.time())
     start_ts = now_ts - float(lookback_h) * 3600.0
 
@@ -37387,60 +37548,42 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     total_open = 0.0
     total_closed = 0.0
 
-    def _row_reason(row: dict) -> str:
+    def _family_for_report(row: dict) -> str:
         try:
-            fam = _setup_audit_family_from_row(row)
-            eng = str((row or {}).get('engine') or '').upper().strip()
-            reason = _setup_audit_reason_from_row(row)
-            parts = []
+            fam = _setup_audit_family_display(row, compact=True)
             if fam and fam != '-':
-                parts.append(fam)
-            if eng:
-                parts.append(f"ENG-{eng}" if len(eng) == 1 else eng)
-            if reason:
-                parts.append(reason)
-            return _setup_audit_short_text(' | '.join(parts), 54)
+                return fam
+            eng = str((row or {}).get('engine') or '').strip()
+            fam2 = _setup_family_id_to_code(_setup_engine_to_family_id(eng, row))
+            return fam2 if fam2 and fam2 != '-' else 'F0'
+        except Exception:
+            return 'F0'
+
+    def _sym_display(row: dict, fallback: str = '') -> str:
+        try:
+            sym = str((row or {}).get('symbol') or fallback or '').upper().strip()
+            if sym.endswith('USDT'):
+                sym = sym[:-4]
+            return sym or '-'
         except Exception:
             return '-'
 
-    idx = 1
     for p, tr in (bot_positions or []):
         row = _setup_audit_merge_trade_setup_row(tr)
-        sid = str(row.get('setup_id') or tr.get('setup_id') or '').strip()
-        side = str(row.get('side') or _pos_side_text(p) or '').upper().strip()
-        sym = str(row.get('symbol') or _pos_symbol(p) or '').upper().strip()
-        if sym.endswith('USDT'):
-            sym_disp = sym[:-4]
-        else:
-            sym_disp = sym
+        side = str(row.get('side') or _pos_side_text(p) or '').upper().strip() or '-'
         pnl = float(_pos_unreal_pnl(p) or 0.0)
         total_open += pnl
-        ev = _setup_audit_price_result_payload(row, horizon_hours=lookback_h, user_id=int(owner_uid), force=False, actual_pnl_usdt=0.0) if sid else {'result': 'OPEN'}
-        result = _setup_audit_result_label(ev.get('result'))
-        table_rows.append([idx, 'OPEN', sid or '-', sym_disp, side or '-', result, _row_reason(row), f"{pnl:+.2f}"])
-        idx += 1
+        table_rows.append([_sym_display(row, _pos_symbol(p)), side, _family_for_report(row), f"{pnl:+.2f}"])
 
     for r in (closed_rows or []):
         row = _setup_audit_merge_trade_setup_row(r)
-        sid = str(row.get('setup_id') or r.get('setup_id') or '').strip()
-        side = str(row.get('side') or r.get('side') or '').upper().strip()
-        sym = str(row.get('symbol') or r.get('symbol') or '').upper().strip()
-        if sym.endswith('USDT'):
-            sym_disp = sym[:-4]
-        else:
-            sym_disp = sym or '-'
+        side = str(row.get('side') or r.get('side') or '').upper().strip() or '-'
         try:
             pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
         except Exception:
             pnl = 0.0
         total_closed += pnl
-        ev = _setup_audit_price_result_payload(row, horizon_hours=lookback_h, user_id=int(owner_uid), force=False, actual_pnl_usdt=pnl) if sid else {}
-        result = _setup_audit_result_label(ev.get('result')) if ev else _setup_audit_result_label(_autotrade_report_friendly_close_reason(row))
-        if result == 'OPEN':
-            # Fallback to real closed-position outcome if price data is temporarily unavailable.
-            result = _setup_audit_result_label(_autotrade_report_friendly_close_reason(row))
-        table_rows.append([idx, 'CLOSED', sid or '-', sym_disp, side or '-', result, _row_reason(row), f"{pnl:+.2f}"])
-        idx += 1
+        table_rows.append([_sym_display(row, r.get('symbol') or ''), side, _family_for_report(row), f"{pnl:+.2f}"])
 
     try:
         now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
@@ -37461,9 +37604,9 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     else:
         table = tabulate(
             table_rows,
-            headers=['#', 'State', 'Setup ID', 'Symbol', 'Type', 'Result', 'Entrance reason / family / engine', 'PnL'],
+            headers=['Symbol', 'Type', 'Family', 'PnL'],
             tablefmt='plain',
-            colalign=('right', 'left', 'left', 'left', 'left', 'left', 'left', 'right'),
+            colalign=('left', 'left', 'left', 'right'),
         )
         out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
     try:
