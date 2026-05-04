@@ -2332,7 +2332,7 @@ def _strategy_config_bootstrap_recommendations() -> None:
 
 
 def _strategy_config_apply_ver08_quality_patch() -> None:
-    """Ver09 balanced quality patch from 04 May audit results.
+    """Ver09/Ver10 balanced quality patch from 04 May audit results.
 
     Ver08 was intentionally very strict (LON/NY + Engine A only). After reviewing
     the next command outputs, that was too narrow and it also risked blocking the
@@ -40337,6 +40337,22 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
                 pass
             _screen_cache_put(f"uid:{int(uid or 0)}::{sess}", body, list(kb or []), ts=time.time())
             _screen_cache_put(f"global::{sess}", body, list(kb or []), ts=time.time())
+
+            # Ver10: if a user-triggered /screen refresh finds executable setups,
+            # immediately route those same setups through the email/autotrade lane.
+            # This prevents the user seeing a setup on /screen while /email_decision
+            # and /autotrade_last still say no_setups. The sync still respects email
+            # caps, cooldowns, duplicate guards, and is_executable_setup_eligible().
+            try:
+                if MANUAL_SCREEN_SYNC_ENABLED and int(uid or 0) > 0 and _setups:
+                    _u = get_user(int(uid or 0)) or {}
+                    _live_sess = str(current_session_utc() or '')
+                    await _screen_sync_pipeline_async(int(uid or 0), dict(_u or {}), _live_sess, str(sess or ''), best_fut or {}, list(_setups or []))
+            except Exception as _sync_e:
+                try:
+                    logger.warning('screen_cache_refresh_sync failed uid=%s: %s', uid, _sync_e)
+                except Exception:
+                    pass
     except Exception:
         return
     finally:
@@ -40540,7 +40556,15 @@ def _screen_cache_put(cache_key: str, body: str, kb: list | None = None, ts: flo
                 pass
             return False
 
-        if (not allow_empty_overwrite) and (not new_has) and old_has and old_age <= keep_window:
+        # Ver10: do NOT keep a generic non-empty /screen cache when the fresh
+        # executable rebuild is empty. A stale candidate cache made /screen show
+        # setups while /email_decision and AutoTrade had no executable pool.
+        # Only the exact recent emailed lane is protected above.
+        try:
+            _keep_generic = str(os.environ.get('SCREEN_KEEP_NONEMPTY_CACHE_WHEN_EMPTY', '0') or '0').strip().lower() in {'1', 'true', 'yes', 'on'}
+        except Exception:
+            _keep_generic = False
+        if _keep_generic and (not allow_empty_overwrite) and (not new_has) and old_has and old_age <= min(300.0, keep_window):
             try:
                 db_log_setup_pipeline_event(0, stage='screen_cache_put', status='kept_nonempty_cache', session=str(key).split('::')[-1], mode='screen', details={'old_age_sec': round(old_age, 1)})
             except Exception:
@@ -40703,10 +40727,10 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
             sources.append(('executable', _executable_rows_to_setup_objects(rows, session_name=sess) or []))
         except Exception:
             sources.append(('executable', []))
-        try:
-            sources.append(('candidate', _db_recent_candidate_setup_objects(int(uid), session_name=sess, max_age_min=max_age_min, limit=20) or []))
-        except Exception:
-            sources.append(('candidate', []))
+        # Ver10: do not show raw/recent generated candidates as Top Trade Setups.
+        # /screen must match the executable/email/autotrade lane. Candidates that
+        # are not in executable_setups can still appear in diagnostics/watch lists,
+        # but not as actionable setup cards.
 
         used_source_name = ''
         for source_name, candidates in sources:
@@ -40724,7 +40748,10 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     if source_name == 'emailed':
                         ok_exec = _basic_valid(item)
                     else:
-                        ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=sess)
+                        try:
+                            ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=sess)
+                        except Exception:
+                            ok_exec, _why_exec = False, 'screen_recent_exec_gate_exception'
                     if not ok_exec:
                         continue
                     if not used_source_name:
@@ -40817,10 +40844,9 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 sources.append(('executable', _executable_rows_to_setup_objects(rows, session_name=req_session_u) or []))
             except Exception:
                 sources.append(('executable', []))
-            try:
-                sources.append(('candidate', _db_recent_candidate_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 2))) or []))
-            except Exception:
-                sources.append(('candidate', []))
+            # Ver10: no raw/recent-candidate fallback for Top Trade Setups.
+            # If it is not emailed or in executable_setups, it must not be shown as
+            # an actionable setup because email/autotrade will not consume it.
 
             for source_name, rows in sources:
                 for item in rows:
@@ -40836,7 +40862,10 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                         if source_name == 'emailed':
                             ok_exec = _basic_valid(item)
                         else:
-                            ok_exec, _why_exec = _autotrade_db_signal_structurally_valid(item, session_name=req_session_u or src_session_u or _session)
+                            try:
+                                ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=req_session_u or src_session_u or _session)
+                            except Exception:
+                                ok_exec, _why_exec = False, 'screen_lane_exec_gate_exception'
                         if ok_exec:
                             out.append(item)
                             seen.add(dedupe_key)
