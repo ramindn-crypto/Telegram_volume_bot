@@ -20539,6 +20539,112 @@ async def send_long_message(
 
     requested_parse_mode = parse_mode
 
+    # Ver16: preserve long HTML <pre> tables by splitting the table into safe
+    # independent <pre> chunks instead of converting the whole report to plain text.
+    # This keeps /setup_audit and /autotrade_report readable even when every row is shown.
+    try:
+        pm_name_pre = str(parse_mode or '').lower()
+        if ('html' in pm_name_pre) and ('<pre>' in str(s)) and ('</pre>' in str(s)) and (len(str(s)) > max_len):
+            raw_s = str(s)
+            pre_start = raw_s.index('<pre>')
+            pre_end = raw_s.rindex('</pre>')
+            prefix = raw_s[:pre_start].rstrip()
+            pre_body = raw_s[pre_start + len('<pre>'):pre_end]
+            suffix = raw_s[pre_end + len('</pre>'):].strip()
+
+            async def _send_chunk_safe(body: str, pm=ParseMode.HTML, markup=None):
+                try:
+                    await update.message.reply_text(
+                        body,
+                        parse_mode=pm,
+                        disable_web_page_preview=disable_web_page_preview,
+                        reply_markup=markup,
+                    )
+                    return
+                except BadRequest as e:
+                    try:
+                        logger.warning('Telegram pre-table parse failed; sent plain fallback: %s', e)
+                    except Exception:
+                        pass
+                    try:
+                        await update.message.reply_text(
+                            _telegram_html_to_plain_for_fallback(body),
+                            parse_mode=None,
+                            disable_web_page_preview=disable_web_page_preview,
+                            reply_markup=markup,
+                        )
+                    except Exception as e2:
+                        try:
+                            logger.warning('Telegram pre-table fallback failed: %s', e2)
+                        except Exception:
+                            pass
+                except RetryAfter as e:
+                    await asyncio.sleep(int(getattr(e, 'retry_after', 1)) + 1)
+                    try:
+                        await update.message.reply_text(body, parse_mode=pm, disable_web_page_preview=disable_web_page_preview, reply_markup=markup)
+                    except Exception:
+                        try:
+                            await update.message.reply_text(_telegram_html_to_plain_for_fallback(body), parse_mode=None, disable_web_page_preview=disable_web_page_preview, reply_markup=markup)
+                        except Exception:
+                            pass
+                except (TimedOut, NetworkError) as e:
+                    try:
+                        logger.warning('Telegram send failed (pre-table network): %s', e)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+                    try:
+                        await update.message.reply_text(body, parse_mode=pm, disable_web_page_preview=disable_web_page_preview, reply_markup=markup)
+                    except Exception:
+                        pass
+
+            table_lines = pre_body.splitlines()
+            chunks_pre = []
+            cur = []
+            cur_len = 0
+            # Leave room for prefix/header on first message and <pre> tags.
+            first_limit = max(700, max_len - len(prefix) - len('<pre></pre>') - 40)
+            next_limit = max(700, max_len - len('<pre></pre>') - 40)
+            cur_limit = first_limit
+            for ln in table_lines:
+                add_len = len(ln) + 1
+                if cur and (cur_len + add_len > cur_limit):
+                    chunks_pre.append(cur)
+                    cur = []
+                    cur_len = 0
+                    cur_limit = next_limit
+                # Extremely long lines are split defensively.
+                while len(ln) > cur_limit:
+                    part = ln[:cur_limit]
+                    chunks_pre.append([part])
+                    ln = ln[cur_limit:]
+                    cur_limit = next_limit
+                cur.append(ln)
+                cur_len += len(ln) + 1
+            if cur:
+                chunks_pre.append(cur)
+            if not chunks_pre:
+                chunks_pre = [[]]
+
+            first_msg = True
+            for idx, rows_chunk in enumerate(chunks_pre):
+                chunk_table = '\n'.join(rows_chunk)
+                body = (prefix + '\n' if idx == 0 and prefix else '') + '<pre>' + chunk_table + '</pre>'
+                # Put suffix after the last table chunk if it fits; otherwise send separately.
+                if idx == len(chunks_pre) - 1 and suffix and len(body) + len(suffix) + 2 <= max_len:
+                    body = body + '\n' + suffix
+                    suffix = ''
+                await _send_chunk_safe(body, ParseMode.HTML, reply_markup if first_msg else None)
+                first_msg = False
+            if suffix:
+                await _send_chunk_safe(suffix, ParseMode.HTML, None)
+            return
+    except Exception as e:
+        try:
+            logger.warning('Long pre-table chunker failed, falling back to normal sender: %s', e)
+        except Exception:
+            pass
+
     # Long HTML containing <pre>/<code>/<b> is fragile because Telegram parses each
     # chunk independently. Convert to plain text before chunking so admin reports
     # never crash or show raw HTML tags after fallback.
@@ -37871,13 +37977,10 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         now_txt = ''
     win = _setup_audit_window_summary(rows)
 
-    try:
-        display_max = int(globals().get('SETUP_AUDIT_DISPLAY_MAX_ROWS', 40) or 40)
-    except Exception:
-        display_max = 80
-    display_max = max(10, min(50, int(display_max)))
-    display_rows = table_rows[:display_max]
-    hidden_rows = max(0, len(table_rows) - len(display_rows))
+    # Ver16: show all rows. send_long_message now chunks <pre> tables safely,
+    # so there is no need to hide audit rows for Telegram length limits.
+    display_rows = list(table_rows)
+    hidden_rows = 0
     table = tabulate(
         display_rows,
         headers=['Sym', 'Side', 'Ses', 'Conf', 'Fam', 'Res'],
@@ -37893,8 +37996,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = still inside the result horizon.",
     ]
-    if hidden_rows > 0:
-        header_lines.append(f"Showing first {len(display_rows)} rows only; {hidden_rows} hidden. Use /setup_audit rows <n> <hours> to show more.")
+    header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
@@ -38923,7 +39025,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v7_unmerged:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v8_allrows_mel:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -39040,21 +39142,17 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         lines.append("No AutoTrade open/closed rows found in this window.")
         out = "\n".join(lines)
     else:
-        try:
-            max_rows = max(10, min(80, int(globals().get('AUTOTRADE_REPORT_DISPLAY_MAX_ROWS', 60) or 60)))
-        except Exception:
-            max_rows = 60
-        display = journal_rows[:max_rows]
-        hidden_rows = max(0, len(journal_rows) - len(display))
+        # Ver16: show every trade row. Time is explicitly converted to Melbourne
+        # in _ts_txt(), and the long <pre> table is chunked safely by send_long_message.
+        display = list(journal_rows)
         table_rows = [[r['time'], r['state'], r['symbol'], r['side'], r['family'], f"{float(r['pnl']):+.2f}"] for r in display]
         table = tabulate(
             table_rows,
-            headers=['Time', 'State', 'Sym', 'Side', 'Fam', 'PnL'],
+            headers=['Mel Time', 'State', 'Sym', 'Side', 'Fam', 'PnL'],
             tablefmt='plain',
             colalign=('left', 'center', 'left', 'center', 'center', 'right'),
         )
-        if hidden_rows > 0:
-            lines.append(f"Showing first <b>{len(display)}</b> trades only; <b>{hidden_rows}</b> hidden.")
+        lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> (full list). Time: <b>Melbourne</b>.")
         out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
     try:
         cache_set(cache_key, out)
