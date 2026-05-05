@@ -12490,7 +12490,14 @@ BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") o
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
 BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0)
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
-BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "0") or 0)  # Ver12: default OFF for sharp F8 BigMove alerts
+BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "7200") or 7200)  # Ver15: same-symbol/same-direction F8 cooldown (opposite direction still allowed)
+# Guard against stale Render env BIGMOVE_COOLDOWN_SEC=0 from older no-cooldown builds.
+# Opposite direction remains a different key, so F8 can still close/reverse immediately.
+if BIGMOVE_COOLDOWN_SEC <= 0:
+    BIGMOVE_COOLDOWN_SEC = 7200
+BIGMOVE_AUTOTRADE_TRIGGER_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_AUTOTRADE_TRIGGER_COOLDOWN_SEC", str(BIGMOVE_COOLDOWN_SEC or 7200)) or (BIGMOVE_COOLDOWN_SEC or 7200))
+if BIGMOVE_AUTOTRADE_TRIGGER_COOLDOWN_SEC <= 0:
+    BIGMOVE_AUTOTRADE_TRIGGER_COOLDOWN_SEC = BIGMOVE_COOLDOWN_SEC
 BIGMOVE_FAMILY_ID = "F8_BIGMOVE_CONT"
 BIGMOVE_FAMILY_NAME = "Big Move Continuation"
 BIGMOVE_SIGNAL_FINAL_RR = float(os.environ.get("BIGMOVE_SIGNAL_FINAL_RR", "1.8") or 1.8)
@@ -12537,9 +12544,9 @@ BIGMOVE_LAST_CLOSED_15M_CACHE_TTL_SEC = int(os.environ.get("BIGMOVE_LAST_CLOSED_
 def bigmove_recently_emailed(uid: int, symbol: str, direction: str) -> bool:
     """BigMove/F8 duplicate guard.
 
-    Ver12 default: no cooldown for F8 BigMove alerts. They are sharp, event-based
-    opportunities, so a repeated confirmed move should be allowed unless the admin
-    explicitly sets BIGMOVE_COOLDOWN_SEC > 0 in Render.
+    Ver15 default: same-symbol / same-direction cooldown is ON for F8 BigMove alerts
+    to stop repeated emails and repeated AutoTrade entries on the same move. Opposite
+    direction is not blocked, so the F8 opposite-position close rule can still act.
     """
     try:
         if int(BIGMOVE_COOLDOWN_SEC or 0) <= 0:
@@ -12569,6 +12576,72 @@ def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
             conn.commit()
     except Exception:
         pass
+
+
+def _bigmove_autotrade_trigger_migrate() -> None:
+    """Deduplicate owner AutoTrade triggers for BigMove/F8 across multiple email recipients.
+
+    BigMove alerts are sent per user, but owner AutoTrade must trigger only once per
+    symbol+direction event. Otherwise one market event sent to multiple subscribers can
+    create repeated owner trades for the same symbol/direction.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bigmove_autotrade_triggers (
+                    user_id INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    triggered_ts REAL NOT NULL DEFAULT 0,
+                    note TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(user_id, symbol, direction)
+                )
+            """)
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _bigmove_autotrade_claim_candidates(owner_uid: int, candidates: list) -> list:
+    """Return only F8 candidates not recently AutoTrade-triggered for owner.
+
+    Cooldown is same symbol + same direction only. Opposite direction is allowed so the
+    safety rule can close an opposite open position immediately.
+    """
+    _bigmove_autotrade_trigger_migrate()
+    out = []
+    try:
+        owner = int(owner_uid or 0)
+        if owner <= 0:
+            return []
+        cooldown = max(0, int(BIGMOVE_AUTOTRADE_TRIGGER_COOLDOWN_SEC or 0))
+        now_ts = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            for c in list(candidates or []):
+                try:
+                    sym = str((c or {}).get('symbol') or '').upper().strip()
+                    direction = str((c or {}).get('direction') or '').upper().strip()
+                    if not sym or direction not in {'UP', 'DOWN'}:
+                        continue
+                    row = cur.execute(
+                        "SELECT triggered_ts FROM bigmove_autotrade_triggers WHERE user_id=? AND symbol=? AND direction=?",
+                        (owner, sym, direction),
+                    ).fetchone()
+                    if row and cooldown > 0 and (now_ts - float(row[0] or 0.0)) < float(cooldown):
+                        continue
+                    cur.execute(
+                        "INSERT OR REPLACE INTO bigmove_autotrade_triggers(user_id, symbol, direction, triggered_ts, note) VALUES(?,?,?,?,?)",
+                        (owner, sym, direction, now_ts, 'claimed_for_owner_autotrade'),
+                    )
+                    out.append(c)
+                except Exception:
+                    continue
+            conn.commit()
+    except Exception:
+        return list(candidates or [])
+    return out
 
 
 # Big-move email confirmation gate:
@@ -13527,7 +13600,16 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
         # AutoTrade job is holding the lock for a few seconds. Wait briefly instead;
         # the setup is also persisted so the next scheduled run can pick it up.
 
-        setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(candidates or []), best_fut or {}, sess, timeout=8)
+        fresh_candidates = await to_thread_autotrade(_bigmove_autotrade_claim_candidates, owner_uid, list(candidates or []), timeout=5)
+        if not fresh_candidates:
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': 'bigmove_same_direction_cooldown_active', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
+            }
+            return
+
+        setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(fresh_candidates or []), best_fut or {}, sess, timeout=8)
         if not setup_list:
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
                 'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
@@ -37798,8 +37880,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = max(0, len(table_rows) - len(display_rows))
     table = tabulate(
         display_rows,
-        headers=['Symbol', 'Type', 'Session', 'Conf', 'Family', 'Result'],
-        tablefmt='rounded_grid',
+        headers=['Sym', 'Side', 'Ses', 'Conf', 'Fam', 'Res'],
+        tablefmt='plain',
         colalign=('left', 'center', 'center', 'right', 'center', 'center'),
     )
     header_lines = [
@@ -37921,8 +38003,8 @@ def _setup_audit_overall_text(uid: int) -> str:
     ]
     table = tabulate(
         table_rows,
-        headers=['Family', 'Session', 'Setups', 'TP', 'SL', 'NOHIT', 'OPEN', 'WR'],
-        tablefmt='rounded_grid',
+        headers=['Fam', 'Ses', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
+        tablefmt='plain',
         colalign=('center', 'center', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
@@ -38834,9 +38916,14 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
 
 
 def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
+    """AutoTrade journal: one row per underlying trade, sorted by latest time.
+
+    Ver15 intentionally does NOT merge rows by symbol. The purpose of this command is
+    to audit every AutoTrade entry/exit and its PnL.
+    """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v6merged:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v7_unmerged:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -38860,9 +38947,9 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     except Exception:
         closed_rows = []
 
-    table_rows = []
     total_open = 0.0
     total_closed = 0.0
+    journal_rows = []
 
     def _family_for_report(row: dict) -> str:
         try:
@@ -38884,12 +38971,37 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         except Exception:
             return '-'
 
+    def _ts_value(row: dict, fallback: float = 0.0) -> float:
+        for k in ('closed_ts', 'opened_ts', 'created_ts', 'updated_ts', 'email_logged_ts', 'emailed_ts'):
+            try:
+                v = float((row or {}).get(k) or 0.0)
+                if v > 0:
+                    return v
+            except Exception:
+                pass
+        return float(fallback or 0.0)
+
+    def _ts_txt(ts: float) -> str:
+        try:
+            return datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M')
+        except Exception:
+            return '-'
+
     for p, tr in (bot_positions or []):
         row = _setup_audit_merge_trade_setup_row(tr)
         side = str(row.get('side') or _pos_side_text(p) or '').upper().strip() or '-'
         pnl = float(_pos_unreal_pnl(p) or 0.0)
         total_open += pnl
-        table_rows.append([_sym_display(row, _pos_symbol(p)), side, _family_for_report(row), f"{pnl:+.2f}"])
+        ts = _ts_value(row, now_ts)
+        journal_rows.append({
+            'ts': ts,
+            'time': _ts_txt(ts),
+            'state': 'OPEN',
+            'symbol': _sym_display(row, _pos_symbol(p)),
+            'side': side,
+            'family': _family_for_report(row),
+            'pnl': pnl,
+        })
 
     for r in (closed_rows or []):
         row = _setup_audit_merge_trade_setup_row(r)
@@ -38899,37 +39011,18 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         except Exception:
             pnl = 0.0
         total_closed += pnl
-        table_rows.append([_sym_display(row, r.get('symbol') or ''), side, _family_for_report(row), f"{pnl:+.2f}"])
+        ts = _ts_value(row, float((r or {}).get('closed_ts') or (r or {}).get('opened_ts') or 0.0))
+        journal_rows.append({
+            'ts': ts,
+            'time': _ts_txt(ts),
+            'state': 'CLOSED',
+            'symbol': _sym_display(row, r.get('symbol') or ''),
+            'side': side,
+            'family': _family_for_report(row),
+            'pnl': pnl,
+        })
 
-    # Merge duplicate rows so one Telegram row represents one symbol, while totals still
-    # use all underlying open/closed trade rows in the requested window.
-    raw_row_count = len(table_rows)
-    grouped: dict[str, dict] = {}
-    for sym, side, fam, pnl_txt in list(table_rows or []):
-        try:
-            key = str(sym or '-').upper().strip() or '-'
-            item = grouped.setdefault(key, {'symbol': key, 'sides': set(), 'families': set(), 'pnl': 0.0, 'count': 0})
-            if str(side or '').strip() and str(side or '').strip() != '-':
-                item['sides'].add(str(side or '').upper().strip())
-            if str(fam or '').strip() and str(fam or '').strip() != '-':
-                item['families'].add(str(fam or '').upper().strip())
-            item['pnl'] += float(str(pnl_txt).replace('+','').replace(',','') or 0.0)
-            item['count'] += 1
-        except Exception:
-            continue
-    merged_rows = []
-    for item in sorted(grouped.values(), key=lambda x: abs(float(x.get('pnl') or 0.0)), reverse=True):
-        sides = sorted(list(item.get('sides') or []))
-        fams = sorted(list(item.get('families') or []))
-        merged_rows.append([
-            item.get('symbol') or '-',
-            sides[0] if len(sides) == 1 else ('MIXED' if sides else '-'),
-            fams[0] if len(fams) == 1 else (','.join(fams[:3]) + ('+' if len(fams) > 3 else '') if fams else 'F0'),
-            int(item.get('count') or 0),
-            f"{float(item.get('pnl') or 0.0):+.2f}",
-        ])
-    table_rows = merged_rows
-
+    journal_rows.sort(key=lambda x: float(x.get('ts') or 0.0), reverse=True)
     try:
         now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
     except Exception:
@@ -38938,36 +39031,36 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         "📒 <b>AutoTrade Journal</b>",
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
-        f"Symbols: <b>{len(table_rows)}</b> | Underlying rows: <b>{raw_row_count}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
+        f"Trades: <b>{len(journal_rows)}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
     ]
     if external_positions:
         lines.append(f"Ignored unmatched manual/external live positions: <b>{len(external_positions)}</b>")
-    if not table_rows:
+    if not journal_rows:
         lines.append(SEP)
         lines.append("No AutoTrade open/closed rows found in this window.")
         out = "\n".join(lines)
     else:
         try:
-            max_rows = max(10, min(60, int(globals().get('AUTOTRADE_REPORT_DISPLAY_MAX_ROWS', 30) or 30)))
+            max_rows = max(10, min(80, int(globals().get('AUTOTRADE_REPORT_DISPLAY_MAX_ROWS', 60) or 60)))
         except Exception:
-            max_rows = 30
-        display_rows = table_rows[:max_rows]
-        hidden_rows = max(0, len(table_rows) - len(display_rows))
+            max_rows = 60
+        display = journal_rows[:max_rows]
+        hidden_rows = max(0, len(journal_rows) - len(display))
+        table_rows = [[r['time'], r['state'], r['symbol'], r['side'], r['family'], f"{float(r['pnl']):+.2f}"] for r in display]
         table = tabulate(
-            display_rows,
-            headers=['Symbol', 'Type', 'Family', 'Rows', 'PnL'],
-            tablefmt='rounded_grid',
-            colalign=('left', 'center', 'center', 'right', 'right'),
+            table_rows,
+            headers=['Time', 'State', 'Sym', 'Side', 'Fam', 'PnL'],
+            tablefmt='plain',
+            colalign=('left', 'center', 'left', 'center', 'center', 'right'),
         )
         if hidden_rows > 0:
-            lines.append(f"Showing first <b>{len(display_rows)}</b> rows only; <b>{hidden_rows}</b> hidden.")
+            lines.append(f"Showing first <b>{len(display)}</b> trades only; <b>{hidden_rows}</b> hidden.")
         out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
     try:
         cache_set(cache_key, out)
     except Exception:
         pass
     return out
-
 
 def _autotrade_report_overall_text_cached(owner: int) -> str:
     owner = int(owner)
