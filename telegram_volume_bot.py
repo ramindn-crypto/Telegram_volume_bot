@@ -2064,14 +2064,24 @@ def _strategy_cfg_execution_sessions_allowed(cfg: dict | None) -> set[str]:
 
 def _strategy_cfg_execution_engines_allowed(cfg: dict | None) -> set[str]:
     try:
-        raw = (cfg or {}).get('execution_engines_allowed', ['A', 'B', 'C', 'F8']) or ['A', 'B', 'C', 'F8']
-        out = {str(x).upper().strip() for x in raw if str(x).strip()}
-        aliases = {'BIGMOVE': 'F8', 'BIG_MOVE': 'F8', 'BIGMOVE_CONT': 'F8', 'F8_BIGMOVE_CONT': 'F8'}
+        default_all = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
+        raw = (cfg or {}).get('execution_engines_allowed', default_all) or default_all
+        out = {str(x).upper().strip().replace('-', '_') for x in raw if str(x).strip()}
+        aliases = {
+            'ENGINE_A': 'A', 'F1': 'A', 'F1_PULLBACK_CONT': 'A',
+            'ENGINE_B': 'B', 'F2': 'B', 'F2_MOMENTUM_IGNITION': 'B',
+            'ENGINE_C': 'C', 'F3': 'C', 'F3_IMPULSE_BASE_CONT': 'C',
+            'SWEEP': 'F4', 'F4_SWEEP_RECLAIM': 'F4',
+            'ORB': 'F5', 'ORB_RETEST': 'F5', 'F5_ORB_RETEST': 'F5',
+            'VWAP': 'F6', 'VWAP_RECLAIM': 'F6', 'F6_VWAP_RECLAIM': 'F6',
+            'EXHAUSTION': 'F7', 'EXHAUSTION_FAILURE': 'F7', 'F7_EXHAUSTION_FAILURE': 'F7',
+            'BIGMOVE': 'F8', 'BIG_MOVE': 'F8', 'BIGMOVE_CONT': 'F8', 'F8_BIGMOVE_CONT': 'F8',
+        }
         norm = {aliases.get(x, x) for x in out}
-        cleaned = {x for x in norm if x in {'A', 'B', 'C', 'F8'}}
-        return cleaned or {'A', 'B', 'C', 'F8'}
+        cleaned = {x for x in norm if x in {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}}
+        return cleaned or {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}
     except Exception:
-        return {'A', 'B', 'C', 'F8'}
+        return {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}
 
 def _strategy_cfg_preferred_trade_window(cfg: dict | None) -> tuple[str, str]:
     try:
@@ -2366,15 +2376,19 @@ def _strategy_config_apply_ver08_quality_patch() -> None:
         # Balanced, not F1-only. Keep all sessions available, but make ASIA stricter.
         cfg['high_win_mode'] = False
         cfg['execution_sessions_allowed'] = ['ASIA', 'LON', 'NY']
-        # A=F1 pullback, B=F2 momentum, F8=Big-Move continuation.
-        # C/F3 is excluded from executable/email/autotrade until it proves better.
-        cfg['execution_engines_allowed'] = ['A', 'B', 'F8']
+        # Ver14: discovery mode. Keep all eight setup families active so we can
+        # collect enough real samples before prioritising winners. F1/F2/F3 are
+        # represented by engines A/B/C; F4-F7 are research-family overlays; F8 is BigMove.
+        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
+        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8']
         cfg['execution_asia_enabled'] = True
         cfg['execution_asia_user_override'] = False
         cfg['execution_engine_b_email_enabled'] = True
         cfg['goal_profile_allow_asia'] = True
         cfg['goal_profile_allow_engine_b'] = True
-        cfg['goal_profile_active_profile'] = 'BALANCED_A_B_F8_VER09'
+        cfg['goal_profile_active_profile'] = 'ALL_FAMILIES_DISCOVERY_VER14'
+        cfg['family_allocator_shadow_mode'] = True
+        cfg['family_allocator_enforce_live'] = False
 
         # Quality floors: reduce raw noise, but avoid the too-tight Ver08 1-3/day profile.
         cfg['min_fut_vol_usd'] = max(15_000_000.0, float(cfg.get('min_fut_vol_usd', 0) or 0.0))
@@ -2394,12 +2408,12 @@ def _strategy_config_apply_ver08_quality_patch() -> None:
         }
 
         # Commercial target: enough signals to learn from, but not the raw 100+/day noise.
-        cfg['target_setups_per_day_lo'] = 3.0
-        cfg['target_setups_per_day_hi'] = 5.0
-        cfg['governor_target_lo'] = 3.0
-        cfg['governor_target_hi'] = 5.0
-        cfg['goal_profile_target_setups_per_day_lo'] = 3.0
-        cfg['goal_profile_target_setups_per_day_hi'] = 5.0
+        cfg['target_setups_per_day_lo'] = 4.0
+        cfg['target_setups_per_day_hi'] = 8.0
+        cfg['governor_target_lo'] = 4.0
+        cfg['governor_target_hi'] = 8.0
+        cfg['goal_profile_target_setups_per_day_lo'] = 4.0
+        cfg['goal_profile_target_setups_per_day_hi'] = 8.0
         cfg['goal_profile_target_win_rate'] = 52.0
         cfg['goal_profile_target_avg_r'] = 0.10
         save_strategy_config(cfg)
@@ -2474,6 +2488,12 @@ try:
     apply_strategy_config(load_strategy_config(force=True))
     _strategy_config_bootstrap_recommendations()
     _strategy_config_apply_ver08_quality_patch()
+    try:
+        _research_seed_family_registry()
+        _research_activate_all_families_runtime()
+        _ver14_all_family_profile_bootstrap()
+    except Exception:
+        pass
 except Exception:
     pass
 
@@ -4525,6 +4545,82 @@ def _autotrade_force_close_live_position(symbol: str, side: str, qty: float | No
     except Exception as e:
         return {'retCode': -1, 'retMsg': f'{type(e).__name__}: {e}'}
 
+
+
+
+AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED = env_bool('AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED', True)
+AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE = env_bool('AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE', True)
+
+
+def _autotrade_setup_family_code(setup: Any) -> str:
+    try:
+        fam = str(getattr(setup, 'family_id', '') or '').strip()
+        if fam:
+            return _setup_family_id_to_code(fam)
+    except Exception:
+        pass
+    try:
+        return _setup_family_id_to_code(_family_id_from_engine(str(getattr(setup, 'engine', '') or ''), setup))
+    except Exception:
+        return ''
+
+
+def _autotrade_f8_close_opposite_position_if_needed(uid: int, setup: Any, symbol: str, side: str) -> tuple[bool, str, dict]:
+    """For F8 BigMove only: close same-symbol opposite live exposure first.
+
+    Ramin's rule: when a sharp BigMove setup appears opposite an existing same-symbol
+    position, flatten the old exposure immediately instead of waiting for SL. This is
+    limited to F8 and recorded in the last-attempt detail.
+    """
+    detail = {'checked': False, 'action': 'none'}
+    try:
+        if not AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED:
+            return (True, 'disabled', detail)
+        if str(_autotrade_runtime_mode()).lower() != 'live':
+            return (True, 'paper_or_not_live', detail)
+        fam_code = _autotrade_setup_family_code(setup)
+        if fam_code != 'F8':
+            return (True, 'not_f8', detail)
+        sym = _bybit_linear_symbol(symbol)
+        sd = str(side or '').upper().strip()
+        if sd not in {'BUY', 'SELL'}:
+            return (False, 'bad_side_for_f8_opposite_close', detail)
+        conflict = _autotrade_live_symbol_conflict(int(uid), sym, side=sd) or {}
+        detail.update({'checked': True, 'conflict': conflict})
+        if not bool(conflict.get('has_conflict')):
+            return (True, 'no_conflict', detail)
+        pos_side = str(conflict.get('position_side') or '').upper().strip()
+        if pos_side == sd:
+            return (False, 'f8_same_side_position_already_open', detail)
+        if pos_side not in {'BUY', 'SELL'}:
+            return (False, 'f8_unknown_existing_position_side', detail)
+        owner_kind = str(conflict.get('owner_kind') or '').lower().strip()
+        if owner_kind != 'bot' and not AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE:
+            return (False, 'f8_opposite_external_position_not_closed', detail)
+
+        qty = float(conflict.get('position_qty') or 0.0)
+        close_res = _autotrade_force_close_live_position(sym, pos_side, qty=qty)
+        detail.update({'action': 'closed_opposite', 'close_res': close_res, 'closed_side': pos_side, 'closed_qty': qty})
+        if int((close_res or {}).get('retCode', -1)) != 0:
+            return (False, f"f8_opposite_close_failed:{(close_res or {}).get('retMsg')}", detail)
+
+        # Mark matching bot journal row closed so local duplicate gates do not block the new F8 setup.
+        try:
+            trade_id = str(conflict.get('trade_id') or '').strip()
+            if trade_id:
+                _autotrade_db_close_trade(trade_id, float(time.time()), 0.0, 'OPPOSITE_F8_CLOSE', 'closed_by_opposite_f8_bigmove_setup')
+        except Exception:
+            pass
+        try:
+            _autotrade_cancel_legacy_conditional_exit_orders(sym, side=pos_side)
+            _bybit_invalidate_live_order_position_cache(sym)
+        except Exception:
+            pass
+        time.sleep(1.2)
+        return (True, 'opposite_position_closed_for_f8', detail)
+    except Exception as exc:
+        detail['error'] = f'{type(exc).__name__}: {exc}'
+        return (False, 'f8_opposite_close_exception', detail)
 
 def _bybit_position_idx_candidates(side: str | None = None, live_pos: dict | None = None) -> list[int]:
     vals: list[int] = []
@@ -7875,6 +7971,25 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
+    # Ver14 F8 safety rule: a confirmed opposite BigMove setup should flatten
+    # existing same-symbol opposite exposure before trying the new direction.
+    try:
+        f8_close_ok, f8_close_reason, f8_close_detail = _autotrade_f8_close_opposite_position_if_needed(uid, s, sym, side)
+        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'f8_opposite_close_ok': bool(f8_close_ok),
+            'f8_opposite_close_reason': str(f8_close_reason or ''),
+            'f8_opposite_close_detail': f8_close_detail,
+        })
+        if not f8_close_ok:
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=str(f8_close_reason or 'f8_opposite_close_failed'))
+            except Exception:
+                pass
+            return (False, str(f8_close_reason or 'f8_opposite_close_failed'))
+    except Exception as _f8_exc:
+        return (False, f'f8_opposite_close_exception:{type(_f8_exc).__name__}')
+
     can_open, can_open_reason, can_open_detail = _autotrade_can_open_symbol(uid, sym, side, session_label)
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
@@ -8625,33 +8740,33 @@ def _research_family_registry_defaults() -> list[dict]:
         {
             "family_id": "F4_SWEEP_RECLAIM",
             "family_name": "Sweep Reclaim Reversal",
-            "status": "experimental",
+            "status": "active",
             "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
-            "eligible_regimes_json": json.dumps(["BALANCE", "EXHAUSTION"]),
+            "eligible_regimes_json": json.dumps(["BALANCE", "EXHAUSTION", "SQUEEZE", "UNSTABLE_HIGH_VOL"]),
             "thesis": "Liquidity sweep and reclaim reversal at range edges.",
         },
         {
             "family_id": "F5_ORB_RETEST",
             "family_name": "Opening Range Breakout Retest",
-            "status": "experimental",
-            "eligible_sessions_json": json.dumps(["LON", "NY"]),
-            "eligible_regimes_json": json.dumps(["SQUEEZE", "EXPANSION"]),
+            "status": "active",
+            "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["SQUEEZE", "EXPANSION", "TREND_UP", "TREND_DOWN"]),
             "thesis": "Opening-range break then retest continuation.",
         },
         {
             "family_id": "F6_VWAP_RECLAIM",
             "family_name": "VWAP Reclaim",
-            "status": "experimental",
-            "eligible_sessions_json": json.dumps(["LON", "NY"]),
-            "eligible_regimes_json": json.dumps(["TREND_UP", "TREND_DOWN", "BALANCE"]),
+            "status": "active",
+            "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["TREND_UP", "TREND_DOWN", "BALANCE", "EXPANSION"]),
             "thesis": "VWAP reclaim or rejection aligned with intraday directional bias.",
         },
         {
             "family_id": "F7_EXHAUSTION_FAILURE",
             "family_name": "Exhaustion Failure Reversal",
-            "status": "experimental",
-            "eligible_sessions_json": json.dumps(["NY", "LON"]),
-            "eligible_regimes_json": json.dumps(["EXHAUSTION", "UNSTABLE_HIGH_VOL"]),
+            "status": "active",
+            "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["EXHAUSTION", "UNSTABLE_HIGH_VOL", "EXPANSION"]),
             "thesis": "Parabolic exhaustion followed by failed continuation and reversal.",
         },
         {
@@ -8995,6 +9110,57 @@ def _research_seed_family_registry() -> None:
         pass
 
 
+def _research_activate_all_families_runtime() -> None:
+    """Ver14 discovery mode: keep F1-F8 active in DB/runtime.
+
+    This updates existing rows too; INSERT OR IGNORE alone would leave old
+    experimental/inactive statuses untouched after deployment.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            for item in _research_family_registry_defaults():
+                fid = str(item.get('family_id') or '')
+                if not fid:
+                    continue
+                cur.execute(
+                    """UPDATE family_registry
+                       SET status='active', eligible_sessions_json=?, eligible_regimes_json=?, updated_ts=?
+                       WHERE UPPER(family_id)=UPPER(?)
+                    """,
+                    (str(item.get('eligible_sessions_json') or '[]'), str(item.get('eligible_regimes_json') or '[]'), float(time.time()), fid),
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _ver14_all_family_profile_bootstrap() -> None:
+    """Persist all-family discovery runtime defaults without breaking user caps."""
+    try:
+        cfg = load_strategy_config(force=True)
+        cfg['ver14_all_family_discovery_applied'] = True
+        cfg['ver14_all_family_discovery_ts'] = float(time.time())
+        cfg['execution_sessions_allowed'] = ['ASIA', 'LON', 'NY']
+        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
+        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8']
+        cfg['execution_asia_enabled'] = True
+        cfg['execution_engine_b_email_enabled'] = True
+        cfg['family_allocator_shadow_mode'] = True
+        cfg['family_allocator_enforce_live'] = False
+        cfg['goal_profile_active_profile'] = 'ALL_FAMILIES_DISCOVERY_VER14'
+        cfg['target_setups_per_day_lo'] = 4.0
+        cfg['target_setups_per_day_hi'] = 8.0
+        cfg['governor_target_lo'] = 4.0
+        cfg['governor_target_hi'] = 8.0
+        cfg['goal_profile_target_setups_per_day_lo'] = 4.0
+        cfg['goal_profile_target_setups_per_day_hi'] = 8.0
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+    except Exception:
+        pass
+
+
 def _research_family_eligible_for_cell(family_id: str, session_name: str, regime_primary: str) -> bool:
     fam = str(family_id or '').upper().strip()
     sess = str(session_name or '').upper().strip()
@@ -9289,6 +9455,7 @@ def _research_run_allocator_cycle(force: bool = False) -> dict:
     except Exception:
         best_fut = {}
     _research_seed_family_registry()
+    _research_activate_all_families_runtime()
     trading_day = _research_trading_day_label()
     plans = _research_build_allocator_plans(best_fut, trading_day=trading_day)
     return {'status': 'ok', 'trading_day': trading_day, 'plans': plans, 'count': len(plans or [])}
@@ -9352,6 +9519,7 @@ def _research_run_daily_refresh(force: bool = False) -> dict:
     except Exception:
         best_fut = {}
     _research_seed_family_registry()
+    _research_activate_all_families_runtime()
     plans = _research_build_allocator_plans(best_fut, trading_day=trading_day)
     state_after = _research_daily_state_snapshot(trading_day)
     return {
@@ -29079,6 +29247,19 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
                 max_ch15 += 0.12
                 max_ch1 += 0.20
                 max_atr += 0.18
+        elif fam in {'F5_ORB_RETEST', 'F6_VWAP_RECLAIM'}:
+            # Breakout/reclaim families naturally sit farther from EMA than pullback setups.
+            max_pb += 0.22
+            max_ch15 += 0.20
+            max_ch1 += 0.28
+            max_atr += 0.22
+        elif fam == 'F7_EXHAUSTION_FAILURE':
+            # Reversal after exhaustion can be extended by definition; keep RR/liquidity
+            # gates later, but do not reject solely for extension here.
+            max_pb += 0.42
+            max_ch15 += 0.40
+            max_ch1 += 0.50
+            max_atr += 0.35
         elif fam == BIGMOVE_FAMILY_ID:
             if sess in {'LON', 'NY'}:
                 max_pb += 0.16
@@ -29105,6 +29286,8 @@ def _setup_entry_quality_gate(s: 'Setup', session_name: str = 'NY', source: str 
             return (False, 'poor_volatility_regime_exec')
 
         if engine == 'A':
+            if fam == 'F7_EXHAUSTION_FAILURE':
+                return (True, 'ok')
             if sess == 'LON':
                 if src == 'exec':
                     lon_ctx_ch4_min = 0.30 if reach_mode else 0.42
@@ -29444,9 +29627,17 @@ def is_executable_setup_eligible(
         _engine_pre = str(getattr(s, "engine", "") or "").upper().strip()
         _fam_pre = str(getattr(s, 'family_id', '') or _family_id_from_engine(_engine_pre, s)).upper().strip()
         if allowed_engines and _engine_pre and _engine_pre not in allowed_engines:
-            # Big-Move setups use engine=F8 in the alert/autotrade path. Treat F8 as
-            # its own allowed executor instead of blocking it as an unsupported engine.
-            if not (_fam_pre == globals().get('BIGMOVE_FAMILY_ID', 'F8_BIGMOVE_CONT') and 'F8' in allowed_engines):
+            # Ver14 all-family discovery: a setup may use the proven A/B/C engine
+            # plumbing while being tagged as F4-F7. Allow it when either the engine
+            # or the compact family code is enabled.
+            try:
+                fam_code_pre = _setup_family_id_to_code(_fam_pre)
+            except Exception:
+                fam_code_pre = ''
+            if not (
+                (_fam_pre == globals().get('BIGMOVE_FAMILY_ID', 'F8_BIGMOVE_CONT') and 'F8' in allowed_engines)
+                or (fam_code_pre and fam_code_pre in allowed_engines)
+            ):
                 return (False, 'execution_profile_engine_disabled')
 
         # Drought-recovery setups are generated from the current live ticker snapshot only
@@ -29497,6 +29688,8 @@ def is_executable_setup_eligible(
         want = 'BULLISH' if side == 'BUY' else 'BEARISH' if side == 'SELL' else ''
 
         if engine == 'A':
+            if fam == 'F7_EXHAUSTION_FAILURE':
+                return (True, 'ok')
             if sess == 'LON':
                 score_floor = max((65.5 if reach_mode else 68.5), score_floor)
                 conf_floor = max((70 if reach_mode else 72), conf_floor)
@@ -29810,6 +30003,14 @@ def is_executable_setup_eligible(
                 if sess == 'ASIA' and ch24_abs < 5.0:
                     return (False, 'asia_balance_reclaim_too_weak')
                 return (True, "ok")
+            if fam == 'F7_EXHAUSTION_FAILURE':
+                if fut_vol < max(12_000_000.0, MIN_FUT_VOL_USD * 0.70):
+                    return (False, 'f7_below_liquidity')
+                if ch24_abs < 14.0:
+                    return (False, 'f7_not_exhausted_enough')
+                if rr_final < max(1.10, rr_floor - 0.05):
+                    return (False, 'f7_below_rr')
+                return (True, "ok")
             if not (bool(getattr(s, "pullback_ready", False)) or bool(getattr(s, "pullback_bypass_hot", False))):
                 return (False, "pullback_not_ready")
             if pb_dist > ((0.96 if reach_mode else 0.82) if sess == 'LON' else (0.86 if sess == 'NY' else 0.78)):
@@ -29837,6 +30038,14 @@ def is_executable_setup_eligible(
             return (True, "ok")
 
         if engine == "B":
+            if fam in {'F5_ORB_RETEST', 'F6_VWAP_RECLAIM'}:
+                if fut_vol < max(10_000_000.0, MIN_FUT_VOL_USD * 0.65):
+                    return (False, f"{fam.lower()}_below_liquidity")
+                if conf < max(70, conf_floor - 2):
+                    return (False, f"{fam.lower()}_below_conf")
+                if rr_final < max(1.08, rr_floor - 0.07):
+                    return (False, f"{fam.lower()}_below_rr")
+                return (True, "ok")
             if fam == BIGMOVE_FAMILY_ID:
                 bm_quality_floor = max(score_floor + 0.5, 66.5 if sess != 'ASIA' else 67.5)
                 bm_conf_floor = max(conf_floor, 78 if sess != 'ASIA' else 80)
@@ -30276,6 +30485,87 @@ def _engine_c_detect_pump_base(
 # =========================================================
 # make_setup
 # =========================================================
+
+
+def _ver14_infer_active_family_hint(
+    side: str,
+    entry: float,
+    ch24: float,
+    ch4: float,
+    ch1: float,
+    ch15: float,
+    fut_vol: float,
+    c15: list,
+    c1: list,
+    session_name: str = "",
+) -> tuple[str, str, str]:
+    """Lightweight F4-F7 discovery overlays.
+
+    The original live engines produced F1/F2/F3 plus F8. Ver14 keeps those and
+    adds safe identification rules for the research families so we can collect
+    live samples before prioritising them. The returned side may flip only for
+    explicit reversal families (F4/F7).
+    """
+    try:
+        sess = str(session_name or '').upper().strip()
+        sd = str(side or '').upper().strip()
+        vol = float(fut_vol or 0.0)
+        if vol < max(5_000_000.0, float(MIN_FUT_VOL_USD or 0.0) * 0.45):
+            return ('', sd, '')
+        closes15 = [float(x[4]) for x in (c15 or []) if len(x) >= 5]
+        highs15 = [float(x[2]) for x in (c15 or []) if len(x) >= 5]
+        lows15 = [float(x[3]) for x in (c15 or []) if len(x) >= 5]
+        vols15 = [float(x[5]) for x in (c15 or []) if len(x) >= 6]
+        last_close = float(closes15[-1]) if closes15 else float(entry or 0.0)
+
+        # F7 — Exhaustion failure reversal: very extended 24h/4h move starts failing.
+        try:
+            if vol >= max(12_000_000.0, float(MIN_FUT_VOL_USD or 0.0) * 0.75):
+                if float(ch24 or 0.0) >= 18.0 and (float(ch1 or 0.0) <= -0.22 or float(ch15 or 0.0) <= -0.18):
+                    return ('F7_EXHAUSTION_FAILURE', 'SELL', 'exhaustion_failure_short')
+                if float(ch24 or 0.0) <= -18.0 and (float(ch1 or 0.0) >= 0.22 or float(ch15 or 0.0) >= 0.18):
+                    return ('F7_EXHAUSTION_FAILURE', 'BUY', 'exhaustion_failure_long')
+        except Exception:
+            pass
+
+        # F6 — VWAP reclaim/rejection aligned with intraday direction.
+        try:
+            if len(closes15) >= 16 and len(vols15) >= 16:
+                typical = []
+                for i in range(-24, 0):
+                    try:
+                        typical.append(((highs15[i] + lows15[i] + closes15[i]) / 3.0, vols15[i]))
+                    except Exception:
+                        continue
+                denom = sum(v for _, v in typical) or 0.0
+                vwap = (sum(px * v for px, v in typical) / denom) if denom > 0 else 0.0
+                prev_close = float(closes15[-2])
+                if vwap > 0:
+                    if prev_close <= vwap and last_close > vwap and (float(ch1 or 0.0) >= -0.05 or float(ch24 or 0.0) >= 3.0):
+                        return ('F6_VWAP_RECLAIM', 'BUY', 'vwap_reclaim_long')
+                    if prev_close >= vwap and last_close < vwap and (float(ch1 or 0.0) <= 0.05 or float(ch24 or 0.0) <= -3.0):
+                        return ('F6_VWAP_RECLAIM', 'SELL', 'vwap_reclaim_short')
+        except Exception:
+            pass
+
+        # F5 — ORB/retest style breakout: close breaks recent range after a retest.
+        try:
+            if sess in {'ASIA', 'LON', 'NY'} and len(closes15) >= 18:
+                prior_high = max(highs15[-13:-1])
+                prior_low = min(lows15[-13:-1])
+                recent_low = min(lows15[-5:])
+                recent_high = max(highs15[-5:])
+                if last_close > prior_high and recent_low <= prior_high * 1.004 and (float(ch24 or 0.0) >= 3.0 or float(ch1 or 0.0) >= 0.15):
+                    return ('F5_ORB_RETEST', 'BUY', 'range_break_retest_long')
+                if last_close < prior_low and recent_high >= prior_low * 0.996 and (float(ch24 or 0.0) <= -3.0 or float(ch1 or 0.0) <= -0.15):
+                    return ('F5_ORB_RETEST', 'SELL', 'range_break_retest_short')
+        except Exception:
+            pass
+
+        return ('', sd, '')
+    except Exception:
+        return ('', str(side or '').upper().strip(), '')
+
 def make_setup(
     base: str,
     mv: MarketVol,
@@ -30469,9 +30759,24 @@ def make_setup(
             balance_reversal_side = balance_reversal_side or ""
         side = str(balance_reversal_side or (("BUY" if ch4 >= 0 else "SELL") if abs(ch4) >= 0.40 else ("BUY" if ch1 > 0 else "SELL")))  # trend-side gating: prefer 4H regime over 1H noise
 
+        # Ver14: identify all active research families (F4-F7) when their
+        # lightweight price/trend rules are met. These are overlays on the
+        # existing engines so they do not break the proven A/B/C/F8 plumbing.
+        try:
+            fam_extra, side_extra, fam_reason_extra = _ver14_infer_active_family_hint(
+                side, entry, ch24, ch4_used, ch1, ch15, fut_vol, c15, c1, session_name=session_name
+            )
+            if fam_extra and not family_id_hint:
+                family_id_hint = str(fam_extra)
+                side = str(side_extra or side).upper().strip()
+                if fam_reason_extra:
+                    notes.append(str(fam_reason_extra))
+        except Exception:
+            pass
+
         # 4H alignment
         # If 4H is basically flat, don't block (leaders often show ch4 ~ 0 while 24H is huge).
-        if family_id_hint != 'F4_SWEEP_RECLAIM' and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
+        if family_id_hint not in {'F4_SWEEP_RECLAIM', 'F7_EXHAUSTION_FAILURE'} and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
             if side == "BUY" and ch4 < ALIGN_4H_MIN:
                 _rej("4h_not_aligned_for_long", base, mv, f"side=BUY ch4={ch4:+.2f}%")
                 return None
@@ -30480,7 +30785,7 @@ def make_setup(
                 return None
 
         # ✅ HARD regime gate: don't fight the 4H direction (unless "strong reversal exception")
-        if family_id_hint != 'F4_SWEEP_RECLAIM' and TF_ALIGN_ENABLED and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
+        if family_id_hint not in {'F4_SWEEP_RECLAIM', 'F7_EXHAUSTION_FAILURE'} and TF_ALIGN_ENABLED and abs(ch4) >= float(ALIGN_4H_NEUTRAL_ZONE):
             if side == "BUY" and ch4 < 0:
                 if not strong_reversal_exception_ok(side, ch24, ch4, ch1):
                     _rej("4h_bear_regime_blocks_long", base, mv, f"ch4={ch4:+.2f}%")
@@ -30500,7 +30805,7 @@ def make_setup(
                 if balance_reversal_mode:
                     min1 = max(0.10, float(min1) * 0.28)
                     min4 = max(0.05, float(min4) * 0.14)
-                if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+                if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode:
                     if side == "BUY":
                         asia_ok = bool(float(ch24 or 0.0) <= -3.0 and (float(ch15 or 0.0) >= -0.10 or float(ch1 or 0.0) >= -0.28 or float(ch4 or 0.0) >= -0.50))
                         if not asia_ok:
@@ -30676,8 +30981,21 @@ def make_setup(
             except Exception:
                 engine_c_ok = False
 
+        # Ver14 research family overlays can activate the underlying engine lane
+        # when their own pattern rules pass. This keeps the downstream setup/email/
+        # autotrade plumbing stable while still tagging the correct family.
+        try:
+            if family_id_hint in {'F5_ORB_RETEST', 'F6_VWAP_RECLAIM'}:
+                engine_b_ok = True
+                notes.append(f"{family_id_hint.lower()}_engine_b_overlay")
+            elif family_id_hint == 'F7_EXHAUSTION_FAILURE':
+                engine_a_ok = True
+                notes.append('f7_exhaustion_failure_overlay')
+        except Exception:
+            pass
+
         if not engine_a_ok and not engine_b_ok and not engine_c_ok:
-            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode and float(fut_vol or 0.0) >= 2_500_000.0 and abs(float(ch24 or 0.0)) >= 3.0:
+            if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode and float(fut_vol or 0.0) >= 2_500_000.0 and abs(float(ch24 or 0.0)) >= 3.0:
                 engine_a_ok = True
                 notes.append("🟡 f4_balance_reclaim_fallback")
             else:
@@ -30753,7 +31071,7 @@ def make_setup(
 
             # Hard block only when the advanced engines strongly disagree.
             if structure == opposite_trend and trend == opposite_trend:
-                if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+                if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode:
                     notes.append(f"smc_structure_trend_soft_conflict={structure}/{trend}")
                     conf = max(0.0, float(conf) - 1.0)
                 else:
@@ -30799,7 +31117,7 @@ def make_setup(
                 conf += 2 + min(2, max(0, smf_score - 2))
             elif (side == "BUY" and smf_sell) or (side == "SELL" and smf_buy):
                 # Strong opposite smart-money signature: avoid
-                if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+                if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode:
                     notes.append("smf_opposes_soft")
                     conf -= 3
                 else:
@@ -30857,7 +31175,7 @@ def make_setup(
 
         if not keep:
             balance_reversal_mode = _research_balance_reversal_mode(session_name)
-            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+            if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode:
                 notes.append("🟡 f4_pullback_override")
                 conf = max(0.0, float(conf) - 3.0)
                 keep = True
@@ -30878,14 +31196,14 @@ def make_setup(
 
         thr = clamp(max(12.0, 2.5 * ((atr_1h / entry) * 100.0 if (atr_1h and entry) else 0.0)), 12.0, 22.0)
         if side == "BUY" and ch24 <= -thr:
-            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+            if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode:
                 notes.append("f4_24h_contradiction_soft")
                 conf = max(0.0, float(conf) - 2.0)
             else:
                 _rej("24h_contradiction_for_long", base, mv, f"ch24={ch24:+.1f}% <= -{thr:.1f}%")
                 return None
         if side == "SELL" and ch24 >= +thr:
-            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+            if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode:
                 notes.append("f4_24h_contradiction_soft")
                 conf = max(0.0, float(conf) - 2.0)
             else:
@@ -30902,7 +31220,7 @@ def make_setup(
                 except Exception:
                     low_flow_now = False
                 strong_context_now = bool(abs(float(ch24 or 0.0)) >= 8.0 and float(fut_vol or 0.0) >= 8_000_000.0)
-                if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+                if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode:
                     notes.append('🟡 f4_weak15m_soft')
                     conf = max(0.0, float(conf) - 2.0)
                 elif low_flow_now or strong_context_now:
@@ -30921,7 +31239,7 @@ def make_setup(
         # ---------------------------------------------------------
         try:
             sess_min = int(_session_generation_conf_floor(session_name))
-            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+            if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
                     sess_min = min(int(sess_min), 52)
                 else:
@@ -30982,12 +31300,12 @@ def make_setup(
         try:
             rr_final = rr_to_tp(entry, sl, tp_target)
             sess_rr_min = float(_session_generation_rr_floor(session_name))
-            if family_id_hint == 'F4_SWEEP_RECLAIM' and balance_reversal_mode:
+            if family_id_hint in {'F4_SWEEP_RECLAIM'} and balance_reversal_mode:
                 if str(session_name or '').upper() == 'ASIA':
                     sess_rr_min = min(float(sess_rr_min), 0.88)
                 else:
                     sess_rr_min = min(float(sess_rr_min), 0.94)
-            if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint != 'F4_SWEEP_RECLAIM':
+            if str(session_name or '').upper() == 'NY' and require_pullback and family_id_hint not in {'F4_SWEEP_RECLAIM', 'F7_EXHAUSTION_FAILURE'}:
                 sess_rr_min = max(float(sess_rr_min), float(_session_generation_rr_floor('NY')) + 0.05)
             if float(rr_final) < float(sess_rr_min):
                 _rej("below_min_rr_tp_session", base, mv, f"rr_final={rr_final:.2f} min={sess_rr_min:.2f} sess={session_name}")
@@ -31181,7 +31499,7 @@ def make_breakout_setup(
                     elif float(ch24 or 0.0) <= -2.6 and (float(ch15 or 0.0) >= -0.45 or float(ch1 or 0.0) >= -0.85 or float(ch4_used or 0.0) >= -1.10):
                         side = "BUY"
                         family_id_hint = family_id_hint or 'F4_SWEEP_RECLAIM'
-                    elif family_id_hint == 'F4_SWEEP_RECLAIM' or _research_balance_reversal_mode(session_name):
+                    elif family_id_hint in {'F4_SWEEP_RECLAIM'} or _research_balance_reversal_mode(session_name):
                         # Soft-fail instead of killing a balance/reclaim candidate behind breakout logic.
                         family_id_hint = family_id_hint or 'F4_SWEEP_RECLAIM'
                         side = balance_reversal_side or side
@@ -45857,6 +46175,12 @@ def main():
     db_init()
     ensure_email_column()
     _evolution_migrate_tables()
+    try:
+        _research_seed_family_registry()
+        _research_activate_all_families_runtime()
+        _ver14_all_family_profile_bootstrap()
+    except Exception:
+        pass
     
     builder = (
         Application.builder()
