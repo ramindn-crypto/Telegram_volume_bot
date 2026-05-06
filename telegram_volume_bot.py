@@ -785,6 +785,13 @@ _SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SCREEN_EXECUTOR
 _EMAIL_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("EMAIL_EXECUTOR_WORKERS", "2")))
 # Dedicated autotrade lane: live entry/risk checks must never queue behind optimizers or scans.
 _AUTOTRADE_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("AUTOTRADE_EXECUTOR_WORKERS", "1")))
+# Ver22: autonomous screen-equivalent setup sync. This is the production lane that
+# continuously does what /screen used to do manually: build the executable screen pool,
+# send setup emails, and trigger autotrade. It prevents /screen from being the trigger.
+_AUTONOMOUS_SCREEN_SYNC_LOCK = asyncio.Lock()
+AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC", "60") or 60)
+AUTONOMOUS_SCREEN_SYNC_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_FIRST_SEC", "25") or 25)
+AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_USERS", "4") or 4)
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
 
@@ -10263,7 +10270,8 @@ _EMAIL_LOOP_HEARTBEAT: Dict[str, Any] = {
     "last_error": "",
 }
 
-_EMAIL_POOL_CACHE_TTL_SEC = int(os.environ.get("EMAIL_POOL_CACHE_TTL_SEC", "900") or 900)
+# Ver22: do not let stale empty/old setup pools suppress autonomous setup emails.
+_EMAIL_POOL_CACHE_TTL_SEC = int(os.environ.get("EMAIL_POOL_CACHE_TTL_SEC", "90") or 90)
 _EMAIL_POOL_CACHE: dict[str, dict] = {}
 
 def _email_pool_cache_get(session_name: str, max_age_sec: int | None = None) -> list:
@@ -42233,6 +42241,29 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
                     mark_symbol_emailed(int(uid), s.symbol, s.side, target_session)
                 except Exception:
                     pass
+
+            # Ver22: /screen-sync and autonomous screen-sync must behave exactly like the
+            # normal setup email lane. After the setup email is sent, immediately queue
+            # AutoTrade for the exact same setup batch. This prevents email/screen from
+            # being ahead of autotrade.
+            try:
+                owner_uid_for_at = int(AUTOTRADE_OWNER_UID or 0)
+                if owner_uid_for_at > 0 and _autotrade_ready() and (int(uid) == owner_uid_for_at or is_admin_user(int(uid))):
+                    _LAST_AUTOTRADE_DECISION[owner_uid_for_at] = {
+                        "status": "QUEUED",
+                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "reason": "screen_sync_email_sent_waiting_for_immediate_autotrade",
+                        "session": str(target_session or ""),
+                        "mode": str(_autotrade_runtime_mode()).lower(),
+                        "trigger": "screen_or_autonomous_sync",
+                    }
+                    _safe_create_task(
+                        _trigger_autotrade_after_email_async(int(uid), str(target_session or ""), list(actionable or [])),
+                        "autotrade_after_screen_sync_email",
+                    )
+            except Exception:
+                pass
+
             return {"status": "sent", "reason": f"synced {len(actionable)} setup(s)", "setup_ids": [str(getattr(s, 'setup_id', '') or '') for s in actionable], "target_session": target_session}
 
         fail_reason = ''
@@ -43507,7 +43538,10 @@ ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_B
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
 BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "60") or 60)
-EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "600"))
+# Ver22: autonomous setup discovery must stay hot. A 10-minute rebuild floor made /screen
+# look like the trigger because manual /screen used the dedicated screen lane while the
+# email lane waited on stale/empty pools. Keep it short by default.
+EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "60"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
 PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "300"))
@@ -46714,6 +46748,126 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             pass
 
 
+
+async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
+    """Autonomous /screen-equivalent setup/email/autotrade lane (Ver22).
+
+    This job intentionally uses the dedicated screen executor and the exact same
+    _build_screen_body_and_kb + _screen_sync_pipeline_async path that manual /screen
+    uses. Therefore setup generation, setup emails, /screen cache, and autotrade are
+    produced without waiting for the admin/user to press /screen.
+    """
+    try:
+        _hb_touch('email', ok=True, details='autonomous_screen_sync_tick')
+        try:
+            db_log_setup_pipeline_event(0, stage='autonomous_screen_sync_tick', status='start', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='screen_email', details={'screen_required': False, 'source': 'job_queue_ver22'})
+        except Exception:
+            pass
+        if _AUTONOMOUS_SCREEN_SYNC_LOCK.locked():
+            try:
+                db_log_setup_pipeline_event(0, stage='autonomous_screen_sync_tick', status='skip_locked', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='screen_email', details={'screen_required': False})
+            except Exception:
+                pass
+            return
+        async with _AUTONOMOUS_SCREEN_SYNC_LOCK:
+            if not EMAIL_ENABLED or not email_config_ok():
+                return
+            try:
+                users = await to_thread_fast(list_users_notify_on, timeout=10)
+            except Exception:
+                users = []
+            users = list(users or [])
+
+            # Always include the AutoTrade owner/admin if an email is configured, even if a
+            # stale notify flag prevents list_users_notify_on from returning it.
+            try:
+                owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+                if owner_uid > 0 and not any(int((u or {}).get('user_id') or 0) == owner_uid for u in users):
+                    ou = get_user(owner_uid) or {}
+                    if ou and (str(ou.get('email_to') or ou.get('email') or '').strip()):
+                        users.append(ou)
+            except Exception:
+                pass
+            if not users:
+                return
+
+            try:
+                best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=12)
+            except Exception:
+                best_fut = {}
+            if not best_fut:
+                try:
+                    best_fut = await to_thread_screen(fetch_futures_tickers, timeout=18)
+                except Exception:
+                    best_fut = {}
+            if not best_fut:
+                return
+
+            processed = 0
+            sent_count = 0
+            skipped = []
+            for u in users[:max(1, int(AUTONOMOUS_SCREEN_SYNC_MAX_USERS or 1))]:
+                try:
+                    uid = int((u or {}).get('user_id') or (u or {}).get('id') or 0)
+                except Exception:
+                    uid = 0
+                if uid <= 0:
+                    continue
+                try:
+                    if not (is_admin_user(uid) or user_has_pro(uid, u)):
+                        continue
+                except Exception:
+                    continue
+                try:
+                    sess = in_session_now(u or {})
+                except Exception:
+                    sess = None
+                if not sess:
+                    skipped.append(f'{uid}:no_live_session')
+                    continue
+                sess_name = str((sess or {}).get('name') or scan_session_name_utc(datetime.now(timezone.utc)) or '').upper().strip()
+                if sess_name not in {'ASIA', 'LON', 'NY'}:
+                    skipped.append(f'{uid}:invalid_session:{sess_name}')
+                    continue
+                processed += 1
+                try:
+                    body, kb, setups = await to_thread_screen(_build_screen_body_and_kb, best_fut, sess_name, uid, timeout=75)
+                except asyncio.TimeoutError:
+                    skipped.append(f'{uid}:screen_build_timeout')
+                    continue
+                except Exception as e:
+                    skipped.append(f'{uid}:screen_build_{type(e).__name__}')
+                    continue
+                try:
+                    _screen_cache_put(f"uid:{uid}::{sess_name}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=True)
+                    _screen_cache_put(f"global::{sess_name}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=True)
+                except Exception:
+                    pass
+                if not setups:
+                    skipped.append(f'{uid}:no_screen_setups')
+                    continue
+                try:
+                    res = await _screen_sync_pipeline_async(uid, dict(u or {}), sess_name, sess_name, best_fut or {}, list(setups or []))
+                    if str((res or {}).get('status') or '').lower() == 'sent':
+                        sent_count += 1
+                    else:
+                        skipped.append(f"{uid}:{str((res or {}).get('reason') or 'not_sent')[:80]}")
+                except Exception as e:
+                    skipped.append(f'{uid}:sync_{type(e).__name__}')
+            try:
+                db_log_setup_pipeline_event(0, stage='autonomous_screen_sync_tick', status='ok', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='screen_email', details={'processed': processed, 'sent_batches': sent_count, 'skipped': skipped[:8], 'screen_required': False})
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            db_log_setup_pipeline_event(0, stage='autonomous_screen_sync_tick', status='error', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='screen_email', details={'error': f'{type(e).__name__}: {e}', 'screen_required': False})
+        except Exception:
+            pass
+        try:
+            logger.exception('autonomous_screen_sync_job failed: %s', e)
+        except Exception:
+            pass
+
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     """Background email engine (trade setups + big-move alerts).
 
@@ -46992,6 +47146,21 @@ def main():
                 "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 90,
+            },
+        )
+
+        # Ver22 major patch: run the /screen-equivalent setup/email/autotrade lane
+        # automatically. This is the safety net that prevents manual /screen from being
+        # the only thing that discovers and emails setups.
+        app.job_queue.run_repeating(
+            autonomous_screen_sync_job,
+            interval=max(30, int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 60)),
+            first=max(10, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 25), max(30, int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 60)) // 2)),
+            name="autonomous_screen_sync_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 120,
             },
         )
 
