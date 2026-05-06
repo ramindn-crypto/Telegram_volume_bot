@@ -2852,6 +2852,12 @@ AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_
 # This protects isolated futures positions where a wide SL with high leverage would
 # otherwise liquidate before the stop can execute.
 AUTOTRADE_LIQ_BUFFER_PCT = float(os.environ.get("AUTOTRADE_LIQ_BUFFER_PCT", "2.0") or 2.0)
+# Extra conservative liquidation guard used internally in addition to the user-visible
+# /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT value. This is intentionally stricter
+# than a simple 1/leverage approximation because Bybit liquidation depends on
+# maintenance margin, fees, mark price, risk limits and account mode.
+AUTOTRADE_LIQ_GUARD_MIN_BUFFER_PCT = float(os.environ.get("AUTOTRADE_LIQ_GUARD_MIN_BUFFER_PCT", "3.0") or 3.0)
+AUTOTRADE_LIQ_GUARD_SAFETY_FACTOR = float(os.environ.get("AUTOTRADE_LIQ_GUARD_SAFETY_FACTOR", "0.72") or 0.72)
 
 # Bybit V5 keys (required for live)
 BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
@@ -2968,6 +2974,38 @@ def _autotrade_liq_before_sl(side: str, liq_price: float, sl_price: float) -> bo
     return False
 
 
+
+def _autotrade_liq_has_required_buffer(side: str, liq_price: float, sl_price: float, entry_price: float, buffer_pct: float | None = None) -> bool:
+    """True when liquidation is beyond SL by the configured safety buffer."""
+    try:
+        side_u = str(side or '').upper().strip()
+        liq = float(liq_price or 0.0)
+        sl = float(sl_price or 0.0)
+        entry = float(entry_price or 0.0)
+        raw_buf = float(buffer_pct if buffer_pct is not None else _autotrade_runtime_liq_buffer_pct())
+        try:
+            raw_buf = max(raw_buf, float(AUTOTRADE_LIQ_GUARD_MIN_BUFFER_PCT))
+        except Exception:
+            raw_buf = max(raw_buf, 3.0)
+        buf = entry * max(0.0, min(25.0, raw_buf)) / 100.0
+        if liq <= 0 or sl <= 0 or entry <= 0 or side_u not in {'BUY', 'SELL'}:
+            return True  # no reliable liq price reported; do not force-close purely on missing data
+        if side_u == 'BUY':
+            return bool(liq < (sl - buf))
+        return bool(liq > (sl + buf))
+    except Exception:
+        return True
+
+
+def _autotrade_live_liq_guard_ok(side: str, liq_price: float, sl_price: float, entry_price: float, buffer_pct: float | None = None) -> bool:
+    """Final live check: liquidation must not be before SL and must keep buffer."""
+    try:
+        if _autotrade_liq_before_sl(side, liq_price, sl_price):
+            return False
+        return _autotrade_liq_has_required_buffer(side, liq_price, sl_price, entry_price, buffer_pct)
+    except Exception:
+        return False
+
 def _autotrade_liq_safety_plan(entry: float, sl: float, side: str, configured_leverage: int | float, buffer_pct: float | None = None) -> dict:
     """Plan a per-symbol leverage that keeps liquidation beyond the stop-loss.
 
@@ -2993,7 +3031,15 @@ def _autotrade_liq_safety_plan(entry: float, sl: float, side: str, configured_le
         st = float(sl or 0.0)
         side_u = str(side or '').upper().strip()
         cfg_lev = max(1, int(float(configured_leverage or 1)))
-        buf_pct = max(0.0, min(25.0, float(buffer_pct if buffer_pct is not None else _autotrade_runtime_liq_buffer_pct())))
+        raw_buf_pct = float(buffer_pct if buffer_pct is not None else _autotrade_runtime_liq_buffer_pct())
+        # Apply a hard internal minimum buffer so liquidation is not merely beyond
+        # the SL by a tiny amount. User-facing config can still be lower, but live
+        # execution stays safer.
+        try:
+            min_buf = float(AUTOTRADE_LIQ_GUARD_MIN_BUFFER_PCT)
+        except Exception:
+            min_buf = 3.0
+        buf_pct = max(0.0, min(25.0, max(float(raw_buf_pct), float(min_buf))))
         out['configured_leverage'] = cfg_lev
         out['buffer_pct'] = float(buf_pct)
         if e <= 0 or st <= 0 or side_u not in {'BUY', 'SELL'}:
@@ -3007,10 +3053,16 @@ def _autotrade_liq_safety_plan(entry: float, sl: float, side: str, configured_le
             return out
         stop_frac = abs(e - st) / e
         buf_frac = float(buf_pct) / 100.0
-        # Use 0.94 instead of 1.00 to leave room for maintenance margin, fees and
-        # mark-price slippage. This intentionally chooses a slightly lower leverage.
+        # Use a conservative factor instead of 1.00 to leave room for maintenance
+        # margin, fees, risk-limit tiers and mark-price slippage. This intentionally
+        # chooses a lower leverage so the Bybit liquidation line sits beyond SL.
+        try:
+            safety_factor = max(0.50, min(0.94, float(AUTOTRADE_LIQ_GUARD_SAFETY_FACTOR)))
+        except Exception:
+            safety_factor = 0.72
+        out['safety_factor'] = float(safety_factor)
         denom = max(1e-9, stop_frac + buf_frac)
-        max_safe_lev = int(math.floor(0.94 / denom))
+        max_safe_lev = int(math.floor(float(safety_factor) / denom))
         safe_lev = max(1, min(cfg_lev, max_safe_lev if max_safe_lev > 0 else 1))
         if safe_lev <= 0:
             safe_lev = 1
@@ -3058,6 +3110,43 @@ def _autotrade_set_symbol_leverage_safe(symbol: str, leverage: int | float) -> t
     except Exception as exc:
         return False, f'{type(exc).__name__}: {exc}', {}
 
+
+
+def _autotrade_adjust_live_liq_beyond_sl(symbol: str, side: str, sl_price: float, entry_price: float, start_leverage: int | float, uid: int | None = None) -> dict:
+    """Try to move Bybit liquidation price beyond SL by lowering live leverage.
+
+    If Bybit reports a liquidation price that would be hit before SL, do not close
+    immediately. First reduce leverage step-by-step down to 1x and re-check the
+    exchange-reported liq price. Only the caller decides whether to close if this
+    still fails.
+    """
+    out = {'ok': False, 'reason': 'not_attempted', 'attempts': []}
+    try:
+        sym = _bybit_linear_symbol(symbol)
+        side_u = str(side or '').upper().strip()
+        start = max(1, int(float(start_leverage or _autotrade_runtime_leverage() or 1)))
+        buffer_pct = _autotrade_runtime_liq_buffer_pct()
+        last_pos = None
+        for lev in range(start, 0, -1):
+            lev_ok, lev_msg, lev_res = _autotrade_set_symbol_leverage_safe(sym, lev)
+            try:
+                time.sleep(0.35)
+            except Exception:
+                pass
+            pos = _autotrade_wait_live_position(sym, side=side_u, wait_sec=2.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side_u)
+            last_pos = pos or last_pos
+            liq = float(_pos_liq_price(pos) if pos else 0.0)
+            entry_live = float(_pos_entry(pos) if pos else entry_price or 0.0) or float(entry_price or 0.0)
+            ok_now = bool(lev_ok) and _autotrade_live_liq_guard_ok(side_u, liq, sl_price, entry_live, buffer_pct)
+            out['attempts'].append({'lev': int(lev), 'set_ok': bool(lev_ok), 'msg': str(lev_msg), 'liq': float(liq), 'entry': float(entry_live), 'ok': bool(ok_now)})
+            if ok_now:
+                out.update({'ok': True, 'reason': 'adjusted', 'leverage': int(lev), 'liq_price': float(liq), 'entry': float(entry_live), 'position': pos})
+                return out
+        out.update({'ok': False, 'reason': 'unable_to_move_liq_beyond_sl', 'position': last_pos})
+        return out
+    except Exception as exc:
+        out.update({'ok': False, 'reason': f'{type(exc).__name__}: {exc}'})
+        return out
 
 def _bybit_get_instr_filters(symbol: str) -> dict:
     """Return best-effort Bybit linear instrument filters.
@@ -8222,40 +8311,65 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return (False, 'live_position_visibility_pending_for_sltp_attach')
 
         # Last-resort live liquidation verification. If Bybit reports a liq price
-        # that would be hit before the SL, immediately flatten the just-opened
-        # position instead of leaving it exposed.
+        # that would be hit before SL, first try to move liquidation farther away by
+        # lowering leverage on the live symbol. Only flatten if the exchange still
+        # reports an unsafe liquidation price after the adjustment attempts.
         live_liq = float(_pos_liq_price(final_pos) or 0.0)
+        live_entry_for_liq = float(_pos_entry(final_pos) or filled_entry or price_ref or 0.0)
+        live_liq_ok = _autotrade_live_liq_guard_ok(side, live_liq, sl_for_order, live_entry_for_liq, _autotrade_runtime_liq_buffer_pct())
         try:
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'live_liq_price': float(live_liq)})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'live_liq_price': float(live_liq),
+                'live_liq_entry': float(live_entry_for_liq),
+                'live_liq_guard_ok': bool(live_liq_ok),
+            })
         except Exception:
             pass
-        if _autotrade_liq_before_sl(side, live_liq, sl_for_order):
-            liq_reason = f'live_liq_before_sl liq={live_liq:g} sl={sl_for_order:g}'
+        if live_liq > 0 and not live_liq_ok:
+            adjust = _autotrade_adjust_live_liq_beyond_sl(sym, side, sl_for_order, live_entry_for_liq, safe_lev, uid=int(uid))
             try:
-                close_payload = {
-                    'category': 'linear',
-                    'symbol': sym,
-                    'side': 'Sell' if side == 'BUY' else 'Buy',
-                    'orderType': 'Market',
-                    'qty': _fmt_qty(float(qty_for_db), qty_step),
-                    'timeInForce': 'IOC',
-                    'reduceOnly': True,
-                    'closeOnTrigger': True,
-                }
-                close_res = _bybit_v5_request('POST', '/v5/order/create', close_payload)
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_before_sl_closed', 'liq_close_payload': close_payload, 'liq_close_res': close_res})
-            except Exception as exc:
-                close_res = {'retCode': -1, 'retMsg': f'{type(exc).__name__}: {exc}'}
-                try:
-                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_before_sl_close_failed', 'liq_close_res': close_res})
-                except Exception:
-                    pass
-            _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_liq_before_sl')
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason=liq_reason)
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'live_liq_adjustment': adjust})
             except Exception:
                 pass
-            return (False, 'live_liq_before_sl_closed')
+            if bool((adjust or {}).get('ok')):
+                final_pos = (adjust or {}).get('position') or final_pos
+                live_liq = float((adjust or {}).get('liq_price') or _pos_liq_price(final_pos) or live_liq or 0.0)
+                live_entry_for_liq = float((adjust or {}).get('entry') or _pos_entry(final_pos) or live_entry_for_liq or 0.0)
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                        'live_liq_price_after_adjust': float(live_liq),
+                        'live_leverage_after_adjust': int((adjust or {}).get('leverage') or safe_lev),
+                        'live_liq_guard_ok_after_adjust': True,
+                    })
+                except Exception:
+                    pass
+            else:
+                liq_reason = f'live_liq_unsafe_after_adjust liq={live_liq:g} sl={sl_for_order:g}'
+                try:
+                    close_payload = {
+                        'category': 'linear',
+                        'symbol': sym,
+                        'side': 'Sell' if side == 'BUY' else 'Buy',
+                        'orderType': 'Market',
+                        'qty': _fmt_qty(float(qty_for_db), qty_step),
+                        'timeInForce': 'IOC',
+                        'reduceOnly': True,
+                        'closeOnTrigger': True,
+                    }
+                    close_res = _bybit_v5_request('POST', '/v5/order/create', close_payload)
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_unsafe_closed', 'liq_close_payload': close_payload, 'liq_close_res': close_res})
+                except Exception as exc:
+                    close_res = {'retCode': -1, 'retMsg': f'{type(exc).__name__}: {exc}'}
+                    try:
+                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_unsafe_close_failed', 'liq_close_res': close_res})
+                    except Exception:
+                        pass
+                _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_liq_unsafe_after_adjust')
+                try:
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason=liq_reason)
+                except Exception:
+                    pass
+                return (False, 'live_liq_unsafe_closed')
 
         s_live = _autotrade_clone_setup_for_execution(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
         trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened_pending_exit_attach')
