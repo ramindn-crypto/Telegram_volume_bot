@@ -6,6 +6,7 @@
 # - Added /performance_chart and /winrate_chart plus admin help entries.
 # - v4: made admin diagnostics non-blocking/cached, delayed heavy startup jobs, and added stale-lessons banner.
 # - Ver17: BigMove alerts now immediately generate and send matching F8 setup emails; /screen uses setup-email timestamp.
+# - Ver21: Autonomous email/autotrade setup pipeline runs independently from /screen.
 
 
 # --- ASIA tightening (hard-coded, no env vars) ---
@@ -43491,7 +43492,12 @@ EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 45))
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
-ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", "300"))
+# Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
+# Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
+# to be the trigger. Keep the autonomous setup pipeline hot by default.
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "60") or 60)
+AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
+ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "2"))
 ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "2"))
 ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC", "12"))
@@ -43600,6 +43606,13 @@ def _alert_job_limit(name: str, default: int) -> int:
         return max(1, int(default))
 
 async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
+    # Ver21: this autonomous pipeline is the source of truth for setup emails and
+    # AutoTrade attempts. Manual /screen sync is only a backup/UX accelerator, not a
+    # required trigger.
+    try:
+        db_log_setup_pipeline_event(0, stage='autonomous_setup_pipeline_tick', status='start', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='email', details={'source': 'job_queue', 'screen_required': False})
+    except Exception:
+        pass
     # Prevent overlapping runs (JobQueue can overlap if a run is slow).
     # Do NOT skip the whole email loop because a user command ran recently or
     # a heavy optimizer/screen task is active. That silently starves emails for
@@ -46963,12 +46976,17 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     if app.job_queue:
-        interval_sec = max(int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or 135), int(ALERT_JOB_MAX_RUNTIME_SEC or 60) + 30)
+        # Ver21: autonomous setup/email/autotrade loop.
+        # This must run even when nobody presses /screen. APScheduler's max_instances +
+        # ALERT_LOCK already prevent overlap, so we do not stretch the interval to the
+        # worst-case runtime. A slow tick is simply coalesced/skipped; the next tick keeps
+        # the pipeline alive.
+        interval_sec = max(30, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60))
     
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
-            first=max(120, min(240, interval_sec // 2)),
+            first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
             name="alert_job",
             job_kwargs={
                 "max_instances": 1,
