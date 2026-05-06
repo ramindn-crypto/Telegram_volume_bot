@@ -4814,6 +4814,76 @@ def _autotrade_clear_position_full_tp_sl(symbol: str, side: str | None = None, l
         return {'retCode': -1, 'retMsg': f'{type(e).__name__}: {e}'}
 
 
+
+def _autotrade_exact_setup_exit_targets(trade_row: dict, side: str = '', fallback_entry: float = 0.0) -> dict:
+    """Return immutable setup SL/TP for a live AutoTrade row.
+
+    Critical safety rule: once a setup is emailed/executed, live TP/SL must stay
+    based on that setup's stored prices, not on a later scan, live mark price,
+    trailing recalculation, or another open row for the same symbol.
+    """
+    out = {'entry': 0.0, 'sl': 0.0, 'tp': 0.0, 'source': 'none'}
+    try:
+        row = dict(trade_row or {})
+    except Exception:
+        row = {}
+    side_u = str(side or row.get('side') or '').upper().strip()
+
+    def _valid(e, sl, tp):
+        try:
+            e = float(e or 0.0); sl = float(sl or 0.0); tp = float(tp or 0.0)
+            if e <= 0 or sl <= 0 or tp <= 0:
+                return False
+            if side_u == 'SELL':
+                return bool(sl > e and tp < e)
+            return bool(sl < e and tp > e)
+        except Exception:
+            return False
+
+    # Prefer original setup payload by setup_id (signals/executable/archived),
+    # because autotrade_trades can be affected by later adoption/repair paths.
+    setup_id = str(row.get('setup_id') or '').strip()
+    if setup_id:
+        try:
+            payload = _signal_setup_eval_payload(setup_id) or {}
+            e = float(payload.get('entry') or row.get('entry') or fallback_entry or 0.0)
+            sl = float(payload.get('sl') or 0.0)
+            tp = float(_resolve_single_tp(e, sl, payload.get('tp'), payload.get('alt_target_a'), payload.get('alt_target_b'), side_u) or 0.0)
+            if _valid(e, sl, tp):
+                out.update({'entry': e, 'sl': sl, 'tp': tp, 'source': 'setup_payload'})
+                return out
+        except Exception:
+            pass
+
+    # Fall back to the journal row, but still keep fixed row TP/SL.
+    try:
+        e = float(row.get('entry') or fallback_entry or 0.0)
+        sl = float(row.get('sl') or 0.0)
+        tp = float(_resolve_single_tp(e, sl, row.get('tp'), row.get('alt_target_a'), row.get('alt_target_b'), side_u) or 0.0)
+        if _valid(e, sl, tp):
+            out.update({'entry': e, 'sl': sl, 'tp': tp, 'source': 'trade_row'})
+            return out
+    except Exception:
+        pass
+    return out
+
+
+def _autotrade_rr_value(entry: float, sl: float, tp: float, side: str) -> float:
+    try:
+        e = float(entry or 0.0); s = float(sl or 0.0); t = float(tp or 0.0)
+        risk = abs(e - s)
+        reward = abs(t - e)
+        if e <= 0 or s <= 0 or t <= 0 or risk <= 0:
+            return 0.0
+        side_u = str(side or '').upper().strip()
+        if side_u == 'SELL' and not (s > e and t < e):
+            return 0.0
+        if side_u != 'SELL' and not (s < e and t > e):
+            return 0.0
+        return float(reward / risk)
+    except Exception:
+        return 0.0
+
 def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None) -> dict:
     """Repair AutoTrade exits using native Full-position TP/SL only.
 
@@ -4849,11 +4919,20 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         result['checked'] = True
 
         entry = float(_pos_entry(pos) or trade_row.get('entry') or 0.0)
-        target_sl = float(trade_row.get('sl') or 0.0)
-        target_tp = float(_resolve_single_tp(entry, target_sl, trade_row.get('tp'), trade_row.get('alt_target_a'), trade_row.get('alt_target_b'), side) or 0.0)
+        fixed_targets = _autotrade_exact_setup_exit_targets(trade_row, side=side, fallback_entry=entry)
+        target_sl = float((fixed_targets or {}).get('sl') or 0.0)
+        target_tp = float((fixed_targets or {}).get('tp') or 0.0)
+        result['target_source'] = str((fixed_targets or {}).get('source') or '')
         if target_sl <= 0 or target_tp <= 0:
             result['pending_missing'] = ['SL' if target_sl <= 0 else '', 'TP' if target_tp <= 0 else '']
             result['pending_missing'] = [x for x in result['pending_missing'] if x]
+            return result
+        # Never repair a live position using inverted/low-RR targets. This prevents
+        # the guardian from changing a clean setup into a poor RR or unsafe SL.
+        live_rr_for_targets = _autotrade_rr_value(entry, target_sl, target_tp, side)
+        result['wanted_rr_live'] = float(live_rr_for_targets or 0.0)
+        if live_rr_for_targets < 1.0:
+            result['error'] = f'fixed_targets_rr_below_1 entry={entry:g} sl={target_sl:g} tp={target_tp:g}'
             return result
 
         native_sl = float(_pos_native_stop_loss(pos) or 0.0)
@@ -4868,6 +4947,26 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             'native_sl_ok_before': bool(native_sl_ok),
             'native_tp_ok_before': bool(native_tp_ok),
         })
+
+        # Liquidation must stay beyond the setup SL. If leverage is unsafe, lower it
+        # before applying/repairing TP/SL. If it cannot be made safe, flatten rather
+        # than leaving a position where liquidation can happen before stop-loss.
+        try:
+            liq_px = float(_pos_liq_price(pos) or 0.0)
+            if liq_px > 0 and not _autotrade_live_liq_guard_ok(side, liq_px, target_sl, entry, _autotrade_runtime_liq_buffer_pct()):
+                lev_start = int(float((pos or {}).get('leverage') or _autotrade_runtime_leverage() or 1))
+                adj = _autotrade_adjust_live_liq_beyond_sl(sym, side, target_sl, entry, lev_start)
+                result['liq_repair'] = adj
+                if not bool((adj or {}).get('ok')):
+                    qty_to_close = abs(float(_pos_size(pos) or 0.0))
+                    close_res = _autotrade_force_close_live_position(sym, side, qty=qty_to_close)
+                    result['liq_unsafe_force_close'] = close_res
+                    result['error'] = f'liq_before_sl_unfixable liq={liq_px:g} sl={target_sl:g}'
+                    return result
+                pos = (adj or {}).get('position') or _autotrade_find_live_position(sym, side=side) or pos
+                entry = float(_pos_entry(pos) or entry or 0.0)
+        except Exception as _liq_exc:
+            result['liq_guard_error'] = f'{type(_liq_exc).__name__}: {_liq_exc}'
 
         # Always cleanup legacy standalone Conditional exits for this symbol/side.
         # If native TP/SL is already correct, this still reduces Orders count.
@@ -8120,13 +8219,48 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             pass
         return (False, str(reserve_reason or 'guard_reserve_failed'))
 
-    exit_plan = _autotrade_live_exit_plan_for_trade(s)
-    live_final_tp = float(exit_plan.get('final_tp') or final_tp or 0.0)
+    # Authoritative exit targets: use the exact setup TP/SL, tick-rounded once.
+    # Do not recalculate TP/SL from live price, trailing logic, or later family rules.
+    tp_rounding = ROUND_DOWN if side == 'BUY' else ROUND_UP
+    live_final_tp = _round_price_to_tick(sym, final_tp, rounding=tp_rounding)
+    if live_final_tp <= 0:
+        live_final_tp = float(final_tp or 0.0)
+    if side == 'BUY' and live_final_tp <= price_ref:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'tp_not_above_live_entry', 'fixed_setup_tp': float(live_final_tp), 'live_entry': float(price_ref)})
+        except Exception:
+            pass
+        return (False, 'tp_not_above_live_entry')
+    if side == 'SELL' and live_final_tp >= price_ref:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'tp_not_below_live_entry', 'fixed_setup_tp': float(live_final_tp), 'live_entry': float(price_ref)})
+        except Exception:
+            pass
+        return (False, 'tp_not_below_live_entry')
+    live_rr = _autotrade_rr_value(price_ref, sl_for_order, live_final_tp, side)
+    try:
+        min_live_rr = float(os.environ.get('AUTOTRADE_MIN_LIVE_RR', '1.0') or 1.0)
+    except Exception:
+        min_live_rr = 1.0
+    min_live_rr = max(1.0, float(min_live_rr or 1.0))
+    if live_rr < min_live_rr:
+        try:
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_rr_below_floor', 'live_rr': float(live_rr), 'min_live_rr': float(min_live_rr), 'fixed_setup_tp': float(live_final_tp), 'fixed_setup_sl': float(sl_for_order), 'live_entry': float(price_ref)})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('below_min_rr'), last_reason=f'live_rr_below_floor {live_rr:.2f}<{min_live_rr:.2f}')
+        except Exception:
+            pass
+        return (False, 'live_rr_below_floor')
     try:
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
             'position_opened_time': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'live_exit_tp': float(live_final_tp or 0.0),
-            'live_tp_design': 'single_full_position_tp_sl',
+            'live_exit_sl': float(sl_for_order or 0.0),
+            'live_exit_rr': float(live_rr),
+            'live_tp_design': 'fixed_setup_tp_sl_position_full',
+            'exit_target_source': 'setup_fixed',
         })
     except Exception:
         pass
@@ -38485,9 +38619,14 @@ def _autotrade_find_open_trade_for_live_position(uid: int, live_pos: dict, journ
     def _score(row: dict):
         opened = float(row.get('opened_ts') or 0.0)
         entry = float(row.get('entry') or 0.0)
-        open_delta = abs(opened - target_opened) if target_opened > 0 and opened > 0 else 10**18
         entry_delta = abs(entry - live_entry) if entry > 0 and live_entry > 0 else 10**18
-        return (open_delta, entry_delta, -opened)
+        if target_opened > 0 and opened > 0:
+            open_delta = abs(opened - target_opened)
+            return (0, open_delta, entry_delta, -opened)
+        # When the exchange open-time cannot be resolved, prefer the latest OPEN
+        # journal row for that same symbol/side. This prevents the guardian from
+        # repairing a live position using an older setup row with different TP/SL.
+        return (1, -opened, entry_delta)
     return dict(sorted(matches, key=_score)[0])
 
 
