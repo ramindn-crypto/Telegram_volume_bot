@@ -39734,21 +39734,57 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.extend([SEP, 'Position day buckets (AutoTrade-owned only)'])
         for row in class_rows[:10]:
             bucket = str(row.get('bucket') or '').strip() or 'current_day'
-            lines.append(f"• {row.get('symbol')} | {row.get('side')} | {bucket}")
+            sym_txt = _symbol_base(str(row.get('symbol') or '')) or str(row.get('symbol') or '-')
+            side_txt = str(row.get('side') or '-').upper().strip() or '-'
+            lines.append(f"• {sym_txt} | {side_txt} | {bucket}")
 
     try:
         bot_positions, _external_positions, _journal_open = _autotrade_collect_live_position_rows(owner, fallback_unmatched_as_owned=True)
     except Exception:
         bot_positions, _external_positions, _journal_open = [], [], []
     lines.extend([SEP, f"Open AutoTrade Positions: {len(bot_positions)}"])
+
+    open_pos_table = ''
     if not bot_positions:
         lines.append('• None')
     else:
-        for p, tr in bot_positions[:12]:
-            lines.append(_autotrade_render_open_position_compact_line(tr, live_pos=p))
+        table_rows = []
+        for p, tr in (bot_positions or []):
+            try:
+                row = dict(tr or {})
+            except Exception:
+                row = {}
+            sym_txt = _symbol_base(str(row.get('symbol') or (_pos_symbol(p) if p else '') or '')) or '-'
+            side_txt = str(row.get('side') or (_pos_side_text(p) if p else '') or '-').upper().strip() or '-'
+            try:
+                risk_usd = float(_estimate_position_risk_usd(p) or 0.0) if p is not None else 0.0
+                if risk_usd <= 0:
+                    risk_usd = float(_autotrade_estimated_risk_usd(float(row.get('entry') or 0.0), float(row.get('sl') or 0.0), float(row.get('qty') or 0.0)) or 0.0)
+            except Exception:
+                risk_usd = 0.0
+            try:
+                pnl_usd = float(_pos_unreal_pnl(p) or 0.0) if p is not None else 0.0
+            except Exception:
+                pnl_usd = 0.0
+            table_rows.append([sym_txt, side_txt, f"${float(risk_usd or 0.0):.2f}", f"{float(pnl_usd or 0.0):+.2f}"])
+        try:
+            open_pos_table = tabulate(
+                table_rows,
+                headers=['Symbol', 'Side', 'Risk', 'PnL'],
+                tablefmt='plain',
+                colalign=('left', 'center', 'right', 'right'),
+            )
+        except Exception:
+            open_pos_table = '\n'.join([f"{r[0]} {r[1]} {r[2]} {r[3]}" for r in table_rows])
 
     lines = [str(ln) for ln in lines if ln is not None and str(ln) != '']
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
+    # Ver18: use HTML <pre> for the open-position table and escape all
+    # dynamic text so Telegram keeps the table aligned and never exposes
+    # internal trade IDs in /autotrade_debug.
+    msg = "\n".join(html.escape(str(ln)) for ln in lines)
+    if open_pos_table:
+        msg += "\n<pre>" + html.escape(open_pos_table) + "</pre>"
+    await send_long_message(update, msg, parse_mode=ParseMode.HTML)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show open positions. Admin sees AutoTrade live + manual journal; others see manual only."""
