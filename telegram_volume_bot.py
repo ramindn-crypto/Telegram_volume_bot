@@ -8,13 +8,14 @@
 # - Ver17: BigMove alerts now immediately generate and send matching F8 setup emails; /screen uses setup-email timestamp.
 # - Ver21: Autonomous email/autotrade setup pipeline runs independently from /screen.
 # - 07May_v01: throttled autonomous screen sync, added DB-backed family/session edge matrix, and safety-clamped AutoTrade defaults.
+# - 07May_v04: setup generation/email duplicate cooldown reduced to 3 hours.
 
 
 # --- ASIA tightening (hard-coded, no env vars) ---
 ASIA_MIN_CONF_BOOST = 10
 ASIA_MIN_FUT_VOL_USD = 10_000_000
 ASIA_EXCLUDED_PREFIXES = ("1000",)
-ASIA_SYMBOL_COOLDOWN_HOURS = 4
+ASIA_SYMBOL_COOLDOWN_HOURS = 3
 
 # =========================================================
 # RENDER WEB SERVICE KEEPALIVE (optional)
@@ -428,7 +429,7 @@ AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
 AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY = 'max_trades_per_day'  # AutoTrade-only daily count cap; independent from /limits maxtrades
 AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY = 'max_entry_drift_pct'
 AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY = 'liq_buffer_pct'
-AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 4.0
+AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
 # Setup audit defaults: report actionable/executable setups, not every raw scanner candidate.
@@ -881,10 +882,10 @@ SETUP_COMBO_REVIEW_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_REVIEW_WINDOW_
 SETUP_COMBO_POLICY_MIN_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_POLICY_MIN_WINDOW_HOURS", "168") or 168)
 SETUP_COMBO_POLICY_LIVE_ENFORCE = env_bool("SETUP_COMBO_POLICY_LIVE_ENFORCE", True)
 # Ver03: broad duplicate prevention for setup generation and setup emails.
-# Default cooldown is 4h (not 6h) for same symbol+side, applied before the executable/email lanes.
+# Default cooldown is 3h for same symbol+side, applied before the executable/email lanes.
 # Opposite-side reversals are still handled by flip-guard rather than hard-blocked by default.
-SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS = float(os.environ.get("SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS", "4") or 4)
-EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS = float(os.environ.get("EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS", "4") or 4)
+SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS = float(os.environ.get("SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS", "3") or 3)
+EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS = float(os.environ.get("EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS", "3") or 3)
 SETUP_GENERATION_COOLDOWN_ANY_SIDE = env_bool("SETUP_GENERATION_COOLDOWN_ANY_SIDE", False)
 EMAIL_SETUP_COOLDOWN_ANY_SIDE = env_bool("EMAIL_SETUP_COOLDOWN_ANY_SIDE", False)
 SETUP_COMBO_POLICY_BLOCK_WATCH = env_bool("SETUP_COMBO_POLICY_BLOCK_WATCH", False)
@@ -2851,9 +2852,9 @@ def max_cooldown_hours() -> int:
         return int(SYMBOL_COOLDOWN_HOURS)
 
 try:
-    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = max(4.0, float(max_cooldown_hours()))
+    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = max(3.0, float(max_cooldown_hours()))
 except Exception:
-    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 4.0
+    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
 
 # Multi-TP
 ATR_PERIOD = 14
@@ -12841,7 +12842,7 @@ def setup_generation_cooldown_hours_for_session(session_name: str) -> float:
     try:
         return float(max(float(cooldown_hours_for_session(session_name)), float(SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS)))
     except Exception:
-        return float(SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS or 4.0)
+        return float(SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS or 3.0)
 
 
 def email_setup_cooldown_hours_for_session(session_name: str) -> float:
@@ -12849,7 +12850,7 @@ def email_setup_cooldown_hours_for_session(session_name: str) -> float:
     try:
         return float(max(float(cooldown_hours_for_session(session_name)), float(EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS)))
     except Exception:
-        return float(EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS or 4.0)
+        return float(EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS or 3.0)
 
 
 def _symbol_side_for_cooldown(symbol: str, side: str) -> tuple[str, str]:
