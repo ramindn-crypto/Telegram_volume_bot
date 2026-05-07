@@ -894,6 +894,17 @@ SETUP_COMBO_POLICY_REVIEW_MINUTE = int(os.environ.get("SETUP_COMBO_POLICY_REVIEW
 # A DISABLE is not permanent. If a scheduled policy is not renewed, it expires and the
 # combination is allowed again for re-testing/rediscovery.
 SETUP_COMBO_POLICY_EXPIRY_HOURS = float(os.environ.get("SETUP_COMBO_POLICY_EXPIRY_HOURS", "168") or 168)
+# Ver10 interim policy override: based on 08 May setup_audit_overall/setup_matrix evidence.
+# These combos are blocked only until the next scheduled Sunday 23:00 Melbourne review;
+# after that, the normal weekly scheduler owns the policy again.
+SETUP_COMBO_INTERIM_DISABLE_ENABLED = env_bool("SETUP_COMBO_INTERIM_DISABLE_ENABLED", True)
+SETUP_COMBO_INTERIM_DISABLE_UNTIL_LOCAL = os.environ.get("SETUP_COMBO_INTERIM_DISABLE_UNTIL_LOCAL", "2026-05-10 23:00").strip() or "2026-05-10 23:00"
+SETUP_COMBO_INTERIM_DISABLE_LIST = tuple(
+    x.strip().upper() for x in str(os.environ.get(
+        "SETUP_COMBO_INTERIM_DISABLE_LIST",
+        "F1-NY,F3-NY,F3-ASIA,F1-ASIA"
+    ) or "").split(",") if x.strip()
+)
 # Ver03: broad duplicate prevention for setup generation and setup emails.
 # Default cooldown is 3h for same symbol+side, applied before the executable/email lanes.
 # Opposite-side reversals are still handled by flip-guard rather than hard-blocked by default.
@@ -38774,6 +38785,75 @@ def _setup_combo_format_policy_ts(ts: float | int | str | None) -> str:
         return '-'
 
 
+def _setup_combo_interim_until_ts() -> float:
+    """End timestamp for the one-off Ver10 interim disable window."""
+    try:
+        raw = str(SETUP_COMBO_INTERIM_DISABLE_UNTIL_LOCAL or '').strip()
+        if not raw:
+            return 0.0
+        tz = _setup_combo_policy_tz()
+        dt = datetime.strptime(raw, '%Y-%m-%d %H:%M').replace(tzinfo=tz)
+        return float(dt.astimezone(timezone.utc).timestamp())
+    except Exception:
+        try:
+            return float(_setup_combo_next_policy_review_dt().astimezone(timezone.utc).timestamp())
+        except Exception:
+            return 0.0
+
+
+def _setup_combo_seed_interim_disable_policy() -> None:
+    """Seed a temporary live DISABLE policy for the current poor-edge combos.
+
+    This is not a manual /setup_matrix policy. It is a deliberate interim override requested
+    after reviewing 08 May results, and it expires at the next Sunday 23:00 Melbourne review.
+    """
+    try:
+        if not bool(globals().get('SETUP_COMBO_INTERIM_DISABLE_ENABLED', True)):
+            return
+        combos = [str(x or '').upper().strip() for x in (globals().get('SETUP_COMBO_INTERIM_DISABLE_LIST', ()) or ()) if str(x or '').strip()]
+        if not combos:
+            return
+        now_ts = float(time.time())
+        expires_ts = float(_setup_combo_interim_until_ts() or 0.0)
+        if expires_ts <= now_ts:
+            return
+        _setup_combo_policy_migrate()
+        policy_tz = str(globals().get('SETUP_COMBO_POLICY_REVIEW_TZ', 'Australia/Melbourne') or 'Australia/Melbourne')
+        run_id = 'SCM-INTERIM-' + datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime('%Y%m%d%H%M%S')
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        policy_uids = [0]
+        if owner_uid > 0:
+            policy_uids.insert(0, owner_uid)
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            for combo in combos:
+                if '-' not in combo:
+                    continue
+                fam, sess = combo.split('-', 1)
+                fam = fam.strip().upper()
+                sess = sess.strip().upper()
+                if not fam or not sess:
+                    continue
+                for pol_uid in list(dict.fromkeys(policy_uids)):
+                    cur.execute("""INSERT OR REPLACE INTO setup_combo_policy
+                        (user_id, family, session, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (int(pol_uid), fam, sess, 'DISABLE', 0, 0.0, 0.0, 0.0, 0, 0, run_id, now_ts,
+                         f'Ver10 interim disable until {_setup_combo_format_policy_ts(expires_ts)}; Sunday scheduled review will reassess.',
+                         'interim', expires_ts, expires_ts, policy_tz))
+            conn.commit()
+        _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
+        try:
+            logger.warning('setup_combo_interim_disable_policy_seeded combos=%s expires=%s', ','.join(combos), _setup_combo_format_policy_ts(expires_ts))
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            logger.warning('setup_combo_interim_disable_policy_failed: %s: %s', type(exc).__name__, exc)
+        except Exception:
+            pass
+
+
 def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
     info = {'updated_ts': 0.0, 'text': '-', 'kind': '-', 'scheduled_text': '-', 'expires_text': '-', 'rows': 0, 'scheduled_rows': 0}
     try:
@@ -38793,9 +38873,10 @@ def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
         if not rows:
             return info
         latest = max(rows, key=lambda r: float(r.get('updated_ts') or 0.0))
+        enforceable_rows = [r for r in rows if str(r.get('policy_kind') or '').lower().strip() in {'scheduled', 'interim', 'emergency'}]
         scheduled_rows = [r for r in rows if str(r.get('policy_kind') or '').lower().strip() == 'scheduled']
-        latest_sched = max(scheduled_rows, key=lambda r: float(r.get('updated_ts') or 0.0)) if scheduled_rows else None
-        chosen = latest_sched or latest
+        latest_enforceable = max(enforceable_rows, key=lambda r: float(r.get('updated_ts') or 0.0)) if enforceable_rows else None
+        chosen = latest_enforceable or latest
         info.update({
             'updated_ts': float(chosen.get('updated_ts') or 0.0),
             'text': _setup_combo_format_policy_ts(chosen.get('updated_ts')),
@@ -38804,6 +38885,7 @@ def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
             'expires_text': _setup_combo_format_policy_ts(chosen.get('expires_ts')),
             'rows': len(rows),
             'scheduled_rows': len(scheduled_rows),
+            'enforceable_rows': len(enforceable_rows),
         })
         return info
     except Exception:
@@ -38811,9 +38893,9 @@ def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
 
 
 def _setup_combo_policy_valid_for_enforcement(pol: dict | None) -> bool:
-    """Only scheduled weekly policies can block live setup generation.
+    """Only scheduled weekly policies or explicit interim overrides can block live setup generation.
 
-    Manual /setup_matrix runs are advisory only. Scheduled policies expire so a
+    Manual /setup_matrix runs are advisory only. Scheduled/interim policies expire so a
     disabled family/session combination is automatically allowed for future re-test
     if it is not renewed by the next weekly review.
     """
@@ -38821,7 +38903,7 @@ def _setup_combo_policy_valid_for_enforcement(pol: dict | None) -> bool:
         if not pol:
             return False
         kind = str(pol.get('policy_kind') or 'manual').lower().strip()
-        if kind != 'scheduled':
+        if kind not in {'scheduled', 'interim', 'emergency'}:
             return False
         expires_ts = float(pol.get('expires_ts') or 0.0)
         if expires_ts > 0 and float(time.time()) > expires_ts:
@@ -39053,7 +39135,7 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         f"Policy update time: <b>{html.escape(str(last_pol.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(last_pol.get('kind') or '-'))}</b> | Next scheduled review: <b>{html.escape(str(next_review_txt))}</b>",
         f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | NOHIT: <b>{nh}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b>",
         f"Recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | Block WATCH=<b>{'ON' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OFF'}</b>",
-        f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Manual <code>/setup_matrix</code> runs are advisory only; only scheduled weekly policies can block executable combos.",
+        f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Manual <code>/setup_matrix</code> runs are advisory only; live blocks come from scheduled weekly policy or a temporary interim override.",
     ]
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -39084,7 +39166,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         table = tabulate(table_rows, headers=['Combo','Exec','Status','Set','Dec','WR','AvgR','Score'], tablefmt='plain')
         info = _setup_combo_latest_policy_update_info(int(uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
-        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nPolicy cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\nLast scheduled policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next review: <b>{html.escape(str(next_txt))}</b>\nManual /setup_matrix rows are advisory; only scheduled weekly policy rows are enforceable.\n<pre>{html.escape(table)}</pre>"
+        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nPolicy cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\nLast enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next review: <b>{html.escape(str(next_txt))}</b>\nManual /setup_matrix rows are advisory; scheduled weekly policies and temporary interim overrides are enforceable.\n<pre>{html.escape(table)}</pre>"
     except Exception as e:
         return f"❌ setup_combo_policy failed: {type(e).__name__}: {html.escape(str(e))}"
 
@@ -48181,6 +48263,10 @@ def main():
         _research_seed_family_registry()
         _research_activate_all_families_runtime()
         _ver14_all_family_profile_bootstrap()
+    except Exception:
+        pass
+    try:
+        _setup_combo_seed_interim_disable_policy()
     except Exception:
         pass
     
