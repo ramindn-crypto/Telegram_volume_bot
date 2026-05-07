@@ -41032,30 +41032,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.extend([SEP, 'Blocking reasons'])
         for r in reasons[:6]:
             lines.append(f"• {r}")
-    if dec:
-        lines.extend([SEP, 'Last decision'])
-        dec_reason = str(dec.get('reason') or '').strip()
-        if not dec_reason and isinstance(dec.get('reasons'), list):
-            dec_reason = ', '.join([str(r) for r in (dec.get('reasons') or [])[:3]])
-        lines.append(f"• {dec.get('status','')} | {dec_reason}")
-        try:
-            last_det = dict(_LAST_AUTOTRADE_DETAIL.get(owner) or {})
-            cod = dict(last_det.get('can_open_detail') or {})
-        except Exception:
-            cod = {}
-        if cod.get('live_open_position'):
-            lines.append(
-                f"• Conflict detail: owner={str(cod.get('live_position_owner') or '?')} | pos_side={str(cod.get('live_position_side') or '?')} | qty={float(cod.get('live_position_qty') or 0.0):.6g}"
-            )
-    class_rows = mday.get('position_classifications') or []
-    if class_rows:
-        lines.extend([SEP, 'Position day buckets (AutoTrade-owned only)'])
-        for row in class_rows[:10]:
-            bucket = str(row.get('bucket') or '').strip() or 'current_day'
-            sym_txt = _symbol_base(str(row.get('symbol') or '')) or str(row.get('symbol') or '-')
-            side_txt = str(row.get('side') or '-').upper().strip() or '-'
-            lines.append(f"• {sym_txt} | {side_txt} | {bucket}")
-
     try:
         bot_positions, _external_positions, _journal_open = _autotrade_collect_live_position_rows(owner, fallback_unmatched_as_owned=True)
     except Exception:
