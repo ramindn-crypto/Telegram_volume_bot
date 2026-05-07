@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver06: /autotrade_report now merges raw Bybit close fragments into one row per practical position; added /autoytrade_report_overall family/session matrix; cleanup now removes old Partial TP/SL children before Full TP/SL attach.
 # - FIX25: Big-Move alert emails now generate immediate owner AutoTrade attempts using ATR-capped SL/TP.
 # - Simplified /learning_status, /autotrade_debug, and /autotrade_last outputs.
 # - Daily risk remaining now restores capacity from positive realized PnL and reduces it from losses.
@@ -447,6 +448,10 @@ SETUP_AUDIT_DEDUP_INCLUDE_LEVELS = env_bool("SETUP_AUDIT_DEDUP_INCLUDE_LEVELS", 
 # Keep the message short enough to preserve Telegram <pre> formatting.
 SETUP_AUDIT_DISPLAY_MAX_ROWS = int(os.environ.get("SETUP_AUDIT_DISPLAY_MAX_ROWS", "25") or 25)
 AUTOTRADE_REPORT_DISPLAY_MAX_ROWS = int(os.environ.get("AUTOTRADE_REPORT_DISPLAY_MAX_ROWS", "30") or 30)
+# Ver06: closed-PnL from Bybit can arrive as several fill/fee/partial-close rows for one
+# position. User reports must count positions, not raw close events.
+AUTOTRADE_REPORT_POSITION_MERGE_WINDOW_SEC = int(os.environ.get("AUTOTRADE_REPORT_POSITION_MERGE_WINDOW_SEC", "420") or 420)
+AUTOTRADE_CANCEL_PARTIAL_TPSL_BEFORE_FULL_ATTACH = env_bool("AUTOTRADE_CANCEL_PARTIAL_TPSL_BEFORE_FULL_ATTACH", True)
 
 
 def _autotrade_config_get(key: str, default=None):
@@ -4569,6 +4574,70 @@ def _autotrade_cancel_legacy_conditional_exit_orders(symbol: str, side: str | No
 
 
 
+
+
+def _autotrade_order_is_partial_tpsl_exit(order: dict) -> bool:
+    """True for native Partial TP/SL children that can split one position close into many rows.
+
+    Ver06 keeps the desired account shape strict: one live position must have one native
+    Full-position TP and one native Full-position SL. Old Partial TP/SL children from older
+    builds are cleaned before a fresh Full TP/SL attach so future closes should not fragment
+    into many tiny PnL rows such as BLEND/ZEREBRO dust lines.
+    """
+    try:
+        if not _bybit_order_active(order):
+            return False
+        txt = _bybit_order_kind_text(order)
+        if 'partialtakeprofit' in txt or 'partialstoploss' in txt:
+            return True
+        mode = str((order or {}).get('tpslMode') or (order or {}).get('tpSlMode') or '').lower().strip()
+        if mode == 'partial' and ('takeprofit' in txt or 'stoploss' in txt):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _autotrade_cancel_partial_tpsl_exit_orders(symbol: str, side: str | None = None) -> int:
+    """Cancel old native Partial TP/SL children for this symbol/side.
+
+    This deliberately does not cancel Full-position TP/SL rows. It only targets Partial
+    TakeProfit/StopLoss children, because those are the common cause of one position being
+    reported as several tiny close-PnL fragments.
+    """
+    if not AUTOTRADE_CANCEL_PARTIAL_TPSL_BEFORE_FULL_ATTACH:
+        return 0
+    count = 0
+    sym = _bybit_linear_symbol(symbol)
+    close_side = ''
+    side_u = str(side or '').upper().strip()
+    if side_u == 'BUY':
+        close_side = 'SELL'
+    elif side_u == 'SELL':
+        close_side = 'BUY'
+    try:
+        for o in list(_bybit_get_open_orders_linear(sym) or []):
+            try:
+                if _bybit_linear_symbol(str((o or {}).get('symbol') or '')) != sym:
+                    continue
+                if not _bybit_order_matches_close_side(o, close_side):
+                    continue
+                if not _autotrade_order_is_partial_tpsl_exit(o):
+                    continue
+                oid = str((o or {}).get('orderId') or '')
+                if not oid:
+                    continue
+                res = _bybit_v5_request('POST', '/v5/order/cancel', {'category': 'linear', 'symbol': sym, 'orderId': oid})
+                if int((res or {}).get('retCode', -1)) == 0:
+                    count += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if count:
+        _bybit_invalidate_live_order_position_cache(sym)
+    return int(count)
+
 def _autotrade_cancel_all_legacy_conditional_exit_orders(max_items: int = 80, max_cancel: int | None = None) -> int:
     """Cancel old bot-created standalone Conditional exit orders across the account.
 
@@ -4650,6 +4719,7 @@ def _autotrade_attach_position_full_tpsl_and_cleanup(symbol: str, side: str, sto
         # First remove old standalone pf_tp/pf_cond rows so the Bybit Orders page
         # does not show extra Conditional exits. Then apply the wanted native TP/SL.
         out['legacy_conditional_cancelled_before'] = _autotrade_cancel_legacy_conditional_exit_orders(symbol, side=side)
+        out['partial_tpsl_cancelled_before'] = _autotrade_cancel_partial_tpsl_exit_orders(symbol, side=side)
         res = _autotrade_apply_position_tp_sl(symbol, float(stop_loss or 0.0), float(take_profit or 0.0), side=side, live_pos=live_pos)
         out['apply_res'] = res or {}
         _bybit_invalidate_live_order_position_cache(symbol)
@@ -4657,7 +4727,9 @@ def _autotrade_attach_position_full_tpsl_and_cleanup(symbol: str, side: str, sto
         out['confirm'] = detail or {}
         # Clean again after attach in case older code left an order hidden behind cache.
         out['legacy_conditional_cancelled_after'] = _autotrade_cancel_legacy_conditional_exit_orders(symbol, side=side)
+        out['partial_tpsl_cancelled_after'] = _autotrade_cancel_partial_tpsl_exit_orders(symbol, side=side)
         out['legacy_conditional_cancelled'] = int(out.get('legacy_conditional_cancelled_before') or 0) + int(out.get('legacy_conditional_cancelled_after') or 0)
+        out['partial_tpsl_cancelled'] = int(out.get('partial_tpsl_cancelled_before') or 0) + int(out.get('partial_tpsl_cancelled_after') or 0)
         # Reconfirm after cleanup to ensure we did not disturb the native TP/SL.
         ok2, detail2 = _autotrade_confirm_position_full_tpsl(symbol, side, float(stop_loss or 0.0), float(take_profit or 0.0), wait_sec=4.0)
         out['confirm_after_cleanup'] = detail2 or {}
@@ -5089,6 +5161,7 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
         # Always cleanup legacy standalone Conditional exits for this symbol/side.
         # If native TP/SL is already correct, this still reduces Orders count.
         cancelled_before = _autotrade_cancel_legacy_conditional_exit_orders(sym, side=side)
+        partial_cancelled_before = _autotrade_cancel_partial_tpsl_exit_orders(sym, side=side)
 
         attach_res = {}
         if not (native_sl_ok and native_tp_ok):
@@ -5099,13 +5172,17 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
                 'placement': 'position_full_tpsl',
                 'reason': 'native_full_tpsl_already_correct',
                 'legacy_conditional_cancelled_before': int(cancelled_before or 0),
+                'partial_tpsl_cancelled_before': int(partial_cancelled_before or 0),
             }
             # Run one more cleanup after a fresh order snapshot in case cache hid old rows.
             attach_res['legacy_conditional_cancelled_after'] = _autotrade_cancel_legacy_conditional_exit_orders(sym, side=side)
+            attach_res['partial_tpsl_cancelled_after'] = _autotrade_cancel_partial_tpsl_exit_orders(sym, side=side)
             attach_res['legacy_conditional_cancelled'] = int(attach_res.get('legacy_conditional_cancelled_before') or 0) + int(attach_res.get('legacy_conditional_cancelled_after') or 0)
+            attach_res['partial_tpsl_cancelled'] = int(attach_res.get('partial_tpsl_cancelled_before') or 0) + int(attach_res.get('partial_tpsl_cancelled_after') or 0)
 
         result['attach_res'] = attach_res
         result['legacy_conditional_cancelled'] = int(cancelled_before or 0) + int((attach_res or {}).get('legacy_conditional_cancelled') or 0)
+        result['partial_tpsl_cancelled'] = int(partial_cancelled_before or 0) + int((attach_res or {}).get('partial_tpsl_cancelled') or 0)
         ok, confirm = _autotrade_confirm_position_full_tpsl(sym, side, target_sl, target_tp, wait_sec=1.5)
         result['confirm'] = confirm or {}
         result['sl_fixed'] = bool(ok and (confirm or {}).get('sl_ok'))
@@ -33497,7 +33574,7 @@ KNOWN_COMMANDS = sorted(set([
     "health", "health_sys",
 
     # AutoTrade (admin)
-    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_fix_exits", "autotrade_debug_reset", "autotrade_report_overall", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
+    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_fix_exits", "autotrade_debug_reset", "autotrade_report_overall", "autoytrade_report_overall", "autotrade_report_matrix", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
@@ -34050,6 +34127,8 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_fix_exits": "Force native Full TP/SL on all live AutoTrade positions and cancel legacy Conditional exit orders",
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
+    "autoytrade_report_overall": "Family/session AutoTrade matrix: /autoytrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
+    "autotrade_report_matrix": "Alias of /autoytrade_report_overall for the family/session AutoTrade matrix",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "trade_lifecycle": "Exchange-backed per-trade lifecycle analytics with TP/SL path classification",
     "trade_lifecycle_detail": "Detailed rolling lifecycle report for the last 48h (or N hours), optional session filter",
@@ -34092,7 +34171,7 @@ ADMIN_HELP_GROUPS = [
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
     ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall", "setup_matrix", "setup_edge_matrix"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_report", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
 ]
@@ -34114,6 +34193,7 @@ def build_help_text_admin() -> str:
         "",
         "Note: quick snapshot commands are cached so normal commands stay instant. Heavy run/diagnostic commands are grouped separately below.",
         "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly policy update), /setup_matrix policy (current live policy).",
+        "AutoTrade matrix examples: /autoytrade_report_overall 24 (daily), /autoytrade_report_overall 168 (weekly).",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -39938,15 +40018,157 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
     return out if int(limit or 0) >= 100000 else out[:limit]
 
 
-def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
-    """AutoTrade journal: one row per underlying trade, sorted by latest time.
 
-    Ver15 intentionally does NOT merge rows by symbol. The purpose of this command is
-    to audit every AutoTrade entry/exit and its PnL.
+
+def _autotrade_report_row_session(row: dict) -> str:
+    try:
+        sess = str((row or {}).get('session') or (row or {}).get('source_session') or (row or {}).get('open_session') or '').upper().strip()
+        if sess in {'ASIA', 'LON', 'NY'}:
+            return sess
+        ts = float((row or {}).get('opened_ts') or (row or {}).get('closed_ts') or (row or {}).get('ts') or 0.0)
+        if ts > 0:
+            return _session_label_from_ts(ts)
+    except Exception:
+        pass
+    return 'UNK'
+
+
+def _autotrade_report_closed_kind(row: dict) -> str:
+    """Return TP/SL/FLAT for realised AutoTrade reporting.
+
+    Prefer lifecycle TP/SL labels when available; otherwise use realised PnL. This keeps
+    /autoytrade_report_overall useful even when a close came from raw Bybit closed-PnL.
+    """
+    try:
+        path = str((row or {}).get('result_path') or (row or {}).get('outcome') or '').upper().strip()
+        label = str((row or {}).get('result_label') or '').upper().strip()
+        if path in {'TP', 'HIT_TP_WIN'} or label == 'TP':
+            return 'TP'
+        if path in {'SL', 'HIT_SL_LOSS'} or label == 'SL':
+            return 'SL'
+        if path in {'HIT_TP_THEN_BE_SL', 'HIT_TP_THEN_SL'}:
+            return 'TP'
+        pnl = float((row or {}).get('pnl') if (row or {}).get('pnl') is not None else (row or {}).get('pnl_usdt') or 0.0)
+        if pnl > 0:
+            return 'TP'
+        if pnl < 0:
+            return 'SL'
+        return 'FLAT'
+    except Exception:
+        return 'FLAT'
+
+
+def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: int | None = None) -> list[dict]:
+    """Merge raw report fragments into one row per practical position close.
+
+    Bybit may return several closed-PnL records for one position close because of partial
+    fills, fees, legacy partial TP/SL children, or force-close fragments. The user-facing
+    report should count that as one position. Open rows are already one per live position.
+    """
+    try:
+        window = max(60, int(merge_window_sec if merge_window_sec is not None else AUTOTRADE_REPORT_POSITION_MERGE_WINDOW_SEC))
+    except Exception:
+        window = 420
+    src = [dict(r or {}) for r in (rows or [])]
+    open_rows = [r for r in src if str(r.get('state') or '').upper().strip() == 'OPEN']
+    closed = [r for r in src if str(r.get('state') or '').upper().strip() != 'OPEN']
+    closed.sort(key=lambda r: float(r.get('ts') or r.get('closed_ts') or 0.0))
+    groups: list[dict] = []
+
+    def _family(r: dict) -> str:
+        return str(r.get('family') or r.get('fam') or r.get('engine') or 'F0').upper().strip() or 'F0'
+
+    for r in closed:
+        try:
+            sym = str(r.get('symbol') or '').upper().strip()
+            side = str(r.get('side') or '').upper().strip()
+            fam = _family(r)
+            sess = _autotrade_report_row_session(r)
+            ts = float(r.get('ts') or r.get('closed_ts') or 0.0)
+            pnl = float(r.get('pnl') if r.get('pnl') is not None else r.get('pnl_usdt') or 0.0)
+            matched = None
+            # Prefer exact setup/trade id when available. Otherwise cluster same symbol/side/family/session
+            # when the closes are only a few minutes apart.
+            sid = str(r.get('setup_id') or '').strip()
+            tid = str(r.get('trade_id') or '').strip()
+            for g in reversed(groups):
+                if str(g.get('symbol') or '') != sym or str(g.get('side') or '') != side or str(g.get('family') or '') != fam:
+                    continue
+                if str(g.get('session') or '') != sess:
+                    continue
+                gsid = str(g.get('setup_id') or '').strip()
+                gtid = str(g.get('trade_id') or '').strip()
+                if sid and gsid and sid == gsid:
+                    matched = g
+                    break
+                if tid and gtid and tid == gtid:
+                    matched = g
+                    break
+                if abs(ts - float(g.get('last_ts') or g.get('ts') or 0.0)) <= float(window):
+                    matched = g
+                    break
+            if matched is None:
+                nr = dict(r)
+                nr['state'] = 'CLOSED'
+                nr['symbol'] = sym
+                nr['side'] = side
+                nr['family'] = fam
+                nr['session'] = sess
+                nr['pnl'] = float(pnl)
+                nr['parts'] = int(r.get('parts') or 1)
+                nr['first_ts'] = float(ts or 0.0)
+                nr['last_ts'] = float(ts or 0.0)
+                nr['ts'] = float(ts or 0.0)
+                nr['closed_kind_votes'] = [_autotrade_report_closed_kind(r)]
+                groups.append(nr)
+            else:
+                matched['pnl'] = float(matched.get('pnl') or 0.0) + float(pnl)
+                matched['pnl_usdt'] = float(matched.get('pnl') or 0.0)
+                matched['parts'] = int(matched.get('parts') or 1) + int(r.get('parts') or 1)
+                matched['first_ts'] = min(float(matched.get('first_ts') or ts), float(ts or 0.0))
+                matched['last_ts'] = max(float(matched.get('last_ts') or ts), float(ts or 0.0))
+                matched['ts'] = float(matched.get('last_ts') or matched.get('ts') or ts)
+                votes = list(matched.get('closed_kind_votes') or [])
+                votes.append(_autotrade_report_closed_kind(r))
+                matched['closed_kind_votes'] = votes
+                # Keep latest display time for the merged close.
+                matched['time'] = r.get('time') or matched.get('time')
+        except Exception:
+            groups.append(dict(r))
+
+    # Decide merged TP/SL after summing PnL.
+    for g in groups:
+        try:
+            pnl = float(g.get('pnl') or 0.0)
+            votes = [str(x).upper() for x in (g.get('closed_kind_votes') or [])]
+            if pnl > 0:
+                kind = 'TP'
+            elif pnl < 0:
+                kind = 'SL'
+            elif votes.count('TP') > votes.count('SL'):
+                kind = 'TP'
+            elif votes.count('SL') > 0:
+                kind = 'SL'
+            else:
+                kind = 'FLAT'
+            g['closed_kind'] = kind
+            g['result_path'] = 'HIT_TP_WIN' if kind == 'TP' else ('HIT_SL_LOSS' if kind == 'SL' else 'MANUAL_OR_UNKNOWN_CLOSE')
+            g['result_label'] = kind
+        except Exception:
+            pass
+    out = list(open_rows) + list(groups)
+    out.sort(key=lambda r: float(r.get('ts') or r.get('last_ts') or 0.0), reverse=True)
+    return out
+
+def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
+    """AutoTrade journal: one row per practical position, sorted by latest time.
+
+    Ver06 merges raw Bybit closed-PnL fragments for the same symbol/side/family/session
+    into one position row, so BLEND/ZEREBRO-style dust fragments do not inflate Trades.
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v8_allrows_mel:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v9_merged_positions_mel:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -40023,7 +40245,12 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'symbol': _sym_display(row, _pos_symbol(p)),
             'side': side,
             'family': _family_for_report(row),
+            'session': _autotrade_report_row_session(row),
+            'setup_id': str(row.get('setup_id') or ''),
+            'trade_id': str(row.get('trade_id') or ''),
+            'opened_ts': float(row.get('opened_ts') or ts or 0.0),
             'pnl': pnl,
+            'parts': 1,
         })
 
     for r in (closed_rows or []):
@@ -40042,9 +40269,19 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'symbol': _sym_display(row, r.get('symbol') or ''),
             'side': side,
             'family': _family_for_report(row),
+            'session': _autotrade_report_row_session(row),
+            'setup_id': str(row.get('setup_id') or r.get('setup_id') or ''),
+            'trade_id': str(row.get('trade_id') or r.get('trade_id') or ''),
+            'opened_ts': float(row.get('opened_ts') or r.get('opened_ts') or 0.0),
+            'closed_ts': float(row.get('closed_ts') or r.get('closed_ts') or ts or 0.0),
+            'result_path': str(row.get('result_path') or r.get('result_path') or ''),
+            'result_label': str(row.get('result_label') or r.get('result_label') or ''),
             'pnl': pnl,
+            'pnl_usdt': pnl,
+            'parts': 1,
         })
 
+    journal_rows = _autotrade_merge_position_report_rows(journal_rows)
     journal_rows.sort(key=lambda x: float(x.get('ts') or 0.0), reverse=True)
     try:
         now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
@@ -40066,14 +40303,15 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         # Ver16: show every trade row. Time is explicitly converted to Melbourne
         # in _ts_txt(), and the long <pre> table is chunked safely by send_long_message.
         display = list(journal_rows)
-        table_rows = [[r['time'], r['state'], r['symbol'], r['side'], r['family'], f"{float(r['pnl']):+.2f}"] for r in display]
+        table_rows = [[r.get('time') or _ts_txt(float(r.get('ts') or 0.0)), r.get('state'), r.get('symbol'), r.get('side'), r.get('family'), int(r.get('parts') or 1), f"{float(r.get('pnl') or 0.0):+.2f}"] for r in display]
         table = tabulate(
             table_rows,
-            headers=['Mel Time', 'State', 'Sym', 'Side', 'Fam', 'PnL'],
+            headers=['Mel Time', 'State', 'Sym', 'Side', 'Fam', 'Parts', 'PnL'],
             tablefmt='plain',
-            colalign=('left', 'center', 'left', 'center', 'center', 'right'),
+            colalign=('left', 'center', 'left', 'center', 'center', 'right', 'right'),
         )
-        lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> (full list). Time: <b>Melbourne</b>.")
+        raw_count = int(len(bot_positions or [])) + int(len(closed_rows or []))
+        lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> merged position rows. Raw fragments: <b>{raw_count}</b>. Time: <b>Melbourne</b>.")
         out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
     try:
         cache_set(cache_key, out)
@@ -40783,6 +41021,191 @@ async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAUL
         "Next setup attempt will start fresh."
     )
 
+
+
+
+def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24) -> str:
+    """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
+    owner_uid = int(owner_uid)
+    lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
+    cache_key = f"autoytrade_report_overall:v1:{owner_uid}:{lookback_h}"
+    try:
+        if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
+            cached = cache_get(cache_key)
+            if isinstance(cached, str) and cached.strip():
+                return cached
+    except Exception:
+        pass
+    _autotrade_migrate_tables()
+    now_ts = float(time.time())
+    start_ts = now_ts - float(lookback_h) * 3600.0
+
+    def _family_for_report(row: dict) -> str:
+        try:
+            fam = _setup_audit_family_display(row, compact=True)
+            if fam and fam != '-':
+                return fam
+            eng = str((row or {}).get('engine') or '').strip()
+            fam2 = _setup_family_id_to_code(_setup_engine_to_family_id(eng, row))
+            return fam2 if fam2 and fam2 != '-' else 'F0'
+        except Exception:
+            return 'F0'
+
+    def _sym_display(row: dict, fallback: str = '') -> str:
+        try:
+            sym = str((row or {}).get('symbol') or fallback or '').upper().strip()
+            if sym.endswith('USDT'):
+                sym = sym[:-4]
+            return sym or '-'
+        except Exception:
+            return '-'
+
+    rows: list[dict] = []
+    open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
+    bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(owner_uid, positions=open_positions, fallback_unmatched_as_owned=True)
+    try:
+        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=0) or []
+    except Exception:
+        closed_rows = []
+
+    for p, tr in (bot_positions or []):
+        row = _setup_audit_merge_trade_setup_row(tr)
+        ts = float(row.get('opened_ts') or now_ts)
+        rows.append({
+            'ts': ts,
+            'time': datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M'),
+            'state': 'OPEN',
+            'symbol': _sym_display(row, _pos_symbol(p)),
+            'side': str(row.get('side') or _pos_side_text(p) or '').upper().strip() or '-',
+            'family': _family_for_report(row),
+            'session': _autotrade_report_row_session(row),
+            'pnl': float(_pos_unreal_pnl(p) or 0.0),
+            'parts': 1,
+        })
+
+    for r in (closed_rows or []):
+        row = _setup_audit_merge_trade_setup_row(r)
+        ts = float(row.get('closed_ts') or r.get('closed_ts') or row.get('opened_ts') or 0.0)
+        try:
+            pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
+        except Exception:
+            pnl = 0.0
+        rows.append({
+            'ts': ts,
+            'time': datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if ts > 0 else '-',
+            'state': 'CLOSED',
+            'symbol': _sym_display(row, r.get('symbol') or ''),
+            'side': str(row.get('side') or r.get('side') or '').upper().strip() or '-',
+            'family': _family_for_report(row),
+            'session': _autotrade_report_row_session(row),
+            'setup_id': str(row.get('setup_id') or r.get('setup_id') or ''),
+            'trade_id': str(row.get('trade_id') or r.get('trade_id') or ''),
+            'opened_ts': float(row.get('opened_ts') or r.get('opened_ts') or 0.0),
+            'closed_ts': ts,
+            'result_path': str(row.get('result_path') or r.get('result_path') or ''),
+            'result_label': str(row.get('result_label') or r.get('result_label') or ''),
+            'pnl': pnl,
+            'pnl_usdt': pnl,
+            'parts': 1,
+        })
+
+    merged = _autotrade_merge_position_report_rows(rows)
+    buckets = defaultdict(lambda: {'trades': 0, 'tp': 0, 'sl': 0, 'open': 0, 'pnl': 0.0, 'parts': 0})
+    for r in merged:
+        fam = str(r.get('family') or 'F0').upper().strip() or 'F0'
+        sess = str(r.get('session') or _autotrade_report_row_session(r) or 'UNK').upper().strip() or 'UNK'
+        key = (fam, sess)
+        b = buckets[key]
+        b['trades'] += 1
+        b['parts'] += int(r.get('parts') or 1)
+        b['pnl'] += float(r.get('pnl') or 0.0)
+        if str(r.get('state') or '').upper().strip() == 'OPEN':
+            b['open'] += 1
+        else:
+            kind = str(r.get('closed_kind') or _autotrade_report_closed_kind(r)).upper().strip()
+            if kind == 'TP':
+                b['tp'] += 1
+            elif kind == 'SL':
+                b['sl'] += 1
+
+    total_tp = sum(int(v.get('tp') or 0) for v in buckets.values())
+    total_sl = sum(int(v.get('sl') or 0) for v in buckets.values())
+    total_open = sum(int(v.get('open') or 0) for v in buckets.values())
+    total_pnl = sum(float(v.get('pnl') or 0.0) for v in buckets.values())
+    total_trades = sum(int(v.get('trades') or 0) for v in buckets.values())
+    raw_fragments = int(len(rows or []))
+    decided = total_tp + total_sl
+    wr = (total_tp / decided * 100.0) if decided > 0 else 0.0
+    try:
+        now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        now_txt = ''
+    lines = [
+        '📊 AutoTrade Report Overall',
+        HDR,
+        f'Window: last {lookback_h}h (Melbourne)' + (f' | Now: {now_txt}' if now_txt else ''),
+        f'Position rows: {total_trades} | Raw fragments merged: {raw_fragments} | TP: {total_tp} | SL: {total_sl} | Open: {total_open} | WR: {wr:.1f}% | PnL: {total_pnl:+.2f} USDT',
+    ]
+    if external_positions:
+        lines.append(f'Ignored unmatched manual/external live positions: {len(external_positions)}')
+    if not buckets:
+        lines.append(SEP)
+        lines.append('No AutoTrade rows found in this window.')
+        out = '\n'.join(lines)
+        cache_set(cache_key, out)
+        return out
+
+    table_rows = []
+    for (fam, sess), v in sorted(buckets.items(), key=lambda kv: (float(kv[1].get('pnl') or 0.0), int(kv[1].get('tp') or 0), -int(kv[1].get('sl') or 0)), reverse=True):
+        d = int(v.get('tp') or 0) + int(v.get('sl') or 0)
+        wr_i = (int(v.get('tp') or 0) / d * 100.0) if d > 0 else 0.0
+        table_rows.append([
+            fam,
+            sess,
+            int(v.get('trades') or 0),
+            int(v.get('tp') or 0),
+            int(v.get('sl') or 0),
+            int(v.get('open') or 0),
+            f'{wr_i:.1f}%',
+            f"{float(v.get('pnl') or 0.0):+.2f}",
+        ])
+    table = tabulate(
+        table_rows,
+        headers=['Fam', 'Ses', 'Trades', 'TP', 'SL', 'Open', 'WR', 'PnL'],
+        tablefmt='plain',
+        colalign=('center', 'center', 'right', 'right', 'right', 'right', 'right', 'right'),
+    )
+    out = '\n'.join(lines) + '\n<pre>' + html.escape(table) + '</pre>'
+    try:
+        cache_set(cache_key, out)
+    except Exception:
+        pass
+    return out
+
+
+async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autoytrade_report_overall [hours] — family/session AutoTrade matrix."""
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    try:
+        text_out = await to_thread_heavy(_autoytrade_report_overall_text_cached, owner, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⚠️ /autoytrade_report_overall timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"❌ /autoytrade_report_overall failed: {type(e).__name__}: {e}")
+        return
+    await send_long_message(update, str(text_out or 'No AutoTrade data found yet.'), parse_mode=ParseMode.HTML)
 
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
@@ -46979,7 +47402,7 @@ async def autotrade_fix_exits_cmd(update: Update, context: ContextTypes.DEFAULT_
         if str(_autotrade_runtime_mode()).lower() != 'live':
             await update.message.reply_text("ℹ️ AutoTrade is not in live mode; no Bybit exit cleanup required.")
             return
-        await update.message.reply_text("🔧 Fixing live exits now: Full TP/SL only, cancelling legacy Conditional exit orders...")
+        await update.message.reply_text("🔧 Fixing live exits now: Full TP/SL only, cancelling legacy Conditional and old Partial TP/SL exit orders...")
         try:
             repaired = await to_thread_autotrade(_autotrade_monitor_live_exit_protection, owner, timeout=max(20, int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 15) + 10))
         except asyncio.TimeoutError:
@@ -46987,12 +47410,14 @@ async def autotrade_fix_exits_cmd(update: Update, context: ContextTypes.DEFAULT_
             return
         repaired = list(repaired or [])
         cancelled = sum(int((r or {}).get('legacy_conditional_cancelled') or 0) for r in repaired if isinstance(r, dict))
+        partial_cancelled = sum(int((r or {}).get('partial_tpsl_cancelled') or int(((r or {}).get('attach_res') or {}).get('partial_tpsl_cancelled') or 0)) for r in repaired if isinstance(r, dict))
         fixed = sum(1 for r in repaired if isinstance(r, dict) and (bool(r.get('sl_fixed')) or bool(r.get('tp_fixed')) or bool(r.get('ok'))))
         lines = [
             "✅ AutoTrade exit cleanup finished",
             "━━━━━━━━━━━━━━━━━━━━",
             f"Positions checked/fixed: {fixed}",
             f"Legacy Conditional orders cancelled: {cancelled}",
+            f"Old Partial TP/SL children cancelled: {partial_cancelled}",
             "Policy: native position-level Full TP/SL only",
             "Expected Bybit view: TP/SL rows, not Conditional rows.",
         ]
@@ -47764,6 +48189,9 @@ def main():
     app.add_handler(CommandHandler("autotrade_fix_exits", autotrade_fix_exits_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
+    app.add_handler(CommandHandler("autoytrade_report_overall", autoytrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("autoytrade_report_overal", autoytrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report_matrix", autoytrade_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report_overal", autotrade_report_overall_cmd, block=False))
     app.add_handler(CommandHandler("edge_status", edge_status_cmd, block=False))
