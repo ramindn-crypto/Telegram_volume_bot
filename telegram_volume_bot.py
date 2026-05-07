@@ -9,6 +9,7 @@
 # - Ver21: Autonomous email/autotrade setup pipeline runs independently from /screen.
 # - 07May_v01: throttled autonomous screen sync, added DB-backed family/session edge matrix, and safety-clamped AutoTrade defaults.
 # - 07May_v04: setup generation/email duplicate cooldown reduced to 3 hours.
+# - 07May_v05: flip guard fixed to a flat 3-hour same-symbol opposite-side block.
 
 
 # --- ASIA tightening (hard-coded, no env vars) ---
@@ -2804,9 +2805,13 @@ SYMBOL_COOLDOWN_HOURS = 3
 # =========================================================
 
 # 1) Flip-Guard: prevents opposite-direction alerts for same symbol for a period
-# Example: SELL then BUY within 2 hours => BUY is blocked (and vice-versa)
+# Example: SELL then BUY within 3 hours => BUY is blocked (and vice-versa)
 FLIP_GUARD_ENABLED = True
-FLIP_GUARD_MULT = 1.0  # 1.0 = same as session cooldown hours; try 1.5–2.0 to be stricter
+# Ver05: fixed 3-hour same-symbol opposite-side guard. This is intentionally
+# separate from normal same-symbol+same-side setup/email cooldowns and does not
+# block other symbols.
+FLIP_GUARD_HOURS = float(os.environ.get("FLIP_GUARD_HOURS", "3") or 3)
+FLIP_GUARD_MULT = 1.0  # legacy compatibility only; not used by the fixed-hour guard
 
 # 2) Higher-TF alignment: require 1H + 4H momentum to agree with the signal direction
 TF_ALIGN_ENABLED = True
@@ -14444,13 +14449,19 @@ def symbol_flip_guard_active(
     session_name: str,
 ) -> bool:
     """
-    Blocks opposite-direction alerts for the same symbol for a period.
-    Uses (session cooldown hours * FLIP_GUARD_MULT).
+    Blocks opposite-direction alerts for the same symbol only.
+
+    Ver05: fixed 3-hour guard by default. It no longer shortens to NY=1h or
+    LON=2h via session cooldowns. This protects against same-symbol whipsaw
+    without blocking any other symbols.
     """
     if not FLIP_GUARD_ENABLED:
         return False
 
-    cooldown_hours = float(cooldown_hours_for_session(session_name)) * float(FLIP_GUARD_MULT)
+    try:
+        cooldown_hours = max(0.0, float(FLIP_GUARD_HOURS or 3.0))
+    except Exception:
+        cooldown_hours = 3.0
     opposite = "SELL" if str(side).upper() == "BUY" else "BUY"
 
     con = db_connect()
