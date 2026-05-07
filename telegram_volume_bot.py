@@ -7,13 +7,14 @@
 # - v4: made admin diagnostics non-blocking/cached, delayed heavy startup jobs, and added stale-lessons banner.
 # - Ver17: BigMove alerts now immediately generate and send matching F8 setup emails; /screen uses setup-email timestamp.
 # - Ver21: Autonomous email/autotrade setup pipeline runs independently from /screen.
+# - 07May_v01: throttled autonomous screen sync, added DB-backed family/session edge matrix, and safety-clamped AutoTrade defaults.
 
 
 # --- ASIA tightening (hard-coded, no env vars) ---
 ASIA_MIN_CONF_BOOST = 10
 ASIA_MIN_FUT_VOL_USD = 10_000_000
 ASIA_EXCLUDED_PREFIXES = ("1000",)
-ASIA_SYMBOL_COOLDOWN_HOURS = 6
+ASIA_SYMBOL_COOLDOWN_HOURS = 4
 
 # =========================================================
 # RENDER WEB SERVICE KEEPALIVE (optional)
@@ -427,7 +428,7 @@ AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
 AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY = 'max_trades_per_day'  # AutoTrade-only daily count cap; independent from /limits maxtrades
 AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY = 'max_entry_drift_pct'
 AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY = 'liq_buffer_pct'
-AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
+AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 4.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
 # Setup audit defaults: report actionable/executable setups, not every raw scanner candidate.
@@ -621,6 +622,76 @@ def _autotrade_runtime_summary_dict() -> dict:
     }
 
 
+def _autotrade_apply_07may_safety_defaults() -> None:
+    """Apply the 07-May runtime AutoTrade safety defaults.
+
+    Ver02 requested defaults:
+    - max open AutoTrade positions: 10
+    - max AutoTrade entries/day: 20
+    - risk/trade: 1.5%
+    - open risk cap: 12%
+    - daily AT cap: 15%
+
+    Behaviour:
+    - The exact Ver02 defaults are applied once using a DB version marker, so an older
+      Ver01 DB value like 4 open trades is lifted to the requested value.
+    - After that, user-lowered values are respected, but values above the requested cap
+      are clamped back down on boot for live safety.
+    - Set AUTOTRADE_07MAY_SAFETY_DEFAULTS_ENABLED=0 to fully disable this bootstrap.
+    """
+    try:
+        if not env_bool('AUTOTRADE_07MAY_SAFETY_DEFAULTS_ENABLED', True):
+            return
+        version_key = '07may_safety_defaults_version'
+        target_version = 'ver02'
+        first_apply = str(_autotrade_config_get(version_key, '') or '').strip().lower() != target_version
+
+        target_open = int(os.environ.get('AUTOTRADE_07MAY_MAX_OPEN_TRADES', '10') or 10)
+        target_day = int(os.environ.get('AUTOTRADE_07MAY_MAX_TRADES_PER_DAY', '20') or 20)
+        target_risk = float(os.environ.get('AUTOTRADE_07MAY_RISK_PER_TRADE_PCT', '1.5') or 1.5)
+        target_open_cap = float(os.environ.get('AUTOTRADE_07MAY_OPEN_RISK_CAP_PCT', '12.0') or 12.0)
+        target_daily = float(os.environ.get('AUTOTRADE_07MAY_DAILY_CAP_PCT', '15.0') or 15.0)
+
+        def _set_once_or_cap(getter, setter, key_or_none, target, cast=float):
+            try:
+                cur = cast(getter())
+            except Exception:
+                cur = cast(0)
+            try:
+                if first_apply:
+                    if key_or_none is not None:
+                        _autotrade_config_set(key_or_none, target)
+                    else:
+                        setter(target)
+                    return
+                if cur <= 0 or cur > cast(target):
+                    if key_or_none is not None:
+                        _autotrade_config_set(key_or_none, target)
+                    else:
+                        setter(target)
+            except Exception:
+                pass
+
+        _set_once_or_cap(_autotrade_runtime_max_open_trades, None, AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, int(target_open), int)
+        _set_once_or_cap(_autotrade_runtime_max_trades_per_day, None, AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(target_day), int)
+        _set_once_or_cap(_autotrade_risk_per_trade_pct, None, AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, float(target_risk), float)
+        _set_once_or_cap(_autotrade_open_risk_cap_pct, None, AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, float(target_open_cap), float)
+
+        try:
+            mode, val = _autotrade_daily_cap_settings()
+            if first_apply or (str(mode or 'PCT').upper() == 'PCT' and (float(val or 0.0) <= 0 or float(val or 0.0) > target_daily)):
+                _autotrade_set_daily_cap_settings('PCT', float(target_daily))
+        except Exception:
+            pass
+
+        try:
+            _autotrade_config_set(version_key, target_version)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -789,9 +860,41 @@ _AUTOTRADE_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("AUTOTRADE_EX
 # continuously does what /screen used to do manually: build the executable screen pool,
 # send setup emails, and trigger autotrade. It prevents /screen from being the trigger.
 _AUTONOMOUS_SCREEN_SYNC_LOCK = asyncio.Lock()
-AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC", "60") or 60)
-AUTONOMOUS_SCREEN_SYNC_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_FIRST_SEC", "25") or 25)
-AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_USERS", "4") or 4)
+# 07May_v01: this job was firing every 60s while one run often needed >60s,
+# which produced repeated APScheduler "maximum number of running instances" warnings.
+# Keep the autonomous lane hot, but make the schedule longer than the hard runtime budget.
+AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC", "120") or 120)
+AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC", "180") or 180)
+AUTONOMOUS_SCREEN_SYNC_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_FIRST_SEC", "45") or 45)
+AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_USERS", "1") or 1)
+
+# 07May_v01: DB-backed family/session edge governance.
+# The review table is always persisted. Live blocking is deliberately limited to
+# statistically weak/losing combinations only; WATCH rows remain allowed by default.
+SETUP_COMBO_REVIEW_ENABLED = env_bool("SETUP_COMBO_REVIEW_ENABLED", True)
+# Ver02: policy promotion/demotion must be weekly, not daily.
+# Daily/manual matrices may be displayed, but they do not update live policy unless the
+# window is at least SETUP_COMBO_POLICY_MIN_WINDOW_HOURS.
+SETUP_COMBO_REVIEW_INTERVAL_HOURS = float(os.environ.get("SETUP_COMBO_REVIEW_INTERVAL_HOURS", "168") or 168)
+SETUP_COMBO_REVIEW_FIRST_SEC = int(os.environ.get("SETUP_COMBO_REVIEW_FIRST_SEC", "3600") or 3600)
+SETUP_COMBO_REVIEW_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_REVIEW_WINDOW_HOURS", "168") or 168)
+SETUP_COMBO_POLICY_MIN_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_POLICY_MIN_WINDOW_HOURS", "168") or 168)
+SETUP_COMBO_POLICY_LIVE_ENFORCE = env_bool("SETUP_COMBO_POLICY_LIVE_ENFORCE", True)
+# Ver03: broad duplicate prevention for setup generation and setup emails.
+# Default cooldown is 4h (not 6h) for same symbol+side, applied before the executable/email lanes.
+# Opposite-side reversals are still handled by flip-guard rather than hard-blocked by default.
+SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS = float(os.environ.get("SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS", "4") or 4)
+EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS = float(os.environ.get("EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS", "4") or 4)
+SETUP_GENERATION_COOLDOWN_ANY_SIDE = env_bool("SETUP_GENERATION_COOLDOWN_ANY_SIDE", False)
+EMAIL_SETUP_COOLDOWN_ANY_SIDE = env_bool("EMAIL_SETUP_COOLDOWN_ANY_SIDE", False)
+SETUP_COMBO_POLICY_BLOCK_WATCH = env_bool("SETUP_COMBO_POLICY_BLOCK_WATCH", False)
+SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "3") or 3)
+SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "6") or 6)
+SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
+SETUP_COMBO_POLICY_DISABLE_WR = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_WR", "45") or 45)
+SETUP_COMBO_POLICY_KEEP_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_AVG_R", "0.05") or 0.05)
+SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "-0.10") or -0.10)
+
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
 
@@ -2684,8 +2787,8 @@ WARN_RISK_PCT_PER_TRADE = 2.0
 # ✅ COOLDOWNS (email anti-spam)
 # =========================================================
 # Lighter cooldowns (emails are rare; don't over-block)
-# NOTE: cooldown only suppresses *emails*, not /screen.
-# You can still keep spam under control via email_gap_min + daily caps.
+# Ver02 note: cooldowns now suppress executable setup generation and setup emails.
+# You can still control additional spam via email_gap_min + daily/session caps.
 SESSION_SYMBOL_COOLDOWN_HOURS = {
     "NY": 1,     # more active
     "LON": 2,    # balanced
@@ -2748,9 +2851,9 @@ def max_cooldown_hours() -> int:
         return int(SYMBOL_COOLDOWN_HOURS)
 
 try:
-    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = max(6.0, float(max_cooldown_hours()))
+    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = max(4.0, float(max_cooldown_hours()))
 except Exception:
-    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 6.0
+    AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 4.0
 
 # Multi-TP
 ATR_PERIOD = 14
@@ -2802,7 +2905,7 @@ AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PC
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "1") or 1)
 # AutoTrade-only daily trade count cap. 0 = unlimited.
 # This is deliberately independent from /limits maxtrades, which remains manual-only.
-AUTOTRADE_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_MAX_TRADES_PER_DAY", "0") or 0)
+AUTOTRADE_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_MAX_TRADES_PER_DAY", "8") or 8)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
 EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
@@ -2830,6 +2933,7 @@ except Exception:
 
 try:
     _autotrade_bootstrap_runtime_config()
+    _autotrade_apply_07may_safety_defaults()
 except Exception:
     pass
 
@@ -12663,7 +12767,7 @@ def symbol_recently_emailed(
     ✅ Session-aware + direction-aware cooldown check.
     Cooldown hours depend on CURRENT session (NY/LON/ASIA).
     """
-    cooldown_hours = float(cooldown_hours_for_session(session_name))
+    cooldown_hours = float(email_setup_cooldown_hours_for_session(session_name))
 
     con = db_connect()
     cur = con.cursor()
@@ -12696,12 +12800,12 @@ def _email_symbol_recently_sent(user_id: int, symbol: str, side: str, session_na
         pass
     try:
         sid = str(setup_id or '').strip()
-        if sid and db_has_emailed_setup(int(user_id), sid, lookback_hours=max(1, int(math.ceil(float(cooldown_hours_for_session(session_name) or 1))))):
+        if sid and db_has_emailed_setup(int(user_id), sid, lookback_hours=max(1, int(math.ceil(float(email_setup_cooldown_hours_for_session(session_name) or 1))))):
             return True
     except Exception:
         pass
     try:
-        cooldown_sec = float(cooldown_hours_for_session(session_name)) * 3600.0
+        cooldown_sec = float(email_setup_cooldown_hours_for_session(session_name)) * 3600.0
         cutoff = float(time.time() - cooldown_sec)
         sym = str(_bybit_linear_symbol(symbol) or '').upper()
         sd = str(side or '').upper().strip()
@@ -12722,10 +12826,115 @@ def _email_symbol_recently_sent(user_id: int, symbol: str, side: str, session_na
             try:
                 rsym = str(_bybit_linear_symbol((r['symbol'] if isinstance(r, sqlite3.Row) else r.get('symbol')) or '')).upper()
                 rside = str((r['side'] if isinstance(r, sqlite3.Row) else r.get('side')) or '').upper().strip()
-                if rsym == sym and rside == sd:
+                if rsym == sym and (bool(globals().get('EMAIL_SETUP_COOLDOWN_ANY_SIDE', False)) or rside == sd):
                     return True
             except Exception:
                 continue
+    except Exception:
+        pass
+    return False
+
+
+
+def setup_generation_cooldown_hours_for_session(session_name: str) -> float:
+    """Cooldown used before a setup is admitted to the executable lane."""
+    try:
+        return float(max(float(cooldown_hours_for_session(session_name)), float(SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS)))
+    except Exception:
+        return float(SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS or 4.0)
+
+
+def email_setup_cooldown_hours_for_session(session_name: str) -> float:
+    """Cooldown used before a setup email is sent."""
+    try:
+        return float(max(float(cooldown_hours_for_session(session_name)), float(EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS)))
+    except Exception:
+        return float(EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS or 4.0)
+
+
+def _symbol_side_for_cooldown(symbol: str, side: str) -> tuple[str, str]:
+    try:
+        sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
+    except Exception:
+        sym = str(symbol or '').upper().strip()
+    return sym, str(side or '').upper().strip()
+
+
+def _setup_generation_symbol_recently_seen(user_id: int, symbol: str, side: str, session_name: str, setup_id: str = '') -> bool:
+    """Block repeated executable setup generation for the same symbol/side.
+
+    This is intentionally independent from AutoTrade. It reads the setup queues
+    (executable_setups and generated_setups), not autotrade_trades, so the audit and
+    generation lane stay separated from real trade outcomes and /autotrade_config.
+    """
+    try:
+        cooldown_sec = float(setup_generation_cooldown_hours_for_session(session_name)) * 3600.0
+        if cooldown_sec <= 0:
+            return False
+        cutoff = float(time.time()) - cooldown_sec
+        sym, sd = _symbol_side_for_cooldown(symbol, side)
+        sid = str(setup_id or '').strip()
+        if not sym or not sd:
+            return False
+        base_sym = sym[:-4] if sym.endswith('USDT') else sym
+        sym_aliases = list(dict.fromkeys([sym, base_sym]))
+        sym_ph = ','.join(['?'] * len(sym_aliases))
+        uid = int(user_id or 0)
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_candidates = list(dict.fromkeys([uid, 0, owner_uid] if uid > 0 else [0, owner_uid]))
+        uid_candidates = [int(x) for x in uid_candidates if int(x or 0) >= 0]
+        if not uid_candidates:
+            uid_candidates = [uid]
+        ph = ','.join(['?'] * len(uid_candidates))
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            # 1) executable lane: this is the important production gate.
+            try:
+                side_clause = '' if SETUP_GENERATION_COOLDOWN_ANY_SIDE else 'AND UPPER(COALESCE(side,\'\'))=?'
+                params = list(uid_candidates) + [float(cutoff)] + list(sym_aliases)
+                if not SETUP_GENERATION_COOLDOWN_ANY_SIDE:
+                    params.append(sd)
+                rows = cur.execute(f"""
+                    SELECT setup_id, executable_ts, symbol, side
+                    FROM executable_setups
+                    WHERE user_id IN ({ph})
+                      AND executable_ts>=?
+                      AND UPPER(COALESCE(symbol,'')) IN ({sym_ph})
+                      {side_clause}
+                    ORDER BY executable_ts DESC
+                    LIMIT 12
+                """, tuple(params)).fetchall() or []
+                for r in rows:
+                    old_sid = str(r['setup_id'] or '').strip()
+                    if sid and old_sid == sid:
+                        continue
+                    return True
+            except Exception:
+                pass
+            # 2) generated_setups fallback: catches raw/generated rows before they are executable.
+            try:
+                side_clause = '' if SETUP_GENERATION_COOLDOWN_ANY_SIDE else 'AND UPPER(COALESCE(side,\'\'))=?'
+                params = list(uid_candidates) + [float(cutoff)] + list(sym_aliases)
+                if not SETUP_GENERATION_COOLDOWN_ANY_SIDE:
+                    params.append(sd)
+                rows = cur.execute(f"""
+                    SELECT setup_id, created_ts, symbol, side
+                    FROM generated_setups
+                    WHERE user_id IN ({ph})
+                      AND created_ts>=?
+                      AND UPPER(COALESCE(symbol,'')) IN ({sym_ph})
+                      {side_clause}
+                    ORDER BY created_ts DESC
+                    LIMIT 12
+                """, tuple(params)).fetchall() or []
+                for r in rows:
+                    old_sid = str(r['setup_id'] or '').strip()
+                    if sid and old_sid == sid:
+                        continue
+                    return True
+            except Exception:
+                pass
     except Exception:
         pass
     return False
@@ -17735,12 +17944,52 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
         except Exception:
             pass
 
+        stats['combo_policy_skips'] = 0
+        stats['cooldown_skips'] = 0
         for s in (setups or []):
             sid = str(getattr(s, 'setup_id', '') or '').strip()
             sym = str(getattr(s, 'symbol', '') or '').upper()
             side = str(getattr(s, 'side', '') or '').upper()
             for _target_uid in target_uids:
                 stats['attempted'] += 1
+                try:
+                    if not _setup_combo_policy_allows_setup(s, sess, user_id=int(_target_uid)):
+                        stats['combo_policy_skips'] += 1
+                        db_log_setup_pipeline_event(
+                            int(_target_uid),
+                            stage='executable_combo_policy',
+                            status='skip',
+                            session=sess,
+                            mode=str(mode or ''),
+                            setup_id=sid,
+                            symbol=sym,
+                            side=side,
+                            details={'reason': 'family_session_combo_disabled_by_edge_matrix', 'source_kind': str(source_kind or 'executable_setups')},
+                        )
+                        continue
+                except Exception:
+                    pass
+                try:
+                    if _setup_generation_symbol_recently_seen(int(_target_uid), sym, side, sess, setup_id=sid):
+                        stats['cooldown_skips'] = int(stats.get('cooldown_skips', 0) or 0) + 1
+                        db_log_setup_pipeline_event(
+                            int(_target_uid),
+                            stage='executable_generation_cooldown',
+                            status='skip',
+                            session=sess,
+                            mode=str(mode or ''),
+                            setup_id=sid,
+                            symbol=sym,
+                            side=side,
+                            details={
+                                'reason': 'same_symbol_side_setup_generation_cooldown_active',
+                                'cooldown_hours': float(setup_generation_cooldown_hours_for_session(sess)),
+                                'source_kind': str(source_kind or 'executable_setups'),
+                            },
+                        )
+                        continue
+                except Exception:
+                    pass
                 if int(_target_uid) > 0:
                     try:
                         db_insert_signal(s, user_id=int(_target_uid))
@@ -33240,7 +33489,7 @@ KNOWN_COMMANDS = sorted(set([
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
-    "setup_audit_overall", "email_decision", "adaptive_status",
+    "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "email_decision", "adaptive_status",
     "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
@@ -33781,6 +34030,8 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; shows Symbol, Type, Conf, Family, Result",
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall family summary with start/end/duration, avg setups/day, and Family/Setups/TP/SL/OPEN/WR",
+    "setup_matrix": "DB-backed family/session edge matrix. Usage: /setup_matrix 24 = daily diagnostic only; /setup_matrix 168 = weekly matrix + policy update; /setup_matrix policy = current live policy",
+    "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
@@ -33828,7 +34079,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall"]),
+    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall", "setup_matrix", "setup_edge_matrix"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_report", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
@@ -33850,6 +34101,7 @@ def build_help_text_admin() -> str:
         "🛠 PulseFutures — Admin Command Guide",
         "",
         "Note: quick snapshot commands are cached so normal commands stay instant. Heavy run/diagnostic commands are grouped separately below.",
+        "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly policy update), /setup_matrix policy (current live policy).",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -36152,7 +36404,8 @@ async def cooldowns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out.append("⏱ Cooldowns (All Sessions)")
     out.append(HDR)
     out.append(f"Current session: {current_session}")
-    out.append(f"Policy: NY={cooldown_hours_for_session('NY')}h | LON={cooldown_hours_for_session('LON')}h | ASIA={cooldown_hours_for_session('ASIA')}h")
+    out.append(f"Email/setup cooldown floor: {float(EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS):.1f}h email | {float(SETUP_GENERATION_SYMBOL_COOLDOWN_HOURS):.1f}h generation")
+    out.append(f"Legacy session base: NY={cooldown_hours_for_session('NY')}h | LON={cooldown_hours_for_session('LON')}h | ASIA={cooldown_hours_for_session('ASIA')}h")
     out.append(SEP)
 
     # keep only most recent per (symbol, side)
@@ -38037,6 +38290,14 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
 
 
 def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts: float = 0.0) -> dict:
+    """Optional AutoTrade PnL lookup for diagnostics only.
+
+    Ver02 default is OFF because /setup_audit and /setup_audit_overall must be fully
+    independent from real AutoTrade results and /autotrade_config. The setup result is
+    resolved from post-setup price path against entry/SL/TP, not from live trades.
+    """
+    if not env_bool('SETUP_AUDIT_INCLUDE_AUTOTRADE_PNL', False):
+        return {}
     out = {}
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -38258,6 +38519,382 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
+# =========================================================
+# 07May_v01 — DB-backed setup family/session edge matrix
+# =========================================================
+_SETUP_COMBO_POLICY_CACHE = {'ts': 0.0, 'rows': {}}
+
+
+def _setup_combo_policy_migrate() -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS setup_combo_scores (
+                run_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL DEFAULT 0,
+                evaluated_ts REAL NOT NULL,
+                window_hours INTEGER NOT NULL,
+                horizon_hours INTEGER NOT NULL,
+                family TEXT NOT NULL,
+                session TEXT NOT NULL,
+                combo TEXT NOT NULL,
+                setups INTEGER NOT NULL DEFAULT 0,
+                decided INTEGER NOT NULL DEFAULT 0,
+                tp INTEGER NOT NULL DEFAULT 0,
+                sl INTEGER NOT NULL DEFAULT 0,
+                nohit INTEGER NOT NULL DEFAULT 0,
+                open INTEGER NOT NULL DEFAULT 0,
+                win_rate REAL NOT NULL DEFAULT 0,
+                avg_r REAL NOT NULL DEFAULT 0,
+                avg_conf REAL NOT NULL DEFAULT 0,
+                avg_quality REAL NOT NULL DEFAULT 0,
+                avg_volume_m REAL NOT NULL DEFAULT 0,
+                score REAL NOT NULL DEFAULT 0,
+                action TEXT NOT NULL DEFAULT 'WATCH',
+                enabled_next INTEGER NOT NULL DEFAULT 1,
+                notes TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(run_id, user_id, family, session)
+            )""")
+            cur.execute("""CREATE TABLE IF NOT EXISTS setup_combo_policy (
+                user_id INTEGER NOT NULL DEFAULT 0,
+                family TEXT NOT NULL,
+                session TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'WATCH',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_score REAL NOT NULL DEFAULT 0,
+                last_win_rate REAL NOT NULL DEFAULT 0,
+                last_avg_r REAL NOT NULL DEFAULT 0,
+                last_setups INTEGER NOT NULL DEFAULT 0,
+                last_decided INTEGER NOT NULL DEFAULT 0,
+                last_run_id TEXT NOT NULL DEFAULT '',
+                updated_ts REAL NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(user_id, family, session)
+            )""")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_combo_scores_user_ts ON setup_combo_scores(user_id, evaluated_ts)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_combo_policy_user_enabled ON setup_combo_policy(user_id, enabled, status)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _setup_combo_policy_cache_rows(force: bool = False) -> dict:
+    try:
+        now = float(time.time())
+        if (not force) and (now - float(_SETUP_COMBO_POLICY_CACHE.get('ts') or 0.0)) < 60:
+            return dict(_SETUP_COMBO_POLICY_CACHE.get('rows') or {})
+        _setup_combo_policy_migrate()
+        rows = {}
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            for r in cur.execute("SELECT * FROM setup_combo_policy").fetchall() or []:
+                d = dict(r)
+                key = (int(d.get('user_id') or 0), str(d.get('family') or '').upper().strip(), str(d.get('session') or '').upper().strip())
+                rows[key] = d
+        _SETUP_COMBO_POLICY_CACHE['ts'] = now
+        _SETUP_COMBO_POLICY_CACHE['rows'] = dict(rows)
+        return dict(rows)
+    except Exception:
+        return {}
+
+
+def _setup_combo_family_session_from_obj(setup_or_row, session_name: str = '') -> tuple[str, str]:
+    try:
+        if isinstance(setup_or_row, dict):
+            row = dict(setup_or_row or {})
+        else:
+            row = {
+                'family_id': str(getattr(setup_or_row, 'family_id', '') or ''),
+                'engine': str(getattr(setup_or_row, 'engine', '') or ''),
+                'setup_id': str(getattr(setup_or_row, 'setup_id', '') or getattr(setup_or_row, 'id', '') or ''),
+                'session': str(getattr(setup_or_row, 'session', '') or getattr(setup_or_row, 'source_session', '') or ''),
+                'details_json': str(getattr(setup_or_row, 'details_json', '') or ''),
+            }
+        fam = _setup_audit_family_code(row)
+        sess = str(session_name or row.get('session') or row.get('source_session') or '').upper().strip() or '-'
+        return str(fam or 'F0').upper().strip(), str(sess or '-').upper().strip()
+    except Exception:
+        return 'F0', str(session_name or '-').upper().strip() or '-'
+
+
+def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> bool:
+    """Live gate for DB-learned family/session combinations.
+
+    Unknown combinations are allowed so a new bot does not starve itself before it has data.
+    Only explicit DISABLE/BLOCK/PAUSE rows are blocked unless SETUP_COMBO_POLICY_BLOCK_WATCH=1.
+    """
+    try:
+        if not bool(globals().get('SETUP_COMBO_POLICY_LIVE_ENFORCE', True)):
+            return True
+        fam, sess = _setup_combo_family_session_from_obj(setup_or_row, session_name=session_name)
+        if sess in {'', '-', 'NONE'} or fam in {'', '-', 'F0'}:
+            return True
+        rows = _setup_combo_policy_cache_rows(force=False)
+        uid = int(user_id or 0)
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        candidates = []
+        if uid > 0:
+            candidates.append(uid)
+        if owner_uid > 0 and owner_uid not in candidates:
+            candidates.append(owner_uid)
+        candidates.append(0)
+        pol = None
+        for cu in candidates:
+            pol = rows.get((int(cu), fam, sess))
+            if pol:
+                break
+        if not pol:
+            return True
+        status = str(pol.get('status') or 'WATCH').upper().strip()
+        enabled = int(pol.get('enabled') or 0) == 1
+        if status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled:
+            return False
+        if status == 'WATCH' and bool(globals().get('SETUP_COMBO_POLICY_BLOCK_WATCH', False)):
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int, str, float]:
+    try:
+        total = int(st.get('setups') or 0)
+        decided = int(st.get('decided') or 0)
+        tp = int(st.get('tp') or 0)
+        sl = int(st.get('sl') or 0)
+        op = int(st.get('open') or 0)
+        wr = float(st.get('wr') or 0.0)
+        avg_r = float(st.get('avg_r') or 0.0)
+        min_decided = int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY if int(window_hours or 0) >= 72 else SETUP_COMBO_POLICY_MIN_DECIDED_DAILY)
+        score = (wr - 50.0) * 1.20 + avg_r * 22.0 + min(20, decided) * 0.45 - ((op / max(1, total)) * 4.0)
+        if decided < max(1, min_decided):
+            return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'Need more decided results ({decided}/{min_decided})', float(score)
+        if wr >= float(SETUP_COMBO_POLICY_KEEP_WR) and avg_r >= float(SETUP_COMBO_POLICY_KEEP_AVG_R):
+            return 'KEEP', 1, 'Positive edge: WR/AvgR above keep threshold', float(score)
+        if wr < float(SETUP_COMBO_POLICY_DISABLE_WR) or avg_r <= float(SETUP_COMBO_POLICY_DISABLE_AVG_R) or (sl >= tp + 2 and decided >= min_decided):
+            return 'DISABLE', 0, 'Negative edge: weak WR/AvgR or SL-heavy combo', float(score)
+        return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, 'Borderline edge; keep collecting data', float(score)
+    except Exception:
+        return 'WATCH', 1, 'Policy calculation error; allowed by safety default', 0.0
+
+
+def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True) -> dict:
+    _setup_combo_policy_migrate()
+    hours = max(1, min(8760, int(hours or 168)))
+    result_horizon = _setup_audit_result_horizon_hours()
+    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=0, dedup=True)
+    audit_tf = str(os.environ.get('SETUP_COMBO_MATRIX_TIMEFRAME', os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m'))) or '15m').strip().lower() or '15m'
+    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf) if rows else {}
+    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+    stats: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        try:
+            fam = _setup_audit_family_code(r)
+            sess = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+            sid = str(r.get('setup_id') or '').strip()
+            actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
+            ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
+            result = _setup_audit_result_label(ev.get('result'))
+            key = (fam, sess)
+            st = stats.setdefault(key, {'family': fam, 'session': sess, 'setups': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'r_sum': 0.0, 'conf_sum': 0.0, 'quality_sum': 0.0, 'vol_sum': 0.0})
+            st['setups'] += 1
+            st['conf_sum'] += float(r.get('conf') or 0.0)
+            st['quality_sum'] += float(r.get('quality_score') or 0.0)
+            st['vol_sum'] += float(r.get('fut_vol_usd') or 0.0) / 1e6
+            if result == 'TP':
+                st['tp'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
+            elif result == 'SL':
+                st['sl'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
+            elif result == 'NOHIT':
+                st['nohit'] += 1
+            else:
+                st['open'] += 1
+        except Exception:
+            continue
+    out_rows = []
+    for (_fam, _sess), st in stats.items():
+        total = int(st.get('setups') or 0)
+        decided = int(st.get('tp') or 0) + int(st.get('sl') or 0) + int(st.get('nohit') or 0)
+        tp = int(st.get('tp') or 0)
+        sl = int(st.get('sl') or 0)
+        nohit = int(st.get('nohit') or 0)
+        op = int(st.get('open') or 0)
+        wr = (tp / max(1, decided) * 100.0) if decided > 0 else 0.0
+        avg_r = (float(st.get('r_sum') or 0.0) / max(1, decided)) if decided > 0 else 0.0
+        avg_conf = float(st.get('conf_sum') or 0.0) / max(1, total)
+        avg_quality = float(st.get('quality_sum') or 0.0) / max(1, total)
+        avg_vol_m = float(st.get('vol_sum') or 0.0) / max(1, total)
+        tmp = {'setups': total, 'decided': decided, 'tp': tp, 'sl': sl, 'nohit': nohit, 'open': op, 'wr': wr, 'avg_r': avg_r}
+        action, enabled_next, notes, score = _setup_combo_action_for_stats(tmp, hours)
+        out_rows.append({
+            'family': _fam, 'session': _sess, 'combo': f'{_fam}-{_sess}', 'setups': total, 'decided': decided,
+            'tp': tp, 'sl': sl, 'nohit': nohit, 'open': op, 'win_rate': wr, 'avg_r': avg_r,
+            'avg_conf': avg_conf, 'avg_quality': avg_quality, 'avg_volume_m': avg_vol_m,
+            'score': score, 'action': action, 'enabled_next': int(enabled_next), 'notes': notes,
+        })
+    out_rows.sort(key=lambda x: (int(x.get('enabled_next') or 0), float(x.get('score') or 0.0), float(x.get('win_rate') or 0.0), int(x.get('decided') or 0)), reverse=True)
+    run_id = 'SCM-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+    policy_window_ok = int(hours or 0) >= int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)
+    if persist and out_rows:
+        try:
+            now_ts = float(time.time())
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                for d in out_rows:
+                    row_tuple = (
+                        run_id, int(uid), now_ts, int(hours), int(result_horizon), d['family'], d['session'], d['combo'],
+                        int(d['setups']), int(d['decided']), int(d['tp']), int(d['sl']), int(d['nohit']), int(d['open']),
+                        float(d['win_rate']), float(d['avg_r']), float(d['avg_conf']), float(d['avg_quality']), float(d['avg_volume_m']),
+                        float(d['score']), str(d['action']), int(d['enabled_next']), str(d['notes'])[:500],
+                    )
+                    cur.execute("""INSERT OR REPLACE INTO setup_combo_scores
+                        (run_id, user_id, evaluated_ts, window_hours, horizon_hours, family, session, combo, setups, decided, tp, sl, nohit, open,
+                         win_rate, avg_r, avg_conf, avg_quality, avg_volume_m, score, action, enabled_next, notes)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", row_tuple)
+                    # Save both owner-scoped and global policy only from a weekly-or-longer window.
+                    # Short windows such as /setup_matrix 24 are diagnostics and must not
+                    # promote/demote live combinations.
+                    if policy_window_ok:
+                        for pol_uid in list(dict.fromkeys([int(uid), 0])):
+                            cur.execute("""INSERT OR REPLACE INTO setup_combo_policy
+                                (user_id, family, session, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (int(pol_uid), d['family'], d['session'], str(d['action']), int(d['enabled_next']), float(d['score']), float(d['win_rate']), float(d['avg_r']), int(d['setups']), int(d['decided']), run_id, now_ts, str(d['notes'])[:500]))
+                conn.commit()
+            _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
+        except Exception as exc:
+            try:
+                logger.warning('setup_combo_matrix_persist_failed: %s: %s', type(exc).__name__, exc)
+            except Exception:
+                pass
+    return {'run_id': run_id, 'rows': out_rows, 'source_rows': len(rows), 'window_hours': hours, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_updated': bool(persist and policy_window_ok and bool(out_rows))}
+
+
+def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True) -> str:
+    res = _setup_combo_matrix_build(int(uid), hours=hours, persist=persist)
+    rows = list((res or {}).get('rows') or [])
+    min_vol_m = _setup_min_volume_floor_usd() / 1e6
+    if not rows:
+        return f"📈 <b>Setup Edge Matrix</b>\n{HDR}\nNo setup combinations found above ${min_vol_m:.0f}M volume for the selected window."
+    total = sum(int(r.get('setups') or 0) for r in rows)
+    tp = sum(int(r.get('tp') or 0) for r in rows)
+    sl = sum(int(r.get('sl') or 0) for r in rows)
+    nh = sum(int(r.get('nohit') or 0) for r in rows)
+    op = sum(int(r.get('open') or 0) for r in rows)
+    decided = tp + sl + nh
+    wr = (tp / max(1, decided) * 100.0) if decided else 0.0
+    keep_n = sum(1 for r in rows if str(r.get('action') or '').upper() == 'KEEP')
+    watch_n = sum(1 for r in rows if str(r.get('action') or '').upper() == 'WATCH')
+    off_n = sum(1 for r in rows if str(r.get('action') or '').upper() == 'DISABLE')
+    table_rows = []
+    for r in rows:
+        table_rows.append([
+            str(r.get('combo') or ''),
+            int(r.get('setups') or 0), int(r.get('decided') or 0), int(r.get('tp') or 0), int(r.get('sl') or 0), int(r.get('open') or 0),
+            f"{float(r.get('win_rate') or 0.0):.1f}%", f"{float(r.get('avg_r') or 0.0):+.2f}",
+            f"{float(r.get('avg_conf') or 0.0):.0f}", f"{float(r.get('avg_quality') or 0.0):.0f}", f"{float(r.get('avg_volume_m') or 0.0):.0f}",
+            f"{float(r.get('score') or 0.0):+.1f}", str(r.get('action') or 'WATCH'),
+        ])
+    table = tabulate(table_rows, headers=['Combo', 'Set', 'Dec', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'Q', 'VolM', 'Score', 'Next'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','right','right','right','center'))
+    header = [
+        "📈 <b>Setup Edge Matrix</b>",
+        HDR,
+        f"Window: <b>{int(res.get('window_hours') or hours)}h</b> | Run: <b>{html.escape(str(res.get('run_id') or '-'))}</b> | Scores persisted: <b>{'YES' if persist else 'NO'}</b> | Weekly policy updated: <b>{'YES' if bool(res.get('policy_updated')) else 'NO'}</b>",
+        f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | NOHIT: <b>{nh}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b>",
+        f"Policy: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | Block WATCH=<b>{'ON' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OFF'}</b>",
+        f"Next = DB recommendation for the next weekly policy cycle (min window <b>{int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)}h</b>). DISABLE combinations are skipped by executable queue when live enforce is ON.",
+    ]
+    return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
+
+
+def _setup_combo_policy_text(uid: int) -> str:
+    try:
+        _setup_combo_policy_migrate()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = [dict(r) for r in cur.execute("SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session", (int(uid),)).fetchall() or []]
+        if not rows:
+            return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nNo saved policy yet. Run <code>/setup_matrix 168</code>."
+        table_rows = []
+        seen = set()
+        for r in rows:
+            key = (str(r.get('family') or ''), str(r.get('session') or ''))
+            if key in seen:
+                continue
+            seen.add(key)
+            table_rows.append([
+                f"{r.get('family')}-{r.get('session')}",
+                'ON' if int(r.get('enabled') or 0) == 1 else 'OFF',
+                str(r.get('status') or ''),
+                int(r.get('last_setups') or 0), int(r.get('last_decided') or 0),
+                f"{float(r.get('last_win_rate') or 0.0):.1f}%", f"{float(r.get('last_avg_r') or 0.0):+.2f}", f"{float(r.get('last_score') or 0.0):+.1f}",
+            ])
+        table = tabulate(table_rows, headers=['Combo','Exec','Status','Set','Dec','WR','AvgR','Score'], tablefmt='plain')
+        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nPolicy cycle: <b>weekly</b> | Review every: <b>{float(SETUP_COMBO_REVIEW_INTERVAL_HOURS):.0f}h</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n<pre>{html.escape(table)}</pre>"
+    except Exception as e:
+        return f"❌ setup_combo_policy failed: {type(e).__name__}: {html.escape(str(e))}"
+
+
+async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+    if args and args[0].lower() in {'policy', 'rules', 'status'}:
+        text = await to_thread_heavy(_setup_combo_policy_text, int(AUTOTRADE_OWNER_UID or uid), timeout=60)
+        await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
+    try:
+        if args and re.fullmatch(r'\d+(\.\d+)?', args[0]):
+            hours = int(float(args[0]))
+    except Exception:
+        hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
+    try:
+        text = await to_thread_heavy(_setup_combo_matrix_text, int(AUTOTRADE_OWNER_UID or uid), int(hours), True, timeout=240)
+    except Exception as e:
+        text = f"❌ setup_matrix failed: {type(e).__name__}: {html.escape(str(e))}"
+    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def setup_combo_review_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not SETUP_COMBO_REVIEW_ENABLED:
+            return
+        uid = int(AUTOTRADE_OWNER_UID or 0)
+        if uid <= 0:
+            try:
+                ids = sorted(list(_admin_ids_all()))
+                uid = int(ids[0]) if ids else 0
+            except Exception:
+                uid = 0
+        if uid <= 0:
+            return
+        res = await to_thread_heavy(_setup_combo_matrix_build, int(uid), max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)), True, timeout=240)
+        try:
+            rows = list((res or {}).get('rows') or [])
+            db_log_setup_pipeline_event(uid, stage='setup_combo_review', status='ok', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={
+                'window_hours': max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)),
+                'rows': len(rows),
+                'keep': sum(1 for r in rows if str(r.get('action') or '').upper() == 'KEEP'),
+                'watch': sum(1 for r in rows if str(r.get('action') or '').upper() == 'WATCH'),
+                'disable': sum(1 for r in rows if str(r.get('action') or '').upper() == 'DISABLE'),
+                'live_enforce': bool(SETUP_COMBO_POLICY_LIVE_ENFORCE),
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            db_log_setup_pipeline_event(int(AUTOTRADE_OWNER_UID or 0), stage='setup_combo_review', status='error', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={'error': f'{type(e).__name__}: {e}'})
+        except Exception:
+            pass
+
+
 async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
     if not is_admin_user(uid):
@@ -38352,6 +38989,13 @@ def _setup_audit_overall_text(uid: int) -> str:
     win = _setup_audit_window_summary(rows)
     dur_days = float(win.get('duration_days') or 0.0)
     avg_daily = float(win.get('avg_daily') or 0.0)
+    try:
+        keep_candidates = [r for r in table_rows if str(r[7]).replace('%','') and float(str(r[7]).replace('%','') or 0.0) >= SETUP_COMBO_POLICY_KEEP_WR and int(r[3]) + int(r[4]) + int(r[5]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
+        weak_candidates = [r for r in table_rows if str(r[7]).replace('%','') and float(str(r[7]).replace('%','') or 0.0) < SETUP_COMBO_POLICY_DISABLE_WR and int(r[3]) + int(r[4]) + int(r[5]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
+        keep_txt = ', '.join([f"{r[0]}-{r[1]}" for r in keep_candidates[:5]]) or '-'
+        weak_txt = ', '.join([f"{r[0]}-{r[1]}" for r in weak_candidates[:5]]) or '-'
+    except Exception:
+        keep_txt, weak_txt = '-', '-'
     header = [
         "📊 <b>Setup Audit Overall</b>",
         HDR,
@@ -38359,6 +39003,8 @@ def _setup_audit_overall_text(uid: int) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Duration: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
+        f"Quick read: strongest now = <b>{html.escape(keep_txt)}</b> | weakest now = <b>{html.escape(weak_txt)}</b>.",
+        "For the persistent weekly DB policy, run <code>/setup_matrix 168</code>. <code>/setup_matrix 24</code> is diagnostic only and does not update live policy.",
         "NOHIT = horizon expired with no TP/SL; OPEN = still inside the result horizon.",
     ]
     table = tabulate(
@@ -46757,6 +47403,14 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
     uses. Therefore setup generation, setup emails, /screen cache, and autotrade are
     produced without waiting for the admin/user to press /screen.
     """
+    job_started_ts = float(time.time())
+
+    def _budget_left() -> float:
+        try:
+            return float(AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC or 120) - (float(time.time()) - job_started_ts)
+        except Exception:
+            return 0.0
+
     try:
         _hb_touch('email', ok=True, details='autonomous_screen_sync_tick')
         try:
@@ -46807,6 +47461,9 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
             sent_count = 0
             skipped = []
             for u in users[:max(1, int(AUTONOMOUS_SCREEN_SYNC_MAX_USERS or 1))]:
+                if _budget_left() < 20:
+                    skipped.append('budget_exhausted')
+                    break
                 try:
                     uid = int((u or {}).get('user_id') or (u or {}).get('id') or 0)
                 except Exception:
@@ -46831,7 +47488,8 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 processed += 1
                 try:
-                    body, kb, setups = await to_thread_screen(_build_screen_body_and_kb, best_fut, sess_name, uid, timeout=75)
+                    screen_timeout = max(20, min(55, int(_budget_left() - 10)))
+                    body, kb, setups = await to_thread_screen(_build_screen_body_and_kb, best_fut, sess_name, uid, timeout=screen_timeout)
                 except asyncio.TimeoutError:
                     skipped.append(f'{uid}:screen_build_timeout')
                     continue
@@ -47062,6 +47720,8 @@ def main():
     app.add_handler(CommandHandler("setup_audit", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
+    app.add_handler(CommandHandler("setup_matrix", setup_matrix_cmd, block=False))
+    app.add_handler(CommandHandler("setup_edge_matrix", setup_matrix_cmd, block=False))
 
     app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
@@ -47152,17 +47812,35 @@ def main():
         # Ver22 major patch: run the /screen-equivalent setup/email/autotrade lane
         # automatically. This is the safety net that prevents manual /screen from being
         # the only thing that discovers and emails setups.
+        auto_screen_interval_sec = max(
+            180,
+            int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 180),
+            int(AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC or 120) + 60,
+        )
         app.job_queue.run_repeating(
             autonomous_screen_sync_job,
-            interval=max(30, int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 60)),
-            first=max(10, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 25), max(30, int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 60)) // 2)),
+            interval=auto_screen_interval_sec,
+            first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 45), auto_screen_interval_sec // 2)),
             name="autonomous_screen_sync_job",
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 120,
+                "misfire_grace_time": 180,
             },
         )
+
+        if SETUP_COMBO_REVIEW_ENABLED:
+            app.job_queue.run_repeating(
+                setup_combo_review_job,
+                interval=max(int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS) * 3600, int(float(SETUP_COMBO_REVIEW_INTERVAL_HOURS or 168) * 3600)),
+                first=max(120, int(SETUP_COMBO_REVIEW_FIRST_SEC or 600)),
+                name="setup_combo_review_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 900,
+                },
+            )
 
         app.job_queue.run_repeating(
             screen_cache_warmup_job,
