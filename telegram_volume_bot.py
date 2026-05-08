@@ -9,6 +9,7 @@
 # - v4: made admin diagnostics non-blocking/cached, delayed heavy startup jobs, and added stale-lessons banner.
 # - Ver17: BigMove alerts now immediately generate and send matching F8 setup emails; /screen uses setup-email timestamp.
 # - Ver21: Autonomous email/autotrade setup pipeline runs independently from /screen.
+# - Ver14: made interim setup-combo policy seeding idempotent/quiet and downgraded manual-position conflict logs from WARNING to INFO.
 # - 07May_v01: throttled autonomous screen sync, added DB-backed family/session edge matrix, and safety-clamped AutoTrade defaults.
 # - 07May_v04: setup generation/email duplicate cooldown reduced to 3 hours.
 # - 07May_v05: flip guard fixed to a flat 3-hour same-symbol opposite-side block.
@@ -7202,11 +7203,15 @@ def _autotrade_log_symbol_block(uid: int, symbol: str, side: str, reason: str, e
         msg = f"{reason} uid={int(uid)} symbol={sym} side={sd}"
         if extra:
             msg += f" | {extra}"
-        # Same-symbol external/manual conflicts are safety blocks, not bot faults.
-        # Keep them visible but avoid Render log spam during active scans.
-        throttle = 900.0 if str(reason or '').startswith('blocked_manual_same_symbol_position') else 90.0
-        key = f"autotrade_block:{int(uid)}:{sym}:{sd}:{str(reason or '')}:{str(extra or '')[:80]}"
-        _log_warning_throttled(key, throttle, msg)
+        reason_s = str(reason or '')
+        key = f"autotrade_block:{int(uid)}:{sym}:{sd}:{reason_s}:{str(extra or '')[:80]}"
+        # Same-symbol external/manual conflicts are expected safety blocks when
+        # you already have a manual/external Bybit position. They are not bot
+        # errors, so keep them out of Render WARNING noise.
+        if reason_s.startswith('blocked_manual_same_symbol_position'):
+            _log_info_throttled(key, 3600.0, msg)
+        else:
+            _log_warning_throttled(key, 90.0, msg)
     except Exception:
         pass
 
@@ -10285,6 +10290,22 @@ def _log_warning_throttled(key: str, ttl_sec: float | None, msg: str, *args) -> 
     except Exception:
         try:
             logger.warning(msg, *args)
+        except Exception:
+            pass
+
+
+def _log_info_throttled(key: str, ttl_sec: float | None, msg: str, *args) -> None:
+    try:
+        now_ts = float(time.time())
+        ttl = max(5.0, float(ttl_sec if ttl_sec is not None else LOG_WARN_THROTTLE_SEC))
+        cache_key = 'INFO:' + (str(key or '').strip() or str(msg or ''))
+        if float(_LOG_WARN_THROTTLE_UNTIL.get(cache_key) or 0.0) > now_ts:
+            return
+        _LOG_WARN_THROTTLE_UNTIL[cache_key] = now_ts + ttl
+        logger.info(msg, *args)
+    except Exception:
+        try:
+            logger.info(msg, *args)
         except Exception:
             pass
 
@@ -38988,11 +39009,14 @@ def _setup_combo_seed_interim_disable_policy() -> None:
 
     This is not a manual /setup_matrix policy. It is a deliberate interim override requested
     after reviewing 08 May results, and it expires at the next Sunday 23:00 Melbourne review.
+    Ver14: idempotent and quiet. Re-deploys must not keep writing/logging a WARNING when
+    the same interim policy is already active in the persistent DB.
     """
     try:
         if not bool(globals().get('SETUP_COMBO_INTERIM_DISABLE_ENABLED', True)):
             return
         combos = [str(x or '').upper().strip() for x in (globals().get('SETUP_COMBO_INTERIM_DISABLE_LIST', ()) or ()) if str(x or '').strip()]
+        combos = list(dict.fromkeys([c for c in combos if '-' in c]))
         if not combos:
             return
         now_ts = float(time.time())
@@ -39001,22 +39025,47 @@ def _setup_combo_seed_interim_disable_policy() -> None:
             return
         _setup_combo_policy_migrate()
         policy_tz = str(globals().get('SETUP_COMBO_POLICY_REVIEW_TZ', 'Australia/Melbourne') or 'Australia/Melbourne')
-        run_id = 'SCM-INTERIM-' + datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime('%Y%m%d%H%M%S')
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
         policy_uids = [0]
         if owner_uid > 0:
             policy_uids.insert(0, owner_uid)
+        policy_uids = list(dict.fromkeys(policy_uids))
+
+        desired_pairs = []
+        for combo in combos:
+            fam, sess = combo.split('-', 1)
+            fam = fam.strip().upper()
+            sess = sess.strip().upper()
+            if fam and sess:
+                desired_pairs.append((fam, sess))
+        if not desired_pairs:
+            return
+
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
-            for combo in combos:
-                if '-' not in combo:
-                    continue
-                fam, sess = combo.split('-', 1)
-                fam = fam.strip().upper()
-                sess = sess.strip().upper()
-                if not fam or not sess:
-                    continue
-                for pol_uid in list(dict.fromkeys(policy_uids)):
+            # If all requested interim rows are already active and not expired, do nothing.
+            already_active = True
+            for pol_uid in policy_uids:
+                for fam, sess in desired_pairs:
+                    row = cur.execute("""SELECT status, enabled, policy_kind, expires_ts
+                        FROM setup_combo_policy
+                        WHERE user_id=? AND UPPER(family)=? AND UPPER(session)=?""",
+                        (int(pol_uid), fam, sess)).fetchone()
+                    if not row:
+                        already_active = False
+                        break
+                    st, en, pk, exp = row
+                    if str(st or '').upper() != 'DISABLE' or int(en or 0) != 0 or str(pk or '').lower() != 'interim' or float(exp or 0.0) <= now_ts:
+                        already_active = False
+                        break
+                if not already_active:
+                    break
+            if already_active:
+                return
+
+            run_id = 'SCM-INTERIM-' + datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime('%Y%m%d%H%M%S')
+            for fam, sess in desired_pairs:
+                for pol_uid in policy_uids:
                     cur.execute("""INSERT OR REPLACE INTO setup_combo_policy
                         (user_id, family, session, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -39026,7 +39075,7 @@ def _setup_combo_seed_interim_disable_policy() -> None:
             conn.commit()
         _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
         try:
-            logger.warning('setup_combo_interim_disable_policy_seeded combos=%s expires=%s', ','.join(combos), _setup_combo_format_policy_ts(expires_ts))
+            logger.info('setup_combo_interim_disable_policy_seeded combos=%s expires=%s', ','.join(combos), _setup_combo_format_policy_ts(expires_ts))
         except Exception:
             pass
     except Exception as exc:
