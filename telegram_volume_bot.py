@@ -909,6 +909,15 @@ SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY
 SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "-0.40") or -0.40)
 SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "-40") or -40)
 SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "2.0") or 2.0)
+# Ver13: link Setup Edge Matrix policy decisions into the optimizer/adaptive runtime config.
+# Scheduled weekly review can promote/tighten/relax family-session runtime gates.
+# Daily safety can only tighten severe losers until the next weekly review.
+SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED = env_bool("SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED", True)
+SETUP_COMBO_BRIDGE_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_BRIDGE_MIN_DECIDED", "4") or 4)
+SETUP_COMBO_BRIDGE_DAILY_ONLY_TIGHTEN = env_bool("SETUP_COMBO_BRIDGE_DAILY_ONLY_TIGHTEN", True)
+SETUP_COMBO_BRIDGE_MAX_QUALITY_ADD = float(os.environ.get("SETUP_COMBO_BRIDGE_MAX_QUALITY_ADD", "4.0") or 4.0)
+SETUP_COMBO_BRIDGE_MAX_RR_ADD = float(os.environ.get("SETUP_COMBO_BRIDGE_MAX_RR_ADD", "0.24") or 0.24)
+SETUP_COMBO_BRIDGE_MAX_CONF_ADD = int(os.environ.get("SETUP_COMBO_BRIDGE_MAX_CONF_ADD", "4") or 4)
 # Ver10 interim policy override: based on 08 May setup_audit_overall/setup_matrix evidence.
 # These combos are blocked only until the next scheduled Sunday 23:00 Melbourne review;
 # after that, the normal weekly scheduler owns the policy again.
@@ -2080,6 +2089,16 @@ def save_strategy_config(cfg: dict) -> None:
 def save_opt_report(report: dict) -> None:
     _strategy_config_migrate()
     try:
+        # Preserve the latest Setup Matrix -> optimizer bridge section even when
+        # older autonomous/adaptive optimizer code saves its own report format.
+        try:
+            if isinstance(report, dict) and 'setup_policy_bridge' not in report:
+                old_rep = load_opt_report()
+                if isinstance(old_rep, dict) and old_rep.get('setup_policy_bridge'):
+                    report = dict(report)
+                    report['setup_policy_bridge'] = old_rep.get('setup_policy_bridge')
+        except Exception:
+            pass
         payload = json.dumps(report, ensure_ascii=False, sort_keys=True)
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
@@ -2103,6 +2122,86 @@ def load_opt_report() -> dict:
     except Exception:
         pass
     return {}
+
+
+def _save_setup_policy_bridge_opt_report(bridge_report: dict) -> None:
+    """Store latest Setup Matrix -> optimizer bridge in /optimize_report."""
+    try:
+        base = load_opt_report()
+        if not isinstance(base, dict):
+            base = {}
+        base['setup_policy_bridge'] = dict(bridge_report or {})
+        base['latest_linked_optimizer_source'] = 'setup_matrix_policy_bridge'
+        save_opt_report(base)
+    except Exception:
+        pass
+
+
+def _optimize_report_human_text(rep: dict) -> str:
+    """Readable /optimize_report summary; raw JSON remains available with /optimize_report raw."""
+    try:
+        cfg = load_strategy_config(force=False)
+    except Exception:
+        cfg = {}
+    bridge = dict((rep or {}).get('setup_policy_bridge') or {}) if isinstance(rep, dict) else {}
+    lines = ["🧪 Optimize Report (last)", HDR]
+    if bridge:
+        try:
+            ts_txt = _fmt_dt_local(datetime.fromtimestamp(float(bridge.get('applied_ts') or 0.0), tz=timezone.utc), "%Y-%m-%d %H:%M") if float(bridge.get('applied_ts') or 0.0) > 0 else '-'
+        except Exception:
+            ts_txt = '-'
+        actions = list(bridge.get('actions') or [])
+        tighten = [a for a in actions if str(a.get('mode') or '').lower() == 'tighten']
+        relax = [a for a in actions if str(a.get('mode') or '').lower() in {'relax', 'preserve'}]
+        lines.extend([
+            "Setup Matrix → optimizer bridge: ON",
+            f"Applied: {ts_txt} | Source: {bridge.get('policy_kind','-')} | Run: {bridge.get('run_id','-')} | Window: {bridge.get('window_hours','-')}h",
+            f"Rows reviewed: {bridge.get('rows_reviewed',0)} | Changes applied: {len(actions)} | Tightened: {len(tighten)} | Relaxed/preserved: {len(relax)}",
+        ])
+        if bridge.get('reason'):
+            lines.append(f"Reason: {bridge.get('reason')}")
+        if actions:
+            lines.append(SEP)
+            lines.append("Main criteria changes applied:")
+            for a in actions[:12]:
+                combo = str(a.get('combo') or '-')
+                mode = str(a.get('mode') or '-')
+                wr = float(a.get('wr') or 0.0)
+                avg_r = float(a.get('avg_r') or 0.0)
+                q = float(a.get('quality_add') or 0.0)
+                c = int(float(a.get('conf_add') or 0))
+                rr = float(a.get('rr_add') or 0.0)
+                ema = a.get('ema_max_pct', None)
+                ch15 = a.get('max_ch15_abs', None)
+                extra = []
+                if ema not in (None, '', 0, 0.0):
+                    extra.append(f"EMA≤{float(ema):.2f}%")
+                if ch15 not in (None, '', 0, 0.0):
+                    extra.append(f"15m≤{float(ch15):.2f}%")
+                extra_txt = (" | " + ", ".join(extra)) if extra else ""
+                lines.append(f"• {combo}: {mode.upper()} | WR={wr:.1f}% AvgR={avg_r:+.2f} | quality {q:+.1f}, conf {c:+d}, RR {rr:+.2f}{extra_txt}")
+            if len(actions) > 12:
+                lines.append(f"• ... {len(actions)-12} more changes stored in DB/config")
+        if bridge.get('notes'):
+            lines.append(SEP)
+            lines.append(str(bridge.get('notes')))
+    else:
+        lines.append("Setup Matrix → optimizer bridge: no applied bridge report yet.")
+
+    lines.extend([
+        SEP,
+        f"Current live targets: {float((cfg or {}).get('target_setups_per_day_lo', 0) or 0):.1f}–{float((cfg or {}).get('target_setups_per_day_hi', 0) or 0):.1f} setups/day | Goal WR≥{float((cfg or {}).get('goal_profile_target_win_rate', 0) or 0):.1f}% | Goal AvgR≥{float((cfg or {}).get('goal_profile_target_avg_r', 0) or 0):.2f}",
+        f"Live floors: email quality≥{float((cfg or {}).get('quality_score_min_email', 0) or 0):.1f} | screen quality≥{float((cfg or {}).get('quality_score_min_screen', 0) or 0):.1f} | base RR≥{float((cfg or {}).get('min_rr_tp', 0) or 0):.2f}",
+        f"Active profile: {str((cfg or {}).get('goal_profile_active_profile', '-') or '-')} | Sessions: {','.join([str(x) for x in ((cfg or {}).get('execution_sessions_allowed') or [])]) or '-'} | Engines: {','.join([str(x) for x in ((cfg or {}).get('execution_engines_allowed') or [])]) or '-'}",
+    ])
+    if isinstance(rep, dict) and rep.get('run_id'):
+        metrics = rep.get('metrics') or {}
+        reasons = metrics.get('promotion_reasons') or []
+        lines.extend([SEP, f"Last background optimizer run: {rep.get('run_id')} | promoted={'YES' if rep.get('promoted') else 'NO'}"])
+        if reasons:
+            lines.append("Background optimizer reasons: " + "; ".join([str(x) for x in reasons[:4]]))
+    lines.append("Raw JSON: /optimize_report raw")
+    return "\n".join(lines)
 
 
 def save_goal_profile_report(report: dict) -> None:
@@ -23066,10 +23165,14 @@ async def cmd_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     rep = load_opt_report()
     if not rep:
-        await update.message.reply_text("No optimize report saved yet. Run /optimize first.")
+        await update.message.reply_text("No optimize report saved yet. The next weekly/daily setup policy bridge or background optimizer run will create it.")
         return
-    pretty = json.dumps(rep, indent=2, ensure_ascii=False, sort_keys=True)
-    await send_long_message(update, f"🧪 Optimize Report (last)\n{HDR}\n```\n{pretty}\n```", parse_mode=ParseMode.MARKDOWN)
+    args = [str(a).strip().lower() for a in (context.args or []) if str(a).strip()]
+    if args and args[0] in {'raw', 'json', 'full'}:
+        pretty = json.dumps(rep, indent=2, ensure_ascii=False, sort_keys=True)
+        await send_long_message(update, f"🧪 Optimize Report (raw)\n{HDR}\n```\n{pretty}\n```", parse_mode=ParseMode.MARKDOWN)
+        return
+    await send_long_message(update, _optimize_report_human_text(rep), parse_mode=None)
 
 
 
@@ -30498,6 +30601,7 @@ def is_executable_setup_eligible(
         # stricter family-specific gates below.
         if fam == globals().get('BIGMOVE_FAMILY_ID', 'F8_BIGMOVE_CONT') and engine not in {'A', 'B', 'C'}:
             engine = 'B'
+        combo_override = _setup_combo_exec_override(cfg_live, fam, sess)
         regime = str(getattr(s, 'regime', '') or '').upper()
         trend = str(getattr(s, 'trend', '') or '').upper()
         structure = str(getattr(s, 'structure', '') or '').upper()
@@ -30625,6 +30729,16 @@ def is_executable_setup_eligible(
                 score_floor -= 0.60
                 rr_floor -= 0.02
 
+        # Ver13 Setup Matrix -> optimizer bridge. These per family/session adjustments
+        # are generated by scheduled weekly review or daily severe-loser safety review.
+        try:
+            if combo_override:
+                score_floor += float(combo_override.get('quality_add', 0.0) or 0.0)
+                conf_floor += int(round(float(combo_override.get('conf_add', 0) or 0)))
+                rr_floor += float(combo_override.get('rr_add', 0.0) or 0.0)
+        except Exception:
+            pass
+
         score_floor = float(clamp(score_floor, 58.0 if active_profile.startswith('GLOBAL_') else 60.0, 92.0))
         conf_floor = int(max(68 if active_profile.startswith('GLOBAL_') else 69, min(95, conf_floor)))
         rr_floor = float(clamp(rr_floor, 0.98 if active_profile.startswith('GLOBAL_') else 1.02, 2.30))
@@ -30649,6 +30763,27 @@ def is_executable_setup_eligible(
         final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if entry > 0 and sl > 0 and final_tp > 0 else 0.0
         fut_vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+
+        # Ver13 per-combo hard refinements from Setup Matrix optimizer bridge.
+        # Used mainly after a disabled combo is allowed back for re-testing.
+        try:
+            if combo_override:
+                fam_code_for_override = _setup_combo_compact_family_from_runtime(fam)
+                min_vol_mult = float(combo_override.get('min_volume_mult', 0.0) or 0.0)
+                if min_vol_mult > 0 and fut_vol < float(_setup_min_volume_floor_usd()) * min_vol_mult:
+                    return (False, 'combo_bridge_below_liquidity')
+                if fam_code_for_override != 'F8':
+                    ema_max = float(combo_override.get('ema_max_pct', 0.0) or 0.0)
+                    if ema_max > 0 and pb_dist > ema_max:
+                        return (False, 'combo_bridge_ema_too_far')
+                max_ch15 = float(combo_override.get('max_ch15_abs', 0.0) or 0.0)
+                if max_ch15 > 0 and ch15_abs > max_ch15:
+                    return (False, 'combo_bridge_15m_too_extended')
+                max_ch1 = float(combo_override.get('max_ch1_abs', 0.0) or 0.0)
+                if max_ch1 > 0 and ch1_abs > max_ch1:
+                    return (False, 'combo_bridge_1h_too_extended')
+        except Exception:
+            pass
 
         # FIX5: low-flow executable bridge. If the scan is producing valid current-market setups
         # but the normal production gates are still too tight, allow clean A/C candidates into
@@ -34152,7 +34287,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; shows Symbol, Type, Conf, Family, Result",
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall family summary with start/end/duration, avg setups/day, and Family/Setups/TP/SL/OPEN/WR",
-    "setup_matrix": "DB-backed family/session edge matrix. Usage: /setup_matrix 24 = daily diagnostic; /setup_matrix 168 = weekly report; /setup_matrix policy = current scheduled weekly policy. Weekly policy updates Sunday 23:00 Melbourne; daily 10:00 safety can temporarily disable severe losers.",
+    "setup_matrix": "DB-backed family/session edge matrix; scheduled weekly/daily safety decisions now feed runtime optimizer gates. Usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy",
     "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
@@ -34177,14 +34312,14 @@ ADMIN_HELP_DESCRIPTIONS = {
     "params_set": "Update one strategy parameter",
     "params_reset": "Reset strategy parameters to defaults",
     "optimize": "Manual optimizer entrypoint (intentionally informational)",
-    "optimize_report": "Show last saved optimization report",
+    "optimize_report": "Show concise optimization report, including Setup Matrix → runtime-gate changes; use /optimize_report raw for JSON",
     "self_optimize": "Explain autonomous optimizer mode",
     "self_optimize_stop": "Explain why manual stop is disabled",
     "self_optimize_report": "Show latest autonomous optimization result",
     "autopilot_report": "Alias of /self_optimize_report with multi-window autopilot details",
     "autopilot_status": "Alias of /learning_status",
     "adaptive_status": "Show daily market-adaptive 30d optimizer status, bootstrap state, and latest auto-applied actions",
-    "adaptive_run": "Run the market-adaptive 30d optimizer now (admin check / bootstrap trigger)",
+    "adaptive_run": "Run market-adaptive optimizer now; it now coexists with Setup Matrix family/session policy bridge",
     "universe_backtest": "Run 7d/30d universe backtest with daily + session summary",
     "goal_status": "Show goal-profile optimizer targets, current execution profile, and latest results",
     "goal_run": "Run bounded goal-profile optimizer now against 7d and 30d universe backtests",
@@ -34225,7 +34360,7 @@ def build_help_text_admin() -> str:
         "🛠 PulseFutures — Admin Command Guide",
         "",
         "Note: quick snapshot commands are cached so normal commands stay instant. Heavy run/diagnostic commands are grouped separately below.",
-        "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current scheduled policy). Weekly policy updates Sunday 23:00 Melbourne; daily 10:00 safety can temporarily disable severe losers.",
+        "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current scheduled policy). Scheduled weekly and daily safety reviews now feed /optimize_report via the runtime-gate bridge.",
         "AutoTrade matrix examples: /autoytrade_report_overall 24 (daily), /autoytrade_report_overall 168 (weekly).",
     ]
 
@@ -38933,6 +39068,183 @@ def _setup_combo_daily_safety_reason(row: dict) -> str:
         return ''
 
 
+
+def _setup_combo_compact_family_from_runtime(family_value: str) -> str:
+    try:
+        fam = str(family_value or '').upper().strip()
+        if re.fullmatch(r'F\d+', fam):
+            return fam
+        try:
+            code = _setup_family_id_to_code(fam)
+            if code:
+                return str(code).upper().strip()
+        except Exception:
+            pass
+        if 'PULLBACK' in fam:
+            return 'F1'
+        if 'MOMENTUM' in fam:
+            return 'F2'
+        if 'IMPULSE' in fam:
+            return 'F3'
+        if 'SWEEP' in fam:
+            return 'F4'
+        if 'ORB' in fam:
+            return 'F5'
+        if 'VWAP' in fam:
+            return 'F6'
+        if 'EXHAUSTION' in fam:
+            return 'F7'
+        if 'BIG' in fam or fam == str(globals().get('BIGMOVE_FAMILY_ID', '')).upper().strip():
+            return 'F8'
+        return fam or 'F0'
+    except Exception:
+        return 'F0'
+
+
+def _setup_combo_exec_override(cfg: dict | None, family_value: str, session_name: str) -> dict:
+    try:
+        cfg = cfg or load_strategy_config(force=False)
+        fam = _setup_combo_compact_family_from_runtime(str(family_value or ''))
+        sess = str(session_name or '').upper().strip()
+        combo = f'{fam}-{sess}'
+        overrides = dict((cfg or {}).get('family_session_exec_overrides') or {})
+        raw = overrides.get(combo) or overrides.get(combo.upper()) or {}
+        if not isinstance(raw, dict):
+            return {}
+        exp = float(raw.get('expires_ts') or 0.0)
+        if exp > 0 and exp <= float(time.time()):
+            return {}
+        return dict(raw)
+    except Exception:
+        return {}
+
+
+def _setup_combo_bridge_action_for_row(row: dict, policy_kind: str, window_hours: int) -> dict | None:
+    try:
+        r = dict(row or {})
+        combo = str(r.get('combo') or f"{r.get('family','')}-{r.get('session','')}").upper().strip()
+        fam = str(r.get('family') or combo.split('-', 1)[0]).upper().strip()
+        sess = str(r.get('session') or (combo.split('-', 1)[1] if '-' in combo else '')).upper().strip()
+        action = str(r.get('action') or 'WATCH').upper().strip()
+        decided = int(r.get('decided') or 0)
+        tp = int(r.get('tp') or 0)
+        sl = int(r.get('sl') or 0)
+        wr = float(r.get('win_rate') or 0.0)
+        avg_r = float(r.get('avg_r') or 0.0)
+        score = float(r.get('score') or 0.0)
+        if not fam or not sess or '-' not in combo:
+            return None
+        min_decided = max(1, int(globals().get('SETUP_COMBO_BRIDGE_MIN_DECIDED', 4) or 4))
+        daily = str(policy_kind or '').lower().strip() == 'daily_safety'
+        if decided < min_decided:
+            return None
+        mode = ''
+        if action == 'DISABLE' or (daily and wr <= float(SETUP_COMBO_DAILY_SAFETY_WR_MAX) and avg_r <= float(SETUP_COMBO_DAILY_SAFETY_AVGR_MAX)):
+            mode = 'tighten'
+            severity = 0.0
+            severity += max(0.0, (45.0 - wr) / 45.0)
+            severity += max(0.0, (-0.10 - avg_r) / 0.90)
+            if sl > tp:
+                severity += min(0.60, (sl - tp) / max(1.0, decided) * 1.5)
+            severity = max(0.20, min(1.00, severity))
+            q_add = round(min(float(SETUP_COMBO_BRIDGE_MAX_QUALITY_ADD), 1.10 + 2.40 * severity), 2)
+            conf_add = int(min(int(SETUP_COMBO_BRIDGE_MAX_CONF_ADD), 1 + round(3 * severity)))
+            rr_add = round(min(float(SETUP_COMBO_BRIDGE_MAX_RR_ADD), 0.05 + 0.13 * severity), 3)
+            ema_max = round(max(0.62, 0.98 - 0.20 * severity), 3)
+            max_ch15 = round(max(0.70, 1.05 - 0.22 * severity), 3)
+            max_ch1 = round(max(1.18, 1.85 - 0.30 * severity), 3)
+            liq_mult = round(1.03 + 0.08 * severity, 3)
+        elif (not daily) and action == 'KEEP' and wr >= 55.0 and avg_r >= 0.05:
+            mode = 'preserve'
+            q_add, conf_add, rr_add, ema_max, max_ch15, max_ch1, liq_mult = -0.25, 0, -0.015, 0.0, 0.0, 0.0, 1.00
+        elif (not daily) and action == 'WATCH' and wr >= 50.0 and avg_r >= 0.0 and sl <= max(tp + 1, tp * 2):
+            mode = 'relax'
+            q_add, conf_add, rr_add, ema_max, max_ch15, max_ch1, liq_mult = -0.35, 0, -0.020, 0.0, 0.0, 0.0, 1.00
+        else:
+            return None
+        return {
+            'combo': combo, 'family': fam, 'session': sess, 'mode': mode,
+            'source_action': action, 'decided': decided, 'tp': tp, 'sl': sl,
+            'wr': wr, 'avg_r': avg_r, 'score': score,
+            'quality_add': float(q_add), 'conf_add': int(conf_add), 'rr_add': float(rr_add),
+            'ema_max_pct': float(ema_max), 'max_ch15_abs': float(max_ch15), 'max_ch1_abs': float(max_ch1),
+            'min_volume_mult': float(liq_mult),
+        }
+    except Exception:
+        return None
+
+
+def _setup_combo_apply_adaptive_parameter_bridge(uid: int, rows: list[dict], policy_kind: str, window_hours: int, run_id: str) -> dict:
+    report = {'ok': False, 'applied_ts': float(time.time()), 'run_id': str(run_id or ''), 'policy_kind': str(policy_kind or 'manual'), 'window_hours': int(window_hours or 0), 'rows_reviewed': len(rows or []), 'actions': [], 'reason': ''}
+    try:
+        if not bool(globals().get('SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED', True)):
+            report['reason'] = 'bridge_disabled'
+            _save_setup_policy_bridge_opt_report(report)
+            return report
+        daily = str(policy_kind or '').lower().strip() == 'daily_safety'
+        cfg = load_strategy_config(force=True)
+        overrides = dict((cfg or {}).get('family_session_exec_overrides') or {})
+        now_ts = float(time.time())
+        try:
+            next_weekly_ts = float(_setup_combo_next_policy_review_dt(now_ts).astimezone(timezone.utc).timestamp())
+        except Exception:
+            next_weekly_ts = now_ts + 7 * 86400
+        expires_ts = next_weekly_ts if daily else now_ts + float(SETUP_COMBO_POLICY_EXPIRY_HOURS or 168.0) * 3600.0
+        actions = []
+        for row in list(rows or []):
+            act = _setup_combo_bridge_action_for_row(row, policy_kind=policy_kind, window_hours=int(window_hours or 0))
+            if not act:
+                continue
+            if daily and str(act.get('mode') or '') != 'tighten' and bool(globals().get('SETUP_COMBO_BRIDGE_DAILY_ONLY_TIGHTEN', True)):
+                continue
+            combo = str(act.get('combo') or '').upper().strip()
+            if not combo:
+                continue
+            act.update({'updated_ts': now_ts, 'expires_ts': expires_ts, 'policy_kind': str(policy_kind or 'manual'), 'run_id': str(run_id or '')})
+            overrides[combo] = act
+            actions.append(act)
+        cleaned = {}
+        for k, v in overrides.items():
+            try:
+                exp = float((v or {}).get('expires_ts') or 0.0)
+                if exp > 0 and exp <= now_ts:
+                    continue
+            except Exception:
+                pass
+            cleaned[str(k).upper().strip()] = v
+        cfg['family_session_exec_overrides'] = cleaned
+        cfg['setup_combo_adaptive_bridge_enabled'] = True
+        cfg['setup_combo_adaptive_bridge_last_run_id'] = str(run_id or '')
+        cfg['setup_combo_adaptive_bridge_last_policy_kind'] = str(policy_kind or 'manual')
+        cfg['setup_combo_adaptive_bridge_last_ts'] = now_ts
+        cfg['goal_profile_uses_setup_matrix_policy'] = True
+        cfg['market_adaptive_uses_setup_matrix_policy'] = True
+        cfg['optimizer_uses_setup_matrix_policy'] = True
+        save_strategy_config(cfg)
+        apply_strategy_config(cfg)
+        report.update({
+            'ok': True,
+            'actions': actions,
+            'overrides_active': len(cleaned),
+            'expires_ts': expires_ts,
+            'notes': 'Runtime-only bridge: changes StrategyConfig gates; no source-code self-rewrite. DISABLE rows are re-tested later under stricter family/session criteria after policy expiry.',
+        })
+        _save_setup_policy_bridge_opt_report(report)
+        try:
+            logger.warning('setup_combo_adaptive_bridge_applied run_id=%s kind=%s actions=%s', run_id, policy_kind, len(actions))
+        except Exception:
+            pass
+        return report
+    except Exception as exc:
+        report.update({'ok': False, 'reason': f'{type(exc).__name__}: {exc}'})
+        _save_setup_policy_bridge_opt_report(report)
+        try:
+            logger.warning('setup_combo_adaptive_bridge_failed: %s: %s', type(exc).__name__, exc)
+        except Exception:
+            pass
+        return report
+
+
 def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
     """Run the daily 10:00 safety review.
 
@@ -38979,7 +39291,14 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
                             (int(pol_uid), fam, sess, 'DISABLE', 0, float(r.get('score') or 0.0), float(r.get('win_rate') or 0.0), float(r.get('avg_r') or 0.0), int(r.get('setups') or 0), int(r.get('decided') or 0), run_id, now_ts, str(reason)[:500], 'daily_safety', now_ts, expires_ts, policy_tz))
                 conn.commit()
             _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
-        out.update({'ok': True, 'disabled': [str((r or {}).get('combo') or '') for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'reason': 'ok'})
+        bridge_report = {}
+        try:
+            if disabled and bool(globals().get('SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED', True)):
+                bridge_rows = [dict(r or {}) for r, _reason in disabled]
+                bridge_report = _setup_combo_apply_adaptive_parameter_bridge(int(uid), bridge_rows, 'daily_safety', int(hours), str(run_id))
+        except Exception:
+            bridge_report = {}
+        out.update({'ok': True, 'disabled': [str((r or {}).get('combo') or '') for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'bridge_report': bridge_report, 'reason': 'ok'})
         try:
             logger.warning('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
         except Exception:
@@ -39234,7 +39553,13 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
                 logger.warning('setup_combo_matrix_persist_failed: %s: %s', type(exc).__name__, exc)
             except Exception:
                 pass
-    return {'run_id': run_id, 'rows': out_rows, 'source_rows': len(rows), 'window_hours': hours, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_updated': bool(policy_updated), 'policy_update_allowed': bool(allow_policy_update), 'policy_kind': str(policy_kind or 'manual'), 'last_policy': _setup_combo_latest_policy_update_info(int(uid))}
+    bridge_report = {}
+    try:
+        if bool(policy_updated) and bool(globals().get('SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED', True)):
+            bridge_report = _setup_combo_apply_adaptive_parameter_bridge(int(uid), list(out_rows), str(policy_kind or 'scheduled'), int(hours), str(run_id))
+    except Exception:
+        bridge_report = {}
+    return {'run_id': run_id, 'rows': out_rows, 'source_rows': len(rows), 'window_hours': hours, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_updated': bool(policy_updated), 'policy_update_allowed': bool(allow_policy_update), 'policy_kind': str(policy_kind or 'manual'), 'bridge_report': bridge_report, 'last_policy': _setup_combo_latest_policy_update_info(int(uid))}
 
 
 def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False) -> str:
