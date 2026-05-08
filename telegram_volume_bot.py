@@ -39291,10 +39291,13 @@ def _setup_combo_apply_adaptive_parameter_bridge(uid: int, rows: list[dict], pol
             'notes': 'Runtime-only bridge: changes StrategyConfig gates; no source-code self-rewrite. DISABLE rows are re-tested later under stricter family/session criteria after policy expiry.',
         })
         _save_setup_policy_bridge_opt_report(report)
-        try:
-            logger.info('setup_combo_adaptive_bridge_applied run_id=%s kind=%s actions=%s', run_id, policy_kind, len(actions))
-        except Exception:
-            pass
+        # Keep Render logs quiet: successful setup-matrix → optimizer bridge sync
+        # is normal operational noise and is visible via /optimize_report instead.
+        if env_bool('PULSE_VERBOSE_POLICY_LOGS', False):
+            try:
+                logger.debug('setup_combo_adaptive_bridge_applied run_id=%s kind=%s actions=%s', run_id, policy_kind, len(actions))
+            except Exception:
+                pass
         return report
     except Exception as exc:
         report.update({'ok': False, 'reason': f'{type(exc).__name__}: {exc}'})
