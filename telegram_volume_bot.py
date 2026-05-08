@@ -7207,11 +7207,11 @@ def _autotrade_log_symbol_block(uid: int, symbol: str, side: str, reason: str, e
         key = f"autotrade_block:{int(uid)}:{sym}:{sd}:{reason_s}:{str(extra or '')[:80]}"
         # Same-symbol external/manual conflicts are expected safety blocks when
         # you already have a manual/external Bybit position. They are not bot
-        # errors, so keep them out of Render WARNING noise.
+        # errors, so do not write them to Render logs at INFO/WARNING level.
+        # They remain visible in Telegram diagnostics/last decision output.
         if reason_s.startswith('blocked_manual_same_symbol_position'):
-            _log_info_throttled(key, 3600.0, msg)
-        else:
-            _log_warning_throttled(key, 90.0, msg)
+            return
+        _log_warning_throttled(key, 90.0, msg)
     except Exception:
         pass
 
