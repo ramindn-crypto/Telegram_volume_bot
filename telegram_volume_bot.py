@@ -2156,7 +2156,7 @@ def _optimize_report_human_text(rep: dict) -> str:
         relax = [a for a in actions if str(a.get('mode') or '').lower() in {'relax', 'preserve'}]
         lines.extend([
             "Setup Matrix → optimizer bridge: ON",
-            f"Applied: {ts_txt} | Source: {bridge.get('policy_kind','-')} | Run: {bridge.get('run_id','-')} | Window: {bridge.get('window_hours','-')}h",
+            f"Applied: {ts_txt} | Source: {bridge.get('policy_kind','-')} | Sync: {bridge.get('sync_source','setup_matrix')} | Run: {bridge.get('run_id','-')} | Window: {bridge.get('window_hours','-')}h",
             f"Rows reviewed: {bridge.get('rows_reviewed',0)} | Changes applied: {len(actions)} | Tightened: {len(tighten)} | Relaxed/preserved: {len(relax)}",
         ])
         if bridge.get('reason'):
@@ -23184,6 +23184,10 @@ async def cmd_optimize_report(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_admin_user(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
         return
+    try:
+        await to_thread_heavy(_setup_combo_sync_active_policy_bridge, int(AUTOTRADE_OWNER_UID or update.effective_user.id), [], 'OPT-SYNC-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S'), int(SETUP_COMBO_REVIEW_WINDOW_HOURS), 'optimize_report', timeout=90)
+    except Exception:
+        pass
     rep = load_opt_report()
     if not rep:
         await update.message.reply_text("No optimize report saved yet. The next weekly/daily setup policy bridge or background optimizer run will create it.")
@@ -39061,6 +39065,10 @@ def _setup_combo_seed_interim_disable_policy() -> None:
                 if not already_active:
                     break
             if already_active:
+                try:
+                    _setup_combo_sync_active_policy_bridge(int(owner_uid or 0), [], 'SCM-INTERIM-SYNC-' + datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime('%Y%m%d%H%M%S'), int(SETUP_COMBO_REVIEW_WINDOW_HOURS), 'interim')
+                except Exception:
+                    pass
                 return
 
             run_id = 'SCM-INTERIM-' + datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime('%Y%m%d%H%M%S')
@@ -39074,6 +39082,10 @@ def _setup_combo_seed_interim_disable_policy() -> None:
                          'interim', expires_ts, expires_ts, policy_tz))
             conn.commit()
         _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
+        try:
+            _setup_combo_sync_active_policy_bridge(int(owner_uid or 0), [], run_id, int(SETUP_COMBO_REVIEW_WINDOW_HOURS), 'interim')
+        except Exception:
+            pass
         try:
             logger.info('setup_combo_interim_disable_policy_seeded combos=%s expires=%s', ','.join(combos), _setup_combo_format_policy_ts(expires_ts))
         except Exception:
@@ -39280,7 +39292,7 @@ def _setup_combo_apply_adaptive_parameter_bridge(uid: int, rows: list[dict], pol
         })
         _save_setup_policy_bridge_opt_report(report)
         try:
-            logger.warning('setup_combo_adaptive_bridge_applied run_id=%s kind=%s actions=%s', run_id, policy_kind, len(actions))
+            logger.info('setup_combo_adaptive_bridge_applied run_id=%s kind=%s actions=%s', run_id, policy_kind, len(actions))
         except Exception:
             pass
         return report
@@ -39349,7 +39361,7 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
             bridge_report = {}
         out.update({'ok': True, 'disabled': [str((r or {}).get('combo') or '') for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'bridge_report': bridge_report, 'reason': 'ok'})
         try:
-            logger.warning('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
+            logger.info('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
         except Exception:
             pass
         return out
@@ -39481,6 +39493,171 @@ def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_
         return True
 
 
+
+def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
+    """Return the current enforceable policy rows by combo.
+
+    This is the single policy state used by /setup_matrix display, live executable
+    blocking, and the Setup Matrix -> optimizer bridge. Manual matrix rows remain
+    advisory; this lookup only returns scheduled/interim/daily-safety/emergency rows
+    that have not expired.
+    """
+    out = {}
+    try:
+        rows = _setup_combo_policy_cache_rows(force=True)
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        ids = []
+        if int(uid or 0) > 0:
+            ids.append(int(uid))
+        if owner_uid > 0 and owner_uid not in ids:
+            ids.append(owner_uid)
+        ids.append(0)
+        for (_uid, fam, sess), pol in rows.items():
+            try:
+                if int(_uid) not in ids:
+                    continue
+                if not _setup_combo_policy_valid_for_enforcement(pol):
+                    continue
+                combo = f"{str(fam).upper().strip()}-{str(sess).upper().strip()}"
+                # Prefer owner/user policy over global when both exist.
+                old = out.get(combo)
+                if old is None or (int(_uid or 0) != 0 and int(old.get('user_id') or 0) == 0):
+                    out[combo] = dict(pol or {})
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+
+def _setup_combo_enrich_rows_with_active_policy(uid: int, rows: list[dict]) -> list[dict]:
+    """Overlay active policy state onto advisory matrix rows.
+
+    The advisory action answers: what this window would recommend.
+    The effective action answers: what the bot is actually enforcing now.
+    """
+    try:
+        policy_by_combo = _setup_combo_enforceable_policy_lookup(int(uid or 0))
+        enriched = []
+        for raw in list(rows or []):
+            r = dict(raw or {})
+            combo = str(r.get('combo') or f"{r.get('family','')}-{r.get('session','')}").upper().strip()
+            pol = policy_by_combo.get(combo)
+            advisory = str(r.get('action') or 'WATCH').upper().strip() or 'WATCH'
+            r['advisory_action'] = advisory
+            r['effective_action'] = advisory
+            r['active_policy_kind'] = '-'
+            r['active_policy_expires_txt'] = '-'
+            r['active_policy_enabled'] = int(r.get('enabled_next') or 1)
+            if pol:
+                st = str(pol.get('status') or advisory).upper().strip() or advisory
+                en = int(pol.get('enabled') or 0) == 1
+                if st in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not en:
+                    r['effective_action'] = 'DISABLE'
+                    r['active_policy_enabled'] = 0
+                elif st in {'KEEP', 'WATCH'}:
+                    r['effective_action'] = st
+                    r['active_policy_enabled'] = 1
+                else:
+                    r['effective_action'] = advisory
+                    r['active_policy_enabled'] = 1 if not bool(globals().get('SETUP_COMBO_POLICY_BLOCK_WATCH', False)) else 0
+                r['active_policy_kind'] = str(pol.get('policy_kind') or '-').lower().strip() or '-'
+                r['active_policy_expires_txt'] = _setup_combo_format_policy_ts(pol.get('expires_ts'))
+                r['active_policy_status'] = st
+            else:
+                r['active_policy_status'] = 'ADVISORY'
+            enriched.append(r)
+        return enriched
+    except Exception:
+        return [dict(r or {}) for r in list(rows or [])]
+
+
+def _setup_combo_policy_rows_for_bridge(uid: int, matrix_rows: list[dict] | None = None) -> list[dict]:
+    """Build bridge input from the active policy table, optionally enriched by matrix stats."""
+    out = []
+    try:
+        by_combo = {}
+        for r in list(matrix_rows or []):
+            try:
+                combo = str(r.get('combo') or f"{r.get('family','')}-{r.get('session','')}").upper().strip()
+                if combo:
+                    by_combo[combo] = dict(r or {})
+            except Exception:
+                continue
+        policy_by_combo = _setup_combo_enforceable_policy_lookup(int(uid or 0))
+        min_dec = max(1, int(globals().get('SETUP_COMBO_BRIDGE_MIN_DECIDED', 4) or 4))
+        for combo, pol in sorted(policy_by_combo.items()):
+            try:
+                fam, sess = combo.split('-', 1)
+                base = dict(by_combo.get(combo) or {})
+                status = str(pol.get('status') or base.get('action') or 'WATCH').upper().strip()
+                enabled = int(pol.get('enabled') or 0) == 1
+                action = 'DISABLE' if (status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled) else status
+                decided = int(base.get('decided') or pol.get('last_decided') or 0)
+                tp = int(base.get('tp') or 0)
+                sl = int(base.get('sl') or 0)
+                wr = float(base.get('win_rate') if base.get('win_rate') is not None else (pol.get('last_win_rate') or 0.0))
+                avg_r = float(base.get('avg_r') if base.get('avg_r') is not None else (pol.get('last_avg_r') or 0.0))
+                score = float(base.get('score') if base.get('score') is not None else (pol.get('last_score') or 0.0))
+                setups = int(base.get('setups') or pol.get('last_setups') or decided)
+                # Interim overrides may be seeded with no stored stats. For bridge purposes
+                # still tighten them so /optimize_report and runtime gates reflect live blocks.
+                if action == 'DISABLE' and decided < min_dec:
+                    decided = min_dec
+                    tp = 0
+                    sl = max(sl, min_dec)
+                    wr = min(wr, 0.0)
+                    avg_r = min(avg_r, -1.0)
+                    score = min(score, -80.0)
+                    setups = max(setups, decided)
+                row = {
+                    'family': fam, 'session': sess, 'combo': combo, 'setups': setups,
+                    'decided': decided, 'tp': tp, 'sl': sl, 'nohit': int(base.get('nohit') or 0),
+                    'open': int(base.get('open') or 0), 'win_rate': wr, 'avg_r': avg_r,
+                    'avg_conf': float(base.get('avg_conf') or 0.0), 'avg_quality': float(base.get('avg_quality') or 0.0),
+                    'avg_volume_m': float(base.get('avg_volume_m') or 0.0), 'score': score,
+                    'action': action, 'enabled_next': 0 if action == 'DISABLE' else 1,
+                    'notes': f"active_policy:{str(pol.get('policy_kind') or '-')}",
+                }
+                out.append(row)
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def _setup_combo_sync_active_policy_bridge(uid: int, matrix_rows: list[dict] | None = None, run_id: str = '', window_hours: int = 168, reason: str = 'policy_sync') -> dict:
+    """Synchronize active Setup Matrix policy with StrategyConfig and /optimize_report.
+
+    This is the missing data-flow link: setup audit/matrix -> enforceable policy ->
+    per-family/session runtime gates -> optimize_report. It never creates new blocks;
+    it only mirrors already-enforceable policy rows into optimizer/adaptive config.
+    """
+    try:
+        rows = _setup_combo_policy_rows_for_bridge(int(uid or 0), list(matrix_rows or []))
+        if not rows:
+            return {'ok': True, 'reason': 'no_active_policy_rows', 'actions': []}
+        sync_run_id = str(run_id or '') or ('SCM-POLICY-SYNC-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S'))
+        report = _setup_combo_apply_adaptive_parameter_bridge(
+            int(uid or 0), rows, str(reason or 'policy_sync'), int(window_hours or SETUP_COMBO_REVIEW_WINDOW_HOURS), sync_run_id
+        )
+        try:
+            if isinstance(report, dict):
+                report['sync_source'] = 'active_setup_combo_policy'
+                report['policy_rows_synced'] = len(rows)
+                _save_setup_policy_bridge_opt_report(report)
+        except Exception:
+            pass
+        return report if isinstance(report, dict) else {'ok': False, 'reason': 'bridge_returned_non_dict'}
+    except Exception as exc:
+        rep = {'ok': False, 'reason': f'{type(exc).__name__}: {exc}', 'actions': []}
+        try:
+            _save_setup_policy_bridge_opt_report(rep)
+        except Exception:
+            pass
+        return rep
+
 def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int, str, float]:
     try:
         total = int(st.get('setups') or 0)
@@ -39604,8 +39781,13 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
                 pass
     bridge_report = {}
     try:
-        if bool(policy_updated) and bool(globals().get('SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED', True)):
-            bridge_report = _setup_combo_apply_adaptive_parameter_bridge(int(uid), list(out_rows), str(policy_kind or 'scheduled'), int(hours), str(run_id))
+        if bool(globals().get('SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED', True)):
+            if bool(policy_updated):
+                bridge_report = _setup_combo_apply_adaptive_parameter_bridge(int(uid), list(out_rows), str(policy_kind or 'scheduled'), int(hours), str(run_id))
+            else:
+                # Manual /setup_matrix must not update policy, but it must still show/sync
+                # the active policy into optimizer/adaptive runtime config and /optimize_report.
+                bridge_report = _setup_combo_sync_active_policy_bridge(int(uid), list(out_rows), str(run_id), int(hours), 'matrix_view')
     except Exception:
         bridge_report = {}
     return {'run_id': run_id, 'rows': out_rows, 'source_rows': len(rows), 'window_hours': hours, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_updated': bool(policy_updated), 'policy_update_allowed': bool(allow_policy_update), 'policy_kind': str(policy_kind or 'manual'), 'bridge_report': bridge_report, 'last_policy': _setup_combo_latest_policy_update_info(int(uid))}
@@ -39613,7 +39795,7 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
 
 def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False) -> str:
     res = _setup_combo_matrix_build(int(uid), hours=hours, persist=persist, allow_policy_update=allow_policy_update, policy_kind='manual')
-    rows = list((res or {}).get('rows') or [])
+    rows = _setup_combo_enrich_rows_with_active_policy(int(uid), list((res or {}).get('rows') or []))
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not rows:
         return f"📈 <b>Setup Edge Matrix</b>\n{HDR}\nNo setup combinations found above ${min_vol_m:.0f}M volume for the selected window."
@@ -39627,6 +39809,9 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
     keep_n = sum(1 for r in rows if str(r.get('action') or '').upper() == 'KEEP')
     watch_n = sum(1 for r in rows if str(r.get('action') or '').upper() == 'WATCH')
     off_n = sum(1 for r in rows if str(r.get('action') or '').upper() == 'DISABLE')
+    live_keep_n = sum(1 for r in rows if str(r.get('effective_action') or '').upper() == 'KEEP')
+    live_watch_n = sum(1 for r in rows if str(r.get('effective_action') or '').upper() == 'WATCH')
+    live_off_n = sum(1 for r in rows if str(r.get('effective_action') or '').upper() == 'DISABLE')
     table_rows = []
     for r in rows:
         table_rows.append([
@@ -39634,9 +39819,9 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
             int(r.get('tp') or 0), int(r.get('sl') or 0), int(r.get('open') or 0),
             f"{float(r.get('win_rate') or 0.0):.1f}%", f"{float(r.get('avg_r') or 0.0):+.2f}",
             f"{float(r.get('avg_conf') or 0.0):.0f}", f"{float(r.get('avg_volume_m') or 0.0):.0f}",
-            f"{float(r.get('score') or 0.0):+.1f}", str(r.get('action') or 'WATCH'),
+            f"{float(r.get('score') or 0.0):+.1f}", str(r.get('effective_action') or r.get('action') or 'WATCH'),
         ])
-    table = tabulate(table_rows, headers=['Combo', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'VolM', 'Score', 'Next'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','center'))
+    table = tabulate(table_rows, headers=['Combo', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'VolM', 'Score', 'Policy'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','center'))
     last_pol = dict((res or {}).get('last_policy') or {})
     try:
         next_review_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
@@ -39648,9 +39833,10 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         f"Window: <b>{int(res.get('window_hours') or hours)}h</b> | Run: <b>{html.escape(str(res.get('run_id') or '-'))}</b> | Scores persisted: <b>{'YES' if persist else 'NO'}</b> | Weekly policy updated: <b>{'YES' if bool(res.get('policy_updated')) else 'NO'}</b>",
         f"Policy update time: <b>{html.escape(str(last_pol.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(last_pol.get('kind') or '-'))}</b> | Next scheduled review: <b>{html.escape(str(next_review_txt))}</b>",
         f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | NOHIT: <b>{nh}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b>",
-        f"Recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | Block WATCH=<b>{'ON' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OFF'}</b>",
+        f"Matrix recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b>",
+        f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | Block WATCH=<b>{'ON' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OFF'}</b>",
         f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> (temporary severe-disable only).",
-        "Manual <code>/setup_matrix</code> runs are advisory only; live blocks come from scheduled weekly policy, daily safety, or a temporary interim override.",
+        "Manual <code>/setup_matrix</code> rows are advisory; the <b>Policy</b> column is the currently enforced scheduled/interim/daily-safety state used by executable queue + emails + AutoTrade + optimizer bridge.",
     ]
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -39879,6 +40065,12 @@ def _setup_audit_overall_text(uid: int) -> str:
         weak_txt = ', '.join([f"{r[0]}-{r[1]}" for r in weak_candidates[:5]]) or '-'
     except Exception:
         keep_txt, weak_txt = '-', '-'
+    try:
+        pol_lookup = _setup_combo_enforceable_policy_lookup(int(uid))
+        pol_disabled = sorted([k for k, v in pol_lookup.items() if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') or 0) == 0])
+        pol_txt = ', '.join(pol_disabled[:8]) if pol_disabled else '-'
+    except Exception:
+        pol_txt = '-'
     header = [
         "📊 <b>Setup Audit Overall</b>",
         HDR,
@@ -39887,6 +40079,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         f"Duration: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
         f"Quick read: strongest now = <b>{html.escape(keep_txt)}</b> | weakest now = <b>{html.escape(weak_txt)}</b>.",
+        f"Current live disabled policy combos: <b>{html.escape(pol_txt)}</b>.",
         "For the weekly DB edge review, use <code>/setup_matrix 168</code>. <code>/setup_matrix 24</code> is diagnostic only. Live policy is officially updated by the scheduled Sunday 23:00 Melbourne review; daily 10:00 safety can add temporary severe-disable rows only.",
         "NOHIT = horizon expired with no TP/SL; OPEN = still inside the result horizon.",
     ]
