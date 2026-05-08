@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver11: Added hybrid setup-combo policy: weekly official review + daily 10:00 severe-disable safety review.
 # - Ver06: /autotrade_report now merges raw Bybit close fragments into one row per practical position; added /autoytrade_report_overall family/session matrix; cleanup now removes old Partial TP/SL children before Full TP/SL attach.
 # - FIX25: Big-Move alert emails now generate immediate owner AutoTrade attempts using ATR-capped SL/TP.
 # - Simplified /learning_status, /autotrade_debug, and /autotrade_last outputs.
@@ -894,6 +895,20 @@ SETUP_COMBO_POLICY_REVIEW_MINUTE = int(os.environ.get("SETUP_COMBO_POLICY_REVIEW
 # A DISABLE is not permanent. If a scheduled policy is not renewed, it expires and the
 # combination is allowed again for re-testing/rediscovery.
 SETUP_COMBO_POLICY_EXPIRY_HOURS = float(os.environ.get("SETUP_COMBO_POLICY_EXPIRY_HOURS", "168") or 168)
+# Ver11 hybrid policy governance:
+# - Weekly review (Sunday 23:00 Melbourne) remains the official policy update.
+# - Daily safety review (default 10:00 Melbourne, before ASIA) can only add temporary
+#   DISABLE rows for severe, statistically clear losers. It does not promote/enable combos
+#   and it expires at the next weekly review to avoid overfitting one noisy day.
+SETUP_COMBO_DAILY_SAFETY_ENABLED = env_bool("SETUP_COMBO_DAILY_SAFETY_ENABLED", True)
+SETUP_COMBO_DAILY_SAFETY_HOUR = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_HOUR", "10") or 10)
+SETUP_COMBO_DAILY_SAFETY_MINUTE = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MINUTE", "0") or 0)
+SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS", "24") or 24)
+SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED", "8") or 8)
+SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WR_MAX", "25") or 25)
+SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "-0.40") or -0.40)
+SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "-40") or -40)
+SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "2.0") or 2.0)
 # Ver10 interim policy override: based on 08 May setup_audit_overall/setup_matrix evidence.
 # These combos are blocked only until the next scheduled Sunday 23:00 Melbourne review;
 # after that, the normal weekly scheduler owns the policy again.
@@ -34137,7 +34152,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; shows Symbol, Type, Conf, Family, Result",
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall family summary with start/end/duration, avg setups/day, and Family/Setups/TP/SL/OPEN/WR",
-    "setup_matrix": "DB-backed family/session edge matrix. Usage: /setup_matrix 24 = daily diagnostic; /setup_matrix 168 = weekly report; /setup_matrix policy = current scheduled weekly policy. Live policy updates only Sunday 23:00 Melbourne.",
+    "setup_matrix": "DB-backed family/session edge matrix. Usage: /setup_matrix 24 = daily diagnostic; /setup_matrix 168 = weekly report; /setup_matrix policy = current scheduled weekly policy. Weekly policy updates Sunday 23:00 Melbourne; daily 10:00 safety can temporarily disable severe losers.",
     "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
@@ -34210,7 +34225,7 @@ def build_help_text_admin() -> str:
         "🛠 PulseFutures — Admin Command Guide",
         "",
         "Note: quick snapshot commands are cached so normal commands stay instant. Heavy run/diagnostic commands are grouped separately below.",
-        "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current scheduled policy). Live policy updates only Sunday 23:00 Melbourne.",
+        "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current scheduled policy). Weekly policy updates Sunday 23:00 Melbourne; daily 10:00 safety can temporarily disable severe losers.",
         "AutoTrade matrix examples: /autoytrade_report_overall 24 (daily), /autoytrade_report_overall 168 (weekly).",
     ]
 
@@ -38775,6 +38790,38 @@ def _setup_combo_review_first_delay_sec() -> int:
         return max(120, int(SETUP_COMBO_REVIEW_FIRST_SEC or 3600))
 
 
+def _setup_combo_daily_safety_schedule_text() -> str:
+    try:
+        return f"Daily {int(SETUP_COMBO_DAILY_SAFETY_HOUR):02d}:{int(SETUP_COMBO_DAILY_SAFETY_MINUTE):02d} {str(SETUP_COMBO_POLICY_REVIEW_TZ)}"
+    except Exception:
+        return 'Daily 10:00 Australia/Melbourne'
+
+
+def _setup_combo_next_daily_safety_dt(now_ts: float | None = None) -> datetime:
+    try:
+        tz = _setup_combo_policy_tz()
+        ts = float(now_ts if now_ts is not None else time.time())
+        now_local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz)
+        hr = max(0, min(23, int(SETUP_COMBO_DAILY_SAFETY_HOUR)))
+        mi = max(0, min(59, int(SETUP_COMBO_DAILY_SAFETY_MINUTE)))
+        target = now_local.replace(hour=hr, minute=mi, second=0, microsecond=0)
+        if target <= now_local:
+            target = target + timedelta(days=1)
+        return target
+    except Exception:
+        return datetime.now(timezone.utc) + timedelta(days=1)
+
+
+def _setup_combo_daily_safety_first_delay_sec() -> int:
+    try:
+        target = _setup_combo_next_daily_safety_dt()
+        now = datetime.now(timezone.utc)
+        target_utc = target.astimezone(timezone.utc) if target.tzinfo else target.replace(tzinfo=_setup_combo_policy_tz()).astimezone(timezone.utc)
+        return max(60, int((target_utc - now).total_seconds()))
+    except Exception:
+        return 3600
+
+
 def _setup_combo_format_policy_ts(ts: float | int | str | None) -> str:
     try:
         val = float(ts or 0.0)
@@ -38854,6 +38901,99 @@ def _setup_combo_seed_interim_disable_policy() -> None:
             pass
 
 
+
+def _setup_combo_daily_safety_reason(row: dict) -> str:
+    """Return non-empty reason only for severe daily losers.
+
+    This deliberately uses stricter rules than the weekly matrix so one noisy day cannot
+    overfit the live policy. Daily safety can only DISABLE temporarily; it never promotes.
+    """
+    try:
+        decided = int(row.get('decided') or 0)
+        tp = int(row.get('tp') or 0)
+        sl = int(row.get('sl') or 0)
+        wr = float(row.get('win_rate') or 0.0)
+        avg_r = float(row.get('avg_r') or 0.0)
+        score = float(row.get('score') or 0.0)
+        min_decided = max(1, int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED or 8))
+        if decided < min_decided:
+            return ''
+        # Hard loser: very low WR and clearly negative R.
+        if wr <= float(SETUP_COMBO_DAILY_SAFETY_WR_MAX) and avg_r <= float(SETUP_COMBO_DAILY_SAFETY_AVGR_MAX):
+            return f'daily_safety: WR {wr:.1f}% and AvgR {avg_r:+.2f} with {decided} decided'
+        # SL-heavy loser: enough sample, stop-outs dominate TPs, and the average R is negative.
+        sl_tp_floor = max(2, int(math.ceil(float(tp) * float(SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT or 2.0))))
+        if sl >= sl_tp_floor and wr <= 35.0 and avg_r <= -0.15:
+            return f'daily_safety: SL-heavy ({sl} SL vs {tp} TP), WR {wr:.1f}%, AvgR {avg_r:+.2f}'
+        # Composite extreme negative score safety net.
+        if score <= float(SETUP_COMBO_DAILY_SAFETY_SCORE_MAX) and wr <= 30.0 and sl > tp:
+            return f'daily_safety: score {score:+.1f}, WR {wr:.1f}%, SL {sl} > TP {tp}'
+        return ''
+    except Exception:
+        return ''
+
+
+def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
+    """Run the daily 10:00 safety review.
+
+    It persists the 24h score snapshot, then inserts temporary DISABLE rows only for
+    severe combos. The rows expire at the next Sunday 23:00 weekly review. Existing
+    weekly/interim policies for other combos are not changed.
+    """
+    out = {'ok': False, 'disabled': [], 'rows': 0, 'run_id': '', 'expires_ts': 0.0}
+    try:
+        if not bool(globals().get('SETUP_COMBO_DAILY_SAFETY_ENABLED', True)):
+            out['reason'] = 'daily_safety_disabled'
+            return out
+        uid = int(uid or 0)
+        if uid <= 0:
+            uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        if uid <= 0:
+            out['reason'] = 'no_uid'
+            return out
+        hours = max(1, int(globals().get('SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS', 24) or 24))
+        res = _setup_combo_matrix_build(uid, hours=hours, persist=True, allow_policy_update=False, policy_kind='daily_safety')
+        rows = list((res or {}).get('rows') or [])
+        run_id = str((res or {}).get('run_id') or ('SCM-DAILY-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')))
+        now_ts = float(time.time())
+        expires_ts = float(_setup_combo_next_policy_review_dt(now_ts).astimezone(timezone.utc).timestamp())
+        policy_tz = str(globals().get('SETUP_COMBO_POLICY_REVIEW_TZ', 'Australia/Melbourne') or 'Australia/Melbourne')
+        disabled = []
+        for r in rows:
+            reason = _setup_combo_daily_safety_reason(r)
+            if reason:
+                disabled.append((r, reason))
+        if disabled:
+            _setup_combo_policy_migrate()
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                for r, reason in disabled:
+                    fam = str(r.get('family') or '').upper().strip()
+                    sess = str(r.get('session') or '').upper().strip()
+                    if not fam or not sess:
+                        continue
+                    for pol_uid in list(dict.fromkeys([int(uid), 0])):
+                        cur.execute("""INSERT OR REPLACE INTO setup_combo_policy
+                            (user_id, family, session, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (int(pol_uid), fam, sess, 'DISABLE', 0, float(r.get('score') or 0.0), float(r.get('win_rate') or 0.0), float(r.get('avg_r') or 0.0), int(r.get('setups') or 0), int(r.get('decided') or 0), run_id, now_ts, str(reason)[:500], 'daily_safety', now_ts, expires_ts, policy_tz))
+                conn.commit()
+            _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
+        out.update({'ok': True, 'disabled': [str((r or {}).get('combo') or '') for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'reason': 'ok'})
+        try:
+            logger.warning('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
+        except Exception:
+            pass
+        return out
+    except Exception as exc:
+        out.update({'ok': False, 'reason': f'{type(exc).__name__}: {exc}'})
+        try:
+            logger.warning('setup_combo_daily_safety_failed: %s: %s', type(exc).__name__, exc)
+        except Exception:
+            pass
+        return out
+
+
 def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
     info = {'updated_ts': 0.0, 'text': '-', 'kind': '-', 'scheduled_text': '-', 'expires_text': '-', 'rows': 0, 'scheduled_rows': 0}
     try:
@@ -38873,7 +39013,7 @@ def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
         if not rows:
             return info
         latest = max(rows, key=lambda r: float(r.get('updated_ts') or 0.0))
-        enforceable_rows = [r for r in rows if str(r.get('policy_kind') or '').lower().strip() in {'scheduled', 'interim', 'emergency'}]
+        enforceable_rows = [r for r in rows if str(r.get('policy_kind') or '').lower().strip() in {'scheduled', 'interim', 'emergency', 'daily_safety'}]
         scheduled_rows = [r for r in rows if str(r.get('policy_kind') or '').lower().strip() == 'scheduled']
         latest_enforceable = max(enforceable_rows, key=lambda r: float(r.get('updated_ts') or 0.0)) if enforceable_rows else None
         chosen = latest_enforceable or latest
@@ -38903,7 +39043,7 @@ def _setup_combo_policy_valid_for_enforcement(pol: dict | None) -> bool:
         if not pol:
             return False
         kind = str(pol.get('policy_kind') or 'manual').lower().strip()
-        if kind not in {'scheduled', 'interim', 'emergency'}:
+        if kind not in {'scheduled', 'interim', 'emergency', 'daily_safety'}:
             return False
         expires_ts = float(pol.get('expires_ts') or 0.0)
         if expires_ts > 0 and float(time.time()) > expires_ts:
@@ -39135,7 +39275,8 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         f"Policy update time: <b>{html.escape(str(last_pol.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(last_pol.get('kind') or '-'))}</b> | Next scheduled review: <b>{html.escape(str(next_review_txt))}</b>",
         f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | NOHIT: <b>{nh}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b>",
         f"Recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | Block WATCH=<b>{'ON' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OFF'}</b>",
-        f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Manual <code>/setup_matrix</code> runs are advisory only; live blocks come from scheduled weekly policy or a temporary interim override.",
+        f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> (temporary severe-disable only).",
+        "Manual <code>/setup_matrix</code> runs are advisory only; live blocks come from scheduled weekly policy, daily safety, or a temporary interim override.",
     ]
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -39166,7 +39307,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         table = tabulate(table_rows, headers=['Combo','Exec','Status','Set','Dec','WR','AvgR','Score'], tablefmt='plain')
         info = _setup_combo_latest_policy_update_info(int(uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
-        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nPolicy cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\nLast enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next review: <b>{html.escape(str(next_txt))}</b>\nManual /setup_matrix rows are advisory; scheduled weekly policies and temporary interim overrides are enforceable.\n<pre>{html.escape(table)}</pre>"
+        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nOfficial cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\nDaily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\nLast enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\nManual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, and temporary interim overrides are enforceable.\n<pre>{html.escape(table)}</pre>"
     except Exception as e:
         return f"❌ setup_combo_policy failed: {type(e).__name__}: {html.escape(str(e))}"
 
@@ -39225,6 +39366,40 @@ async def setup_combo_review_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         try:
             db_log_setup_pipeline_event(int(AUTOTRADE_OWNER_UID or 0), stage='setup_combo_review', status='error', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={'error': f'{type(e).__name__}: {e}'})
+        except Exception:
+            pass
+
+
+
+async def setup_combo_daily_safety_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not SETUP_COMBO_DAILY_SAFETY_ENABLED:
+            return
+        uid = int(AUTOTRADE_OWNER_UID or 0)
+        if uid <= 0:
+            try:
+                ids = sorted(list(_admin_ids_all()))
+                uid = int(ids[0]) if ids else 0
+            except Exception:
+                uid = 0
+        if uid <= 0:
+            return
+        res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(uid), timeout=240)
+        try:
+            db_log_setup_pipeline_event(uid, stage='setup_combo_daily_safety', status='ok' if (res or {}).get('ok') else 'skip', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={
+                'window_hours': int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS),
+                'rows': int((res or {}).get('rows') or 0),
+                'disabled': list((res or {}).get('disabled') or []),
+                'expires': _setup_combo_format_policy_ts((res or {}).get('expires_ts')),
+                'reason': str((res or {}).get('reason') or ''),
+                'policy_kind': 'daily_safety',
+                'schedule': _setup_combo_daily_safety_schedule_text(),
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            db_log_setup_pipeline_event(int(AUTOTRADE_OWNER_UID or 0), stage='setup_combo_daily_safety', status='error', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={'error': f'{type(e).__name__}: {e}'})
         except Exception:
             pass
 
@@ -39338,7 +39513,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         f"Duration: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
         f"Quick read: strongest now = <b>{html.escape(keep_txt)}</b> | weakest now = <b>{html.escape(weak_txt)}</b>.",
-        "For the weekly DB edge review, use <code>/setup_matrix 168</code>. <code>/setup_matrix 24</code> is diagnostic only. Live policy is updated only by the scheduled Sunday 23:00 Melbourne review.",
+        "For the weekly DB edge review, use <code>/setup_matrix 168</code>. <code>/setup_matrix 24</code> is diagnostic only. Live policy is officially updated by the scheduled Sunday 23:00 Melbourne review; daily 10:00 safety can add temporary severe-disable rows only.",
         "NOHIT = horizon expired with no TP/SL; OPEN = still inside the result horizon.",
     ]
     table = tabulate(
@@ -48501,6 +48676,19 @@ def main():
                     "max_instances": 1,
                     "coalesce": True,
                     "misfire_grace_time": 3600,
+                },
+            )
+
+        if SETUP_COMBO_DAILY_SAFETY_ENABLED:
+            app.job_queue.run_repeating(
+                setup_combo_daily_safety_job,
+                interval=24 * 3600,
+                first=_setup_combo_daily_safety_first_delay_sec(),
+                name="setup_combo_daily_safety_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 1800,
                 },
             )
 
