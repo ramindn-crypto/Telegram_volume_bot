@@ -40131,9 +40131,9 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
             f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | TP=<b>{tp_n}</b> SL=<b>{sl_n}</b> OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
             f"Live disabled combos now: <b>{html.escape(', '.join(disabled_now) if disabled_now else '-')}</b> | Live WATCH rows: <b>{len(watch_now)}</b>",
             f"Data recommendation from this window: DISABLE=<b>{html.escape(', '.join(rec_disable) if rec_disable else '-')}</b> | TIGHTEN/WATCH=<b>{html.escape(', '.join(rec_tighten) if rec_tighten else '-')}</b>",
-            "Note: Day/hour/regime rows need several days of data before they are reliable. Use 168h/720h for real policy decisions; 24h is diagnostic.",
+            "Note: Day/hour/regime rows need several days of data before they are reliable. Use 168h/720h for real policy decisions; 24h is diagnostic. The strongest table can still be negative; treat it as least-bad unless WR/AvgR and sample size are both good.",
             SEP,
-            _setup_edge_stats_table(by_combo, 'Family + session — best', sort_mode='best', min_setups=1, limit=12),
+            _setup_edge_stats_table(by_combo, 'Family + session — strongest / least-bad', sort_mode='best', min_setups=1, limit=12),
             _setup_edge_stats_table(by_combo, 'Family + session — worst', sort_mode='worst', min_setups=1, limit=12),
             _setup_edge_stats_table(by_symbol, 'Symbols — worst / blocklist candidates', sort_mode='worst', min_setups=1, limit=15),
             _setup_edge_stats_table(by_combo_side, 'Family + session + side', sort_mode='worst', min_setups=1, limit=15),
@@ -40204,10 +40204,20 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
         disabled = ', '.join(list((res or {}).get('disabled') or [])) or '-'
         expires = _setup_combo_format_policy_ts((res or {}).get('expires_ts'))
+        try:
+            active_policy = _setup_combo_enforceable_policy_lookup(int(AUTOTRADE_OWNER_UID or uid))
+            already_disabled = sorted([
+                k for k, v in (active_policy or {}).items()
+                if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') or 0) == 0
+            ])
+        except Exception:
+            already_disabled = []
+        active_disabled_txt = ', '.join(already_disabled) if already_disabled else '-'
         text = (
             f"🛡️ <b>Setup Combo Daily Safety</b>\n{HDR}\n"
             f"Status: <b>{'OK' if (res or {}).get('ok') else 'SKIP/ERROR'}</b> | Run: <b>{html.escape(str((res or {}).get('run_id') or '-'))}</b>\n"
-            f"Rows reviewed: <b>{int((res or {}).get('rows') or 0)}</b> | Disabled now: <b>{html.escape(disabled)}</b> | Expires: <b>{html.escape(expires)}</b>\n"
+            f"Rows reviewed: <b>{int((res or {}).get('rows') or 0)}</b> | Newly disabled by this run: <b>{html.escape(disabled)}</b> | Expires: <b>{html.escape(expires)}</b>\n"
+            f"Currently active disabled combos: <b>{html.escape(active_disabled_txt)}</b>\n"
             f"Reason: <b>{html.escape(str((res or {}).get('reason') or '-'))}</b>"
         )
         await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -41768,34 +41778,49 @@ def _autotrade_report_overall_text_cached(owner: int) -> str:
         return ""
 
     by_session = weighted.get('by_session') or {}
+    weighted_decided = int(weighted.get('decided') or 0)
+    weighted_open = int(weighted.get('open') or 0)
+    weighted_tp = int(weighted.get('tp_only') or 0)
+    weighted_sl = int(weighted.get('losses') or 0)
+    weighted_untracked = max(0, int(weighted_total) - int(weighted_decided) - int(weighted_open))
+    display_open = max(int(weighted_open), int(live_open_count))
+    tracked_display = max(int(weighted_total), int(closed_total) + int(live_open_count))
+    lifecycle_open_mismatch = int(live_open_count) > int(weighted_open)
     lines = [
         "📈 AutoTrade Report (overall)",
         HDR,
-        f"Tracked autotrade rows: {max(weighted_total, closed_total)}",
+        f"Tracked autotrade rows: {tracked_display}",
         f"Closed autotrades: {closed_total} | Current live open positions: {live_open_count}",
         (f"Ignored manual/external live positions: {len(external_live_open)}" if external_live_open else None),
         ("Closed count uses merged Bybit/journal fallback because lifecycle rows are not fully decided yet." if int(perf.get('closed') or 0) <= 0 and int(closed_total or 0) > 0 else None),
+        (f"Lifecycle note: {weighted_untracked} tracked rows are still UNTRACKED/pending outcome sync. Live Bybit open count is used for Open when it is higher than lifecycle OPEN." if (weighted_untracked > 0 or lifecycle_open_mismatch) else None),
     ]
     lines = [str(x) for x in lines if x]
 
     if weighted_total > 0:
         lines.extend([
-            f"Decided: {int(weighted.get('decided') or 0)} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
-            f"TP: {int(weighted.get('tp_only') or 0) + int(weighted.get('alt_target_a_plus') or 0)} | SL: {int(weighted.get('losses') or 0)} | Open: {int(weighted.get('open') or 0)}",
+            f"Decided: {weighted_decided} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
+            f"TP: {weighted_tp} | SL: {weighted_sl} | Open: {display_open} | Untracked: {weighted_untracked}",
             f"Avg staged credit/trade: {float(weighted.get('avg_weighted_credit') or 0.0):.2f}",
         ])
+        if weighted_decided <= 0:
+            lines.append("Outcome status: pending/insufficient close reconciliation; do not use this WR yet. Use /autotrade_report for current live PnL rows.")
     else:
         lines.extend([
             "Weighted lifecycle WR: pending journal/outcome data",
             f"Closed autotrade PnL summary: {int(perf.get('wins') or 0)}W / {int(perf.get('losses') or 0)}L | {float(perf.get('win_rate') or 0.0):.1f}% | Net {float(perf.get('net') or 0.0):+.2f} USDT",
+            f"Open: {display_open}",
         ])
 
     if by_session:
-        lines.extend(["", "Session breakdown:"])
+        lines.extend(["", "Session breakdown (lifecycle rows only):"])
         for sess, item in sorted(by_session.items()):
+            sess_tp = int(item.get('tp_only') or 0)
             lines.append(
-                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP {int(item.get('tp_only') or 0) + int(item.get('alt_target_a_plus') or 0)} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
+                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP {sess_tp} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
             )
+        if lifecycle_open_mismatch:
+            lines.append(f"• LIVE_EXCHANGE: OPEN {int(live_open_count)} — authoritative current Bybit open-position count")
 
     out = "\n".join(lines)
     try:
