@@ -10,6 +10,7 @@
 # - Ver17: BigMove alerts now immediately generate and send matching F8 setup emails; /screen uses setup-email timestamp.
 # - Ver21: Autonomous email/autotrade setup pipeline runs independently from /screen.
 # - Ver14: made interim setup-combo policy seeding idempotent/quiet and downgraded manual-position conflict logs from WARNING to INFO.
+# - Ver17: added deep setup analytics, separated advisory vs live policy in /setup_matrix, added missed policy catch-up, and fixed /autotrade_report_overall open/closed fallback counts.
 # - 07May_v01: throttled autonomous screen sync, added DB-backed family/session edge matrix, and safety-clamped AutoTrade defaults.
 # - 07May_v04: setup generation/email duplicate cooldown reduced to 3 hours.
 # - 07May_v05: flip guard fixed to a flat 3-hour same-symbol opposite-side block.
@@ -910,6 +911,12 @@ SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY
 SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "-0.40") or -0.40)
 SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "-40") or -40)
 SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "2.0") or 2.0)
+# Catch up missed policy reviews after Render restarts/redeploys. Without this, if the
+# service starts after the scheduled Sunday 23:00 or daily 10:00 tick, APScheduler waits
+# for the next cycle and a bad combo can stay live for another day/week.
+SETUP_COMBO_POLICY_CATCHUP_ENABLED = env_bool("SETUP_COMBO_POLICY_CATCHUP_ENABLED", True)
+SETUP_COMBO_DAILY_SAFETY_CATCHUP_MAX_HOURS = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_CATCHUP_MAX_HOURS", "2.5") or 2.5)
+SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS = float(os.environ.get("SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS", "8") or 8)
 # Ver13: link Setup Edge Matrix policy decisions into the optimizer/adaptive runtime config.
 # Scheduled weekly review can promote/tighten/relax family-session runtime gates.
 # Daily safety can only tighten severe losers until the next weekly review.
@@ -923,11 +930,14 @@ SETUP_COMBO_BRIDGE_MAX_CONF_ADD = int(os.environ.get("SETUP_COMBO_BRIDGE_MAX_CON
 # These combos are blocked only until the next scheduled Sunday 23:00 Melbourne review;
 # after that, the normal weekly scheduler owns the policy again.
 SETUP_COMBO_INTERIM_DISABLE_ENABLED = env_bool("SETUP_COMBO_INTERIM_DISABLE_ENABLED", True)
-SETUP_COMBO_INTERIM_DISABLE_UNTIL_LOCAL = os.environ.get("SETUP_COMBO_INTERIM_DISABLE_UNTIL_LOCAL", "2026-05-10 23:00").strip() or "2026-05-10 23:00"
+# Ver17 protective override from the 11 May analysis: F1-NY had the only statistically
+# clear poor edge (16 decided, 5 TP / 11 SL, WR 31.2%, AvgR -0.20). Keep it blocked
+# until the next scheduled Sunday review, unless overridden by environment variable.
+SETUP_COMBO_INTERIM_DISABLE_UNTIL_LOCAL = os.environ.get("SETUP_COMBO_INTERIM_DISABLE_UNTIL_LOCAL", "2026-05-17 23:00").strip() or "2026-05-17 23:00"
 SETUP_COMBO_INTERIM_DISABLE_LIST = tuple(
     x.strip().upper() for x in str(os.environ.get(
         "SETUP_COMBO_INTERIM_DISABLE_LIST",
-        "F1-NY,F3-NY,F3-ASIA,F1-ASIA"
+        "F1-NY"
     ) or "").split(",") if x.strip()
 )
 # Ver03: broad duplicate prevention for setup generation and setup emails.
@@ -33771,7 +33781,7 @@ KNOWN_COMMANDS = sorted(set([
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
-    "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "email_decision", "adaptive_status",
+    "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis", "email_decision", "adaptive_status",
     "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
@@ -34312,8 +34322,9 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; shows Symbol, Type, Conf, Family, Result",
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall family summary with start/end/duration, avg setups/day, and Family/Setups/TP/SL/OPEN/WR",
-    "setup_matrix": "DB-backed family/session edge matrix; scheduled weekly/daily safety decisions now feed runtime optimizer gates. Usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy",
+    "setup_matrix": "DB-backed family/session edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
     "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
+    "setup_deep_analysis": "Deep setup analytics: family/session, symbol, side, Melbourne hour/day, regime buckets. Usage: /setup_deep_analysis 168",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
@@ -34363,7 +34374,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall", "setup_matrix", "setup_edge_matrix"]),
+    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_report", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
@@ -34385,7 +34396,7 @@ def build_help_text_admin() -> str:
         "🛠 PulseFutures — Admin Command Guide",
         "",
         "Note: quick snapshot commands are cached so normal commands stay instant. Heavy run/diagnostic commands are grouped separately below.",
-        "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current scheduled policy). Scheduled weekly and daily safety reviews now feed /optimize_report via the runtime-gate bridge.",
+        "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
         "AutoTrade matrix examples: /autoytrade_report_overall 24 (daily), /autoytrade_report_overall 168 (weekly).",
     ]
 
@@ -38982,6 +38993,62 @@ def _setup_combo_daily_safety_first_delay_sec() -> int:
         return 3600
 
 
+def _setup_combo_previous_policy_review_dt(now_ts: float | None = None) -> datetime:
+    """Most recent scheduled weekly review time in the policy timezone."""
+    try:
+        tz = _setup_combo_policy_tz()
+        ts = float(now_ts if now_ts is not None else time.time())
+        now_local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz)
+        wd = max(0, min(6, int(SETUP_COMBO_POLICY_REVIEW_WEEKDAY)))
+        hr = max(0, min(23, int(SETUP_COMBO_POLICY_REVIEW_HOUR)))
+        mi = max(0, min(59, int(SETUP_COMBO_POLICY_REVIEW_MINUTE)))
+        days_back = (int(now_local.weekday()) - wd) % 7
+        target = (now_local - timedelta(days=days_back)).replace(hour=hr, minute=mi, second=0, microsecond=0)
+        if target > now_local:
+            target = target - timedelta(days=7)
+        return target
+    except Exception:
+        return datetime.now(timezone.utc) - timedelta(days=7)
+
+
+def _setup_combo_previous_daily_safety_dt(now_ts: float | None = None) -> datetime:
+    """Most recent scheduled daily safety time in the policy timezone."""
+    try:
+        tz = _setup_combo_policy_tz()
+        ts = float(now_ts if now_ts is not None else time.time())
+        now_local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz)
+        hr = max(0, min(23, int(SETUP_COMBO_DAILY_SAFETY_HOUR)))
+        mi = max(0, min(59, int(SETUP_COMBO_DAILY_SAFETY_MINUTE)))
+        target = now_local.replace(hour=hr, minute=mi, second=0, microsecond=0)
+        if target > now_local:
+            target = target - timedelta(days=1)
+        return target
+    except Exception:
+        return datetime.now(timezone.utc) - timedelta(days=1)
+
+
+def _setup_combo_policy_kind_updated_since(uid: int, policy_kind: str, since_ts: float) -> bool:
+    try:
+        _setup_combo_policy_migrate()
+        ids = []
+        if int(uid or 0) > 0:
+            ids.append(int(uid))
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        if owner_uid > 0 and owner_uid not in ids:
+            ids.append(owner_uid)
+        ids.append(0)
+        qmarks = ','.join(['?'] * len(ids))
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            row = cur.execute(
+                f"SELECT COUNT(1) FROM setup_combo_policy WHERE user_id IN ({qmarks}) AND LOWER(policy_kind)=? AND updated_ts>=?",
+                tuple(ids + [str(policy_kind or '').lower().strip(), float(since_ts or 0.0)])
+            ).fetchone()
+        return bool(row and int(row[0] or 0) > 0)
+    except Exception:
+        return False
+
+
 def _setup_combo_format_policy_ts(ts: float | int | str | None) -> str:
     try:
         val = float(ts or 0.0)
@@ -39078,7 +39145,7 @@ def _setup_combo_seed_interim_disable_policy() -> None:
                         (user_id, family, session, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (int(pol_uid), fam, sess, 'DISABLE', 0, 0.0, 0.0, 0.0, 0, 0, run_id, now_ts,
-                         f'Ver10 interim disable until {_setup_combo_format_policy_ts(expires_ts)}; Sunday scheduled review will reassess.',
+                         f'Ver17 protective disable from 11 May edge analysis until {_setup_combo_format_policy_ts(expires_ts)}; Sunday scheduled review will reassess.',
                          'interim', expires_ts, expires_ts, policy_tz))
             conn.commit()
         _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
@@ -39822,9 +39889,12 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
             int(r.get('tp') or 0), int(r.get('sl') or 0), int(r.get('open') or 0),
             f"{float(r.get('win_rate') or 0.0):.1f}%", f"{float(r.get('avg_r') or 0.0):+.2f}",
             f"{float(r.get('avg_conf') or 0.0):.0f}", f"{float(r.get('avg_volume_m') or 0.0):.0f}",
-            f"{float(r.get('score') or 0.0):+.1f}", str(r.get('effective_action') or r.get('action') or 'WATCH'),
+            f"{float(r.get('score') or 0.0):+.1f}",
+            str(r.get('advisory_action') or r.get('action') or 'WATCH'),
+            str(r.get('effective_action') or r.get('action') or 'WATCH'),
+            str(r.get('active_policy_kind') or '-'),
         ])
-    table = tabulate(table_rows, headers=['Combo', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'VolM', 'Score', 'Policy'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','center'))
+    table = tabulate(table_rows, headers=['Combo', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'VolM', 'Score', 'Adv', 'Live', 'Kind'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','center','center','center'))
     last_pol = dict((res or {}).get('last_policy') or {})
     try:
         next_review_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
@@ -39839,9 +39909,244 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         f"Matrix recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b>",
         f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | Block WATCH=<b>{'ON' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OFF'}</b>",
         f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> (temporary severe-disable only).",
-        "Manual <code>/setup_matrix</code> rows are advisory; the <b>Policy</b> column is the currently enforced scheduled/interim/daily-safety state used by executable queue + emails + AutoTrade + optimizer bridge.",
+        "Manual <code>/setup_matrix</code> rows are advisory. <b>Adv</b> is what this selected window recommends; <b>Live</b> is the currently enforced scheduled/interim/daily-safety state used by executable queue + emails + AutoTrade + optimizer bridge.",
     ]
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
+
+
+
+def _setup_edge_extract_regime(row: dict) -> str:
+    """Best-effort market-regime label for setup analytics.
+
+    Uses explicit regime fields when present, then details_json, then a conservative
+    ch4/ch1/ch24 fallback so the analysis still works on older DB rows.
+    """
+    try:
+        r = dict(row or {})
+        keys = (
+            'regime_primary', 'market_regime', 'regime', 'daily_regime', 'session_regime',
+            'trend_regime', 'structure_regime', 'macro_regime'
+        )
+        for k in keys:
+            v = str(r.get(k) or '').upper().strip()
+            if v and v not in {'-', 'NONE', 'N/A', 'UNKNOWN'}:
+                return v[:24]
+        raw = r.get('details_json') or r.get('details') or ''
+        if isinstance(raw, str) and raw.strip().startswith('{'):
+            try:
+                d = json.loads(raw)
+                if isinstance(d, dict):
+                    for k in keys:
+                        v = str(d.get(k) or '').upper().strip()
+                        if v and v not in {'-', 'NONE', 'N/A', 'UNKNOWN'}:
+                            return v[:24]
+            except Exception:
+                pass
+        ch4 = float(r.get('ch4') or 0.0)
+        ch1 = float(r.get('ch1') or 0.0)
+        ch24 = float(r.get('ch24') or 0.0)
+        if abs(ch24) < 1.50 and abs(ch4) < 0.60:
+            return 'SIDEWAYS'
+        if ch4 > 0 and ch1 > 0:
+            return 'BULLISH'
+        if ch4 < 0 and ch1 < 0:
+            return 'BEARISH'
+        if ch24 > 0:
+            return 'BULLISH_MIXED'
+        if ch24 < 0:
+            return 'BEARISH_MIXED'
+        return 'MIXED'
+    except Exception:
+        return 'UNKNOWN'
+
+
+def _setup_edge_stats_add(bucket: dict, key: str, result: str, r_mult: float, conf: float = 0.0, vol_m: float = 0.0) -> None:
+    b = bucket.setdefault(str(key or '-'), {'setups': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'r_sum': 0.0, 'conf_sum': 0.0, 'vol_sum': 0.0})
+    b['setups'] += 1
+    b['conf_sum'] += float(conf or 0.0)
+    b['vol_sum'] += float(vol_m or 0.0)
+    res = str(result or '').upper().strip()
+    if res == 'TP':
+        b['tp'] += 1
+        b['r_sum'] += float(r_mult or 0.0)
+    elif res == 'SL':
+        b['sl'] += 1
+        b['r_sum'] += float(r_mult or 0.0)
+    elif res == 'NOHIT':
+        b['nohit'] += 1
+    else:
+        b['open'] += 1
+
+
+def _setup_edge_stats_rows(stats: dict, *, min_setups: int = 1, sort_mode: str = 'score', limit: int = 12) -> list[list]:
+    rows = []
+    for key, b in (stats or {}).items():
+        setups = int(b.get('setups') or 0)
+        if setups < int(min_setups or 1):
+            continue
+        tp = int(b.get('tp') or 0)
+        sl = int(b.get('sl') or 0)
+        nh = int(b.get('nohit') or 0)
+        op = int(b.get('open') or 0)
+        decided = tp + sl + nh
+        wr = (tp / max(1, decided) * 100.0) if decided else 0.0
+        avg_r = (float(b.get('r_sum') or 0.0) / max(1, decided)) if decided else 0.0
+        avg_conf = float(b.get('conf_sum') or 0.0) / max(1, setups)
+        avg_vol = float(b.get('vol_sum') or 0.0) / max(1, setups)
+        score = (wr - 50.0) + avg_r * 25.0 + min(20, decided) * 0.35 - (op / max(1, setups) * 2.0)
+        rows.append({
+            'key': str(key), 'setups': setups, 'decided': decided, 'tp': tp, 'sl': sl, 'open': op,
+            'wr': wr, 'avg_r': avg_r, 'avg_conf': avg_conf, 'avg_vol': avg_vol, 'score': score,
+        })
+    if sort_mode == 'worst':
+        rows.sort(key=lambda r: (int(r['decided'] <= 0), r['score'], r['wr'], -r['sl'], -r['decided']))
+    elif sort_mode == 'best':
+        rows.sort(key=lambda r: (int(r['decided'] <= 0), -r['score'], -r['wr'], -r['decided']))
+    elif sort_mode == 'volume':
+        rows.sort(key=lambda r: (-r['setups'], r['score']))
+    else:
+        rows.sort(key=lambda r: (-r['score'], -r['wr'], -r['decided']))
+    out = []
+    for r in rows[:max(1, int(limit or 12))]:
+        out.append([
+            r['key'], int(r['setups']), int(r['decided']), int(r['tp']), int(r['sl']), int(r['open']),
+            f"{float(r['wr']):.1f}%", f"{float(r['avg_r']):+.2f}", f"{float(r['avg_conf']):.0f}", f"{float(r['avg_vol']):.0f}", f"{float(r['score']):+.1f}",
+        ])
+    return out
+
+
+def _setup_edge_stats_table(stats: dict, title: str, *, sort_mode: str = 'score', min_setups: int = 1, limit: int = 12) -> str:
+    rows = _setup_edge_stats_rows(stats, min_setups=min_setups, sort_mode=sort_mode, limit=limit)
+    if not rows:
+        return f"{title}\nNo rows."
+    table = tabulate(rows, headers=['Key', 'Set', 'Dec', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'VolM', 'Score'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','right','right'))
+    return f"{title}\n<pre>{html.escape(table)}</pre>"
+
+
+def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
+    """Deep setup analytics: family/session + symbol + day/hour + market regime.
+
+    This is intentionally read-only. It does not change live policy; /setup_matrix safety
+    or the scheduled daily/weekly policy jobs do that.
+    """
+    try:
+        uid = int(uid or 0)
+        hours = max(1, min(8760, int(hours or 168)))
+        result_horizon = _setup_audit_result_horizon_hours()
+        rows = _setup_audit_load_rows(uid, hours=hours, limit=0, dedup=True)
+        min_vol_m = _setup_min_volume_floor_usd() / 1e6
+        if not rows:
+            return f"🧠 <b>Setup Deep Analysis</b>\n{HDR}\nNo unique executable setup rows above ${min_vol_m:.0f}M in the last {hours}h."
+        audit_tf = str(os.environ.get('SETUP_EDGE_DEEP_TIMEFRAME', os.environ.get('SETUP_COMBO_MATRIX_TIMEFRAME', os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', '15m'))) or '15m').strip().lower() or '15m'
+        candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
+        actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(uid, start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+
+        by_combo = {}
+        by_family = {}
+        by_session = {}
+        by_symbol = {}
+        by_side = {}
+        by_hour = {}
+        by_day = {}
+        by_regime = {}
+        by_combo_side = {}
+        first_ts = 0.0
+        last_ts = 0.0
+        evaluated = 0
+        tp_n = sl_n = nohit_n = open_n = 0
+
+        for r in rows:
+            try:
+                ts = float(_setup_audit_row_ts(r) or 0.0)
+                if ts > 0:
+                    first_ts = ts if first_ts <= 0 else min(first_ts, ts)
+                    last_ts = max(last_ts, ts)
+                sid = str(r.get('setup_id') or '').strip()
+                fam = _setup_audit_family_code(r)
+                sess = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+                sym = str(r.get('symbol') or '').upper().strip()
+                if sym.endswith('USDT'):
+                    sym = sym[:-4]
+                side = str(r.get('side') or '').upper().strip() or '-'
+                actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
+                ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=uid, candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
+                result = _setup_audit_result_label(ev.get('result'))
+                if result == 'TP':
+                    tp_n += 1
+                elif result == 'SL':
+                    sl_n += 1
+                elif result == 'NOHIT':
+                    nohit_n += 1
+                else:
+                    open_n += 1
+                r_mult = float(_setup_audit_net_r_for_result(r, result) or 0.0) if result in {'TP', 'SL'} else 0.0
+                conf = float(r.get('conf') or 0.0)
+                vol_m = float(r.get('fut_vol_usd') or 0.0) / 1e6
+                combo = f'{fam}-{sess}'
+                _setup_edge_stats_add(by_combo, combo, result, r_mult, conf, vol_m)
+                _setup_edge_stats_add(by_family, fam, result, r_mult, conf, vol_m)
+                _setup_edge_stats_add(by_session, sess, result, r_mult, conf, vol_m)
+                _setup_edge_stats_add(by_symbol, sym, result, r_mult, conf, vol_m)
+                _setup_edge_stats_add(by_side, side, result, r_mult, conf, vol_m)
+                _setup_edge_stats_add(by_combo_side, f'{combo}-{side}', result, r_mult, conf, vol_m)
+                regime = _setup_edge_extract_regime(r)
+                _setup_edge_stats_add(by_regime, regime, result, r_mult, conf, vol_m)
+                if ts > 0:
+                    dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+                    _setup_edge_stats_add(by_day, dt.strftime('%a'), result, r_mult, conf, vol_m)
+                    _setup_edge_stats_add(by_hour, dt.strftime('%H:00'), result, r_mult, conf, vol_m)
+                evaluated += 1
+            except Exception:
+                continue
+
+        decided = tp_n + sl_n + nohit_n
+        wr = (tp_n / max(1, decided) * 100.0) if decided else 0.0
+        try:
+            start_txt = datetime.fromtimestamp(first_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M') if first_ts else '-'
+            end_txt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M') if last_ts else '-'
+        except Exception:
+            start_txt = end_txt = '-'
+        policy_by_combo = _setup_combo_enforceable_policy_lookup(uid)
+        disabled_now = sorted([k for k, v in policy_by_combo.items() if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') or 0) == 0])
+        watch_now = sorted([k for k, v in policy_by_combo.items() if str((v or {}).get('status') or '').upper() == 'WATCH' and int((v or {}).get('enabled') or 0) == 1])
+        min_dec_weekly = int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY if hours >= 72 else SETUP_COMBO_POLICY_MIN_DECIDED_DAILY)
+        # Recommendations are data-derived from the selected window, separate from live policy.
+        rec_disable = []
+        rec_tighten = []
+        for combo, b in by_combo.items():
+            tp = int(b.get('tp') or 0); sl = int(b.get('sl') or 0); nh = int(b.get('nohit') or 0)
+            dec = tp + sl + nh
+            if dec < max(1, min_dec_weekly):
+                continue
+            wr_i = tp / max(1, dec) * 100.0
+            avg_r_i = float(b.get('r_sum') or 0.0) / max(1, dec)
+            if wr_i < float(SETUP_COMBO_POLICY_DISABLE_WR) or avg_r_i <= float(SETUP_COMBO_POLICY_DISABLE_AVG_R) or (sl >= tp + 2 and dec >= min_dec_weekly):
+                rec_disable.append(combo)
+            elif wr_i < 50.0 or avg_r_i < 0.0:
+                rec_tighten.append(combo)
+        lines = [
+            "🧠 <b>Setup Deep Analysis</b>",
+            HDR,
+            f"Window: <b>{hours}h</b> | Rows evaluated: <b>{evaluated}</b> | Start: <b>{html.escape(start_txt)}</b> | End: <b>{html.escape(end_txt)}</b>",
+            f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | TP=<b>{tp_n}</b> SL=<b>{sl_n}</b> OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
+            f"Live disabled combos now: <b>{html.escape(', '.join(disabled_now) if disabled_now else '-')}</b> | Live WATCH rows: <b>{len(watch_now)}</b>",
+            f"Data recommendation from this window: DISABLE=<b>{html.escape(', '.join(rec_disable) if rec_disable else '-')}</b> | TIGHTEN/WATCH=<b>{html.escape(', '.join(rec_tighten) if rec_tighten else '-')}</b>",
+            "Note: Day/hour/regime rows need several days of data before they are reliable. Use 168h/720h for real policy decisions; 24h is diagnostic.",
+            SEP,
+            _setup_edge_stats_table(by_combo, 'Family + session — best', sort_mode='best', min_setups=1, limit=12),
+            _setup_edge_stats_table(by_combo, 'Family + session — worst', sort_mode='worst', min_setups=1, limit=12),
+            _setup_edge_stats_table(by_symbol, 'Symbols — worst / blocklist candidates', sort_mode='worst', min_setups=1, limit=15),
+            _setup_edge_stats_table(by_combo_side, 'Family + session + side', sort_mode='worst', min_setups=1, limit=15),
+            _setup_edge_stats_table(by_hour, 'Melbourne hour-of-day', sort_mode='worst', min_setups=1, limit=24),
+            _setup_edge_stats_table(by_day, 'Melbourne day-of-week', sort_mode='worst', min_setups=1, limit=7),
+            _setup_edge_stats_table(by_regime, 'Market regime bucket', sort_mode='worst', min_setups=1, limit=12),
+            _setup_edge_stats_table(by_session, 'Session summary', sort_mode='worst', min_setups=1, limit=5),
+            _setup_edge_stats_table(by_family, 'Family summary', sort_mode='worst', min_setups=1, limit=10),
+            _setup_edge_stats_table(by_side, 'Side summary', sort_mode='worst', min_setups=1, limit=5),
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ setup_deep_analysis failed: {type(e).__name__}: {html.escape(str(e))}"
 
 
 def _setup_combo_policy_text(uid: int) -> str:
@@ -39883,6 +40188,28 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
     if args and args[0].lower() in {'policy', 'rules', 'status'}:
         text = await to_thread_heavy(_setup_combo_policy_text, int(AUTOTRADE_OWNER_UID or uid), timeout=60)
+        await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    if args and args[0].lower() in {'deep', 'analysis', 'analytics', 'timing', 'times'}:
+        hours_deep = SETUP_COMBO_REVIEW_WINDOW_HOURS
+        try:
+            if len(args) >= 2 and re.fullmatch(r'\d+(\.\d+)?', args[1]):
+                hours_deep = int(float(args[1]))
+        except Exception:
+            hours_deep = SETUP_COMBO_REVIEW_WINDOW_HOURS
+        text = await to_thread_heavy(_setup_edge_deep_text, int(AUTOTRADE_OWNER_UID or uid), int(hours_deep), timeout=240)
+        await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    if args and args[0].lower() in {'safety', 'daily_safety', 'run_safety'}:
+        res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
+        disabled = ', '.join(list((res or {}).get('disabled') or [])) or '-'
+        expires = _setup_combo_format_policy_ts((res or {}).get('expires_ts'))
+        text = (
+            f"🛡️ <b>Setup Combo Daily Safety</b>\n{HDR}\n"
+            f"Status: <b>{'OK' if (res or {}).get('ok') else 'SKIP/ERROR'}</b> | Run: <b>{html.escape(str((res or {}).get('run_id') or '-'))}</b>\n"
+            f"Rows reviewed: <b>{int((res or {}).get('rows') or 0)}</b> | Disabled now: <b>{html.escape(disabled)}</b> | Expires: <b>{html.escape(expires)}</b>\n"
+            f"Reason: <b>{html.escape(str((res or {}).get('reason') or '-'))}</b>"
+        )
         await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         return
     hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
@@ -39965,6 +40292,100 @@ async def setup_combo_daily_safety_job(context: ContextTypes.DEFAULT_TYPE):
             db_log_setup_pipeline_event(int(AUTOTRADE_OWNER_UID or 0), stage='setup_combo_daily_safety', status='error', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={'error': f'{type(e).__name__}: {e}'})
         except Exception:
             pass
+
+
+
+
+async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
+    """One-shot startup catch-up for missed weekly/daily setup-combo policy reviews."""
+    try:
+        if not bool(globals().get('SETUP_COMBO_POLICY_CATCHUP_ENABLED', True)):
+            return
+        uid = int(AUTOTRADE_OWNER_UID or 0)
+        if uid <= 0:
+            try:
+                ids = sorted(list(_admin_ids_all()))
+                uid = int(ids[0]) if ids else 0
+            except Exception:
+                uid = 0
+        if uid <= 0:
+            return
+        now_ts = float(time.time())
+        # Weekly catch-up only shortly after the missed Sunday 23:00 window.
+        try:
+            prev_weekly = _setup_combo_previous_policy_review_dt(now_ts)
+            prev_weekly_ts = float(prev_weekly.astimezone(timezone.utc).timestamp())
+            age_h = (now_ts - prev_weekly_ts) / 3600.0
+            if bool(SETUP_COMBO_REVIEW_ENABLED) and 0.0 <= age_h <= float(SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS or 8):
+                if not _setup_combo_policy_kind_updated_since(int(uid), 'scheduled', prev_weekly_ts - 300.0):
+                    res = await to_thread_heavy(
+                        _setup_combo_matrix_build,
+                        int(uid),
+                        max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)),
+                        True,
+                        True,
+                        'scheduled',
+                        timeout=240,
+                    )
+                    try:
+                        db_log_setup_pipeline_event(uid, stage='setup_combo_review_catchup', status='ok', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={
+                            'scheduled_for': _setup_combo_format_policy_ts(prev_weekly_ts),
+                            'window_hours': max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)),
+                            'rows': len(list((res or {}).get('rows') or [])),
+                            'policy_updated': bool((res or {}).get('policy_updated')),
+                        })
+                    except Exception:
+                        pass
+        except Exception as e:
+            try:
+                db_log_setup_pipeline_event(uid, stage='setup_combo_review_catchup', status='error', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={'error': f'{type(e).__name__}: {e}'})
+            except Exception:
+                pass
+        # Daily safety catch-up shortly after 10:00 Melbourne. This is intentionally
+        # severe-disable only and expires at the next weekly review.
+        try:
+            prev_daily = _setup_combo_previous_daily_safety_dt(now_ts)
+            prev_daily_ts = float(prev_daily.astimezone(timezone.utc).timestamp())
+            age_h = (now_ts - prev_daily_ts) / 3600.0
+            if bool(SETUP_COMBO_DAILY_SAFETY_ENABLED) and 0.0 <= age_h <= float(SETUP_COMBO_DAILY_SAFETY_CATCHUP_MAX_HOURS or 2.5):
+                if not _setup_combo_policy_kind_updated_since(int(uid), 'daily_safety', prev_daily_ts - 300.0):
+                    res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(uid), timeout=240)
+                    try:
+                        db_log_setup_pipeline_event(uid, stage='setup_combo_daily_safety_catchup', status='ok' if (res or {}).get('ok') else 'skip', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={
+                            'scheduled_for': _setup_combo_format_policy_ts(prev_daily_ts),
+                            'window_hours': int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS),
+                            'rows': int((res or {}).get('rows') or 0),
+                            'disabled': list((res or {}).get('disabled') or []),
+                            'reason': str((res or {}).get('reason') or ''),
+                        })
+                    except Exception:
+                        pass
+        except Exception as e:
+            try:
+                db_log_setup_pipeline_event(uid, stage='setup_combo_daily_safety_catchup', status='error', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={'error': f'{type(e).__name__}: {e}'})
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and re.fullmatch(r'\d+(\.\d+)?', args[0]):
+            hours = int(float(args[0]))
+    except Exception:
+        hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
+    try:
+        text = await to_thread_heavy(_setup_edge_deep_text, int(AUTOTRADE_OWNER_UID or uid), int(hours), timeout=240)
+    except Exception as e:
+        text = f"❌ setup_deep_analysis failed: {type(e).__name__}: {html.escape(str(e))}"
+    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -41323,22 +41744,25 @@ def _autotrade_report_overall_text_cached(owner: int) -> str:
     perf_rows = _autotrade_performance_rows(owner, days=days)
     perf = _autotrade_performance_summary(perf_rows)
     live_open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
-    journal_open = []
     try:
-        journal_open = _autotrade_db_open_trades(owner) or []
+        bot_live_open, external_live_open, _journal_open = _autotrade_collect_live_position_rows(owner, positions=live_open_positions, fallback_unmatched_as_owned=True)
     except Exception:
-        journal_open = []
-    bot_live_open = []
-    external_live_open = []
-    for p in (live_open_positions or []):
-        tr = _autotrade_live_position_owner_trade(owner, p, journal_open=journal_open)
-        if tr:
-            bot_live_open.append((p, tr))
-        else:
-            external_live_open.append(p)
+        bot_live_open, external_live_open = [], list(live_open_positions or [])
     live_open_count = len(bot_live_open or [])
     weighted_total = int(weighted.get('total') or 0)
     closed_total = int(perf.get('closed') or 0)
+    fallback_closed_rows = []
+    try:
+        # The lifecycle/weighted tables can lag or miss Bybit-close fragments during the
+        # single-TP migration. Match /autotrade_report by falling back to merged closed rows
+        # so the overall summary never says 0 closed while the journal shows closed PnL.
+        days_for_rows = max(1, min(30, int(days or 1)))
+        fallback_closed_rows = _autotrade_closed_report_rows(owner, float(time.time()) - float(days_for_rows) * 86400.0, float(time.time()), lookback_h=int(days_for_rows * 24), limit=0) or []
+    except Exception:
+        fallback_closed_rows = []
+    fallback_closed_count = len(_autotrade_merge_position_report_rows([_setup_audit_merge_trade_setup_row(r) for r in fallback_closed_rows])) if fallback_closed_rows else 0
+    if closed_total <= 0 and fallback_closed_count > 0:
+        closed_total = int(fallback_closed_count)
     total_visible = max(weighted_total, closed_total) + int(live_open_count if weighted_total <= 0 else 0)
     if total_visible <= 0 and weighted_total <= 0 and closed_total <= 0:
         return ""
@@ -41350,7 +41774,9 @@ def _autotrade_report_overall_text_cached(owner: int) -> str:
         f"Tracked autotrade rows: {max(weighted_total, closed_total)}",
         f"Closed autotrades: {closed_total} | Current live open positions: {live_open_count}",
         (f"Ignored manual/external live positions: {len(external_live_open)}" if external_live_open else None),
+        ("Closed count uses merged Bybit/journal fallback because lifecycle rows are not fully decided yet." if int(perf.get('closed') or 0) <= 0 and int(closed_total or 0) > 0 else None),
     ]
+    lines = [str(x) for x in lines if x]
 
     if weighted_total > 0:
         lines.extend([
@@ -49126,6 +49552,9 @@ def main():
     app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
     app.add_handler(CommandHandler("setup_matrix", setup_matrix_cmd, block=False))
     app.add_handler(CommandHandler("setup_edge_matrix", setup_matrix_cmd, block=False))
+    app.add_handler(CommandHandler("setup_deep_analysis", setup_deep_analysis_cmd, block=False))
+    app.add_handler(CommandHandler("setup_edge_deep", setup_deep_analysis_cmd, block=False))
+    app.add_handler(CommandHandler("setup_matrix_deep", setup_deep_analysis_cmd, block=False))
 
     app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
@@ -49259,6 +49688,16 @@ def main():
                     "max_instances": 1,
                     "coalesce": True,
                     "misfire_grace_time": 1800,
+                },
+            )
+
+        if SETUP_COMBO_POLICY_CATCHUP_ENABLED and (SETUP_COMBO_REVIEW_ENABLED or SETUP_COMBO_DAILY_SAFETY_ENABLED):
+            app.job_queue.run_once(
+                setup_combo_policy_catchup_job,
+                when=90,
+                name="setup_combo_policy_catchup_job",
+                job_kwargs={
+                    "misfire_grace_time": 900,
                 },
             )
 
