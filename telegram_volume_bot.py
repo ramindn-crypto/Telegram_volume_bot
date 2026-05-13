@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - 14May_ver03: Added dynamic AutoTrade risk scoring/sizing: base risk from /autotrade_config scales 0.50x–1.50x by setup score (family/session/side/symbol/hour/regime/RR/volume/confidence), with daily/open caps still enforced.
 # - Ver11: Added hybrid setup-combo policy: weekly official review + daily 10:00 severe-disable safety review.
 # - Ver06: /autotrade_report now merges raw Bybit close fragments into one row per practical position; added /autoytrade_report_overall family/session matrix; cleanup now removes old Partial TP/SL children before Full TP/SL attach.
 # - FIX25: Big-Move alert emails now generate immediate owner AutoTrade attempts using ATR-capped SL/TP.
@@ -434,6 +435,15 @@ AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
 AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY = 'max_trades_per_day'  # AutoTrade-only daily count cap; independent from /limits maxtrades
 AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY = 'max_entry_drift_pct'
 AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY = 'liq_buffer_pct'
+# Ver03: Dynamic AutoTrade risk scaling. The configured risk remains the base
+# from /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT, then the bot may size
+# weaker setups down and stronger setups up inside this bounded multiplier range.
+AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY = 'dynamic_risk_enabled'
+AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY = 'dynamic_risk_min_mult'
+AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY = 'dynamic_risk_max_mult'
+AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY = 'dynamic_risk_low_score'
+AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY = 'dynamic_risk_base_score'
+AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY = 'dynamic_risk_high_score'
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
@@ -508,6 +518,12 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: int(_autotrade_runtime_max_trades_per_day()),
         AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT),
         AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY: float(AUTOTRADE_LIQ_BUFFER_PCT),
+        AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_RISK_ENABLED', True) else 0,
+        AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '0.50') or 0.50),
+        AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.50') or 1.50),
+        AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', '35') or 35),
+        AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', '60') or 60),
+        AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '85') or 85),
     }
     for k, v in defaults.items():
         try:
@@ -615,6 +631,66 @@ def _autotrade_runtime_isolated() -> bool:
         return bool(AUTOTRADE_ISOLATED)
 
 
+def _autotrade_dynamic_risk_enabled() -> bool:
+    try:
+        raw = _autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 1 if env_bool('AUTOTRADE_DYNAMIC_RISK_ENABLED', True) else 0)
+        return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        return True
+
+
+def _autotrade_dynamic_risk_min_mult() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '0.50')) or 0.50)
+    except Exception:
+        val = 0.50
+    return max(0.10, min(1.00, float(val)))
+
+
+def _autotrade_dynamic_risk_max_mult() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.50')) or 1.50)
+    except Exception:
+        val = 1.50
+    return max(1.00, min(3.00, float(val)))
+
+
+def _autotrade_dynamic_risk_low_score() -> float:
+    try:
+        return float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', '35')) or 35.0)
+    except Exception:
+        return 35.0
+
+
+def _autotrade_dynamic_risk_base_score() -> float:
+    try:
+        return float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', '60')) or 60.0)
+    except Exception:
+        return 60.0
+
+
+def _autotrade_dynamic_risk_high_score() -> float:
+    try:
+        return float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '85')) or 85.0)
+    except Exception:
+        return 85.0
+
+
+def _autotrade_dynamic_risk_bounds() -> tuple[float, float, float, float, float]:
+    min_mult = float(_autotrade_dynamic_risk_min_mult())
+    max_mult = float(_autotrade_dynamic_risk_max_mult())
+    if max_mult < min_mult:
+        max_mult = min_mult
+    low_score = float(_autotrade_dynamic_risk_low_score())
+    base_score = float(_autotrade_dynamic_risk_base_score())
+    high_score = float(_autotrade_dynamic_risk_high_score())
+    if base_score <= low_score:
+        base_score = low_score + 1.0
+    if high_score <= base_score:
+        high_score = base_score + 1.0
+    return min_mult, max_mult, low_score, base_score, high_score
+
+
 def _autotrade_runtime_summary_dict() -> dict:
     mode_txt, daily_val = _autotrade_daily_cap_settings()
     return {
@@ -628,6 +704,12 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_MAX_ENTRY_DRIFT_PCT': float(_autotrade_runtime_max_entry_drift_pct()),
         'AUTOTRADE_LEVERAGE': int(_autotrade_runtime_leverage()),
         'AUTOTRADE_LIQ_BUFFER_PCT': float(_autotrade_runtime_liq_buffer_pct()),
+        'AUTOTRADE_DYNAMIC_RISK_ENABLED': bool(_autotrade_dynamic_risk_enabled()),
+        'AUTOTRADE_DYNAMIC_RISK_MIN_MULT': float(_autotrade_dynamic_risk_min_mult()),
+        'AUTOTRADE_DYNAMIC_RISK_MAX_MULT': float(_autotrade_dynamic_risk_max_mult()),
+        'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE': float(_autotrade_dynamic_risk_low_score()),
+        'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE': float(_autotrade_dynamic_risk_base_score()),
+        'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE': float(_autotrade_dynamic_risk_high_score()),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
     }
 
@@ -7937,32 +8019,306 @@ def _autotrade_clear_debug_state(uid: int | None = None) -> None:
         pass
 
 
-def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd: float, remaining_risk_usd: float, open_risk_usd: float, daily_cap_usd: float) -> tuple[float, float, str]:
-    """Return (effective_risk_usd, multiplier, regime).
+def _autotrade_setup_attr(setup, name: str, default=None):
+    try:
+        if isinstance(setup, dict):
+            return setup.get(name, default)
+        return getattr(setup, name, default)
+    except Exception:
+        return default
 
-    Best approach used here:
-    - /riskmode remains the user-selected base risk
-    - dynamic multiplier scales size up/down based on setup quality
-    - never exceed remaining daily capacity
-    - if the clipped risk becomes too small, block the trade upstream
+
+def _autotrade_setup_float(setup, name: str, default: float = 0.0) -> float:
+    try:
+        v = _autotrade_setup_attr(setup, name, default)
+        f = float(v if v is not None else default)
+        if math.isnan(f) or math.isinf(f):
+            return float(default)
+        return float(f)
+    except Exception:
+        return float(default)
+
+
+def _autotrade_setup_family_code(setup) -> str:
+    try:
+        fam = str(_autotrade_setup_attr(setup, 'family_id', '') or '').upper().strip()
+        if fam:
+            m = re.search(r'F\d+', fam)
+            if m:
+                return m.group(0)
+        eng = str(_autotrade_setup_attr(setup, 'engine', '') or '').upper().strip()
+        aliases = {'A': 'F1', 'B': 'F2', 'C': 'F3', 'ENGINE_A': 'F1', 'ENGINE_B': 'F2', 'ENGINE_C': 'F3'}
+        if eng in aliases:
+            return aliases[eng]
+        m = re.search(r'F\d+', eng)
+        if m:
+            return m.group(0)
+    except Exception:
+        pass
+    return 'F0'
+
+
+def _autotrade_setup_rr(setup) -> float:
+    try:
+        entry = float(_autotrade_setup_attr(setup, 'entry', 0.0) or 0.0)
+        sl = float(_autotrade_setup_attr(setup, 'sl', 0.0) or 0.0)
+        side = str(_autotrade_setup_attr(setup, 'side', '') or '').upper().strip()
+        tp = _resolve_single_tp(
+            entry,
+            sl,
+            _autotrade_setup_attr(setup, 'tp', None),
+            _autotrade_setup_attr(setup, 'alt_target_a', None),
+            _autotrade_setup_attr(setup, 'alt_target_b', None),
+            side,
+        )
+        risk = abs(entry - sl)
+        reward = abs(float(tp or 0.0) - entry)
+        if entry <= 0 or risk <= 0 or reward <= 0:
+            return 0.0
+        return float(reward / risk)
+    except Exception:
+        return 0.0
+
+
+def _autotrade_risk_metric_component(metrics: dict | None, key: str, label: str, max_abs: float, min_decided: int = 2) -> tuple[float, str | None]:
+    try:
+        m = dict((metrics or {}).get(str(key or '').upper().strip()) or {})
+        dec = int(m.get('decided') or 0)
+        if dec < int(min_decided):
+            return 0.0, None
+        wr = float(m.get('wr') or 0.0)
+        avg_r = float(m.get('avg_r') or 0.0)
+        raw = (wr - 50.0) * 0.22 + avg_r * 10.0 + min(12, dec) * 0.25
+        comp = float(_clamp(raw, -abs(float(max_abs)), abs(float(max_abs))))
+        return comp, f"{label}:{wr:.0f}%/{avg_r:+.2f}R/n{dec}={comp:+.1f}"
+    except Exception:
+        return 0.0, None
+
+
+def _autotrade_dynamic_risk_score(uid: int, setup, session_name: str = '', regime: str = 'UNKNOWN') -> dict:
+    """Score one setup for AutoTrade risk sizing.
+
+    The score intentionally combines signal quality and live edge evidence:
+    confidence/quality, family, session, side, symbol, Melbourne hour, RR,
+    liquidity, trend regime and current entry drift. It returns a bounded
+    multiplier that scales the user's configured AutoTrade base risk.
     """
     try:
-        conf = int(getattr(setup, 'conf', 0) or 0)
-        engine = str(getattr(setup, 'engine', '') or '').upper()
-        market_symbol = str(getattr(setup, 'market_symbol', '') or getattr(setup, 'symbol', '') or '')
+        min_mult, max_mult, low_score, base_score, high_score = _autotrade_dynamic_risk_bounds()
+        enabled = bool(_autotrade_dynamic_risk_enabled())
+        if not enabled:
+            return {
+                'enabled': False, 'score': float(base_score), 'multiplier': 1.0,
+                'components': ['dynamic_risk_disabled'], 'bounds': {'min_mult': min_mult, 'max_mult': max_mult, 'low_score': low_score, 'base_score': base_score, 'high_score': high_score},
+            }
 
-        regime = 'UNKNOWN'
+        conf = int(float(_autotrade_setup_attr(setup, 'conf', 0) or 0))
+        q = float(_autotrade_setup_attr(setup, 'quality_score', 0.0) or 0.0)
+        exec_score = float(_autotrade_setup_attr(setup, 'exec_score', 0.0) or 0.0)
+        family_score = float(_autotrade_setup_attr(setup, 'family_score', 0.0) or 0.0)
+        side = str(_autotrade_setup_attr(setup, 'side', '') or '').upper().strip()
+        fam = _autotrade_setup_family_code(setup)
+        sess = str(session_name or _autotrade_setup_attr(setup, 'session', '') or _autotrade_setup_attr(setup, 'source_session', '') or '').upper().strip() or '-'
+        sym = str(_autotrade_setup_attr(setup, 'symbol', '') or _autotrade_setup_attr(setup, 'market_symbol', '') or '').upper().strip()
+        if sym.endswith('USDT'):
+            sym = sym[:-4]
+        created_ts = float(_autotrade_setup_attr(setup, 'executable_ts', 0.0) or _autotrade_setup_attr(setup, 'created_ts', 0.0) or _autotrade_setup_attr(setup, 'signal_created_ts', 0.0) or time.time())
+        hour = datetime.fromtimestamp(created_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%H:00') if created_ts > 0 else '-'
+        reg = str(regime or _autotrade_setup_attr(setup, 'regime_primary', '') or 'UNKNOWN').upper().strip()
+        rr = _autotrade_setup_rr(setup)
+        vol_usd = float(_autotrade_setup_attr(setup, 'fut_vol_usd', 0.0) or 0.0)
+        vol_m = vol_usd / 1_000_000.0 if vol_usd > 0 else 0.0
+        ch1 = float(_autotrade_setup_attr(setup, 'ch1', 0.0) or 0.0)
+        ch4 = float(_autotrade_setup_attr(setup, 'ch4', 0.0) or 0.0)
+        ch15 = float(_autotrade_setup_attr(setup, 'ch15', 0.0) or 0.0)
+
+        score = 50.0
+        components: list[str] = []
+
+        c_comp = float(_clamp((conf - 80.0) * 0.70, -15.0, 16.0))
+        score += c_comp
+        components.append(f"conf{conf}={c_comp:+.1f}")
+
+        if q > 0:
+            q_comp = float(_clamp((q - 70.0) * 0.45, -12.0, 14.0))
+            score += q_comp
+            components.append(f"quality{q:.0f}={q_comp:+.1f}")
+        elif exec_score > 0:
+            e_comp = float(_clamp((exec_score - 70.0) * 0.35, -8.0, 10.0))
+            score += e_comp
+            components.append(f"exec{exec_score:.0f}={e_comp:+.1f}")
+
+        if family_score:
+            fsc_comp = float(_clamp(float(family_score) * 0.08, -6.0, 6.0))
+            score += fsc_comp
+            components.append(f"family_score={fsc_comp:+.1f}")
+
+        if rr > 0:
+            if rr >= 2.0:
+                rr_comp = 8.0
+            elif rr >= 1.55:
+                rr_comp = 5.0
+            elif rr >= 1.35:
+                rr_comp = 1.5
+            elif rr < 1.10:
+                rr_comp = -12.0
+            elif rr < 1.25:
+                rr_comp = -6.0
+            else:
+                rr_comp = -2.0
+            score += rr_comp
+            components.append(f"RR{rr:.2f}={rr_comp:+.1f}")
+
+        if vol_m > 0:
+            if vol_m >= 200:
+                v_comp = 5.0
+            elif vol_m >= 75:
+                v_comp = 3.0
+            elif vol_m >= 25:
+                v_comp = 1.0
+            elif vol_m < 15:
+                v_comp = -8.0
+            elif vol_m < 20:
+                v_comp = -5.0
+            else:
+                v_comp = -1.0
+            score += v_comp
+            components.append(f"vol{vol_m:.0f}M={v_comp:+.1f}")
+
+        # Directional momentum alignment check.
         try:
-            c1 = fetch_ohlcv(market_symbol, "1h", 60)
-            regime = pf_market_regime(c1[-30:] if c1 else c1)
+            if side == 'BUY':
+                agree = sum(1 for x in (ch15, ch1, ch4) if float(x) > 0)
+                oppose = sum(1 for x in (ch15, ch1, ch4) if float(x) < 0)
+            elif side == 'SELL':
+                agree = sum(1 for x in (ch15, ch1, ch4) if float(x) < 0)
+                oppose = sum(1 for x in (ch15, ch1, ch4) if float(x) > 0)
+            else:
+                agree = oppose = 0
+            mom_comp = float(_clamp((agree - oppose) * 2.0, -6.0, 6.0))
+            if mom_comp:
+                score += mom_comp
+                components.append(f"mom_align={mom_comp:+.1f}")
         except Exception:
-            regime = 'UNKNOWN'
+            pass
 
-        mult = float(pf_dynamic_risk_multiplier(conf, regime=regime, engine=engine) or 1.0)
-        # SAFETY: never scale risk ABOVE the user's /riskmode base.
-        mult = min(float(mult), 1.0)
+        # Family/regime nudges. These are small because the edge matrix provides the main evidence.
+        fam_comp = 0.0
+        if fam == 'F8':
+            fam_comp += 5.0 if reg in {'TRENDING', 'EXPANSION', 'VOLATILE'} else -4.0 if reg == 'RANGING' else 2.0
+        elif fam == 'F3':
+            fam_comp += 3.0 if reg in {'TRENDING', 'NORMAL', 'EXPANSION'} else -2.0 if reg == 'VOLATILE' else 1.0
+        elif fam == 'F2':
+            fam_comp += 2.0 if reg in {'TRENDING', 'EXPANSION'} else -5.0 if reg in {'RANGING', 'VOLATILE'} else 0.0
+        elif fam == 'F1':
+            fam_comp += 2.0 if reg in {'RANGING', 'NORMAL'} else -1.0 if reg == 'TRENDING' else 0.0
+        if side == 'SELL':
+            fam_comp += 1.5
+        elif side == 'BUY':
+            fam_comp -= 1.5
+        fam_comp = float(_clamp(fam_comp, -8.0, 8.0))
+        if fam_comp:
+            score += fam_comp
+            components.append(f"{fam}/{reg}/{side}={fam_comp:+.1f}")
+
+        # Live learned edge evidence from the same executable audit lane used by /setup_matrix.
+        data = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+        combo_side = f'{fam}-{sess}-{side}'
+        combo = f'{fam}-{sess}'
+        for metrics_key, key, label, max_abs, min_dec in [
+            ('combo_side_metrics', combo_side, 'combo_side', 22.0, 3),
+            ('combo_metrics', combo, 'combo', 14.0, 3),
+            ('side_metrics', side, 'side', 12.0, 8),
+            ('family_metrics', fam, 'family', 10.0, 6),
+            ('session_metrics', sess, 'session', 8.0, 6),
+            ('symbol_metrics', sym, 'symbol', 10.0, 2),
+            ('hour_metrics', hour, 'hour', 7.0, 3),
+        ]:
+            comp, text = _autotrade_risk_metric_component((data or {}).get(metrics_key) or {}, key, label, max_abs, min_dec)
+            if comp:
+                score += comp
+                if text:
+                    components.append(text)
+
+        # Explicit guard hits are strong de-risk signals. They should normally be blocked
+        # before AutoTrade, but this keeps sizing safe if a stale setup slips through.
+        if combo_side in dict((data or {}).get('combo_side_block') or {}):
+            score -= 30.0
+            components.append(f"guard_combo_side_block={combo_side}:-30")
+        if sym and sym in dict((data or {}).get('symbol_block') or {}):
+            score -= 25.0
+            components.append(f"guard_symbol_block={sym}:-25")
+        if hour in dict((data or {}).get('hour_watch') or {}) and fam in {'F1', 'F2', 'F6'}:
+            score -= 8.0
+            components.append(f"weak_hour_{hour}:{fam}=-8")
+
+        try:
+            det = dict(_LAST_AUTOTRADE_DETAIL.get(int(uid), {}) or {})
+            adverse = float(det.get('entry_drift_adverse_pct') or 0.0)
+            if adverse >= 1.0:
+                score -= 8.0
+                components.append(f"adverse_drift{adverse:.2f}%=-8")
+            elif adverse >= 0.5:
+                score -= 4.0
+                components.append(f"adverse_drift{adverse:.2f}%=-4")
+        except Exception:
+            pass
+
+        unclamped_score = float(score)
+        score = float(_clamp(score, 0.0, 100.0))
+        if score >= base_score:
+            mult = 1.0 + ((score - base_score) / max(1.0, high_score - base_score)) * (max_mult - 1.0)
+        else:
+            mult = 1.0 - ((base_score - score) / max(1.0, base_score - low_score)) * (1.0 - min_mult)
+        mult = float(_clamp(mult, min_mult, max_mult))
+        return {
+            'enabled': True,
+            'score': float(score),
+            'unclamped_score': float(unclamped_score),
+            'multiplier': float(mult),
+            'components': components[:18],
+            'family': fam,
+            'session': sess,
+            'side': side,
+            'symbol': sym,
+            'hour': hour,
+            'regime': reg,
+            'rr': float(rr),
+            'volume_m': float(vol_m),
+            'bounds': {'min_mult': min_mult, 'max_mult': max_mult, 'low_score': low_score, 'base_score': base_score, 'high_score': high_score},
+        }
+    except Exception as exc:
+        min_mult, max_mult, low_score, base_score, high_score = _autotrade_dynamic_risk_bounds()
+        return {
+            'enabled': bool(_autotrade_dynamic_risk_enabled()), 'score': float(base_score), 'multiplier': 1.0,
+            'components': [f'dynamic_risk_error:{type(exc).__name__}'],
+            'bounds': {'min_mult': min_mult, 'max_mult': max_mult, 'low_score': low_score, 'base_score': base_score, 'high_score': high_score},
+        }
+
+
+def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd: float, remaining_risk_usd: float, open_risk_usd: float, daily_cap_usd: float, session_name: str = '') -> tuple[float, float, str]:
+    """Return (effective_risk_usd, multiplier, regime).
+
+    Ver03 dynamic risk model:
+    - /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT remains the base risk.
+    - Each setup receives a composite risk score from confidence, RR, volume,
+      family/session/side/symbol/hour edge, regime and entry drift.
+    - Score maps to a bounded multiplier, default 0.50x..1.50x.
+    - Daily/open caps and post-fill risk controls still cap the final size.
+    """
+    try:
+        market_symbol = str(getattr(setup, 'market_symbol', '') or getattr(setup, 'symbol', '') or '')
+        regime = str(getattr(setup, 'regime_primary', '') or '').upper().strip() or 'UNKNOWN'
+        if regime in {'', '-', 'NONE', 'UNKNOWN'}:
+            try:
+                c1 = fetch_ohlcv(market_symbol, "1h", 60)
+                regime = pf_market_regime(c1[-30:] if c1 else c1)
+            except Exception:
+                regime = 'UNKNOWN'
+
+        score_info = _autotrade_dynamic_risk_score(uid=int(uid or 0), setup=setup, session_name=session_name, regime=regime)
+        mult = float(score_info.get('multiplier') or 1.0)
         target_risk = max(0.0, float(base_risk_usd) * float(mult))
-        target_risk = min(target_risk, float(base_risk_usd))
 
         if daily_cap_usd > 0:
             cap_left = max(0.0, float(daily_cap_usd) - max(0.0, float(open_risk_usd)))
@@ -7971,10 +8327,25 @@ def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd:
         if remaining_risk_usd >= 0:
             target_risk = min(target_risk, float(remaining_risk_usd))
 
-        return (max(0.0, float(target_risk)), mult, str(regime or 'UNKNOWN').upper())
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'dynamic_risk_enabled': bool(score_info.get('enabled')),
+                'dynamic_risk_score': float(score_info.get('score') or 0.0),
+                'dynamic_risk_unclamped_score': float(score_info.get('unclamped_score') or score_info.get('score') or 0.0),
+                'dynamic_risk_components': list(score_info.get('components') or []),
+                'dynamic_risk_bounds': dict(score_info.get('bounds') or {}),
+                'dynamic_risk_family': str(score_info.get('family') or ''),
+                'dynamic_risk_session': str(score_info.get('session') or session_name or ''),
+                'dynamic_risk_side': str(score_info.get('side') or ''),
+                'dynamic_risk_hour': str(score_info.get('hour') or ''),
+                'dynamic_risk_rr': float(score_info.get('rr') or 0.0),
+            })
+        except Exception:
+            pass
+        return (max(0.0, float(target_risk)), float(mult), str(regime or 'UNKNOWN').upper())
     except Exception:
         return (max(0.0, float(base_risk_usd or 0.0)), 1.0, 'UNKNOWN')
-
 
 
 
@@ -8041,7 +8412,7 @@ def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict |
         if isinstance(meta, dict):
             row.update(meta)
         if isinstance(detail, dict):
-            for k in ('when','setup_id','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct'):
+            for k in ('when','setup_id','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct','dynamic_risk_score','risk_multiplier','configured_risk_pct','allowed_risk_pct','risk_actual_pct','risk_actual_usd'):
                 if k in detail and detail.get(k) not in (None, ''):
                     row[k] = detail.get(k)
         row['when'] = str(row.get('when') or datetime.now(timezone.utc).isoformat(timespec='seconds'))
@@ -8344,10 +8715,18 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         remaining_risk_usd=float(remaining_risk) if math.isfinite(remaining_risk) else float(base_per_trade_risk),
         open_risk_usd=float(open_risk),
         daily_cap_usd=float(daily_cap),
+        session_name=str(session_label or ''),
     )
 
     stop_distance = abs(float(price_ref) - float(sl_for_order))
-    allowed_risk_usd = min(float(base_per_trade_risk), float(effective_risk))
+    # Ver03 dynamic risk: effective_risk may be below or above the base risk
+    # (default 0.50x..1.50x). Daily and open-risk caps still bound the final size.
+    allowed_risk_usd = float(effective_risk)
+    open_risk_cap_usd = float(_risk_amount_from_pct(float(equity), float(_autotrade_open_risk_cap_pct())) or 0.0)
+    remaining_open_risk_usd = float('inf')
+    if open_risk_cap_usd > 0:
+        remaining_open_risk_usd = max(0.0, float(open_risk_cap_usd) - float(open_risk))
+        allowed_risk_usd = min(float(allowed_risk_usd), float(remaining_open_risk_usd))
     if math.isfinite(remaining_risk):
         allowed_risk_usd = min(float(allowed_risk_usd), float(remaining_risk))
     allowed_risk_usd = max(0.0, float(allowed_risk_usd))
@@ -8369,12 +8748,15 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'risk_value': float(_autotrade_risk_per_trade_pct() or 0.0),
             'risk_base_usd': float(base_per_trade_risk),
             'risk_effective_usd': float(effective_risk),
+            'risk_effective_pct': float(_risk_pct_from_amount(float(equity), float(effective_risk))),
             'risk_multiplier': float(risk_mult),
             'risk_regime': str(risk_regime),
             'configured_risk_pct': float(configured_risk_pct),
             'allowed_risk_usd': float(allowed_risk_usd),
             'allowed_risk_pct': float(allowed_risk_pct),
             'daily_cap_usd': float(daily_cap),
+            'open_risk_cap_usd': float(open_risk_cap_usd),
+            'remaining_open_risk_usd': float(remaining_open_risk_usd) if math.isfinite(remaining_open_risk_usd) else float('inf'),
             'open_risk_usd_before': float(open_risk),
             'daily_used_total_before': float(used_total_before),
             'realized_loss_today': float(mday.get('realized_loss_today') or 0.0),
@@ -8428,6 +8810,18 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 pass
             return (False, f'leverage_set_failed_for_liq_guard:{lev_msg}')
 
+    if open_risk_cap_usd > 0 and math.isfinite(remaining_open_risk_usd) and remaining_open_risk_usd <= 0:
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'open_risk_cap_reached'})
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=f'open_risk_cap_reached ({open_risk:.2f}/{open_risk_cap_usd:.2f})')
+        except Exception:
+            pass
+        return (False, 'open_risk_cap_reached')
+
     if math.isfinite(remaining_risk) and remaining_risk <= 0:
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'daily_remaining_risk_zero'})
@@ -8474,17 +8868,20 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return (False, 'risk_cap_enforcement_failed')
     actual_risk_pct = _risk_pct_from_amount(float(equity), float(actual_risk))
 
-    # Hard per-trade risk cap from /autotrade_config for ALL families, including
-    # immediate Big-Move (F8) AutoTrades. Dynamic risk and family-specific logic may
-    # reduce risk, but they are never allowed to size above this configured cap.
+    # Hard per-trade cap from /autotrade_config for ALL families, including
+    # immediate Big-Move (F8) AutoTrades. Ver03 dynamic risk may scale the base
+    # above 1.0x, but never above the configured dynamic max multiplier.
     try:
-        hard_cap_pct = max(0.0, float(_autotrade_risk_per_trade_pct() or 0.0))
+        base_cap_pct = max(0.0, float(_autotrade_risk_per_trade_pct() or 0.0))
+        dyn_cap_mult = float(_autotrade_dynamic_risk_max_mult() if _autotrade_dynamic_risk_enabled() else 1.0)
+        hard_cap_pct = float(base_cap_pct) * max(1.0, float(dyn_cap_mult))
         hard_cap_usd = float(_risk_amount_from_pct(float(equity), float(hard_cap_pct)) or 0.0)
         if hard_cap_usd > 0 and float(actual_risk) > (float(hard_cap_usd) * 1.0005):
             try:
                 _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
                 _LAST_AUTOTRADE_DETAIL[int(uid)].update({
                     'reject_reason': 'per_trade_risk_pct_exceeded',
+                    'base_cap_pct': float(base_cap_pct),
                     'hard_cap_pct': float(hard_cap_pct),
                     'hard_cap_usd': float(hard_cap_usd),
                     'risk_actual_usd': float(actual_risk),
@@ -8748,7 +9145,9 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             try:
                 final_entry_for_risk = float(_pos_entry(final_pos) or filled_entry or price_ref)
                 final_risk = _autotrade_true_risk_usd(final_entry_for_risk, sl_for_order, qty_for_db, contract_size)
-                hard_cap_pct_live = max(0.0, float(_autotrade_risk_per_trade_pct() or 0.0))
+                base_cap_pct_live = max(0.0, float(_autotrade_risk_per_trade_pct() or 0.0))
+                dyn_cap_mult_live = float(_autotrade_dynamic_risk_max_mult() if _autotrade_dynamic_risk_enabled() else 1.0)
+                hard_cap_pct_live = float(base_cap_pct_live) * max(1.0, float(dyn_cap_mult_live))
                 hard_cap_usd_live = float(_risk_amount_from_pct(float(equity), float(hard_cap_pct_live)) or 0.0)
                 final_cap_usd = min(float(allowed_risk_usd), float(hard_cap_usd_live or allowed_risk_usd))
                 _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
@@ -34417,7 +34816,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "trade_id_reset": "Reset your own Trade ID numbering",
     "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
     "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
-    "autotrade_config": "Show/set AutoTrade runtime config: risk, caps, mode, max open, max trades/day, leverage, isolated",
+    "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated. Dynamic keys: AUTOTRADE_DYNAMIC_RISK_ENABLED, AUTOTRADE_DYNAMIC_RISK_MIN_MULT, AUTOTRADE_DYNAMIC_RISK_MAX_MULT, AUTOTRADE_DYNAMIC_RISK_LOW_SCORE, AUTOTRADE_DYNAMIC_RISK_BASE_SCORE, AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
@@ -34451,6 +34850,7 @@ def build_help_text_admin() -> str:
         "Note: quick snapshot commands are cached so normal commands stay instant. Heavy run/diagnostic commands are grouped separately below.",
         "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
         "AutoTrade matrix examples: /autoytrade_report_overall 24 (daily), /autoytrade_report_overall 168 (weekly).",
+        "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.5 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 35 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 60 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 85.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -35490,7 +35890,11 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lines = [
             "🤖 AutoTrade Runtime Config",
             HDR,
-            f"AUTOTRADE_RISK_PER_TRADE_PCT = {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']):.2f}",
+            f"AUTOTRADE_RISK_PER_TRADE_PCT = {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']):.2f} (base)",
+            f"AUTOTRADE_DYNAMIC_RISK_ENABLED = {'true' if bool(summary.get('AUTOTRADE_DYNAMIC_RISK_ENABLED')) else 'false'}",
+            f"AUTOTRADE_DYNAMIC_RISK_RANGE = {float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.5)):.2f}x–{float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.5)):.2f}x",
+            f"AUTOTRADE_DYNAMIC_RISK_SCORE = low {float(summary.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 35)):.0f} | base {float(summary.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 60)):.0f} | high {float(summary.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', 85)):.0f}",
+            f"Effective risk range now ≈ {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.5)):.2f}%–{float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.5)):.2f}%",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
@@ -35501,7 +35905,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
             "",
             "Examples:",
-            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.5",
+            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.0   (base risk)",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.5",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
             "• /autotrade_config AUTOTRADE_MODE live",
@@ -35525,7 +35932,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     value_raw = " ".join(context.args[1:]).strip()
     if key not in {
         'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT',
-        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED'
+        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED',
+        'AUTOTRADE_DYNAMIC_RISK_ENABLED', 'AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 'AUTOTRADE_DYNAMIC_RISK_MAX_MULT',
+        'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -35534,6 +35943,24 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         if key == 'AUTOTRADE_RISK_PER_TRADE_PCT':
             val = max(0.0, float(value_raw))
             _autotrade_config_set(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, val)
+        elif key == 'AUTOTRADE_DYNAMIC_RISK_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_DYNAMIC_RISK_MIN_MULT':
+            val = max(0.10, min(1.00, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, val)
+        elif key == 'AUTOTRADE_DYNAMIC_RISK_MAX_MULT':
+            val = max(1.00, min(3.00, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, val)
+        elif key == 'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE':
+            val = max(0.0, min(100.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY, val)
+        elif key == 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE':
+            val = max(0.0, min(100.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY, val)
+        elif key == 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE':
+            val = max(0.0, min(100.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, val)
         elif key == 'AUTOTRADE_OPEN_RISK_CAP_PCT':
             val = max(0.0, float(value_raw))
             _autotrade_config_set(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, val)
@@ -39706,6 +40133,10 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
         candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf) if rows else {}
         actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(eval_uid, start_ts=now_ts - float(hrs) * 3600.0, end_ts=now_ts + 3600.0) if rows else {}
         by_combo_side: dict[str, dict] = {}
+        by_combo: dict[str, dict] = {}
+        by_family: dict[str, dict] = {}
+        by_session: dict[str, dict] = {}
+        by_side: dict[str, dict] = {}
         by_symbol: dict[str, dict] = {}
         by_hour: dict[str, dict] = {}
         for r in list(rows or []):
@@ -39722,7 +40153,12 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
                 result = _setup_audit_result_label(ev.get('result'))
                 r_mult = float(_setup_audit_net_r_for_result(r, result) or 0.0) if result in {'TP', 'SL'} else 0.0
                 combo_side = f'{fam}-{sess}-{side}'
+                combo = f'{fam}-{sess}'
                 _setup_edge_guard_add(by_combo_side, combo_side, result, r_mult)
+                _setup_edge_guard_add(by_combo, combo, result, r_mult)
+                _setup_edge_guard_add(by_family, fam, result, r_mult)
+                _setup_edge_guard_add(by_session, sess, result, r_mult)
+                _setup_edge_guard_add(by_side, side, result, r_mult)
                 _setup_edge_guard_add(by_symbol, sym, result, r_mult)
                 ts = float(_setup_audit_row_ts(r) or 0.0)
                 if ts > 0:
@@ -39773,6 +40209,13 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
         data = {
             'ok': True, 'enabled': True, 'uid': eval_uid, 'hours': hrs, 'rows': len(rows or []), 'built_ts': now_ts,
             'combo_side_block': combo_side_block, 'symbol_block': symbol_block, 'hour_watch': hour_watch,
+            'combo_side_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo_side.items()},
+            'combo_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo.items()},
+            'family_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_family.items()},
+            'session_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_session.items()},
+            'side_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_side.items()},
+            'symbol_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_symbol.items()},
+            'hour_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_hour.items()},
             'reason': 'ok',
         }
         cache.update({'ts': now_ts, 'uid': eval_uid, 'hours': hrs, 'data': data})
@@ -42475,6 +42918,17 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append(f"   Setup ID: {sid}")
             lines.append(f"   Time: {when_txt}")
             lines.append(f"   Entry: {entry} | SL: {sl}{drift_txt}")
+            try:
+                drs = a.get('dynamic_risk_score', '')
+                rmult = a.get('risk_multiplier', '')
+                arisk = a.get('allowed_risk_pct', a.get('risk_actual_pct', ''))
+                if drs not in ('', None) or rmult not in ('', None):
+                    score_txt = f"{float(drs):.1f}" if drs not in ('', None) else '-'
+                    mult_txt = f"{float(rmult):.2f}x" if rmult not in ('', None) else '-'
+                    risk_txt = f" | Risk≈{float(arisk):.2f}%" if arisk not in ('', None) else ''
+                    lines.append(f"   DynRisk: score {score_txt} | mult {mult_txt}{risk_txt}")
+            except Exception:
+                pass
         except Exception:
             continue
         if i != min(len(hist), max_rows):
