@@ -955,6 +955,26 @@ SETUP_COMBO_POLICY_DISABLE_WR = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE
 SETUP_COMBO_POLICY_KEEP_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_AVG_R", "0.05") or 0.05)
 SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "-0.10") or -0.10)
 
+# 13May edge-quality micro guard: family/session policy is useful, but the latest
+# matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
+# F1-LON-BUY, GIGA/H/B) while the opposite side was still profitable.  This guard
+# sits after the family/session policy and before persistence/email/autotrade so the
+# bot can block bad directions/symbols without killing the whole family/session.
+SETUP_EDGE_MICRO_GUARD_ENABLED = env_bool("SETUP_EDGE_MICRO_GUARD_ENABLED", True)
+SETUP_EDGE_GUARD_WINDOW_HOURS = int(os.environ.get("SETUP_EDGE_GUARD_WINDOW_HOURS", "168") or 168)
+SETUP_EDGE_GUARD_CACHE_SEC = int(os.environ.get("SETUP_EDGE_GUARD_CACHE_SEC", "900") or 900)
+SETUP_EDGE_GUARD_SIDE_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_SIDE_MIN_DECIDED", "5") or 5)
+SETUP_EDGE_GUARD_SIDE_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_SIDE_WR_MAX", "30") or 30)
+SETUP_EDGE_GUARD_SIDE_AVGR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_SIDE_AVGR_MAX", "-0.25") or -0.25)
+SETUP_EDGE_GUARD_SYMBOL_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_SYMBOL_MIN_DECIDED", "3") or 3)
+SETUP_EDGE_GUARD_SYMBOL_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_SYMBOL_WR_MAX", "5") or 5)
+SETUP_EDGE_GUARD_HOUR_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_HOUR_MIN_DECIDED", "5") or 5)
+SETUP_EDGE_GUARD_HOUR_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_HOUR_WR_MAX", "25") or 25)
+SETUP_EDGE_GUARD_HOUR_AVGR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_HOUR_AVGR_MAX", "-0.30") or -0.30)
+SETUP_EDGE_GUARD_INTERIM_UNTIL_LOCAL = os.environ.get("SETUP_EDGE_GUARD_INTERIM_UNTIL_LOCAL", "2026-05-17 23:00").strip() or "2026-05-17 23:00"
+SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST = tuple(x.strip().upper() for x in str(os.environ.get("SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST", "F1-ASIA-BUY,F1-LON-BUY") or "").split(",") if x.strip())
+SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST = tuple(x.strip().upper() for x in str(os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST", "GIGA,H,B") or "").split(",") if x.strip())
+
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
 
@@ -18144,7 +18164,8 @@ def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: flo
     if sess:
         where_session = ' AND UPPER(COALESCE(x.session, "")) = ? '
         params.append(sess)
-    params.append(int(limit))
+    fetch_limit = max(int(limit or 10), min(max(int(limit or 10) * 6, int(limit or 10) + 30), 250))
+    params.append(int(fetch_limit))
     cur.execute(
         f"""
         SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
@@ -18161,9 +18182,22 @@ def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: flo
         """,
         tuple(params),
     )
-    rows = cur.fetchall() or []
+    rows = [dict(r) for r in (cur.fetchall() or [])]
     con.close()
-    return [dict(r) for r in rows]
+    # Filter already-persisted stale bad-edge setups before email/autotrade consume them.
+    # This keeps the executable lane synchronized with the same micro guard used at persistence time.
+    out = []
+    for r in rows:
+        try:
+            allowed, _reason = _setup_edge_quality_guard_allows_setup(r, str(r.get('session') or session_name or ''), user_id=int(user_id or 0))
+            if not allowed:
+                continue
+        except Exception:
+            pass
+        out.append(r)
+        if len(out) >= int(limit or 10):
+            break
+    return out
 
 
 def _persist_executable_candidates(user_id: int, session_name: str, setups: List[Setup], source_kind: str = 'executable_setups', mode: str = 'email') -> dict:
@@ -18197,6 +18231,7 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
             pass
 
         stats['combo_policy_skips'] = 0
+        stats['edge_quality_skips'] = 0
         stats['cooldown_skips'] = 0
         for s in (setups or []):
             sid = str(getattr(s, 'setup_id', '') or '').strip()
@@ -18217,6 +18252,24 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                             symbol=sym,
                             side=side,
                             details={'reason': 'family_session_combo_disabled_by_edge_matrix', 'source_kind': str(source_kind or 'executable_setups')},
+                        )
+                        continue
+                except Exception:
+                    pass
+                try:
+                    _edge_allowed, _edge_reason = _setup_edge_quality_guard_allows_setup(s, sess, user_id=int(_target_uid))
+                    if not _edge_allowed:
+                        stats['edge_quality_skips'] = int(stats.get('edge_quality_skips', 0) or 0) + 1
+                        db_log_setup_pipeline_event(
+                            int(_target_uid),
+                            stage='executable_edge_quality_guard',
+                            status='skip',
+                            session=sess,
+                            mode=str(mode or ''),
+                            setup_id=sid,
+                            symbol=sym,
+                            side=side,
+                            details={'reason': str(_edge_reason or 'edge_quality_guard_block'), 'source_kind': str(source_kind or 'executable_setups')},
                         )
                         continue
                 except Exception:
@@ -39564,6 +39617,227 @@ def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_
 
 
 
+
+_SETUP_EDGE_GUARD_CACHE = {'ts': 0.0, 'uid': 0, 'hours': 0, 'data': {}}
+
+def _setup_edge_guard_interim_until_ts() -> float:
+    try:
+        raw = str(globals().get('SETUP_EDGE_GUARD_INTERIM_UNTIL_LOCAL', '') or '').strip()
+        if not raw:
+            return float(_setup_combo_interim_until_ts() or 0.0)
+        tz = _setup_combo_policy_tz()
+        dt = datetime.strptime(raw, '%Y-%m-%d %H:%M').replace(tzinfo=tz)
+        return float(dt.astimezone(timezone.utc).timestamp())
+    except Exception:
+        try:
+            return float(_setup_combo_interim_until_ts() or 0.0)
+        except Exception:
+            return 0.0
+
+
+def _setup_edge_guard_interim_active() -> bool:
+    try:
+        until_ts = float(_setup_edge_guard_interim_until_ts() or 0.0)
+        return until_ts > float(time.time())
+    except Exception:
+        return False
+
+
+def _setup_edge_bucket_metrics(bucket: dict | None) -> dict:
+    try:
+        b = dict(bucket or {})
+        setups = int(b.get('setups') or 0)
+        tp = int(b.get('tp') or 0)
+        sl = int(b.get('sl') or 0)
+        nh = int(b.get('nohit') or 0)
+        op = int(b.get('open') or 0)
+        decided = tp + sl + nh
+        wr = (tp / max(1, decided) * 100.0) if decided else 0.0
+        avg_r = (float(b.get('r_sum') or 0.0) / max(1, decided)) if decided else 0.0
+        score = (wr - 50.0) + avg_r * 25.0 + min(20, decided) * 0.35 - (op / max(1, setups) * 2.0)
+        return {'setups': setups, 'decided': decided, 'tp': tp, 'sl': sl, 'nohit': nh, 'open': op, 'wr': wr, 'avg_r': avg_r, 'score': score}
+    except Exception:
+        return {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': 0.0}
+
+
+def _setup_edge_guard_add(bucket: dict, key: str, result: str, r_mult: float) -> None:
+    try:
+        k = str(key or '').upper().strip() or '-'
+        b = bucket.setdefault(k, {'setups': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'r_sum': 0.0})
+        b['setups'] += 1
+        res = str(result or '').upper().strip()
+        if res == 'TP':
+            b['tp'] += 1
+            b['r_sum'] += float(r_mult or 0.0)
+        elif res == 'SL':
+            b['sl'] += 1
+            b['r_sum'] += float(r_mult or 0.0)
+        elif res == 'NOHIT':
+            b['nohit'] += 1
+        else:
+            b['open'] += 1
+    except Exception:
+        pass
+
+
+def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool = False) -> dict:
+    """Build cached weak side/symbol/hour guard from the same executable audit lane.
+
+    It is deliberately more granular than setup_combo_policy: it blocks a bad side of a
+    family/session (for example BUY only) or a repeatedly losing symbol while preserving
+    profitable directions in the same family/session.
+    """
+    try:
+        if not bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)):
+            return {'ok': True, 'enabled': False, 'combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': 'disabled'}
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        eval_uid = int(uid or owner_uid or 0)
+        if eval_uid <= 0:
+            return {'ok': True, 'enabled': True, 'combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': 'no_uid'}
+        hrs = int(hours or globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168)
+        now_ts = float(time.time())
+        cache = globals().setdefault('_SETUP_EDGE_GUARD_CACHE', {'ts': 0.0, 'uid': 0, 'hours': 0, 'data': {}})
+        if (not force) and int(cache.get('uid') or 0) == eval_uid and int(cache.get('hours') or 0) == hrs and now_ts - float(cache.get('ts') or 0.0) < float(globals().get('SETUP_EDGE_GUARD_CACHE_SEC', 900) or 900):
+            return dict(cache.get('data') or {})
+
+        result_horizon = _setup_audit_result_horizon_hours()
+        rows = _setup_audit_load_rows(eval_uid, hours=hrs, limit=0, dedup=True)
+        audit_tf = str(os.environ.get('SETUP_EDGE_GUARD_TIMEFRAME', os.environ.get('SETUP_COMBO_MATRIX_TIMEFRAME', os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', '15m'))) or '15m').strip().lower() or '15m'
+        candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf) if rows else {}
+        actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(eval_uid, start_ts=now_ts - float(hrs) * 3600.0, end_ts=now_ts + 3600.0) if rows else {}
+        by_combo_side: dict[str, dict] = {}
+        by_symbol: dict[str, dict] = {}
+        by_hour: dict[str, dict] = {}
+        for r in list(rows or []):
+            try:
+                sid = str(r.get('setup_id') or '').strip()
+                fam = _setup_audit_family_code(r)
+                sess = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+                side = str(r.get('side') or '').upper().strip() or '-'
+                sym = str(r.get('symbol') or '').upper().strip()
+                if sym.endswith('USDT'):
+                    sym = sym[:-4]
+                actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
+                ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=eval_uid, candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
+                result = _setup_audit_result_label(ev.get('result'))
+                r_mult = float(_setup_audit_net_r_for_result(r, result) or 0.0) if result in {'TP', 'SL'} else 0.0
+                combo_side = f'{fam}-{sess}-{side}'
+                _setup_edge_guard_add(by_combo_side, combo_side, result, r_mult)
+                _setup_edge_guard_add(by_symbol, sym, result, r_mult)
+                ts = float(_setup_audit_row_ts(r) or 0.0)
+                if ts > 0:
+                    hr_key = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%H:00')
+                    _setup_edge_guard_add(by_hour, hr_key, result, r_mult)
+            except Exception:
+                continue
+
+        side_min = max(1, int(globals().get('SETUP_EDGE_GUARD_SIDE_MIN_DECIDED', 5) or 5))
+        side_wr_max = float(globals().get('SETUP_EDGE_GUARD_SIDE_WR_MAX', 30) or 30)
+        side_avgr_max = float(globals().get('SETUP_EDGE_GUARD_SIDE_AVGR_MAX', -0.25) or -0.25)
+        symbol_min = max(1, int(globals().get('SETUP_EDGE_GUARD_SYMBOL_MIN_DECIDED', 3) or 3))
+        symbol_wr_max = float(globals().get('SETUP_EDGE_GUARD_SYMBOL_WR_MAX', 5) or 5)
+        hour_min = max(1, int(globals().get('SETUP_EDGE_GUARD_HOUR_MIN_DECIDED', 5) or 5))
+        hour_wr_max = float(globals().get('SETUP_EDGE_GUARD_HOUR_WR_MAX', 25) or 25)
+        hour_avgr_max = float(globals().get('SETUP_EDGE_GUARD_HOUR_AVGR_MAX', -0.30) or -0.30)
+
+        combo_side_block = {}
+        for key, b in by_combo_side.items():
+            m = _setup_edge_bucket_metrics(b)
+            if m['decided'] >= side_min and m['wr'] <= side_wr_max and m['avg_r'] <= side_avgr_max and m['sl'] >= max(m['tp'] + 2, 3):
+                combo_side_block[key] = {**m, 'reason': f"weak combo-side {key}: {m['tp']}TP/{m['sl']}SL, WR {m['wr']:.1f}%, AvgR {m['avg_r']:+.2f}"}
+
+        symbol_block = {}
+        for key, b in by_symbol.items():
+            m = _setup_edge_bucket_metrics(b)
+            if m['decided'] >= symbol_min and m['wr'] <= symbol_wr_max and m['tp'] == 0 and m['sl'] >= symbol_min:
+                symbol_block[key] = {**m, 'reason': f"weak symbol {key}: {m['tp']}TP/{m['sl']}SL in {m['decided']} decided setups"}
+
+        hour_watch = {}
+        for key, b in by_hour.items():
+            m = _setup_edge_bucket_metrics(b)
+            if m['decided'] >= hour_min and m['wr'] <= hour_wr_max and m['avg_r'] <= hour_avgr_max and m['sl'] >= m['tp'] + 3:
+                hour_watch[key] = {**m, 'reason': f"weak Melbourne hour {key}: {m['tp']}TP/{m['sl']}SL, WR {m['wr']:.1f}%, AvgR {m['avg_r']:+.2f}"}
+
+        # Evidence-based temporary overrides from the latest reviewed matrix. They expire at
+        # the same Sunday 23:00 policy review and can be overridden by env vars.
+        if _setup_edge_guard_interim_active():
+            for key in tuple(globals().get('SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST', ()) or ()): 
+                k = str(key or '').upper().strip()
+                if k:
+                    combo_side_block.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': 'interim evidence block until Sunday policy review'})
+            for key in tuple(globals().get('SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST', ()) or ()): 
+                k = str(key or '').upper().strip()
+                if k:
+                    symbol_block.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': 'interim symbol block until Sunday policy review'})
+
+        data = {
+            'ok': True, 'enabled': True, 'uid': eval_uid, 'hours': hrs, 'rows': len(rows or []), 'built_ts': now_ts,
+            'combo_side_block': combo_side_block, 'symbol_block': symbol_block, 'hour_watch': hour_watch,
+            'reason': 'ok',
+        }
+        cache.update({'ts': now_ts, 'uid': eval_uid, 'hours': hrs, 'data': data})
+        return data
+    except Exception as exc:
+        return {'ok': False, 'enabled': True, 'combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': f'{type(exc).__name__}: {exc}'}
+
+
+def _setup_edge_guard_setup_key(setup_or_row, session_name: str = '') -> tuple[str, str, str, str, str]:
+    try:
+        fam, sess = _setup_combo_family_session_from_obj(setup_or_row, session_name=session_name)
+        if isinstance(setup_or_row, dict):
+            row = dict(setup_or_row or {})
+            side = str(row.get('side') or '').upper().strip() or '-'
+            sym = str(row.get('symbol') or '').upper().strip()
+            ts = float(row.get('executable_ts') or row.get('ts') or row.get('signal_created_ts') or time.time())
+        else:
+            side = str(getattr(setup_or_row, 'side', '') or '').upper().strip() or '-'
+            sym = str(getattr(setup_or_row, 'symbol', '') or getattr(setup_or_row, 'market_symbol', '') or '').upper().strip()
+            ts = float(getattr(setup_or_row, 'executable_ts', 0.0) or getattr(setup_or_row, 'created_ts', 0.0) or getattr(setup_or_row, 'signal_created_ts', 0.0) or time.time())
+        if sym.endswith('USDT'):
+            sym = sym[:-4]
+        hour = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%H:00') if ts > 0 else '-'
+        return str(fam or 'F0').upper().strip(), str(sess or '-').upper().strip(), side, sym, hour
+    except Exception:
+        return 'F0', str(session_name or '-').upper().strip() or '-', '-', '', '-'
+
+
+def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
+    """Return (allowed, reason) for granular side/symbol edge filtering."""
+    try:
+        if not bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)):
+            return True, 'edge_micro_guard_disabled'
+        fam, sess, side, sym, hour = _setup_edge_guard_setup_key(setup_or_row, session_name=session_name)
+        data = _setup_edge_guard_build(int(user_id or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+        combo_side = f'{fam}-{sess}-{side}'
+        cs = dict((data or {}).get('combo_side_block') or {})
+        sb = dict((data or {}).get('symbol_block') or {})
+        hw = dict((data or {}).get('hour_watch') or {})
+        if combo_side in cs:
+            return False, str((cs.get(combo_side) or {}).get('reason') or f'combo-side {combo_side} blocked by edge guard')
+        if sym and sym in sb:
+            return False, str((sb.get(sym) or {}).get('reason') or f'symbol {sym} blocked by edge guard')
+        # Hour is a secondary confirmation only, not a standalone global ban. It blocks only
+        # when the setup belongs to a generally weak family or a poor aggregate combo, so one
+        # bad hour cannot remove otherwise strong F3/F8 opportunities.
+        if hour in hw and fam in {'F1', 'F6'}:
+            return False, str((hw.get(hour) or {}).get('reason') or f'hour {hour} blocked for weak family {fam}')
+        return True, 'ok'
+    except Exception as exc:
+        return True, f'guard_error_allowed:{type(exc).__name__}: {exc}'
+
+
+def _setup_edge_guard_snapshot_text(uid: int = 0) -> str:
+    try:
+        data = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+        cs = sorted(list((data or {}).get('combo_side_block') or {}))
+        sy = sorted(list((data or {}).get('symbol_block') or {}))
+        hw = sorted(list((data or {}).get('hour_watch') or {}))
+        exp = _setup_combo_format_policy_ts(_setup_edge_guard_interim_until_ts()) if _setup_edge_guard_interim_active() else '-'
+        return f"Micro edge guard: {'ON' if bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)) else 'OFF'} | Block side={', '.join(cs[:10]) if cs else '-'} | Block symbol={', '.join(sy[:12]) if sy else '-'} | Weak-hour watch={', '.join(hw[:8]) if hw else '-'} | Interim expires={exp}"
+    except Exception as exc:
+        return f"Micro edge guard: ERROR {type(exc).__name__}: {exc}"
+
+
 def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
     """Return the current enforceable policy rows by combo.
 
@@ -39750,6 +40024,35 @@ def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int
         return 'WATCH', 1, 'Policy calculation error; allowed by safety default', 0.0
 
 
+
+def _setup_combo_adjust_action_for_side_split(st: dict, side_stats: dict, family: str, session: str, action: str, enabled_next: int, notes: str, score: float) -> tuple[str, int, str, float, str]:
+    """Avoid disabling a whole family/session when only one direction is bad.
+
+    Latest evidence showed F1-ASIA and F1-LON were negative in aggregate because BUY was
+    poor, while SELL was profitable. In that case the combo remains WATCH and the micro
+    guard blocks only the weak side.
+    """
+    try:
+        fam = str(family or '').upper().strip()
+        sess = str(session or '').upper().strip()
+        weak_sides = []
+        strong_sides = []
+        for side in ('BUY', 'SELL'):
+            b = dict((side_stats or {}).get((fam, sess, side)) or {})
+            m = _setup_edge_bucket_metrics(b)
+            if m['decided'] >= max(3, int(globals().get('SETUP_EDGE_GUARD_SIDE_MIN_DECIDED', 5) or 5)) and m['wr'] <= float(globals().get('SETUP_EDGE_GUARD_SIDE_WR_MAX', 30) or 30) and m['avg_r'] <= float(globals().get('SETUP_EDGE_GUARD_SIDE_AVGR_MAX', -0.25) or -0.25) and m['sl'] >= max(m['tp'] + 2, 3):
+                weak_sides.append(side)
+            if m['decided'] >= 3 and m['wr'] >= 60.0 and m['avg_r'] >= 0.35 and m['tp'] > m['sl']:
+                strong_sides.append(side)
+        guard_txt = '-'
+        if weak_sides:
+            guard_txt = 'Block ' + '/'.join(weak_sides)
+        if str(action or '').upper() == 'DISABLE' and weak_sides and strong_sides:
+            return 'WATCH', 1 if not bool(globals().get('SETUP_COMBO_POLICY_BLOCK_WATCH', False)) else 0, f"Directional split: {guard_txt}; keep combo alive for strong side {'/'.join(strong_sides)}", float(score), guard_txt
+        return action, int(enabled_next), notes, float(score), guard_txt
+    except Exception:
+        return action, int(enabled_next), notes, float(score), '-'
+
 def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False, policy_kind: str = 'manual') -> dict:
     _setup_combo_policy_migrate()
     hours = max(1, min(8760, int(hours or 168)))
@@ -39759,6 +40062,7 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
     candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf) if rows else {}
     actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
     stats: dict[tuple[str, str], dict] = {}
+    side_stats: dict[tuple[str, str, str], dict] = {}
     for r in rows:
         try:
             fam = _setup_audit_family_code(r)
@@ -39773,6 +40077,19 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
             st['conf_sum'] += float(r.get('conf') or 0.0)
             st['quality_sum'] += float(r.get('quality_score') or 0.0)
             st['vol_sum'] += float(r.get('fut_vol_usd') or 0.0) / 1e6
+            side = str(r.get('side') or '').upper().strip() or '-'
+            st_side = side_stats.setdefault((fam, sess, side), {'setups': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'r_sum': 0.0})
+            st_side['setups'] += 1
+            if result == 'TP':
+                st_side['tp'] += 1
+                st_side['r_sum'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
+            elif result == 'SL':
+                st_side['sl'] += 1
+                st_side['r_sum'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
+            elif result == 'NOHIT':
+                st_side['nohit'] += 1
+            else:
+                st_side['open'] += 1
             if result == 'TP':
                 st['tp'] += 1
                 st['r_sum'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
@@ -39800,11 +40117,13 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
         avg_vol_m = float(st.get('vol_sum') or 0.0) / max(1, total)
         tmp = {'setups': total, 'decided': decided, 'tp': tp, 'sl': sl, 'nohit': nohit, 'open': op, 'wr': wr, 'avg_r': avg_r}
         action, enabled_next, notes, score = _setup_combo_action_for_stats(tmp, hours)
+        action, enabled_next, notes, score, guard_txt = _setup_combo_adjust_action_for_side_split(st, side_stats, _fam, _sess, action, enabled_next, notes, score)
         out_rows.append({
             'family': _fam, 'session': _sess, 'combo': f'{_fam}-{_sess}', 'setups': total, 'decided': decided,
             'tp': tp, 'sl': sl, 'nohit': nohit, 'open': op, 'win_rate': wr, 'avg_r': avg_r,
             'avg_conf': avg_conf, 'avg_quality': avg_quality, 'avg_volume_m': avg_vol_m,
             'score': score, 'action': action, 'enabled_next': int(enabled_next), 'notes': notes,
+            'guard': guard_txt,
         })
     out_rows.sort(key=lambda x: (int(x.get('enabled_next') or 0), float(x.get('score') or 0.0), float(x.get('win_rate') or 0.0), int(x.get('decided') or 0)), reverse=True)
     run_id = 'SCM-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
@@ -39890,11 +40209,12 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
             f"{float(r.get('win_rate') or 0.0):.1f}%", f"{float(r.get('avg_r') or 0.0):+.2f}",
             f"{float(r.get('avg_conf') or 0.0):.0f}", f"{float(r.get('avg_volume_m') or 0.0):.0f}",
             f"{float(r.get('score') or 0.0):+.1f}",
+            str(r.get('guard') or '-'),
             str(r.get('advisory_action') or r.get('action') or 'WATCH'),
             str(r.get('effective_action') or r.get('action') or 'WATCH'),
             str(r.get('active_policy_kind') or '-'),
         ])
-    table = tabulate(table_rows, headers=['Combo', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'VolM', 'Score', 'Adv', 'Live', 'Kind'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','center','center','center'))
+    table = tabulate(table_rows, headers=['Combo', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'VolM', 'Score', 'Guard', 'Adv', 'Live', 'Kind'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','left','center','center','center'))
     last_pol = dict((res or {}).get('last_policy') or {})
     try:
         next_review_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
@@ -39908,6 +40228,7 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | NOHIT: <b>{nh}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b>",
         f"Matrix recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b>",
         f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | Block WATCH=<b>{'ON' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OFF'}</b>",
+        html.escape(_setup_edge_guard_snapshot_text(int(uid))),
         f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> (temporary severe-disable only).",
         "Manual <code>/setup_matrix</code> rows are advisory. <b>Adv</b> is what this selected window recommends; <b>Live</b> is the currently enforced scheduled/interim/daily-safety state used by executable queue + emails + AutoTrade + optimizer bridge.",
     ]
@@ -40130,6 +40451,7 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
             f"Window: <b>{hours}h</b> | Rows evaluated: <b>{evaluated}</b> | Start: <b>{html.escape(start_txt)}</b> | End: <b>{html.escape(end_txt)}</b>",
             f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | TP=<b>{tp_n}</b> SL=<b>{sl_n}</b> OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
             f"Live disabled combos now: <b>{html.escape(', '.join(disabled_now) if disabled_now else '-')}</b> | Live WATCH rows: <b>{len(watch_now)}</b>",
+            html.escape(_setup_edge_guard_snapshot_text(uid)),
             f"Data recommendation from this window: DISABLE=<b>{html.escape(', '.join(rec_disable) if rec_disable else '-')}</b> | TIGHTEN/WATCH=<b>{html.escape(', '.join(rec_tighten) if rec_tighten else '-')}</b>",
             "Note: Day/hour/regime rows need several days of data before they are reliable. Use 168h/720h for real policy decisions; 24h is diagnostic. The strongest table can still be negative; treat it as least-bad unless WR/AvgR and sample size are both good.",
             SEP,
