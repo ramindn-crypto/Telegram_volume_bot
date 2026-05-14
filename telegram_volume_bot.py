@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - 14May_ver06: Added strict live risk/leverage guard: no silent leverage downgrade to 1x, post-attach exchange-risk verification, and guardian emergency reduction for oversized live positions.
 # - 14May_ver03: Added dynamic AutoTrade risk scoring/sizing: base risk from /autotrade_config scales 0.50x–1.50x by setup score (family/session/side/symbol/hour/regime/RR/volume/confidence), with daily/open caps still enforced.
 # - Ver11: Added hybrid setup-combo policy: weekly official review + daily 10:00 severe-disable safety review.
 # - Ver06: /autotrade_report now merges raw Bybit close fragments into one row per practical position; added /autoytrade_report_overall family/session matrix; cleanup now removes old Partial TP/SL children before Full TP/SL attach.
@@ -444,6 +445,14 @@ AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY = 'dynamic_risk_max_mult'
 AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY = 'dynamic_risk_low_score'
 AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY = 'dynamic_risk_base_score'
 AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY = 'dynamic_risk_high_score'
+# Ver06: live risk/leverage enforcement. The configured leverage remains the target;
+# the bot must not silently open a setup at 1x just because the liquidation guard
+# calculates that 10x would be unsafe. If a setup cannot be safely opened at the
+# configured leverage, it is skipped instead of downgraded. A separate emergency
+# guardian also trims/closes any already-open position whose actual exchange risk is
+# far above the allowed dynamic-risk cap.
+AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY = 'allow_leverage_downgrade'
+AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY = 'emergency_risk_max_mult'
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
@@ -524,6 +533,8 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', '35') or 35),
         AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', '60') or 60),
         AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '85') or 85),
+        AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY: 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', False) else 0,
+        AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '2.0') or 2.0),
     }
     for k, v in defaults.items():
         try:
@@ -691,6 +702,39 @@ def _autotrade_dynamic_risk_bounds() -> tuple[float, float, float, float, float]
     return min_mult, max_mult, low_score, base_score, high_score
 
 
+
+def _autotrade_allow_leverage_downgrade() -> bool:
+    try:
+        raw = _autotrade_config_get(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', False) else 0)
+        return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        return False
+
+
+def _autotrade_emergency_risk_max_mult() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY, os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '2.0')) or 2.0)
+    except Exception:
+        val = 2.0
+    return max(1.00, min(10.0, float(val)))
+
+
+def _autotrade_hard_risk_cap_usd(equity: float, multiplier: float | None = None) -> float:
+    '''Hard per-position risk cap from base risk and dynamic max multiplier.'''
+    try:
+        eq = float(equity or 0.0)
+        if eq <= 0:
+            return 0.0
+        base_pct = max(0.0, float(_autotrade_risk_per_trade_pct() or 0.0))
+        dyn_mult = float(_autotrade_dynamic_risk_max_mult() if _autotrade_dynamic_risk_enabled() else 1.0)
+        cap = _risk_amount_from_pct(eq, base_pct * max(1.0, dyn_mult))
+        if multiplier is not None:
+            cap *= max(1.0, float(multiplier or 1.0))
+        return max(0.0, float(cap))
+    except Exception:
+        return 0.0
+
+
 def _autotrade_runtime_summary_dict() -> dict:
     mode_txt, daily_val = _autotrade_daily_cap_settings()
     return {
@@ -710,6 +754,8 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE': float(_autotrade_dynamic_risk_low_score()),
         'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE': float(_autotrade_dynamic_risk_base_score()),
         'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE': float(_autotrade_dynamic_risk_high_score()),
+        'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE': bool(_autotrade_allow_leverage_downgrade()),
+        'AUTOTRADE_EMERGENCY_RISK_MAX_MULT': float(_autotrade_emergency_risk_max_mult()),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
     }
 
@@ -3767,6 +3813,82 @@ def _autotrade_true_risk_usd(entry_price: float, stop_price: float, qty_contract
         return 0.0
 
 
+
+def _autotrade_live_position_risk_detail(p: dict) -> dict:
+    '''Return current live position risk based on detected exchange SL.'''
+    try:
+        sym = _pos_symbol(p)
+        side = _pos_side_text(p)
+        entry = float(_pos_entry(p) or 0.0)
+        sl = float(_pos_stop(p) or 0.0)
+        qty = abs(float(_pos_size(p) or 0.0))
+        try:
+            cs = float((_bybit_get_instr_filters(sym) or {}).get('contractSize') or 1.0)
+        except Exception:
+            cs = 1.0
+        risk = _autotrade_true_risk_usd(entry, sl, qty, cs) if entry > 0 and sl > 0 and qty > 0 else 0.0
+        return {'symbol': sym, 'side': side, 'entry': entry, 'sl': sl, 'qty': qty, 'contract_size': cs, 'risk_usd': float(risk), 'leverage': float(_pos_leverage(p) or 0.0)}
+    except Exception as exc:
+        return {'risk_usd': 0.0, 'error': f'{type(exc).__name__}: {exc}'}
+
+
+def _autotrade_reduce_live_position_to_risk_cap(symbol: str, side: str, risk_cap_usd: float, reason: str = 'risk_cap', live_pos: dict | None = None) -> dict:
+    '''Reduce or close a live position until detected SL risk is within cap.'''
+    out = {'ok': False, 'action': 'none', 'reason': str(reason or 'risk_cap'), 'cap_usd': float(risk_cap_usd or 0.0)}
+    try:
+        sym = _bybit_linear_symbol(symbol)
+        side_u = str(side or '').upper().strip()
+        p = live_pos or _autotrade_find_live_position(sym, side=side_u)
+        if not p:
+            out.update({'ok': True, 'action': 'no_position'})
+            return out
+        detail = _autotrade_live_position_risk_detail(p)
+        out['before'] = detail
+        risk_now = float(detail.get('risk_usd') or 0.0)
+        cap = float(risk_cap_usd or 0.0)
+        if cap <= 0 or risk_now <= cap * 1.0005:
+            out.update({'ok': True, 'action': 'within_cap'})
+            return out
+        entry = float(detail.get('entry') or 0.0)
+        sl = float(detail.get('sl') or 0.0)
+        qty = float(detail.get('qty') or 0.0)
+        cs = float(detail.get('contract_size') or 1.0)
+        if entry <= 0 or sl <= 0 or qty <= 0:
+            close_res = _autotrade_force_close_live_position(sym, side_u, qty=qty)
+            out.update({'action': 'closed_missing_risk_inputs', 'close_res': close_res, 'ok': int((close_res or {}).get('retCode', -1)) == 0})
+            return out
+        allowed_qty = _autotrade_qty_from_risk(entry, sl, 0.0, risk_usd=cap, contract_size=cs)
+        allowed_qty, allowed_reason = _round_qty_down(sym, allowed_qty, entry)
+        reduce_qty = qty - float(allowed_qty or 0.0) if allowed_qty and allowed_qty > 0 else qty
+        reduce_qty, reduce_reason = _round_qty_down(sym, reduce_qty, entry)
+        if reduce_qty is None or reduce_qty <= 0:
+            close_res = _autotrade_force_close_live_position(sym, side_u, qty=qty)
+            out.update({'action': 'closed_unreducible', 'allowed_reason': allowed_reason, 'reduce_reason': reduce_reason, 'close_res': close_res, 'ok': int((close_res or {}).get('retCode', -1)) == 0})
+            return out
+        payload = {
+            'category': 'linear',
+            'symbol': sym,
+            'side': 'Sell' if side_u == 'BUY' else 'Buy',
+            'orderType': 'Market',
+            'qty': _fmt_qty(float(reduce_qty), (_bybit_get_instr_filters(sym) or {}).get('qtyStep')),
+            'timeInForce': 'IOC',
+            'reduceOnly': True,
+            'closeOnTrigger': True,
+        }
+        res = _bybit_v5_request('POST', '/v5/order/create', payload)
+        out.update({'action': 'reduced', 'reduce_qty': float(reduce_qty), 'payload': payload, 'res': res, 'ok': int((res or {}).get('retCode', -1)) == 0})
+        p2 = _autotrade_wait_live_position(sym, side=side_u, wait_sec=3.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side_u)
+        if p2:
+            out['after'] = _autotrade_live_position_risk_detail(p2)
+            if float((out.get('after') or {}).get('risk_usd') or 0.0) > cap * 1.05:
+                close_res = _autotrade_force_close_live_position(sym, side_u, qty=float(_pos_size(p2) or 0.0))
+                out.update({'action': 'closed_after_reduce_still_over_cap', 'close_res': close_res, 'ok': int((close_res or {}).get('retCode', -1)) == 0})
+        return out
+    except Exception as exc:
+        out.update({'ok': False, 'action': 'error', 'error': f'{type(exc).__name__}: {exc}'})
+        return out
+
+
 def _autotrade_find_live_position(symbol: str, side: str | None = None) -> dict | None:
     sym = _bybit_linear_symbol(symbol)
     side_u = str(side or "").upper().strip()
@@ -4026,6 +4148,13 @@ def _pos_liq_price(p: dict) -> float:
     except Exception:
         return 0.0
 
+
+def _pos_leverage(p: dict) -> float:
+    try:
+        return float((p or {}).get('leverage') or (p or {}).get('positionLeverage') or 0.0)
+    except Exception:
+        return 0.0
+
 def _bybit_exit_close_side_for_position_side(side: str | None) -> str:
     try:
         s = str(side or '').upper().strip()
@@ -4143,14 +4272,18 @@ def _pos_size(p: dict) -> float:
         return 0.0
 
 def _estimate_position_risk_usd(p: dict) -> float:
-    """Estimate risk using entry vs stopLoss if available; otherwise 0."""
+    """Estimate exchange risk using live entry, detected SL and instrument size."""
     try:
         entry = _pos_entry(p)
         sl = _pos_stop(p)
         size = abs(_pos_size(p))
         if entry <= 0 or sl <= 0 or size <= 0:
             return 0.0
-        return abs(entry - sl) * size
+        try:
+            cs = float((_bybit_get_instr_filters(_pos_symbol(p)) or {}).get('contractSize') or 1.0)
+        except Exception:
+            cs = 1.0
+        return _autotrade_true_risk_usd(entry, sl, size, cs)
     except Exception:
         return 0.0
 
@@ -8806,6 +8939,19 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             pass
         return (False, f"liq_guard_failed:{liq_plan.get('reason')}")
     safe_lev = int(liq_plan.get('safe_leverage') or configured_lev)
+    # Ver06: do not silently downgrade a live AutoTrade to 1x/low leverage.
+    # If configured 10x is not safe with the selected SL and liquidation buffer,
+    # skip the setup. This prevents positions like TONUSDT opening at 1x while
+    # the user expected AUTOTRADE_LEVERAGE=10.
+    if safe_lev < configured_lev and not _autotrade_allow_leverage_downgrade():
+        reason = f'configured_leverage_not_safe requires_{safe_lev}x_but_configured_{configured_lev}x'
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': reason, 'leverage_downgrade_blocked': True})
+            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=reason)
+        except Exception:
+            pass
+        return (False, reason)
     if str(_autotrade_runtime_mode()).lower() == 'live':
         lev_ok, lev_msg, lev_res = _autotrade_set_symbol_leverage_safe(sym, safe_lev)
         try:
@@ -9359,6 +9505,30 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 pass
             _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_attach_failed_force_closed')
             return (False, f"live_exit_attach_failed_force_closed ({(close_res or {}).get('retCode')} {(close_res or {}).get('retMsg')})")
+
+        # Ver06: after Bybit TP/SL attachment/repair, re-read the actual exchange
+        # position and stop. If the true SL-based risk is above the cap, reduce/close
+        # immediately before reporting the trade as successfully opened.
+        try:
+            post_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=2.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or final_pos
+            post_detail = _autotrade_live_position_risk_detail(post_pos) if post_pos else {}
+            strict_cap = float(final_cap_usd or _autotrade_hard_risk_cap_usd(float(equity)) or allowed_risk_usd or 0.0)
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'post_attach_risk_detail': post_detail, 'post_attach_risk_cap_usd': float(strict_cap)})
+            if strict_cap > 0 and float((post_detail or {}).get('risk_usd') or 0.0) > strict_cap * 1.0005:
+                rg = _autotrade_reduce_live_position_to_risk_cap(sym, side, strict_cap, reason='post_attach_risk_cap', live_pos=post_pos)
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'post_attach_risk_guard': rg})
+                if not bool((rg or {}).get('ok')) or str((rg or {}).get('action') or '').startswith('closed'):
+                    _autotrade_exec_mark(reserved_keys, 'FAILED', 'post_attach_risk_cap_closed')
+                    try:
+                        _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='failed', last_reason='post_attach_risk_cap_closed')
+                    except Exception:
+                        pass
+                    return (False, 'post_attach_risk_cap_closed')
+        except Exception as exc:
+            try:
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'post_attach_risk_guard_error': f'{type(exc).__name__}: {exc}'})
+            except Exception:
+                pass
 
         try:
             _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason='live_opened')
@@ -35904,6 +36074,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DYNAMIC_RISK_RANGE = {float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.5)):.2f}x–{float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.5)):.2f}x",
             f"AUTOTRADE_DYNAMIC_RISK_SCORE = low {float(summary.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 35)):.0f} | base {float(summary.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 60)):.0f} | high {float(summary.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', 85)):.0f}",
             f"Effective risk range now ≈ {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.5)):.2f}%–{float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.5)):.2f}%",
+            f"AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE = {'true' if bool(summary.get('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE')) else 'false'}",
+            f"AUTOTRADE_EMERGENCY_RISK_MAX_MULT = {float(summary.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', 2.0)):.2f}x",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
@@ -35918,6 +36090,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.5",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5",
+            "• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE false",
+            "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 2.0",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
             "• /autotrade_config AUTOTRADE_MODE live",
@@ -35943,7 +36117,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT',
         'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED',
         'AUTOTRADE_DYNAMIC_RISK_ENABLED', 'AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 'AUTOTRADE_DYNAMIC_RISK_MAX_MULT',
-        'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE'
+        'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE',
+        'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -35970,6 +36145,12 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE':
             val = max(0.0, min(100.0, float(value_raw)))
             _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, val)
+        elif key == 'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT':
+            val = max(1.0, min(10.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY, val)
         elif key == 'AUTOTRADE_OPEN_RISK_CAP_PCT':
             val = max(0.0, float(value_raw))
             _autotrade_config_set(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, val)
@@ -49447,6 +49628,22 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
                 rr = _autotrade_repair_live_exit_protection(int(uid), tr, live_pos=p)
                 if any(bool(rr.get(k)) for k in ('sl_fixed', 'tp_fixed', 'tp_order_fixed', 'be_applied', 'legacy_conditional_cancelled')):
                     repaired.append(rr)
+                # Ver06 emergency risk guardian: if an existing live position's
+                # detected SL risk is far above the configured dynamic-risk cap,
+                # reduce/close it. This catches stale/wrong exchange stops or any
+                # position that slipped past post-fill verification.
+                try:
+                    eq = _live_equity_usdt_cached(ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC) or _effective_equity_for_risk(get_user(int(uid)) or {}, prefer_live=True)
+                    emerg_cap = _autotrade_hard_risk_cap_usd(float(eq or 0.0), multiplier=_autotrade_emergency_risk_max_mult())
+                    if emerg_cap > 0:
+                        rd = _autotrade_live_position_risk_detail(p)
+                        if float((rd or {}).get('risk_usd') or 0.0) > emerg_cap * 1.0005:
+                            rg = _autotrade_reduce_live_position_to_risk_cap(_pos_symbol(p), _pos_side_text(p), emerg_cap, reason='guardian_emergency_risk_cap', live_pos=p)
+                            rg['checked'] = True
+                            rg['placement'] = 'guardian_emergency_risk_cap'
+                            repaired.append(rg)
+                except Exception:
+                    pass
             except Exception:
                 continue
 
