@@ -1054,8 +1054,17 @@ SETUP_EDGE_GUARD_HOUR_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_HOUR_MI
 SETUP_EDGE_GUARD_HOUR_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_HOUR_WR_MAX", "25") or 25)
 SETUP_EDGE_GUARD_HOUR_AVGR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_HOUR_AVGR_MAX", "-0.30") or -0.30)
 SETUP_EDGE_GUARD_INTERIM_UNTIL_LOCAL = os.environ.get("SETUP_EDGE_GUARD_INTERIM_UNTIL_LOCAL", "2026-05-17 23:00").strip() or "2026-05-17 23:00"
-SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST = tuple(x.strip().upper() for x in str(os.environ.get("SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST", "F1-ASIA-BUY,F1-LON-BUY") or "").split(",") if x.strip())
+SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST = tuple(x.strip().upper() for x in str(os.environ.get(
+    "SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST",
+    # Ver05 smoke-test guard: BUY-side lanes remain the weak area; keep strong SELL lanes alive.
+    "F1-ASIA-BUY,F1-LON-BUY,F2-ASIA-BUY,F2-NY-BUY,F3-LON-BUY,F6-NY-BUY"
+) or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST = tuple(x.strip().upper() for x in str(os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST", "GIGA,H,B") or "").split(",") if x.strip())
+SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple(x.strip() for x in str(os.environ.get(
+    "SETUP_EDGE_GUARD_INTERIM_HOUR_LIST",
+    # Secondary hour watch only. It is applied only to weak families, not to F3/F8 quality setups.
+    "10:00,13:00,19:00,23:00"
+) or "").split(",") if x.strip())
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
@@ -40205,6 +40214,10 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
                 k = str(key or '').upper().strip()
                 if k:
                     symbol_block.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': 'interim symbol block until Sunday policy review'})
+            for key in tuple(globals().get('SETUP_EDGE_GUARD_INTERIM_HOUR_LIST', ()) or ()): 
+                k = str(key or '').strip()
+                if k:
+                    hour_watch.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -40.0, 'reason': 'interim weak-hour watch until Sunday policy review'})
 
         data = {
             'ok': True, 'enabled': True, 'uid': eval_uid, 'hours': hrs, 'rows': len(rows or []), 'built_ts': now_ts,
@@ -40262,7 +40275,7 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         # Hour is a secondary confirmation only, not a standalone global ban. It blocks only
         # when the setup belongs to a generally weak family or a poor aggregate combo, so one
         # bad hour cannot remove otherwise strong F3/F8 opportunities.
-        if hour in hw and fam in {'F1', 'F6'}:
+        if hour in hw and fam in {'F1', 'F2', 'F6'}:
             return False, str((hw.get(hour) or {}).get('reason') or f'hour {hour} blocked for weak family {fam}')
         return True, 'ok'
     except Exception as exc:
@@ -40940,7 +40953,8 @@ def _setup_combo_policy_text(uid: int) -> str:
         table = tabulate(table_rows, headers=['Combo','Exec','Status','Set','Dec','WR','AvgR','Score'], tablefmt='plain')
         info = _setup_combo_latest_policy_update_info(int(uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
-        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nOfficial cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\nDaily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\nLast enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\nManual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, and temporary interim overrides are enforceable.\n<pre>{html.escape(table)}</pre>"
+        guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(uid)))
+        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nOfficial cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\nDaily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\nLast enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n{guard_txt}\nManual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary interim overrides, and the micro edge guard are enforceable.\n<pre>{html.escape(table)}</pre>"
     except Exception as e:
         return f"❌ setup_combo_policy failed: {type(e).__name__}: {html.escape(str(e))}"
 
@@ -41279,6 +41293,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
         f"Quick read: strongest now = <b>{html.escape(keep_txt)}</b> | weakest now = <b>{html.escape(weak_txt)}</b>.",
         f"Current live disabled policy combos: <b>{html.escape(pol_txt)}</b>.",
+        html.escape(_setup_edge_guard_snapshot_text(int(uid))),
         "For the weekly DB edge review, use <code>/setup_matrix 168</code>. <code>/setup_matrix 24</code> is diagnostic only. Live policy is officially updated by the scheduled Sunday 23:00 Melbourne review; daily 10:00 safety can add temporary severe-disable rows only.",
         "NOHIT = horizon expired with no TP/SL; OPEN = still inside the result horizon.",
     ]
@@ -42502,98 +42517,20 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         pass
     return out
 
-def _autotrade_report_overall_text_cached(owner: int) -> str:
-    owner = int(owner)
-    cache_key = f"autotrade_report_overall_text:{owner}"
+def _autotrade_report_overall_text_cached(owner: int, lookback_h: int = 24) -> str:
+    """/autotrade_report_overall — practical AutoTrade overall matrix.
+
+    Ver05: the old lifecycle-weighted summary could show 0 decided / hundreds
+    untracked while /autotrade_report had real closed PnL. Delegate to the same
+    merged Bybit+journal position logic as /autoytrade_report_overall so this
+    command is immediately useful for WR/PnL/family-session review.
+    """
     try:
-        if cache_valid(cache_key, int(PERFORMANCE_REPORT_CACHE_TTL_SEC or 30)):
-            cached = cache_get(cache_key)
-            if isinstance(cached, str) and cached.strip():
-                return cached
-    except Exception:
-        pass
-
-    _autotrade_migrate_tables()
-    days = _autotrade_history_days_available(owner)
-    weighted = _autotrade_weighted_outcome_summary(owner, days=days)
-    perf_rows = _autotrade_performance_rows(owner, days=days)
-    perf = _autotrade_performance_summary(perf_rows)
-    live_open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
-    try:
-        bot_live_open, external_live_open, _journal_open = _autotrade_collect_live_position_rows(owner, positions=live_open_positions, fallback_unmatched_as_owned=True)
-    except Exception:
-        bot_live_open, external_live_open = [], list(live_open_positions or [])
-    live_open_count = len(bot_live_open or [])
-    weighted_total = int(weighted.get('total') or 0)
-    closed_total = int(perf.get('closed') or 0)
-    fallback_closed_rows = []
-    try:
-        # The lifecycle/weighted tables can lag or miss Bybit-close fragments during the
-        # single-TP migration. Match /autotrade_report by falling back to merged closed rows
-        # so the overall summary never says 0 closed while the journal shows closed PnL.
-        days_for_rows = max(1, min(30, int(days or 1)))
-        fallback_closed_rows = _autotrade_closed_report_rows(owner, float(time.time()) - float(days_for_rows) * 86400.0, float(time.time()), lookback_h=int(days_for_rows * 24), limit=0) or []
-    except Exception:
-        fallback_closed_rows = []
-    fallback_closed_count = len(_autotrade_merge_position_report_rows([_setup_audit_merge_trade_setup_row(r) for r in fallback_closed_rows])) if fallback_closed_rows else 0
-    if closed_total <= 0 and fallback_closed_count > 0:
-        closed_total = int(fallback_closed_count)
-    total_visible = max(weighted_total, closed_total) + int(live_open_count if weighted_total <= 0 else 0)
-    if total_visible <= 0 and weighted_total <= 0 and closed_total <= 0:
-        return ""
-
-    by_session = weighted.get('by_session') or {}
-    weighted_decided = int(weighted.get('decided') or 0)
-    weighted_open = int(weighted.get('open') or 0)
-    weighted_tp = int(weighted.get('tp_only') or 0)
-    weighted_sl = int(weighted.get('losses') or 0)
-    weighted_untracked = max(0, int(weighted_total) - int(weighted_decided) - int(weighted_open))
-    display_open = max(int(weighted_open), int(live_open_count))
-    tracked_display = max(int(weighted_total), int(closed_total) + int(live_open_count))
-    lifecycle_open_mismatch = int(live_open_count) > int(weighted_open)
-    lines = [
-        "📈 AutoTrade Report (overall)",
-        HDR,
-        f"Tracked autotrade rows: {tracked_display}",
-        f"Closed autotrades: {closed_total} | Current live open positions: {live_open_count}",
-        (f"Ignored manual/external live positions: {len(external_live_open)}" if external_live_open else None),
-        ("Closed count uses merged Bybit/journal fallback because lifecycle rows are not fully decided yet." if int(perf.get('closed') or 0) <= 0 and int(closed_total or 0) > 0 else None),
-        (f"Lifecycle note: {weighted_untracked} tracked rows are still UNTRACKED/pending outcome sync. Live Bybit open count is used for Open when it is higher than lifecycle OPEN." if (weighted_untracked > 0 or lifecycle_open_mismatch) else None),
-    ]
-    lines = [str(x) for x in lines if x]
-
-    if weighted_total > 0:
-        lines.extend([
-            f"Decided: {weighted_decided} | Weighted WR: {float(weighted.get('weighted_win_rate') or 0.0):.1f}% | Binary WR: {float(weighted.get('binary_win_rate') or 0.0):.1f}%",
-            f"TP: {weighted_tp} | SL: {weighted_sl} | Open: {display_open} | Untracked: {weighted_untracked}",
-            f"Avg staged credit/trade: {float(weighted.get('avg_weighted_credit') or 0.0):.2f}",
-        ])
-        if weighted_decided <= 0:
-            lines.append("Outcome status: pending/insufficient close reconciliation; do not use this WR yet. Use /autotrade_report for current live PnL rows.")
-    else:
-        lines.extend([
-            "Weighted lifecycle WR: pending journal/outcome data",
-            f"Closed autotrade PnL summary: {int(perf.get('wins') or 0)}W / {int(perf.get('losses') or 0)}L | {float(perf.get('win_rate') or 0.0):.1f}% | Net {float(perf.get('net') or 0.0):+.2f} USDT",
-            f"Open: {display_open}",
-        ])
-
-    if by_session:
-        lines.extend(["", "Session breakdown (lifecycle rows only):"])
-        for sess, item in sorted(by_session.items()):
-            sess_tp = int(item.get('tp_only') or 0)
-            lines.append(
-                f"• {sess}: total {int(item.get('total') or 0)} | decided {int(item.get('decided') or 0)} | WR {float(item.get('weighted_win_rate') or 0.0):.1f}% | TP {sess_tp} SL {int(item.get('losses') or 0)} OPEN {int(item.get('open') or 0)}"
-            )
-        if lifecycle_open_mismatch:
-            lines.append(f"• LIVE_EXCHANGE: OPEN {int(live_open_count)} — authoritative current Bybit open-position count")
-
-    out = "\n".join(lines)
-    try:
-        cache_set(cache_key, out)
-    except Exception:
-        pass
-    return out
-
+        owner = int(owner)
+        lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
+        return _autoytrade_report_overall_text_cached(owner, lookback_h)
+    except Exception as exc:
+        return f"❌ /autotrade_report_overall failed: {type(exc).__name__}: {exc}"
 
 def _performance_report_payload_cached(owner: int, days: int) -> dict:
     owner = int(owner)
@@ -43404,9 +43341,16 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
 
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))
     owner = int(AUTOTRADE_OWNER_UID or uid)
     try:
-        text_out = await to_thread_heavy(_autotrade_report_overall_text_cached, owner, timeout=PERFORMANCE_REPORT_TIMEOUT_SEC)
+        text_out = await to_thread_heavy(_autotrade_report_overall_text_cached, owner, lookback_h, timeout=PERFORMANCE_REPORT_TIMEOUT_SEC)
     except asyncio.TimeoutError:
         await update.message.reply_text(f"⚠️ /autotrade_report_overall timed out after {int(PERFORMANCE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
         return
