@@ -3,7 +3,7 @@
 # - 14May_ver06: Added strict live risk/leverage guard: no silent leverage downgrade to 1x, post-attach exchange-risk verification, and guardian emergency reduction for oversized live positions.
 # - 14May_ver03: Added dynamic AutoTrade risk scoring/sizing: base risk from /autotrade_config scales 0.50x–1.50x by setup score (family/session/side/symbol/hour/regime/RR/volume/confidence), with daily/open caps still enforced.
 # - Ver11: Added hybrid setup-combo policy: weekly official review + daily 10:00 severe-disable safety review.
-# - Ver06: /autotrade_report now merges raw Bybit close fragments into one row per practical position; added /autoytrade_report_overall family/session matrix; cleanup now removes old Partial TP/SL children before Full TP/SL attach.
+# - Ver06: /autotrade_report now merges raw Bybit close fragments into one row per practical position; added /autotrade_report_overall family/session matrix; cleanup now removes old Partial TP/SL children before Full TP/SL attach.
 # - FIX25: Big-Move alert emails now generate immediate owner AutoTrade attempts using ATR-capped SL/TP.
 # - Simplified /learning_status, /autotrade_debug, and /autotrade_last outputs.
 # - Daily risk remaining now restores capacity from positive realized PnL and reduces it from losses.
@@ -1183,6 +1183,12 @@ SETUP_EDGE_GUARD_HOUR_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_HOUR_MI
 SETUP_EDGE_GUARD_HOUR_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_HOUR_WR_MAX", "25") or 25)
 SETUP_EDGE_GUARD_HOUR_AVGR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_HOUR_AVGR_MAX", "-0.30") or -0.30)
 SETUP_EDGE_GUARD_INTERIM_UNTIL_LOCAL = os.environ.get("SETUP_EDGE_GUARD_INTERIM_UNTIL_LOCAL", "2026-05-17 23:00").strip() or "2026-05-17 23:00"
+# Ver08: combo-side blocks are allowed to live until the weekly review, but
+# static symbol blocks are intentionally short-lived. Symbols often recover quickly
+# after one liquidation/pump cycle, while bad family/session/side lanes are slower
+# structural edges that should remain blocked until the weekly review reassesses them.
+SETUP_EDGE_GUARD_INTERIM_SYMBOL_TTL_HOURS = float(os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_TTL_HOURS", "24") or 24)
+SETUP_EDGE_GUARD_INTERIM_SYMBOL_UNTIL_LOCAL = os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_UNTIL_LOCAL", "").strip()
 SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST = tuple(x.strip().upper() for x in str(os.environ.get(
     "SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST",
     # Ver07 crisis guard: latest forward test showed F1/F3/F2 BUY and F1 ASIA/LON sides were the major drain.
@@ -21281,7 +21287,7 @@ def fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> List[List[float]]:
             if float(_OHLCV_RATE_LIMIT_WARN_UNTIL.get(warn_key) or 0.0) <= now_ts:
                 _OHLCV_RATE_LIMIT_WARN_UNTIL[warn_key] = now_ts + max(10.0, float(OHLCV_WARN_SUPPRESS_SEC or 120.0))
                 try:
-                    logger.info(
+                    logger.debug(
                         'fetch_ohlcv rate-limited for %s %s x%s; symbol cooling %ss and using stale cache if available',
                         symbol_u, tf_key, req_limit, int(cd),
                     )
@@ -35178,7 +35184,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "autoytrade_report_overall": "Family/session AutoTrade matrix: /autotrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
-    "autotrade_report_matrix": "Alias of /autoytrade_report_overall for the family/session AutoTrade matrix",
+    "autotrade_report_matrix": "Alias of /autotrade_report_overall for the family/session AutoTrade matrix",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "trade_lifecycle": "Exchange-backed per-trade lifecycle analytics with TP/SL path classification",
     "trade_lifecycle_detail": "Detailed rolling lifecycle report for the last 48h (or N hours), optional session filter",
@@ -35246,7 +35252,7 @@ def build_help_text_admin() -> str:
         "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
         "AutoTrade matrix examples: /autotrade_report_overall 24 (daily), /autotrade_report_overall 168 (weekly).",
         "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90.",
-        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE false | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_flat_now | /admin_reset_test_data confirm.",
+        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE false | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -39946,6 +39952,30 @@ def _setup_combo_format_policy_ts(ts: float | int | str | None) -> str:
         return '-'
 
 
+def _setup_combo_policy_kind_label(kind: str, short: bool = False) -> str:
+    """User-facing label for policy kind.
+
+    'interim' was technically correct internally, but it was confusing in Telegram.
+    These rows are temporary overrides active until the Sunday weekly review.
+    """
+    k = str(kind or '').lower().strip()
+    if short:
+        return {
+            'interim': 'weekly_override',
+            'scheduled': 'weekly',
+            'daily_safety': 'daily_safety',
+            'emergency': 'emergency',
+            'manual': 'advisory',
+        }.get(k, k or '-')
+    return {
+        'interim': 'weekly-review override',
+        'scheduled': 'weekly review',
+        'daily_safety': 'daily safety',
+        'emergency': 'emergency',
+        'manual': 'advisory',
+    }.get(k, k or '-')
+
+
 def _setup_combo_interim_until_ts() -> float:
     """End timestamp for the one-off Ver10 interim disable window."""
     try:
@@ -40357,7 +40387,8 @@ def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
         info.update({
             'updated_ts': float(chosen.get('updated_ts') or 0.0),
             'text': _setup_combo_format_policy_ts(chosen.get('updated_ts')),
-            'kind': str(chosen.get('policy_kind') or 'manual'),
+            'kind': _setup_combo_policy_kind_label(chosen.get('policy_kind')),
+            'kind_raw': str(chosen.get('policy_kind') or 'manual'),
             'scheduled_text': _setup_combo_format_policy_ts(chosen.get('scheduled_for_ts')),
             'expires_text': _setup_combo_format_policy_ts(chosen.get('expires_ts')),
             'rows': len(rows),
@@ -40473,6 +40504,52 @@ def _setup_edge_guard_interim_active() -> bool:
     try:
         until_ts = float(_setup_edge_guard_interim_until_ts() or 0.0)
         return until_ts > float(time.time())
+    except Exception:
+        return False
+
+
+def _setup_edge_guard_symbol_until_ts() -> float:
+    """Expiry for static symbol micro-guard blocks.
+
+    Symbol blocks should be shorter than side/combo blocks.  A symbol can have a
+    one-day post-spike mean reversion / liquidity shock and then become usable again.
+    We therefore persist a 24h expiry in autotrade_config so restarts do not extend
+    the window, while allowing env SETUP_EDGE_GUARD_INTERIM_SYMBOL_UNTIL_LOCAL to
+    override it when needed. Evidence-based symbol blocks from fresh audit rows still
+    remain rolling and independent of this static-list expiry.
+    """
+    try:
+        raw_until = str(globals().get('SETUP_EDGE_GUARD_INTERIM_SYMBOL_UNTIL_LOCAL', '') or '').strip()
+        if raw_until:
+            tz = _setup_combo_policy_tz()
+            dt = datetime.strptime(raw_until, '%Y-%m-%d %H:%M').replace(tzinfo=tz)
+            return float(dt.astimezone(timezone.utc).timestamp())
+    except Exception:
+        pass
+    try:
+        symbols = ','.join(sorted([str(x).upper().strip() for x in (globals().get('SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST', ()) or ()) if str(x).strip()]))
+        digest = hashlib.sha1(symbols.encode('utf-8')).hexdigest() if symbols else 'none'
+        key_exp = 'setup_edge_symbol_block_expires_ts'
+        key_hash = 'setup_edge_symbol_block_list_hash'
+        old_hash = str(_autotrade_config_get(key_hash, '') or '')
+        exp = float(_autotrade_config_get(key_exp, 0) or 0.0)
+        now_ts = float(time.time())
+        if old_hash != digest or exp <= 0:
+            ttl_h = max(1.0, float(globals().get('SETUP_EDGE_GUARD_INTERIM_SYMBOL_TTL_HOURS', 24) or 24))
+            exp = now_ts + ttl_h * 3600.0
+            _autotrade_config_set(key_hash, digest)
+            _autotrade_config_set(key_exp, exp)
+        return float(exp or 0.0)
+    except Exception:
+        try:
+            return float(time.time()) + 24.0 * 3600.0
+        except Exception:
+            return 0.0
+
+
+def _setup_edge_guard_symbol_interim_active() -> bool:
+    try:
+        return float(_setup_edge_guard_symbol_until_ts() or 0.0) > float(time.time())
     except Exception:
         return False
 
@@ -40601,21 +40678,26 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
             if m['decided'] >= hour_min and m['wr'] <= hour_wr_max and m['avg_r'] <= hour_avgr_max and m['sl'] >= m['tp'] + 3:
                 hour_watch[key] = {**m, 'reason': f"weak Melbourne hour {key}: {m['tp']}TP/{m['sl']}SL, WR {m['wr']:.1f}%, AvgR {m['avg_r']:+.2f}"}
 
-        # Evidence-based temporary overrides from the latest reviewed matrix. They expire at
-        # the same Sunday 23:00 policy review and can be overridden by env vars.
+        # Evidence-based temporary overrides from the latest reviewed matrix.
+        # Combo-side/hour guards live until the weekly review. Static symbol guards are
+        # shorter (default 24h), because individual crypto symbols can recover quickly
+        # after a one-off pump/dump/liquidity shock.
         if _setup_edge_guard_interim_active():
+            weekly_txt = _setup_combo_format_policy_ts(_setup_edge_guard_interim_until_ts())
             for key in tuple(globals().get('SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST', ()) or ()): 
                 k = str(key or '').upper().strip()
                 if k:
-                    combo_side_block.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': 'interim evidence block until Sunday policy review'})
-            for key in tuple(globals().get('SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST', ()) or ()): 
-                k = str(key or '').upper().strip()
-                if k:
-                    symbol_block.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': 'interim symbol block until Sunday policy review'})
+                    combo_side_block.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': f'temporary combo-side block until weekly review {weekly_txt}'})
             for key in tuple(globals().get('SETUP_EDGE_GUARD_INTERIM_HOUR_LIST', ()) or ()): 
                 k = str(key or '').strip()
                 if k:
-                    hour_watch.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -40.0, 'reason': 'interim weak-hour watch until Sunday policy review'})
+                    hour_watch.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -40.0, 'reason': f'temporary weak-hour watch until weekly review {weekly_txt}'})
+        if _setup_edge_guard_symbol_interim_active():
+            sym_txt = _setup_combo_format_policy_ts(_setup_edge_guard_symbol_until_ts())
+            for key in tuple(globals().get('SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST', ()) or ()): 
+                k = str(key or '').upper().strip()
+                if k:
+                    symbol_block.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': f'temporary symbol block until {sym_txt}'})
 
         data = {
             'ok': True, 'enabled': True, 'uid': eval_uid, 'hours': hrs, 'rows': len(rows or []), 'built_ts': now_ts,
@@ -40724,8 +40806,16 @@ def _setup_edge_guard_snapshot_text(uid: int = 0) -> str:
         cs = sorted(list((data or {}).get('combo_side_block') or {}))
         sy = sorted(list((data or {}).get('symbol_block') or {}))
         hw = sorted(list((data or {}).get('hour_watch') or {}))
-        exp = _setup_combo_format_policy_ts(_setup_edge_guard_interim_until_ts()) if _setup_edge_guard_interim_active() else '-'
-        return f"Micro edge guard: {'ON' if bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)) else 'OFF'} | Block side={', '.join(cs[:10]) if cs else '-'} | Block symbol={', '.join(sy[:12]) if sy else '-'} | Weak-hour watch={', '.join(hw[:8]) if hw else '-'} | Interim expires={exp}"
+        side_exp = _setup_combo_format_policy_ts(_setup_edge_guard_interim_until_ts()) if _setup_edge_guard_interim_active() else '-'
+        sym_exp = _setup_combo_format_policy_ts(_setup_edge_guard_symbol_until_ts()) if _setup_edge_guard_symbol_interim_active() else 'rolling evidence only'
+        return (
+            f"Micro edge guard: {'ON' if bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)) else 'OFF'}"
+            f" | Block side={', '.join(cs[:10]) if cs else '-'}"
+            f" | Side review={side_exp}"
+            f" | Block symbol={', '.join(sy[:12]) if sy else '-'}"
+            f" | Symbol review={sym_exp}"
+            f" | Weak-hour watch={', '.join(hw[:8]) if hw else '-'}"
+        )
     except Exception as exc:
         return f"Micro edge guard: ERROR {type(exc).__name__}: {exc}"
 
@@ -40797,7 +40887,7 @@ def _setup_combo_enrich_rows_with_active_policy(uid: int, rows: list[dict]) -> l
                 else:
                     r['effective_action'] = advisory
                     r['active_policy_enabled'] = 1 if not bool(globals().get('SETUP_COMBO_POLICY_BLOCK_WATCH', False)) else 0
-                r['active_policy_kind'] = str(pol.get('policy_kind') or '-').lower().strip() or '-'
+                r['active_policy_kind'] = _setup_combo_policy_kind_label(pol.get('policy_kind'), short=True)
                 r['active_policy_expires_txt'] = _setup_combo_format_policy_ts(pol.get('expires_ts'))
                 r['active_policy_status'] = st
             else:
@@ -41371,7 +41461,44 @@ def _setup_combo_policy_text(uid: int) -> str:
             cur = conn.cursor()
             rows = [dict(r) for r in cur.execute("SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session", (int(uid),)).fetchall() or []]
         if not rows:
-            return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nNo saved policy yet. Run <code>/setup_matrix 168</code>."
+            # After /admin_reset_test_data the historical policy table is intentionally
+            # cleared. Re-seed configured safety overrides, then fall back to the latest
+            # persisted advisory matrix so /setup_matrix policy still gives a useful
+            # status instead of a dead-end message.
+            try:
+                _setup_combo_seed_interim_disable_policy()
+                with sqlite3.connect(DB_PATH) as conn2:
+                    conn2.row_factory = sqlite3.Row
+                    cur2 = conn2.cursor()
+                    rows = [dict(r) for r in cur2.execute("SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session", (int(uid),)).fetchall() or []]
+            except Exception:
+                rows = []
+        if not rows:
+            next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
+            guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(uid)))
+            fallback_table = ''
+            try:
+                with sqlite3.connect(DB_PATH) as conn3:
+                    conn3.row_factory = sqlite3.Row
+                    cur3 = conn3.cursor()
+                    ids = [int(uid), 0]
+                    qmarks = ','.join(['?'] * len(ids))
+                    latest = cur3.execute(f"SELECT run_id FROM setup_combo_scores WHERE user_id IN ({qmarks}) ORDER BY evaluated_ts DESC LIMIT 1", tuple(ids)).fetchone()
+                    if latest and latest['run_id']:
+                        score_rows = [dict(r) for r in cur3.execute("SELECT * FROM setup_combo_scores WHERE run_id=? ORDER BY score DESC, family, session", (latest['run_id'],)).fetchall() or []]
+                        tr = []
+                        for r in score_rows[:20]:
+                            tr.append([str(r.get('combo') or f"{r.get('family','')}-{r.get('session','')}"), int(r.get('setups') or 0), int(r.get('decided') or 0), f"{float(r.get('win_rate') or 0.0):.1f}%", f"{float(r.get('avg_r') or 0.0):+.2f}", str(r.get('action') or 'WATCH')])
+                        if tr:
+                            fallback_table = "\nLatest advisory matrix after reset:\n<pre>" + html.escape(tabulate(tr, headers=['Combo','Set','Dec','WR','AvgR','Adv'], tablefmt='plain')) + "</pre>"
+            except Exception:
+                fallback_table = ''
+            return (
+                f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
+                f"No saved weekly/daily policy rows yet after the clean test-data reset. This is OK.\n"
+                f"Live enforcement still uses the micro edge guard below, and the next saved weekly policy review is <b>{html.escape(str(next_txt))}</b>.\n"
+                f"{guard_txt}" + fallback_table
+            )
         table_rows = []
         seen = set()
         for r in rows:
@@ -41390,7 +41517,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         info = _setup_combo_latest_policy_update_info(int(uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(uid)))
-        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nOfficial cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\nDaily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\nLast enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n{guard_txt}\nManual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary interim overrides, and the micro edge guard are enforceable.\n<pre>{html.escape(table)}</pre>"
+        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nOfficial cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\nDaily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\nLast enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n{guard_txt}\nManual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, and the micro edge guard are enforceable.\n<pre>{html.escape(table)}</pre>"
     except Exception as e:
         return f"❌ setup_combo_policy failed: {type(e).__name__}: {html.escape(str(e))}"
 
@@ -42671,7 +42798,7 @@ def _autotrade_report_closed_kind(row: dict) -> str:
     """Return TP/SL/FLAT for realised AutoTrade reporting.
 
     Prefer lifecycle TP/SL labels when available; otherwise use realised PnL. This keeps
-    /autoytrade_report_overall useful even when a close came from raw Bybit closed-PnL.
+    /autotrade_report_overall useful even when a close came from raw Bybit closed-PnL.
     """
     try:
         path = str((row or {}).get('result_path') or (row or {}).get('outcome') or '').upper().strip()
@@ -42958,7 +43085,7 @@ def _autotrade_report_overall_text_cached(owner: int, lookback_h: int = 24) -> s
 
     Ver05: the old lifecycle-weighted summary could show 0 decided / hundreds
     untracked while /autotrade_report had real closed PnL. Delegate to the same
-    merged Bybit+journal position logic as /autoytrade_report_overall so this
+    merged Bybit+journal position logic as /autotrade_report_overall so this
     command is immediately useful for WR/PnL/family-session review.
     """
     try:
@@ -43747,7 +43874,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
 
 
 async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autoytrade_report_overall [hours] — family/session AutoTrade matrix."""
+    """/autotrade_report_overall [hours] — family/session AutoTrade matrix."""
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
@@ -43763,10 +43890,10 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     try:
         text_out = await to_thread_heavy(_autoytrade_report_overall_text_cached, owner, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
     except asyncio.TimeoutError:
-        await update.message.reply_text(f"⚠️ /autoytrade_report_overall timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
+        await update.message.reply_text(f"⚠️ /autotrade_report_overall timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
         return
     except Exception as e:
-        await update.message.reply_text(f"❌ /autoytrade_report_overall failed: {type(e).__name__}: {e}")
+        await update.message.reply_text(f"❌ /autotrade_report_overall failed: {type(e).__name__}: {e}")
         return
     await send_long_message(update, str(text_out or 'No AutoTrade data found yet.'), parse_mode=ParseMode.HTML)
 
@@ -49650,6 +49777,36 @@ async def admin_revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Access revoked. User {uid} set to FREE.")
 
 
+def _sqlite_archive_table_with_archived_at(cur, src_table: str, archive_table: str, archived_at: float) -> int:
+    """Archive common columns from src into archive and append archived_at.
+
+    Older DBs can have archive tables with fewer/more columns than the live table.
+    This helper avoids the classic SQLite error: "table X has N columns but M values
+    were supplied" by explicitly naming only common columns.
+    """
+    try:
+        src = str(src_table or '').strip()
+        dst = str(archive_table or '').strip()
+        if not src or not dst:
+            return 0
+        cur.execute(f"CREATE TABLE IF NOT EXISTS {dst} AS SELECT * FROM {src} WHERE 0")
+        try:
+            cur.execute(f"ALTER TABLE {dst} ADD COLUMN archived_at REAL")
+        except Exception:
+            pass
+        src_cols = [r[1] for r in cur.execute(f"PRAGMA table_info({src})").fetchall() or []]
+        dst_cols = [r[1] for r in cur.execute(f"PRAGMA table_info({dst})").fetchall() or []]
+        common = [c for c in src_cols if c in dst_cols and c != 'archived_at']
+        if not common:
+            return 0
+        col_sql = ','.join([f'"{c}"' for c in common])
+        dst_sql = col_sql + ',"archived_at"'
+        cur.execute(f"INSERT INTO {dst} ({dst_sql}) SELECT {col_sql}, ? FROM {src}", (float(archived_at or time.time()),))
+        return int(cur.rowcount or 0)
+    except Exception:
+        raise
+
+
 async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/admin_reset_report — archive current signals + outcomes then reset live tables.
 
@@ -49673,29 +49830,12 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
             outcomes_src = row[0] if row else None
 
             # --- Signals archive ---
-            c.execute("""CREATE TABLE IF NOT EXISTS signals_archive AS
-                         SELECT *, 0.0 AS archived_at FROM signals WHERE 0""")
-            try:
-                c.execute("ALTER TABLE signals_archive ADD COLUMN archived_at REAL")
-            except Exception:
-                pass
-
-            # Archive + clear signals
-            c.execute("INSERT INTO signals_archive SELECT *, ? FROM signals", (now_ts,))
+            _sqlite_archive_table_with_archived_at(c, 'signals', 'signals_archive', now_ts)
             c.execute("DELETE FROM signals")
 
             # --- Outcomes archive (optional) ---
             if outcomes_src:
-                # Create archive table based on the existing outcomes table schema
-                c.execute(f"""CREATE TABLE IF NOT EXISTS outcomes_archive AS
-                             SELECT *, 0.0 AS archived_at FROM {outcomes_src} WHERE 0""")
-                try:
-                    c.execute("ALTER TABLE outcomes_archive ADD COLUMN archived_at REAL")
-                except Exception:
-                    pass
-
-                # Archive + clear outcomes
-                c.execute(f"INSERT INTO outcomes_archive SELECT *, ? FROM {outcomes_src}", (now_ts,))
+                _sqlite_archive_table_with_archived_at(c, outcomes_src, 'outcomes_archive', now_ts)
                 c.execute(f"DELETE FROM {outcomes_src}")
 
             conn.commit()
@@ -49757,10 +49897,17 @@ async def admin_reset_test_data_cmd(update: Update, context: ContextTypes.DEFAUL
                 except Exception as exc:
                     skipped.append(f'{t}:{type(exc).__name__}')
             conn.commit()
+        try:
+            _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
+            _SETUP_EDGE_GUARD_CACHE['ts'] = 0.0
+            _setup_combo_seed_interim_disable_policy()
+        except Exception:
+            pass
         await update.message.reply_text(
             "✅ Test/report dataset reset complete.\n"
             f"Deleted/cleared tables: {len(deleted)}\n"
             "Configs preserved: users, autotrade_config, strategy_config, email/session/tz/billing.\n"
+            "Configured safety policy/micro-guard was re-seeded for the clean forward test.\n"
             "Live Bybit positions were not closed. Use /open_trades and close manually or wait for the scheduled flat job."
         )
     except Exception as exc:
