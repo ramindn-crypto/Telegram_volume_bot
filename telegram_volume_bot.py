@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - 15May_ver10: Clean forward-test mode after dataset reset: removed default static symbol micro-blocks so symbols are active again; symbol blocks now only appear from new rolling evidence during the fresh test.
 # - 15May_ver09: /setup_matrix policy now shows the full configured combo universe with ON/PART/OFF status after clean test-data reset.
 # - 15May_ver07: Crisis hardening after poor 24h live results: safer dynamic risk range (±25%), stricter setup micro-guard, daily AutoTrade caps, pre-ASIA flatten job, and admin data-reset command.
 # - 14May_ver06: Added strict live risk/leverage guard: no silent leverage downgrade to 1x, post-attach exchange-risk verification, and guardian emergency reduction for oversized live positions.
@@ -1195,7 +1196,7 @@ SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST = tuple(x.strip().upper() for x in str(
     # Ver07 crisis guard: latest forward test showed F1/F3/F2 BUY and F1 ASIA/LON sides were the major drain.
     "F1-ASIA-BUY,F1-ASIA-SELL,F1-LON-BUY,F1-LON-SELL,F2-ASIA-BUY,F2-NY-BUY,F3-ASIA-BUY,F3-LON-BUY,F6-NY-BUY"
 ) or "").split(",") if x.strip())
-SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST = tuple(x.strip().upper() for x in str(os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST", "GIGA,H,B,BILL,SAGA") or "").split(",") if x.strip())
+SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST = tuple(x.strip().upper() for x in str(os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST", "") or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple(x.strip() for x in str(os.environ.get(
     "SETUP_EDGE_GUARD_INTERIM_HOUR_LIST",
     # Bad-hour watch. Ver07 blocks low/medium-score setups in these hours and allows only exceptional quality.
@@ -40808,7 +40809,8 @@ def _setup_edge_guard_snapshot_text(uid: int = 0) -> str:
         sy = sorted(list((data or {}).get('symbol_block') or {}))
         hw = sorted(list((data or {}).get('hour_watch') or {}))
         side_exp = _setup_combo_format_policy_ts(_setup_edge_guard_interim_until_ts()) if _setup_edge_guard_interim_active() else '-'
-        sym_exp = _setup_combo_format_policy_ts(_setup_edge_guard_symbol_until_ts()) if _setup_edge_guard_symbol_interim_active() else 'rolling evidence only'
+        static_sy = [str(x).upper().strip() for x in (globals().get('SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST', ()) or ()) if str(x).strip()]
+        sym_exp = (_setup_combo_format_policy_ts(_setup_edge_guard_symbol_until_ts()) if (static_sy and _setup_edge_guard_symbol_interim_active()) else 'rolling evidence only')
         return (
             f"Micro edge guard: {'ON' if bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)) else 'OFF'}"
             f" | Block side={', '.join(cs[:10]) if cs else '-'}"
