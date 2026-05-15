@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - 15May_ver07: Crisis hardening after poor 24h live results: safer dynamic risk range (±25%), stricter setup micro-guard, daily AutoTrade caps, pre-ASIA flatten job, and admin data-reset command.
 # - 14May_ver06: Added strict live risk/leverage guard: no silent leverage downgrade to 1x, post-attach exchange-risk verification, and guardian emergency reduction for oversized live positions.
 # - 14May_ver03: Added dynamic AutoTrade risk scoring/sizing: base risk from /autotrade_config scales 0.50x–1.50x by setup score (family/session/side/symbol/hour/regime/RR/volume/confidence), with daily/open caps still enforced.
 # - Ver11: Added hybrid setup-combo policy: weekly official review + daily 10:00 severe-disable safety review.
@@ -453,6 +454,25 @@ AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY = 'dynamic_risk_high_score'
 # far above the allowed dynamic-risk cap.
 AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY = 'allow_leverage_downgrade'
 AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY = 'emergency_risk_max_mult'
+
+# 15May_ver07 safer live defaults after poor 24h forward-test result.
+AUTOTRADE_CFG_VER07_SAFETY_VERSION_KEY = 'ver07_safety_defaults_version'
+AUTOTRADE_VER07_SAFETY_DEFAULTS_ENABLED = env_bool('AUTOTRADE_VER07_SAFETY_DEFAULTS_ENABLED', True)
+AUTOTRADE_VER07_TARGET_RISK_PCT = float(os.environ.get('AUTOTRADE_VER07_TARGET_RISK_PCT', '0.80') or 0.80)
+AUTOTRADE_VER07_MIN_RISK_MULT = float(os.environ.get('AUTOTRADE_VER07_MIN_RISK_MULT', '0.75') or 0.75)
+AUTOTRADE_VER07_MAX_RISK_MULT = float(os.environ.get('AUTOTRADE_VER07_MAX_RISK_MULT', '1.25') or 1.25)
+AUTOTRADE_VER07_OPEN_RISK_CAP_PCT = float(os.environ.get('AUTOTRADE_VER07_OPEN_RISK_CAP_PCT', '6.0') or 6.0)
+AUTOTRADE_VER07_DAILY_RISK_CAP_PCT = float(os.environ.get('AUTOTRADE_VER07_DAILY_RISK_CAP_PCT', '6.0') or 6.0)
+AUTOTRADE_VER07_MAX_OPEN_TRADES = int(os.environ.get('AUTOTRADE_VER07_MAX_OPEN_TRADES', '5') or 5)
+AUTOTRADE_VER07_MAX_TRADES_PER_DAY = int(os.environ.get('AUTOTRADE_VER07_MAX_TRADES_PER_DAY', '8') or 8)
+AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT = float(os.environ.get('AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT', '0.80') or 0.80)
+
+AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
+AUTOTRADE_FLAT_BEFORE_ASIA_HOUR = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9)
+AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45)
+AUTOTRADE_FLAT_CLOSE_ALL_LIVE = env_bool('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)
+AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
+AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '09:00-11:00') or '').split(',') if x.strip())
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
@@ -528,13 +548,13 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT),
         AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY: float(AUTOTRADE_LIQ_BUFFER_PCT),
         AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_RISK_ENABLED', True) else 0,
-        AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '0.50') or 0.50),
-        AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.50') or 1.50),
-        AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', '35') or 35),
-        AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', '60') or 60),
-        AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '85') or 85),
+        AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '0.75') or 0.75),
+        AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.25') or 1.25),
+        AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', '40') or 40),
+        AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', '65') or 65),
+        AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '90') or 90),
         AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY: 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', False) else 0,
-        AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '2.0') or 2.0),
+        AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '1.25') or 1.25),
     }
     for k, v in defaults.items():
         try:
@@ -652,7 +672,7 @@ def _autotrade_dynamic_risk_enabled() -> bool:
 
 def _autotrade_dynamic_risk_min_mult() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '0.50')) or 0.50)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '0.75')) or 0.75)
     except Exception:
         val = 0.50
     return max(0.10, min(1.00, float(val)))
@@ -660,7 +680,7 @@ def _autotrade_dynamic_risk_min_mult() -> float:
 
 def _autotrade_dynamic_risk_max_mult() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.50')) or 1.50)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.25')) or 1.25)
     except Exception:
         val = 1.50
     return max(1.00, min(3.00, float(val)))
@@ -668,21 +688,21 @@ def _autotrade_dynamic_risk_max_mult() -> float:
 
 def _autotrade_dynamic_risk_low_score() -> float:
     try:
-        return float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', '35')) or 35.0)
+        return float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', '40')) or 40.0)
     except Exception:
         return 35.0
 
 
 def _autotrade_dynamic_risk_base_score() -> float:
     try:
-        return float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', '60')) or 60.0)
+        return float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', '65')) or 65.0)
     except Exception:
         return 60.0
 
 
 def _autotrade_dynamic_risk_high_score() -> float:
     try:
-        return float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '85')) or 85.0)
+        return float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '90')) or 90.0)
     except Exception:
         return 85.0
 
@@ -713,7 +733,7 @@ def _autotrade_allow_leverage_downgrade() -> bool:
 
 def _autotrade_emergency_risk_max_mult() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY, os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '2.0')) or 2.0)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY, os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '1.25')) or 1.25)
     except Exception:
         val = 2.0
     return max(1.00, min(10.0, float(val)))
@@ -829,6 +849,69 @@ def _autotrade_apply_07may_safety_defaults() -> None:
     except Exception:
         pass
 
+
+
+def _autotrade_apply_ver07_safety_defaults() -> None:
+    """Apply 15-May ver07 crisis-safety runtime defaults once."""
+    try:
+        if not bool(globals().get('AUTOTRADE_VER07_SAFETY_DEFAULTS_ENABLED', True)):
+            return
+        target_version = 'ver07_2026_05_15'
+        first_apply = str(_autotrade_config_get(AUTOTRADE_CFG_VER07_SAFETY_VERSION_KEY, '') or '').strip().lower() != target_version
+
+        def _cur_float(key, default):
+            try:
+                return float(_autotrade_config_get(key, default) or default)
+            except Exception:
+                return float(default)
+
+        def _cur_int(key, default):
+            try:
+                return int(float(_autotrade_config_get(key, default) or default))
+            except Exception:
+                return int(default)
+
+        def _cap_float(key, target, *, lower_is_ok=True):
+            try:
+                cur = _cur_float(key, target)
+                if first_apply or cur <= 0 or (lower_is_ok and cur > float(target)) or ((not lower_is_ok) and cur < float(target)):
+                    _autotrade_config_set(key, float(target))
+            except Exception:
+                pass
+
+        def _cap_int(key, target):
+            try:
+                cur = _cur_int(key, target)
+                if first_apply or cur <= 0 or cur > int(target):
+                    _autotrade_config_set(key, int(target))
+            except Exception:
+                pass
+
+        _cap_float(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, float(AUTOTRADE_VER07_TARGET_RISK_PCT), lower_is_ok=True)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, float(AUTOTRADE_VER07_MIN_RISK_MULT))
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, float(AUTOTRADE_VER07_MAX_RISK_MULT))
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY, 40.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY, 65.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, 90.0)
+        _autotrade_config_set(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY, 1.25)
+        _cap_float(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, float(AUTOTRADE_VER07_OPEN_RISK_CAP_PCT), lower_is_ok=True)
+        try:
+            mode, val = _autotrade_daily_cap_settings()
+            if first_apply or str(mode or 'PCT').upper() != 'PCT' or float(val or 0.0) <= 0 or float(val or 0.0) > float(AUTOTRADE_VER07_DAILY_RISK_CAP_PCT):
+                _autotrade_set_daily_cap_settings('PCT', float(AUTOTRADE_VER07_DAILY_RISK_CAP_PCT))
+        except Exception:
+            pass
+        _cap_int(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, int(AUTOTRADE_VER07_MAX_OPEN_TRADES))
+        _cap_int(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(AUTOTRADE_VER07_MAX_TRADES_PER_DAY))
+        _cap_float(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, float(AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT), lower_is_ok=True)
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_VER07_SAFETY_VERSION_KEY, target_version)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
@@ -1065,7 +1148,7 @@ SETUP_COMBO_INTERIM_DISABLE_UNTIL_LOCAL = os.environ.get("SETUP_COMBO_INTERIM_DI
 SETUP_COMBO_INTERIM_DISABLE_LIST = tuple(
     x.strip().upper() for x in str(os.environ.get(
         "SETUP_COMBO_INTERIM_DISABLE_LIST",
-        "F1-NY"
+        "F1-NY,F1-ASIA,F1-LON,F3-ASIA"
     ) or "").split(",") if x.strip()
 )
 # Ver03: broad duplicate prevention for setup generation and setup emails.
@@ -1102,15 +1185,21 @@ SETUP_EDGE_GUARD_HOUR_AVGR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_HOUR_AVG
 SETUP_EDGE_GUARD_INTERIM_UNTIL_LOCAL = os.environ.get("SETUP_EDGE_GUARD_INTERIM_UNTIL_LOCAL", "2026-05-17 23:00").strip() or "2026-05-17 23:00"
 SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST = tuple(x.strip().upper() for x in str(os.environ.get(
     "SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST",
-    # Ver05 smoke-test guard: BUY-side lanes remain the weak area; keep strong SELL lanes alive.
-    "F1-ASIA-BUY,F1-LON-BUY,F2-ASIA-BUY,F2-NY-BUY,F3-LON-BUY,F6-NY-BUY"
+    # Ver07 crisis guard: latest forward test showed F1/F3/F2 BUY and F1 ASIA/LON sides were the major drain.
+    "F1-ASIA-BUY,F1-ASIA-SELL,F1-LON-BUY,F1-LON-SELL,F2-ASIA-BUY,F2-NY-BUY,F3-ASIA-BUY,F3-LON-BUY,F6-NY-BUY"
 ) or "").split(",") if x.strip())
-SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST = tuple(x.strip().upper() for x in str(os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST", "GIGA,H,B") or "").split(",") if x.strip())
+SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST = tuple(x.strip().upper() for x in str(os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST", "GIGA,H,B,BILL,SAGA") or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple(x.strip() for x in str(os.environ.get(
     "SETUP_EDGE_GUARD_INTERIM_HOUR_LIST",
-    # Secondary hour watch only. It is applied only to weak families, not to F3/F8 quality setups.
-    "10:00,13:00,19:00,23:00"
+    # Bad-hour watch. Ver07 blocks low/medium-score setups in these hours and allows only exceptional quality.
+    "10:00,11:00,13:00,18:00,19:00,23:00"
 ) or "").split(",") if x.strip())
+SETUP_EDGE_GUARD_STRICT_MIN_CONF = int(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_CONF", "83") or 83)
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "30000000") or 30000000)
+SETUP_EDGE_GUARD_BAD_HOUR_MIN_QUALITY = float(os.environ.get("SETUP_EDGE_GUARD_BAD_HOUR_MIN_QUALITY", "90") or 90)
+SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED", "12") or 12)
+SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX", "32") or 32)
+SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE = float(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE", "92") or 92)
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
@@ -3245,6 +3334,7 @@ except Exception:
 try:
     _autotrade_bootstrap_runtime_config()
     _autotrade_apply_07may_safety_defaults()
+    _autotrade_apply_ver07_safety_defaults()
 except Exception:
     pass
 
@@ -5214,6 +5304,122 @@ def _autotrade_force_close_live_position(symbol: str, side: str, qty: float | No
 
 
 
+
+
+def _local_hhmm_in_window(hhmm: str, window: str) -> bool:
+    try:
+        cur_h, cur_m = [int(x) for x in str(hhmm).split(':')[:2]]
+        start_s, end_s = str(window or '').split('-', 1)
+        sh, sm = [int(x) for x in start_s.split(':')[:2]]
+        eh, em = [int(x) for x in end_s.split(':')[:2]]
+        cur = cur_h * 60 + cur_m
+        start = sh * 60 + sm
+        end = eh * 60 + em
+        if start <= end:
+            return start <= cur < end
+        return cur >= start or cur < end
+    except Exception:
+        return False
+
+
+def _autotrade_entry_blackout_now(now_ts: float | None = None) -> tuple[bool, str]:
+    try:
+        if not bool(globals().get('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)):
+            return False, ''
+        ts = float(now_ts if now_ts is not None else time.time())
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+        hhmm = dt.strftime('%H:%M')
+        for w in tuple(globals().get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', ()) or ()): 
+            if _local_hhmm_in_window(hhmm, str(w)):
+                return True, f'entry_blackout_{w}_melbourne'
+        return False, ''
+    except Exception:
+        return False, ''
+
+
+def _autotrade_close_owned_live_positions(uid: int, reason: str = 'scheduled_flat') -> dict:
+    out = {'ok': True, 'reason': str(reason or 'scheduled_flat'), 'closed': [], 'skipped': [], 'errors': []}
+    try:
+        uid_i = int(uid or 0)
+        live_positions = list(_bybit_get_open_positions_linear() or [])
+        journal_open = list(_autotrade_db_open_trades(uid_i) or [])
+        for p in live_positions:
+            try:
+                sym = _pos_symbol(p)
+                side = _pos_side_text(p)
+                tr = _autotrade_find_open_trade_for_live_position(uid_i, p, journal_open=journal_open)
+                if not tr and not bool(globals().get('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)):
+                    out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'no_matching_autotrade_journal'})
+                    continue
+                qty = abs(float(_pos_size(p) or 0.0))
+                res = _autotrade_force_close_live_position(sym, side, qty=qty)
+                row = {'symbol': sym, 'side': side, 'qty': qty, 'retCode': (res or {}).get('retCode'), 'retMsg': (res or {}).get('retMsg')}
+                out['closed'].append(row)
+                try:
+                    if tr and str(tr.get('trade_id') or ''):
+                        _autotrade_db_close_trade(str(tr.get('trade_id')), time.time(), 0.0, 'SCHEDULED_FLAT', str(reason or 'scheduled_flat'))
+                except Exception:
+                    pass
+            except Exception as exc:
+                out['errors'].append(f'{type(exc).__name__}: {exc}')
+        try:
+            _autotrade_cancel_all_legacy_conditional_exit_orders(max_items=80)
+        except Exception:
+            pass
+        if out['errors']:
+            out['ok'] = False
+        return out
+    except Exception as exc:
+        return {'ok': False, 'reason': str(reason or 'scheduled_flat'), 'closed': [], 'skipped': [], 'errors': [f'{type(exc).__name__}: {exc}']}
+
+
+async def autotrade_flat_before_asia_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)):
+            return
+        if not _autotrade_ready() or str(_autotrade_runtime_mode()).lower() != 'live':
+            return
+        uid = int(AUTOTRADE_OWNER_UID or 0)
+        if uid <= 0:
+            return
+        res = await to_thread_autotrade(_autotrade_close_owned_live_positions, uid, 'scheduled_flat_before_asia_09_45_melbourne', timeout=45)
+        closed = list((res or {}).get('closed') or [])
+        if closed:
+            try:
+                msg = '🧹 AutoTrade scheduled flat before ASIA\n' + f"Closed positions: {len(closed)}\n" + '\n'.join([f"• {x.get('symbol')} {x.get('side')} ret={x.get('retCode')}" for x in closed[:12]])
+                await context.bot.send_message(chat_id=uid, text=msg)
+            except Exception:
+                pass
+    except Exception as exc:
+        try:
+            _hb_touch('autotrade_flat_before_asia', ok=False, error=f'{type(exc).__name__}: {exc}', details='flat_job_error')
+        except Exception:
+            pass
+
+
+async def autotrade_flat_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually close AutoTrade-owned live positions now."""
+    uid_req = int(update.effective_user.id)
+    if not is_admin_user(uid_req) and int(uid_req) != int(AUTOTRADE_OWNER_UID or 0):
+        await update.message.reply_text("⛔ Owner/admin only.")
+        return
+    if not _autotrade_ready() or str(_autotrade_runtime_mode()).lower() != 'live':
+        await update.message.reply_text("AutoTrade is not live/ready.")
+        return
+    owner = int(AUTOTRADE_OWNER_UID or uid_req)
+    try:
+        res = await to_thread_autotrade(_autotrade_close_owned_live_positions, owner, 'manual_autotrade_flat_now', timeout=60)
+        closed = list((res or {}).get('closed') or [])
+        skipped = list((res or {}).get('skipped') or [])
+        errs = list((res or {}).get('errors') or [])
+        lines = ["🧹 AutoTrade flat now", HDR, f"Closed attempts: {len(closed)} | Skipped: {len(skipped)} | Errors: {len(errs)}"]
+        for x in closed[:15]:
+            lines.append(f"• {x.get('symbol')} {x.get('side')} qty={x.get('qty')} ret={x.get('retCode')} {x.get('retMsg') or ''}")
+        if errs:
+            lines.append("Errors: " + "; ".join([str(e) for e in errs[:3]]))
+        await update.message.reply_text("\n".join(lines))
+    except Exception as exc:
+        await update.message.reply_text(f"❌ /autotrade_flat_now failed: {type(exc).__name__}: {exc}")
 
 AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED = env_bool('AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED', True)
 AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE = env_bool('AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE', True)
@@ -8601,6 +8807,14 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, 'not_owner')
     if not _autotrade_allowed_session(session_label):
         return (False, f'autotrade_session_not_allowed ({session_label})')
+    blacked, black_reason = _autotrade_entry_blackout_now()
+    if blacked:
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': black_reason, 'entry_blackout': True})
+        except Exception:
+            pass
+        return (False, black_reason)
     if not setups:
         return (False, 'no_setups')
 
@@ -34960,9 +35174,10 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
     "autotrade_fix_exits": "Force native Full TP/SL on all live AutoTrade positions and cancel legacy Conditional exit orders",
+    "autotrade_flat_now": "Manually close AutoTrade-owned live positions now",
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
-    "autoytrade_report_overall": "Family/session AutoTrade matrix: /autoytrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
+    "autoytrade_report_overall": "Family/session AutoTrade matrix: /autotrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
     "autotrade_report_matrix": "Alias of /autoytrade_report_overall for the family/session AutoTrade matrix",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "trade_lifecycle": "Exchange-backed per-trade lifecycle analytics with TP/SL path classification",
@@ -34973,6 +35188,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "cooldown_clear_all": "Clear all cooldowns",
     "admin_reset_report": "Archive signals/outcomes and reset live performance report",
     "admin_reset_signal_reports": "Hard reset report-related tables",
+    "admin_reset_test_data": "Clean forward-test reset: deletes setup/signal/autotrade/report datasets but preserves configs/users/email/session/tz",
     "reset": "Reset bot data / clean DB (dangerous)",
     "restore": "Restore from latest DB backup",
     "params_show": "Show active strategy parameters",
@@ -35006,9 +35222,9 @@ ADMIN_HELP_GROUPS = [
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
     ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_report", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
-    ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_signal_reports", "reset", "restore"]),
+    ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_test_data", "admin_reset_signal_reports", "reset", "restore"]),
 ]
 
 
@@ -35028,8 +35244,8 @@ def build_help_text_admin() -> str:
         "",
         "Note: quick snapshot commands are cached so normal commands stay instant. Heavy run/diagnostic commands are grouped separately below.",
         "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
-        "AutoTrade matrix examples: /autoytrade_report_overall 24 (daily), /autoytrade_report_overall 168 (weekly).",
-        "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.5 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 35 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 60 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 85.",
+        "AutoTrade matrix examples: /autotrade_report_overall 24 (daily), /autotrade_report_overall 168 (weekly).",
+        "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -36071,9 +36287,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             HDR,
             f"AUTOTRADE_RISK_PER_TRADE_PCT = {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']):.2f} (base)",
             f"AUTOTRADE_DYNAMIC_RISK_ENABLED = {'true' if bool(summary.get('AUTOTRADE_DYNAMIC_RISK_ENABLED')) else 'false'}",
-            f"AUTOTRADE_DYNAMIC_RISK_RANGE = {float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.5)):.2f}x–{float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.5)):.2f}x",
-            f"AUTOTRADE_DYNAMIC_RISK_SCORE = low {float(summary.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 35)):.0f} | base {float(summary.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 60)):.0f} | high {float(summary.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', 85)):.0f}",
-            f"Effective risk range now ≈ {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.5)):.2f}%–{float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.5)):.2f}%",
+            f"AUTOTRADE_DYNAMIC_RISK_RANGE = {float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.75)):.2f}x–{float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.25)):.2f}x",
+            f"AUTOTRADE_DYNAMIC_RISK_SCORE = low {float(summary.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 40)):.0f} | base {float(summary.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 65)):.0f} | high {float(summary.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', 90)):.0f}",
+            f"Effective risk range now ≈ {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.75)):.2f}%–{float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.25)):.2f}%",
             f"AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE = {'true' if bool(summary.get('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE')) else 'false'}",
             f"AUTOTRADE_EMERGENCY_RISK_MAX_MULT = {float(summary.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', 2.0)):.2f}x",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
@@ -36088,10 +36304,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "Examples:",
             "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.0   (base risk)",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.5",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25",
             "• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE false",
-            "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 2.0",
+            "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
             "• /autotrade_config AUTOTRADE_MODE live",
@@ -40375,8 +40591,8 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
         symbol_block = {}
         for key, b in by_symbol.items():
             m = _setup_edge_bucket_metrics(b)
-            if m['decided'] >= symbol_min and m['wr'] <= symbol_wr_max and m['tp'] == 0 and m['sl'] >= symbol_min:
-                symbol_block[key] = {**m, 'reason': f"weak symbol {key}: {m['tp']}TP/{m['sl']}SL in {m['decided']} decided setups"}
+            if m['decided'] >= symbol_min and m['wr'] <= max(symbol_wr_max, 25.0) and m['sl'] >= max(m['tp'] + 2, symbol_min):
+                symbol_block[key] = {**m, 'reason': f"weak symbol {key}: {m['tp']}TP/{m['sl']}SL in {m['decided']} decided setups, WR {m['wr']:.1f}%"}
 
         hour_watch = {}
         for key, b in by_hour.items():
@@ -40449,15 +40665,53 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         cs = dict((data or {}).get('combo_side_block') or {})
         sb = dict((data or {}).get('symbol_block') or {})
         hw = dict((data or {}).get('hour_watch') or {})
+        # Ver07 setup-volume governor: forward testing produced too many low/medium
+        # quality executable rows. Apply conservative global floors before old bad
+        # rows can reach email/autotrade.
+        try:
+            if isinstance(setup_or_row, dict):
+                conf_v = float(setup_or_row.get('conf') or setup_or_row.get('confidence') or 0.0)
+                q_v = float(setup_or_row.get('quality_score') or setup_or_row.get('score') or conf_v or 0.0)
+                vol_v = float(setup_or_row.get('fut_vol_usd') or setup_or_row.get('volume') or setup_or_row.get('vol_usd') or 0.0)
+            else:
+                conf_v = float(getattr(setup_or_row, 'conf', 0.0) or getattr(setup_or_row, 'confidence', 0.0) or 0.0)
+                q_v = float(getattr(setup_or_row, 'quality_score', 0.0) or getattr(setup_or_row, 'score', 0.0) or conf_v or 0.0)
+                vol_v = float(getattr(setup_or_row, 'fut_vol_usd', 0.0) or getattr(setup_or_row, 'volume', 0.0) or getattr(setup_or_row, 'vol_usd', 0.0) or 0.0)
+        except Exception:
+            conf_v, q_v, vol_v = 0.0, 0.0, 0.0
+        try:
+            min_conf = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_CONF', 83) or 83)
+            if min_conf > 0 and conf_v > 0 and conf_v < min_conf and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
+                return False, f'strict_min_conf_block conf={conf_v:.0f}<{min_conf:.0f}'
+        except Exception:
+            pass
+        try:
+            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 30000000) or 30000000)
+            if min_vol > 0 and vol_v > 0 and vol_v < min_vol and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
+                return False, f'strict_min_volume_block vol=${vol_v/1_000_000:.1f}M<{min_vol/1_000_000:.0f}M'
+        except Exception:
+            pass
+        try:
+            side_metrics = dict((data or {}).get('side_metrics') or {})
+            sm = dict(side_metrics.get(side) or {})
+            if int(sm.get('decided') or 0) >= int(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED', 12) or 12):
+                if float(sm.get('wr') or 0.0) <= float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX', 32) or 32) and float(sm.get('avg_r') or 0.0) < 0 and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
+                    return False, f'weak_global_side_block {side}: WR {float(sm.get("wr") or 0.0):.1f}%, AvgR {float(sm.get("avg_r") or 0.0):+.2f}, quality {q_v:.0f}'
+        except Exception:
+            pass
         if combo_side in cs:
             return False, str((cs.get(combo_side) or {}).get('reason') or f'combo-side {combo_side} blocked by edge guard')
         if sym and sym in sb:
             return False, str((sb.get(sym) or {}).get('reason') or f'symbol {sym} blocked by edge guard')
-        # Hour is a secondary confirmation only, not a standalone global ban. It blocks only
-        # when the setup belongs to a generally weak family or a poor aggregate combo, so one
-        # bad hour cannot remove otherwise strong F3/F8 opportunities.
-        if hour in hw and fam in {'F1', 'F2', 'F6'}:
-            return False, str((hw.get(hour) or {}).get('reason') or f'hour {hour} blocked for weak family {fam}')
+        # Hour is normally a secondary filter, but ver07 escalates current bad hours:
+        # only exceptional high-quality setups can pass in 10/11/13/18/19/23 Melbourne windows.
+        if hour in hw:
+            try:
+                min_q = float(globals().get('SETUP_EDGE_GUARD_BAD_HOUR_MIN_QUALITY', 90) or 90)
+            except Exception:
+                min_q = 90.0
+            if q_v < min_q or fam in {'F1', 'F2', 'F3', 'F6'}:
+                return False, str((hw.get(hour) or {}).get('reason') or f'hour {hour} blocked unless quality>={min_q:.0f}; fam={fam}, quality={q_v:.0f}')
         return True, 'ok'
     except Exception as exc:
         return True, f'guard_error_allowed:{type(exc).__name__}: {exc}'
@@ -49456,6 +49710,61 @@ async def admin_reset_report_cmd(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"❌ admin_reset_report failed: {e}")
 
 
+
+async def admin_reset_test_data_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Delete performance/test datasets while preserving runtime/admin configs."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args or str(context.args[0]).strip().lower() not in {'confirm', 'yes'}:
+        await update.message.reply_text(
+            "⚠️ This deletes historical setup/signal/email/autotrade report data for a clean forward test.\n"
+            "It does NOT close live Bybit positions and does NOT delete configs/users/email/session/tz/API settings.\n\n"
+            "Run: /admin_reset_test_data confirm"
+        )
+        return
+    preserve = {'users', 'autotrade_config', 'strategy_config', 'family_registry', 'family_param_sets', 'usdt_payments', 'payments_ledger', 'support_tickets', 'trade_id_seq'}
+    delete_tables = [
+        'signals', 'signal_outcomes', 'emailed_setups', 'executable_setups', 'generated_setups',
+        'setup_pipeline_events', 'setup_audit_results', 'setup_combo_scores', 'setup_combo_policy',
+        'emailed_setup_identities', 'emailed_symbols', 'emailed_symbols_v2', 'email_daily', 'email_state',
+        'setup_counter', 'emailed_bigmoves', 'pending_bigmoves', 'emailed_spikes', 'emailed_earlywarnings',
+        'bigmove_autotrade_triggers', 'autotrade_trades', 'autotrade_day_risk', 'autotrade_exec_guard',
+        'admin_setup_lifecycle', 'trade_lifecycle', 'trade_lifecycle_events',
+        'universe_snapshots', 'optimization_runs', 'optimization_results', 'promotion_log',
+        'universe_backtest_runs', 'evolution_state', 'evolution_runs', 'evolution_diagnostics',
+        'evolution_recommendations', 'market_scan_snapshots', 'market_scan_symbols',
+        'runtime_profiles', 'runtime_profile_events', 'research_decision_audit', 'family_eval_daily',
+        'allocator_plans', 'regime_snapshots'
+    ]
+    try:
+        deleted = []
+        skipped = []
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            existing = {str(r[0]) for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() or []}
+            for t in delete_tables:
+                if t in preserve:
+                    skipped.append(t)
+                    continue
+                if t not in existing:
+                    continue
+                try:
+                    c.execute(f'DELETE FROM {t}')
+                    deleted.append(t)
+                except Exception as exc:
+                    skipped.append(f'{t}:{type(exc).__name__}')
+            conn.commit()
+        await update.message.reply_text(
+            "✅ Test/report dataset reset complete.\n"
+            f"Deleted/cleared tables: {len(deleted)}\n"
+            "Configs preserved: users, autotrade_config, strategy_config, email/session/tz/billing.\n"
+            "Live Bybit positions were not closed. Use /open_trades and close manually or wait for the scheduled flat job."
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ admin_reset_test_data failed: {type(exc).__name__}: {exc}")
+
 async def admin_payments_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         await update.message.reply_text("❌ Admin only.")
@@ -50510,6 +50819,7 @@ def main():
     app.add_handler(CommandHandler("admin_grant", admin_grant_cmd, block=False))
     app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd, block=False))
     app.add_handler(CommandHandler("admin_reset_report", admin_reset_report_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_test_data", admin_reset_test_data_cmd, block=False))
     app.add_handler(CommandHandler("admin_reset_signal_reports", admin_reset_signal_reports_cmd, block=False))
     app.add_handler(CommandHandler("admin_payments", admin_payments_cmd, block=False))
 
@@ -50525,6 +50835,7 @@ def main():
     app.add_handler(CommandHandler("trade_lifecycle_detail", trade_lifecycle_detail_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_fix_exits", autotrade_fix_exits_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_flat_now", autotrade_flat_now_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
     app.add_handler(CommandHandler("autoytrade_report_overall", autoytrade_report_overall_cmd, block=False))
@@ -50642,6 +50953,25 @@ def main():
                     "misfire_grace_time": 900,
                 },
             )
+
+        if bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)):
+            try:
+                from datetime import time as _dt_time
+                app.job_queue.run_daily(
+                    autotrade_flat_before_asia_job,
+                    time=_dt_time(
+                        hour=int(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9) or 9),
+                        minute=int(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 45) or 45),
+                        tzinfo=MEL_TZ,
+                    ),
+                    name="autotrade_flat_before_asia_job",
+                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 1800},
+                )
+            except Exception as _flat_sched_exc:
+                try:
+                    logger.warning('autotrade flat-before-ASIA schedule failed: %s', _flat_sched_exc)
+                except Exception:
+                    pass
 
         app.job_queue.run_repeating(
             screen_cache_warmup_job,
