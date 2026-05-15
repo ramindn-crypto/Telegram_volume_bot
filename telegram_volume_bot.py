@@ -1201,7 +1201,7 @@ SETUP_COMBO_INTERIM_DISABLE_UNTIL_LOCAL = os.environ.get("SETUP_COMBO_INTERIM_DI
 SETUP_COMBO_INTERIM_DISABLE_LIST = tuple(
     x.strip().upper() for x in str(os.environ.get(
         "SETUP_COMBO_INTERIM_DISABLE_LIST",
-        "F1-NY,F1-ASIA,F1-LON,F3-ASIA"
+        "F1-NY"
     ) or "").split(",") if x.strip()
 )
 # Ver03: broad duplicate prevention for setup generation and setup emails.
@@ -1244,17 +1244,20 @@ SETUP_EDGE_GUARD_INTERIM_SYMBOL_TTL_HOURS = float(os.environ.get("SETUP_EDGE_GUA
 SETUP_EDGE_GUARD_INTERIM_SYMBOL_UNTIL_LOCAL = os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_UNTIL_LOCAL", "").strip()
 SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST = tuple(x.strip().upper() for x in str(os.environ.get(
     "SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST",
-    # Ver07 crisis guard: latest forward test showed F1/F3/F2 BUY and F1 ASIA/LON sides were the major drain.
-    "F1-ASIA-BUY,F1-ASIA-SELL,F1-LON-BUY,F1-LON-SELL,F2-ASIA-BUY,F2-NY-BUY,F3-ASIA-BUY,F3-LON-BUY,F6-NY-BUY"
+    # Ver13 reset-friendly guard: after a clean dataset reset, do not keep full old SELL-side
+    # or F3-ASIA BUY blocks from the pre-reset sample. Keep only the strongest BUY-side
+    # weak lanes until the Sunday review; fresh evidence can add more dynamically.
+    "F1-ASIA-BUY,F1-LON-BUY,F2-ASIA-BUY,F2-NY-BUY,F3-LON-BUY,F6-NY-BUY"
 ) or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST = tuple(x.strip().upper() for x in str(os.environ.get("SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST", "") or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple(x.strip() for x in str(os.environ.get(
     "SETUP_EDGE_GUARD_INTERIM_HOUR_LIST",
-    # Bad-hour watch. Ver07 blocks low/medium-score setups in these hours and allows only exceptional quality.
-    "10:00,11:00,13:00,18:00,19:00,23:00"
+    # Bad-hour watch. Ver13 removes the old NY late-hour watch after dataset reset so
+    # the bot can collect fresh NY evidence; 10/11/13/19 remain cautious windows.
+    "10:00,11:00,13:00,19:00"
 ) or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = int(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_CONF", "83") or 83)
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "30000000") or 30000000)
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "20000000") or 20000000)
 SETUP_EDGE_GUARD_BAD_HOUR_MIN_QUALITY = float(os.environ.get("SETUP_EDGE_GUARD_BAD_HOUR_MIN_QUALITY", "90") or 90)
 SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED", "12") or 12)
 SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX", "32") or 32)
@@ -40192,6 +40195,30 @@ def _setup_combo_seed_interim_disable_policy() -> None:
 
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
+            # Ver13: when the default interim disable list is narrowed after a clean reset,
+            # remove older interim rows that are no longer part of the current configured
+            # protection set. Otherwise stale F1-ASIA/F1-LON/F3-ASIA rows can keep the
+            # bot starved until Sunday even though the code now wants only F1-NY blocked.
+            desired_set = set(desired_pairs)
+            stale_removed = 0
+            for pol_uid in policy_uids:
+                try:
+                    stale_rows = cur.execute("""SELECT family, session FROM setup_combo_policy
+                        WHERE user_id=? AND LOWER(policy_kind)=?""", (int(pol_uid), 'interim')).fetchall()
+                    for sfam, ssess in list(stale_rows or []):
+                        pair = (str(sfam or '').upper().strip(), str(ssess or '').upper().strip())
+                        if pair and pair not in desired_set:
+                            cur.execute("""DELETE FROM setup_combo_policy
+                                WHERE user_id=? AND UPPER(family)=? AND UPPER(session)=? AND LOWER(policy_kind)=?""",
+                                (int(pol_uid), pair[0], pair[1], 'interim'))
+                            stale_removed += 1
+                except Exception:
+                    pass
+            if stale_removed:
+                try:
+                    logger.info('setup_combo_interim_stale_policy_removed rows=%s desired=%s', stale_removed, ','.join([f'{a}-{b}' for a,b in desired_pairs]))
+                except Exception:
+                    pass
             # If all requested interim rows are already active and not expired, do nothing.
             already_active = True
             for pol_uid in policy_uids:
