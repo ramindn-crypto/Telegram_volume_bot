@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - 15May_ver09: /setup_matrix policy now shows the full configured combo universe with ON/PART/OFF status after clean test-data reset.
 # - 15May_ver07: Crisis hardening after poor 24h live results: safer dynamic risk range (±25%), stricter setup micro-guard, daily AutoTrade caps, pre-ASIA flatten job, and admin data-reset command.
 # - 14May_ver06: Added strict live risk/leverage guard: no silent leverage downgrade to 1x, post-attach exchange-risk verification, and guardian emergency reduction for oversized live positions.
 # - 14May_ver03: Added dynamic AutoTrade risk scoring/sizing: base risk from /autotrade_config scales 0.50x–1.50x by setup score (family/session/side/symbol/hour/regime/RR/volume/confidence), with daily/open caps still enforced.
@@ -41454,70 +41455,211 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
 
 
 def _setup_combo_policy_text(uid: int) -> str:
+    """Human policy view.
+
+    Ver09: after /admin_reset_test_data the saved policy table can contain only the
+    disabled safety rows, which made /setup_matrix policy look like there were no
+    active combinations.  This view now shows the full configured family/session
+    universe and overlays:
+      - full combo policy (ON/OFF)
+      - side-level micro guard (BUY/SELL/PARTIAL)
+      - latest advisory stats when available
+    """
     try:
         _setup_combo_policy_migrate()
+        owner_uid = int(uid or 0)
+        if owner_uid <= 0:
+            owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
-            rows = [dict(r) for r in cur.execute("SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session", (int(uid),)).fetchall() or []]
+            rows = [dict(r) for r in cur.execute(
+                "SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session",
+                (int(owner_uid),)
+            ).fetchall() or []]
         if not rows:
             # After /admin_reset_test_data the historical policy table is intentionally
-            # cleared. Re-seed configured safety overrides, then fall back to the latest
-            # persisted advisory matrix so /setup_matrix policy still gives a useful
-            # status instead of a dead-end message.
+            # cleared. Re-seed configured safety overrides so live policy visibility is
+            # not lost during a clean forward test.
             try:
                 _setup_combo_seed_interim_disable_policy()
                 with sqlite3.connect(DB_PATH) as conn2:
                     conn2.row_factory = sqlite3.Row
                     cur2 = conn2.cursor()
-                    rows = [dict(r) for r in cur2.execute("SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session", (int(uid),)).fetchall() or []]
+                    rows = [dict(r) for r in cur2.execute(
+                        "SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session",
+                        (int(owner_uid),)
+                    ).fetchall() or []]
             except Exception:
                 rows = []
-        if not rows:
-            next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
-            guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(uid)))
-            fallback_table = ''
-            try:
-                with sqlite3.connect(DB_PATH) as conn3:
-                    conn3.row_factory = sqlite3.Row
-                    cur3 = conn3.cursor()
-                    ids = [int(uid), 0]
-                    qmarks = ','.join(['?'] * len(ids))
-                    latest = cur3.execute(f"SELECT run_id FROM setup_combo_scores WHERE user_id IN ({qmarks}) ORDER BY evaluated_ts DESC LIMIT 1", tuple(ids)).fetchone()
-                    if latest and latest['run_id']:
-                        score_rows = [dict(r) for r in cur3.execute("SELECT * FROM setup_combo_scores WHERE run_id=? ORDER BY score DESC, family, session", (latest['run_id'],)).fetchall() or []]
-                        tr = []
-                        for r in score_rows[:20]:
-                            tr.append([str(r.get('combo') or f"{r.get('family','')}-{r.get('session','')}"), int(r.get('setups') or 0), int(r.get('decided') or 0), f"{float(r.get('win_rate') or 0.0):.1f}%", f"{float(r.get('avg_r') or 0.0):+.2f}", str(r.get('action') or 'WATCH')])
-                        if tr:
-                            fallback_table = "\nLatest advisory matrix after reset:\n<pre>" + html.escape(tabulate(tr, headers=['Combo','Set','Dec','WR','AvgR','Adv'], tablefmt='plain')) + "</pre>"
-            except Exception:
-                fallback_table = ''
-            return (
-                f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
-                f"No saved weekly/daily policy rows yet after the clean test-data reset. This is OK.\n"
-                f"Live enforcement still uses the micro edge guard below, and the next saved weekly policy review is <b>{html.escape(str(next_txt))}</b>.\n"
-                f"{guard_txt}" + fallback_table
-            )
-        table_rows = []
-        seen = set()
+
+        # Latest advisory matrix rows are optional. They provide live stats but are not
+        # required to know which combos are currently active/disabled.
+        latest_scores = {}
+        try:
+            with sqlite3.connect(DB_PATH) as conn3:
+                conn3.row_factory = sqlite3.Row
+                cur3 = conn3.cursor()
+                ids = [int(owner_uid), 0]
+                qmarks = ','.join(['?'] * len(ids))
+                latest = cur3.execute(
+                    f"SELECT run_id FROM setup_combo_scores WHERE user_id IN ({qmarks}) ORDER BY evaluated_ts DESC LIMIT 1",
+                    tuple(ids)
+                ).fetchone()
+                if latest and latest['run_id']:
+                    for sr in cur3.execute("SELECT * FROM setup_combo_scores WHERE run_id=?", (latest['run_id'],)).fetchall() or []:
+                        d = dict(sr)
+                        combo = str(d.get('combo') or f"{d.get('family','')}-{d.get('session','')}").upper().strip()
+                        if combo:
+                            latest_scores[combo] = d
+        except Exception:
+            latest_scores = {}
+
+        # Active policy rows by combo, respecting expiry and owner/global precedence.
+        policy_by_combo = _setup_combo_enforceable_policy_lookup(int(owner_uid))
+
+        # Build the configured universe. Include F1-F8 by default so the admin can see
+        # what is active even when there is no fresh setup data after a reset.
+        families = set()
+        sessions = set()
+        try:
+            cfg = load_strategy_config(force=False)
+        except Exception:
+            cfg = {}
+        try:
+            raw_fams = (cfg or {}).get('active_family_codes') or []
+            for f in raw_fams:
+                ff = str(f or '').upper().strip()
+                if re.fullmatch(r'F\d+', ff):
+                    families.add(ff)
+        except Exception:
+            pass
+        for f in [f'F{i}' for i in range(1, 9)]:
+            families.add(f)
+        try:
+            for s in _strategy_cfg_execution_sessions_allowed(cfg):
+                ss = str(s or '').upper().strip()
+                if ss:
+                    sessions.add(ss)
+        except Exception:
+            pass
+        try:
+            for s in _autotrade_get_sessions():
+                ss = str(s or '').upper().strip()
+                if ss:
+                    sessions.add(ss)
+        except Exception:
+            pass
+        if not sessions:
+            sessions.update(['ASIA', 'LON', 'NY'])
+        # Preferred display order.
+        sess_order = ['ASIA', 'LON', 'NY']
+        families.update([c.split('-', 1)[0] for c in list(policy_by_combo.keys()) + list(latest_scores.keys()) if '-' in c])
+        sessions.update([c.split('-', 1)[1] for c in list(policy_by_combo.keys()) + list(latest_scores.keys()) if '-' in c])
+
+        # Side-level micro guard overlay.
+        try:
+            guard_data = _setup_edge_guard_build(int(owner_uid), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+            side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_side_block') or {}).keys())
+        except Exception:
+            side_blocks = set()
+
+        rows_by_combo = {}
         for r in rows:
-            key = (str(r.get('family') or ''), str(r.get('session') or ''))
-            if key in seen:
+            try:
+                combo = f"{str(r.get('family') or '').upper().strip()}-{str(r.get('session') or '').upper().strip()}"
+                if combo and combo != '-':
+                    # Prefer owner row over global row.
+                    old = rows_by_combo.get(combo)
+                    if old is None or (int(r.get('user_id') or 0) != 0 and int(old.get('user_id') or 0) == 0):
+                        rows_by_combo[combo] = dict(r)
+            except Exception:
                 continue
-            seen.add(key)
-            table_rows.append([
-                f"{r.get('family')}-{r.get('session')}",
-                'ON' if int(r.get('enabled') or 0) == 1 else 'OFF',
-                str(r.get('status') or ''),
-                int(r.get('last_setups') or 0), int(r.get('last_decided') or 0),
-                f"{float(r.get('last_win_rate') or 0.0):.1f}%", f"{float(r.get('last_avg_r') or 0.0):+.2f}", f"{float(r.get('last_score') or 0.0):+.1f}",
-            ])
-        table = tabulate(table_rows, headers=['Combo','Exec','Status','Set','Dec','WR','AvgR','Score'], tablefmt='plain')
-        info = _setup_combo_latest_policy_update_info(int(uid))
+
+        table_rows = []
+        active_count = partial_count = disabled_count = 0
+        for fam in sorted(families, key=lambda x: (int(x[1:]) if re.fullmatch(r'F\d+', x) else 99, x)):
+            for sess in sorted(sessions, key=lambda x: (sess_order.index(x) if x in sess_order else 99, x)):
+                combo = f'{fam}-{sess}'
+                pol = dict(policy_by_combo.get(combo) or {})
+                raw_pol = dict(rows_by_combo.get(combo) or {})
+                score = dict(latest_scores.get(combo) or {})
+
+                full_disabled = False
+                if pol:
+                    st = str(pol.get('status') or '').upper().strip()
+                    full_disabled = st in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or int(pol.get('enabled') or 0) == 0
+                elif raw_pol:
+                    # Non-enforceable/expired rows are shown as historical only; they do
+                    # not disable execution.
+                    full_disabled = False
+
+                buy_block = f'{combo}-BUY' in side_blocks
+                sell_block = f'{combo}-SELL' in side_blocks
+                if full_disabled or (buy_block and sell_block):
+                    exec_state = 'OFF'
+                    live_state = 'DISABLE'
+                    disabled_count += 1
+                elif buy_block or sell_block:
+                    exec_state = 'PART'
+                    live_state = 'TIGHTEN'
+                    partial_count += 1
+                else:
+                    exec_state = 'ON'
+                    live_state = 'WATCH'
+                    active_count += 1
+
+                if buy_block and sell_block:
+                    side_txt = 'BUY/SELL'
+                elif buy_block:
+                    side_txt = 'BUY'
+                elif sell_block:
+                    side_txt = 'SELL'
+                else:
+                    side_txt = '-'
+
+                set_v = int(score.get('setups') if score.get('setups') is not None else (pol.get('last_setups') or raw_pol.get('last_setups') or 0))
+                dec_v = int(score.get('decided') if score.get('decided') is not None else (pol.get('last_decided') or raw_pol.get('last_decided') or 0))
+                wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
+                avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
+                adv = str(score.get('action') or '-').upper().strip() or '-'
+                kind_src = pol.get('policy_kind') or raw_pol.get('policy_kind') or '-'
+                kind_txt = _setup_combo_policy_kind_label(kind_src, short=True) if kind_src and kind_src != '-' else '-'
+                if not pol and raw_pol and float(raw_pol.get('expires_ts') or 0.0) > 0:
+                    kind_txt = 'expired'
+                table_rows.append([
+                    combo, exec_state, live_state, side_txt,
+                    set_v, dec_v, f'{wr_v:.1f}%', f'{avg_v:+.2f}', adv, kind_txt,
+                ])
+
+        # Show disabled/tightened rows first, then active rows by family/session. This makes
+        # the safety state obvious while still showing every currently available combo.
+        order_rank = {'OFF': 0, 'PART': 1, 'ON': 2}
+        def _row_key(row):
+            combo = str(row[0])
+            fam, sess = combo.split('-', 1) if '-' in combo else (combo, '')
+            fam_n = int(fam[1:]) if re.fullmatch(r'F\d+', fam) else 99
+            sess_n = sess_order.index(sess) if sess in sess_order else 99
+            return (order_rank.get(str(row[1]), 9), fam_n, sess_n, combo)
+        table_rows = sorted(table_rows, key=_row_key)
+        table = tabulate(table_rows, headers=['Combo','Exec','Live','SideBlock','Set','Dec','WR','AvgR','Adv','Kind'], tablefmt='plain')
+
+        info = _setup_combo_latest_policy_update_info(int(owner_uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
-        guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(uid)))
-        return f"📈 <b>Setup Combo Policy</b>\n{HDR}\nOfficial cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\nDaily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\nLast enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n{guard_txt}\nManual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, and the micro edge guard are enforceable.\n<pre>{html.escape(table)}</pre>"
+        guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
+        note = (
+            f"Visible combos: <b>{len(table_rows)}</b> | Active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
+            f"Legend: <b>ON</b>=active, <b>PART</b>=only one side is blocked by micro guard, <b>OFF</b>=fully disabled."
+        )
+        return (
+            f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
+            f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
+            f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
+            f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
+            f"{guard_txt}\n{note}\n"
+            f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, and the micro edge guard are enforceable.\n"
+            f"<pre>{html.escape(table)}</pre>"
+        )
     except Exception as e:
         return f"❌ setup_combo_policy failed: {type(e).__name__}: {html.escape(str(e))}"
 
