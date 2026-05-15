@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - 15May_ver11: Controlled safe-leverage downgrade: setups needing practical lower leverage (e.g. 7x vs configured 10x) can open safely; very low required leverage remains blocked.
 # - 15May_ver10: Clean forward-test mode after dataset reset: removed default static symbol micro-blocks so symbols are active again; symbol blocks now only appear from new rolling evidence during the fresh test.
 # - 15May_ver09: /setup_matrix policy now shows the full configured combo universe with ON/PART/OFF status after clean test-data reset.
 # - 15May_ver07: Crisis hardening after poor 24h live results: safer dynamic risk range (±25%), stricter setup micro-guard, daily AutoTrade caps, pre-ASIA flatten job, and admin data-reset command.
@@ -456,6 +457,12 @@ AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY = 'dynamic_risk_high_score'
 # far above the allowed dynamic-risk cap.
 AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY = 'allow_leverage_downgrade'
 AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY = 'emergency_risk_max_mult'
+# 15May_ver11: controlled leverage downgrade. A setup that needs 7x while the
+# user configured 10x should not be skipped if the required leverage is still
+# practical and safely above the minimum. Very low required leverage (e.g. 1x-4x)
+# is still skipped because it usually means the SL/liquidation geometry is too wide.
+AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY = 'safe_leverage_downgrade_min'
+AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY = 'ver11_leverage_policy_version'
 
 # 15May_ver07 safer live defaults after poor 24h forward-test result.
 AUTOTRADE_CFG_VER07_SAFETY_VERSION_KEY = 'ver07_safety_defaults_version'
@@ -555,8 +562,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', '40') or 40),
         AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', '65') or 65),
         AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '90') or 90),
-        AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY: 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', False) else 0,
+        AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY: 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', True) else 0,
         AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '1.25') or 1.25),
+        AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY: float(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '5') or 5),
     }
     for k, v in defaults.items():
         try:
@@ -727,10 +735,24 @@ def _autotrade_dynamic_risk_bounds() -> tuple[float, float, float, float, float]
 
 def _autotrade_allow_leverage_downgrade() -> bool:
     try:
-        raw = _autotrade_config_get(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', False) else 0)
+        raw = _autotrade_config_get(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', True) else 0)
         return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
     except Exception:
-        return False
+        return True
+
+
+def _autotrade_safe_leverage_downgrade_min() -> int:
+    """Minimum practical leverage allowed for automatic liquidation-safe downgrade.
+
+    Example: configured 10x and safe 7x is allowed; configured 10x and safe 1x
+    remains skipped. This keeps autotrading alive without repeating the old silent
+    1x behaviour that caused confusing oversized-looking positions.
+    """
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '5')) or 5)
+    except Exception:
+        val = 5.0
+    return max(1, min(20, int(round(float(val)))))
 
 
 def _autotrade_emergency_risk_max_mult() -> float:
@@ -777,6 +799,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE': float(_autotrade_dynamic_risk_base_score()),
         'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE': float(_autotrade_dynamic_risk_high_score()),
         'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE': bool(_autotrade_allow_leverage_downgrade()),
+        'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN': int(_autotrade_safe_leverage_downgrade_min()),
         'AUTOTRADE_EMERGENCY_RISK_MAX_MULT': float(_autotrade_emergency_risk_max_mult()),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
     }
@@ -896,7 +919,10 @@ def _autotrade_apply_ver07_safety_defaults() -> None:
         _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY, 40.0)
         _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY, 65.0)
         _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, 90.0)
-        _autotrade_config_set(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 0)
+        # Ver11 changed this policy to controlled downgrade: allow only if the
+        # calculated safe leverage remains above the configured minimum.
+        _autotrade_config_set(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, 5)
         _autotrade_config_set(AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY, 1.25)
         _cap_float(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, float(AUTOTRADE_VER07_OPEN_RISK_CAP_PCT), lower_is_ok=True)
         try:
@@ -914,6 +940,26 @@ def _autotrade_apply_ver07_safety_defaults() -> None:
             pass
     except Exception:
         pass
+
+def _autotrade_apply_ver11_leverage_policy_defaults() -> None:
+    """One-time migration for controlled safe-leverage downgrade.
+
+    Ver06/Ver07 correctly stopped silent 1x downgrades, but it also blocked valid
+    setups where the safe leverage was still practical (for example 7x while the
+    configured leverage is 10x). This migration turns downgrade back on, but keeps
+    a minimum safe leverage floor so 1x/2x/3x-style setups are still rejected.
+    """
+    try:
+        target_version = 'ver11_2026_05_15'
+        first_apply = str(_autotrade_config_get(AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY, '') or '').strip().lower() != target_version
+        if not first_apply:
+            return
+        _autotrade_config_set(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, int(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '5') or 5))
+        _autotrade_config_set(AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY, target_version)
+    except Exception:
+        pass
+
 
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
@@ -3343,6 +3389,7 @@ try:
     _autotrade_bootstrap_runtime_config()
     _autotrade_apply_07may_safety_defaults()
     _autotrade_apply_ver07_safety_defaults()
+    _autotrade_apply_ver11_leverage_policy_defaults()
 except Exception:
     pass
 
@@ -8768,7 +8815,7 @@ def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict |
         if isinstance(meta, dict):
             row.update(meta)
         if isinstance(detail, dict):
-            for k in ('when','setup_id','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct','dynamic_risk_score','risk_multiplier','configured_risk_pct','allowed_risk_pct','risk_actual_pct','risk_actual_usd'):
+            for k in ('when','setup_id','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct','dynamic_risk_score','risk_multiplier','configured_risk_pct','allowed_risk_pct','risk_actual_pct','risk_actual_usd','configured_leverage','safe_leverage','leverage_downgrade_applied','leverage_policy','leverage_downgrade_blocked'):
                 if k in detail and detail.get(k) not in (None, ''):
                     row[k] = detail.get(k)
         row['when'] = str(row.get('when') or datetime.now(timezone.utc).isoformat(timespec='seconds'))
@@ -9161,19 +9208,38 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             pass
         return (False, f"liq_guard_failed:{liq_plan.get('reason')}")
     safe_lev = int(liq_plan.get('safe_leverage') or configured_lev)
-    # Ver06: do not silently downgrade a live AutoTrade to 1x/low leverage.
-    # If configured 10x is not safe with the selected SL and liquidation buffer,
-    # skip the setup. This prevents positions like TONUSDT opening at 1x while
-    # the user expected AUTOTRADE_LEVERAGE=10.
-    if safe_lev < configured_lev and not _autotrade_allow_leverage_downgrade():
-        reason = f'configured_leverage_not_safe requires_{safe_lev}x_but_configured_{configured_lev}x'
+    # Ver11: controlled leverage downgrade. Do not skip a good setup just because
+    # 10x is too aggressive for the SL/liquidation buffer when a practical safe
+    # leverage is available (e.g. use 7x instead of 10x). Still block very low
+    # required leverage (default <5x) to avoid repeating the old silent 1x issue.
+    if safe_lev < configured_lev:
+        min_safe_lev = int(_autotrade_safe_leverage_downgrade_min())
+        allow_downgrade = bool(_autotrade_allow_leverage_downgrade()) and int(safe_lev) >= int(min_safe_lev)
+        if not allow_downgrade:
+            reason = f'configured_leverage_not_safe requires_{safe_lev}x_but_configured_{configured_lev}x_min_allowed_{min_safe_lev}x'
+            try:
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                    'reject_reason': reason,
+                    'leverage_downgrade_blocked': True,
+                    'configured_leverage': int(configured_lev),
+                    'safe_leverage': int(safe_lev),
+                    'leverage_policy': f'blocked_below_min_{min_safe_lev}x',
+                })
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=reason)
+            except Exception:
+                pass
+            return (False, reason)
         try:
             _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': reason, 'leverage_downgrade_blocked': True})
-            _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('risk_cap'), last_reason=reason)
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'leverage_downgrade_applied': True,
+                'configured_leverage': int(configured_lev),
+                'safe_leverage': int(safe_lev),
+                'leverage_policy': f'controlled_safe_downgrade_{configured_lev}x_to_{safe_lev}x',
+            })
         except Exception:
             pass
-        return (False, reason)
     if str(_autotrade_runtime_mode()).lower() == 'live':
         lev_ok, lev_msg, lev_res = _autotrade_set_symbol_leverage_safe(sym, safe_lev)
         try:
@@ -35219,7 +35285,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "trade_id_reset": "Reset your own Trade ID numbering",
     "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
     "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
-    "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated. Dynamic keys: AUTOTRADE_DYNAMIC_RISK_ENABLED, AUTOTRADE_DYNAMIC_RISK_MIN_MULT, AUTOTRADE_DYNAMIC_RISK_MAX_MULT, AUTOTRADE_DYNAMIC_RISK_LOW_SCORE, AUTOTRADE_DYNAMIC_RISK_BASE_SCORE, AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE. Safety keys: AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE, AUTOTRADE_EMERGENCY_RISK_MAX_MULT",
+    "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated. Dynamic keys: AUTOTRADE_DYNAMIC_RISK_ENABLED, AUTOTRADE_DYNAMIC_RISK_MIN_MULT, AUTOTRADE_DYNAMIC_RISK_MAX_MULT, AUTOTRADE_DYNAMIC_RISK_LOW_SCORE, AUTOTRADE_DYNAMIC_RISK_BASE_SCORE, AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE. Safety keys: AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE, AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN, AUTOTRADE_EMERGENCY_RISK_MAX_MULT",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
@@ -35254,7 +35320,7 @@ def build_help_text_admin() -> str:
         "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
         "AutoTrade matrix examples: /autotrade_report_overall 24 (daily), /autotrade_report_overall 168 (weekly).",
         "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90.",
-        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE false | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
+        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -36300,6 +36366,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DYNAMIC_RISK_SCORE = low {float(summary.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 40)):.0f} | base {float(summary.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 65)):.0f} | high {float(summary.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', 90)):.0f}",
             f"Effective risk range now ≈ {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.75)):.2f}%–{float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.25)):.2f}%",
             f"AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE = {'true' if bool(summary.get('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE')) else 'false'}",
+            f"AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN = {int(summary.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 5))}x",
             f"AUTOTRADE_EMERGENCY_RISK_MAX_MULT = {float(summary.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', 2.0)):.2f}x",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
@@ -36315,7 +36382,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25",
-            "• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE false",
+            "• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true",
+            "• /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5",
             "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
@@ -36343,7 +36411,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED',
         'AUTOTRADE_DYNAMIC_RISK_ENABLED', 'AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 'AUTOTRADE_DYNAMIC_RISK_MAX_MULT',
         'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE',
-        'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT'
+        'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', 'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -36373,6 +36441,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN':
+            val = max(1, min(20, int(float(value_raw))))
+            _autotrade_config_set(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, val)
         elif key == 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT':
             val = max(1.0, min(10.0, float(value_raw)))
             _autotrade_config_set(AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY, val)
@@ -43571,6 +43642,16 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     mult_txt = f"{float(rmult):.2f}x" if rmult not in ('', None) else '-'
                     risk_txt = f" | Risk≈{float(arisk):.2f}%" if arisk not in ('', None) else ''
                     lines.append(f"   DynRisk: score {score_txt} | mult {mult_txt}{risk_txt}")
+            except Exception:
+                pass
+            try:
+                cfg_lev = a.get('configured_leverage', '')
+                safe_lev = a.get('safe_leverage', '')
+                lev_pol = str(a.get('leverage_policy') or '').strip()
+                lev_applied = bool(a.get('leverage_downgrade_applied'))
+                if cfg_lev not in ('', None) and safe_lev not in ('', None):
+                    suffix = ' | controlled downgrade applied' if lev_applied else (f' | {lev_pol}' if lev_pol else '')
+                    lines.append(f"   Leverage: configured {int(float(cfg_lev))}x | safe {int(float(safe_lev))}x{suffix}")
             except Exception:
                 pass
         except Exception:
