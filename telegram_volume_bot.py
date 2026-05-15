@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - 15May_ver12: Enforced strict TP/SL-only lifecycle: no automatic mid-trade market closes/reductions for risk correction, exit-attach lag, or opposite F8 signals; report now shows TP/SL/OPEN exit type.
 # - 15May_ver11: Controlled safe-leverage downgrade: setups needing practical lower leverage (e.g. 7x vs configured 10x) can open safely; very low required leverage remains blocked.
 # - 15May_ver10: Clean forward-test mode after dataset reset: removed default static symbol micro-blocks so symbols are active again; symbol blocks now only appear from new rolling evidence during the fresh test.
 # - 15May_ver09: /setup_matrix policy now shows the full configured combo universe with ON/PART/OFF status after clean test-data reset.
@@ -476,7 +477,7 @@ AUTOTRADE_VER07_MAX_OPEN_TRADES = int(os.environ.get('AUTOTRADE_VER07_MAX_OPEN_T
 AUTOTRADE_VER07_MAX_TRADES_PER_DAY = int(os.environ.get('AUTOTRADE_VER07_MAX_TRADES_PER_DAY', '8') or 8)
 AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT = float(os.environ.get('AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT', '0.80') or 0.80)
 
-AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
+AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)
 AUTOTRADE_FLAT_BEFORE_ASIA_HOUR = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9)
 AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45)
 AUTOTRADE_FLAT_CLOSE_ALL_LIVE = env_bool('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)
@@ -801,6 +802,10 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE': bool(_autotrade_allow_leverage_downgrade()),
         'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN': int(_autotrade_safe_leverage_downgrade_min()),
         'AUTOTRADE_EMERGENCY_RISK_MAX_MULT': float(_autotrade_emergency_risk_max_mult()),
+        'AUTOTRADE_STRICT_TPSL_ONLY': bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)),
+        'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH': bool(globals().get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)),
+        'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL': bool(globals().get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)),
+        'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED': bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
     }
 
@@ -5476,8 +5481,16 @@ async def autotrade_flat_now_cmd(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as exc:
         await update.message.reply_text(f"❌ /autotrade_flat_now failed: {type(exc).__name__}: {exc}")
 
-AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED = env_bool('AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED', True)
-AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE = env_bool('AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE', True)
+# Ver12: strict TP/SL-only lifecycle. AutoTrade should not close or partially
+# reduce a live position at market in the middle of a trade. A position should
+# normally finish only via native Bybit position TP or SL. Manual /autotrade_flat_now
+# remains available as an explicit owner action.
+AUTOTRADE_STRICT_TPSL_ONLY = env_bool('AUTOTRADE_STRICT_TPSL_ONLY', True)
+AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = env_bool('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)
+AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = env_bool('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)
+AUTOTRADE_PREFILL_RISK_BUFFER_MULT = float(os.environ.get('AUTOTRADE_PREFILL_RISK_BUFFER_MULT', '0.92') or 0.92)
+AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED = env_bool('AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED', False)
+AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE = env_bool('AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE', False)
 
 
 def _autotrade_setup_family_code(setup: Any) -> str:
@@ -5494,11 +5507,12 @@ def _autotrade_setup_family_code(setup: Any) -> str:
 
 
 def _autotrade_f8_close_opposite_position_if_needed(uid: int, setup: Any, symbol: str, side: str) -> tuple[bool, str, dict]:
-    """For F8 BigMove only: close same-symbol opposite live exposure first.
+    """For F8 BigMove only: handle same-symbol opposite live exposure.
 
-    Ramin's rule: when a sharp BigMove setup appears opposite an existing same-symbol
-    position, flatten the old exposure immediately instead of waiting for SL. This is
-    limited to F8 and recorded in the last-attempt detail.
+    Ver12 strict TP/SL-only policy: do not flatten the existing exposure just
+    because a new opposite setup appears. If an opposite position is already open,
+    the new setup is skipped and the existing position must finish by its native
+    Bybit TP or SL, unless the owner manually runs /autotrade_flat_now.
     """
     detail = {'checked': False, 'action': 'none'}
     try:
@@ -5525,6 +5539,9 @@ def _autotrade_f8_close_opposite_position_if_needed(uid: int, setup: Any, symbol
         owner_kind = str(conflict.get('owner_kind') or '').lower().strip()
         if owner_kind != 'bot' and not AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE:
             return (False, 'f8_opposite_external_position_not_closed', detail)
+        if bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)):
+            detail.update({'action': 'blocked_new_f8_opposite_kept_existing_until_tp_sl', 'existing_side': pos_side})
+            return (False, 'opposite_position_open_wait_for_existing_tp_sl', detail)
 
         qty = float(conflict.get('position_qty') or 0.0)
         close_res = _autotrade_force_close_live_position(sym, pos_side, qty=qty)
@@ -5796,11 +5813,16 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
                 adj = _autotrade_adjust_live_liq_beyond_sl(sym, side, target_sl, entry, lev_start)
                 result['liq_repair'] = adj
                 if not bool((adj or {}).get('ok')):
-                    qty_to_close = abs(float(_pos_size(pos) or 0.0))
-                    close_res = _autotrade_force_close_live_position(sym, side, qty=qty_to_close)
-                    result['liq_unsafe_force_close'] = close_res
-                    result['error'] = f'liq_before_sl_unfixable liq={liq_px:g} sl={target_sl:g}'
-                    return result
+                    if bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)) and not bool(globals().get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)):
+                        result['liq_unsafe_not_closed_strict_tpsl_only'] = True
+                        result['error'] = f'liq_before_sl_unfixable_no_market_close liq={liq_px:g} sl={target_sl:g}'
+                        # Continue to re-apply native TP/SL; no intermediate market close.
+                    else:
+                        qty_to_close = abs(float(_pos_size(pos) or 0.0))
+                        close_res = _autotrade_force_close_live_position(sym, side, qty=qty_to_close)
+                        result['liq_unsafe_force_close'] = close_res
+                        result['error'] = f'liq_before_sl_unfixable liq={liq_px:g} sl={target_sl:g}'
+                        return result
                 pos = (adj or {}).get('position') or _autotrade_find_live_position(sym, side=side) or pos
                 entry = float(_pos_entry(pos) or entry or 0.0)
         except Exception as _liq_exc:
@@ -9141,6 +9163,23 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if math.isfinite(remaining_risk):
         allowed_risk_usd = min(float(allowed_risk_usd), float(remaining_risk))
     allowed_risk_usd = max(0.0, float(allowed_risk_usd))
+    # Ver12: size slightly below the theoretical cap so normal market-order
+    # slippage does not require an immediate reduce-only correction. This keeps
+    # live positions on the intended TP/SL-only lifecycle.
+    try:
+        _prefill_mult = max(0.50, min(1.00, float(globals().get('AUTOTRADE_PREFILL_RISK_BUFFER_MULT', 0.92) or 0.92)))
+        if bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)):
+            allowed_risk_usd_before_prefill_buffer = float(allowed_risk_usd)
+            allowed_risk_usd = float(allowed_risk_usd) * float(_prefill_mult)
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'strict_tpsl_only': True,
+                'prefill_risk_buffer_mult': float(_prefill_mult),
+                'allowed_risk_usd_before_prefill_buffer': float(allowed_risk_usd_before_prefill_buffer),
+                'allowed_risk_usd_after_prefill_buffer': float(allowed_risk_usd),
+            })
+    except Exception:
+        pass
 
     configured_risk_pct = _risk_pct_from_amount(float(equity), float(base_per_trade_risk))
     allowed_risk_pct = _risk_pct_from_amount(float(equity), float(allowed_risk_usd))
@@ -9551,36 +9590,43 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 'filled_risk_pct': float(filled_risk_pct),
             })
             if filled_risk > (allowed_risk_usd * 1.0005):
-                allowed_qty = _autotrade_qty_from_risk(filled_entry, sl_for_order, equity, risk_usd=allowed_risk_usd, contract_size=contract_size)
-                allowed_qty, reduce_reason = _round_qty_down(sym, allowed_qty, filled_entry)
-                if allowed_qty is None or allowed_qty <= 0:
-                    _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_no_valid_reduction:{reduce_reason}')
-                    return (False, f'post_fill_risk_breach_no_valid_reduction:{reduce_reason}')
-                reduce_qty = max(0.0, filled_qty - float(allowed_qty))
-                reduce_qty, reduce_reason = _round_qty_down(sym, reduce_qty, filled_entry)
-                if reduce_qty is None or reduce_qty <= 0:
-                    _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_reduce_qty_invalid:{reduce_reason}')
-                    return (False, f'post_fill_risk_breach_reduce_qty_invalid:{reduce_reason}')
-                reduce_payload = {
-                    'category': 'linear',
-                    'symbol': sym,
-                    'side': 'Sell' if side == 'BUY' else 'Buy',
-                    'orderType': 'Market',
-                    'qty': _fmt_qty(reduce_qty, qty_step),
-                    'timeInForce': 'IOC',
-                    'reduceOnly': True,
-                    'closeOnTrigger': True,
-                }
-                reduce_res = _bybit_v5_request('POST', '/v5/order/create', reduce_payload)
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reduce_payload': reduce_payload, 'reduce_res': reduce_res})
-                if int((reduce_res or {}).get('retCode', -1)) != 0:
-                    err = f"{(reduce_res or {}).get('retCode')} {(reduce_res or {}).get('retMsg')}"
-                    _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_reduce_failed:{err}')
-                    return (False, f'post_fill_risk_breach_reduce_failed ({err})')
-                corrected = True
-                live_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=3.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
-                filled_qty = abs(float((_pos_size(live_pos) if live_pos else allowed_qty) or allowed_qty or 0.0))
-                filled_entry = float((_pos_entry(live_pos) if live_pos else filled_entry) or filled_entry or price_ref)
+                if bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)) and not bool(globals().get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)):
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                        'post_fill_risk_over_cap_no_market_reduce': True,
+                        'post_fill_risk_policy': 'strict_tpsl_only_leave_native_tp_sl_to_manage',
+                    })
+                else:
+                    allowed_qty = _autotrade_qty_from_risk(filled_entry, sl_for_order, equity, risk_usd=allowed_risk_usd, contract_size=contract_size)
+                    allowed_qty, reduce_reason = _round_qty_down(sym, allowed_qty, filled_entry)
+                    if allowed_qty is None or allowed_qty <= 0:
+                        _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_no_valid_reduction:{reduce_reason}')
+                        return (False, f'post_fill_risk_breach_no_valid_reduction:{reduce_reason}')
+                    reduce_qty = max(0.0, filled_qty - float(allowed_qty))
+                    reduce_qty, reduce_reason = _round_qty_down(sym, reduce_qty, filled_entry)
+                    if reduce_qty is None or reduce_qty <= 0:
+                        _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_reduce_qty_invalid:{reduce_reason}')
+                        return (False, f'post_fill_risk_breach_reduce_qty_invalid:{reduce_reason}')
+                    reduce_payload = {
+                        'category': 'linear',
+                        'symbol': sym,
+                        'side': 'Sell' if side == 'BUY' else 'Buy',
+                        'orderType': 'Market',
+                        'qty': _fmt_qty(reduce_qty, qty_step),
+                        'timeInForce': 'IOC',
+                        'reduceOnly': True,
+                        'closeOnTrigger': True,
+                    }
+                    reduce_res = _bybit_v5_request('POST', '/v5/order/create', reduce_payload)
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reduce_payload': reduce_payload, 'reduce_res': reduce_res})
+                    if int((reduce_res or {}).get('retCode', -1)) != 0:
+                        err = f"{(reduce_res or {}).get('retCode')} {(reduce_res or {}).get('retMsg')}"
+                        _autotrade_exec_mark(reserved_keys, 'FAILED', f'post_fill_risk_breach_reduce_failed:{err}')
+                        return (False, f'post_fill_risk_breach_reduce_failed ({err})')
+                    corrected = True
+                    live_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=3.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
+                    filled_qty = abs(float((_pos_size(live_pos) if live_pos else allowed_qty) or allowed_qty or 0.0))
+                    filled_entry = float((_pos_entry(live_pos) if live_pos else filled_entry) or filled_entry or price_ref)
+
 
         final_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=5.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
         qty_for_db = abs(float((_pos_size(final_pos) if final_pos else filled_qty) or qty))
@@ -9596,41 +9642,48 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                 _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
                 _LAST_AUTOTRADE_DETAIL[int(uid)].update({'final_live_risk_usd': float(final_risk), 'final_live_risk_cap_usd': float(final_cap_usd)})
                 if final_cap_usd > 0 and final_risk > (final_cap_usd * 1.0005):
-                    allowed_qty_live = _autotrade_qty_from_risk(final_entry_for_risk, sl_for_order, equity, risk_usd=final_cap_usd, contract_size=contract_size)
-                    allowed_qty_live, allowed_reason_live = _round_qty_down(sym, allowed_qty_live, final_entry_for_risk)
-                    reduce_qty_live = max(0.0, float(qty_for_db) - float(allowed_qty_live or 0.0)) if allowed_qty_live and allowed_qty_live > 0 else float(qty_for_db)
-                    reduce_qty_live, reduce_reason_live = _round_qty_down(sym, reduce_qty_live, final_entry_for_risk)
-                    if reduce_qty_live and reduce_qty_live > 0:
-                        reduce_payload_live = {
-                            'category': 'linear',
-                            'symbol': sym,
-                            'side': 'Sell' if side == 'BUY' else 'Buy',
-                            'orderType': 'Market',
-                            'qty': _fmt_qty(reduce_qty_live, qty_step),
-                            'timeInForce': 'IOC',
-                            'reduceOnly': True,
-                            'closeOnTrigger': True,
-                        }
-                        reduce_res_live = _bybit_v5_request('POST', '/v5/order/create', reduce_payload_live)
-                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({'final_risk_reduce_payload': reduce_payload_live, 'final_risk_reduce_res': reduce_res_live})
-                        if int((reduce_res_live or {}).get('retCode', -1)) != 0:
-                            err = f"{(reduce_res_live or {}).get('retCode')} {(reduce_res_live or {}).get('retMsg')}"
-                            _autotrade_exec_mark(reserved_keys, 'FAILED', f'final_risk_cap_reduce_failed:{err}')
-                            return (False, f'final_risk_cap_reduce_failed ({err})')
-                        corrected = True
-                        final_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=3.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or final_pos
-                        qty_for_db = abs(float((_pos_size(final_pos) if final_pos else max(0.0, float(qty_for_db) - float(reduce_qty_live))) or 0.0))
-                        final_entry_for_risk = float((_pos_entry(final_pos) if final_pos else final_entry_for_risk) or final_entry_for_risk)
-                        final_risk = _autotrade_true_risk_usd(final_entry_for_risk, sl_for_order, qty_for_db, contract_size)
-                    if final_cap_usd > 0 and final_risk > (final_cap_usd * 1.0005):
-                        close_res = _autotrade_force_close_live_position(sym, side, qty_for_db)
-                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'final_per_trade_risk_pct_exceeded_closed', 'risk_close_res': close_res})
-                        _autotrade_exec_mark(reserved_keys, 'FAILED', 'final_per_trade_risk_pct_exceeded')
-                        try:
-                            _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason=f'final_per_trade_risk_pct_exceeded actual={_risk_pct_from_amount(float(equity), float(final_risk)):.2f}% cap={hard_cap_pct_live:.2f}%')
-                        except Exception:
-                            pass
-                        return (False, 'final_per_trade_risk_pct_exceeded_closed')
+                    if bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)) and not bool(globals().get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)):
+                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                            'final_risk_over_cap_no_market_reduce': True,
+                            'final_risk_policy': 'strict_tpsl_only_leave_native_tp_sl_to_manage',
+                        })
+                    else:
+                        allowed_qty_live = _autotrade_qty_from_risk(final_entry_for_risk, sl_for_order, equity, risk_usd=final_cap_usd, contract_size=contract_size)
+                        allowed_qty_live, allowed_reason_live = _round_qty_down(sym, allowed_qty_live, final_entry_for_risk)
+                        reduce_qty_live = max(0.0, float(qty_for_db) - float(allowed_qty_live or 0.0)) if allowed_qty_live and allowed_qty_live > 0 else float(qty_for_db)
+                        reduce_qty_live, reduce_reason_live = _round_qty_down(sym, reduce_qty_live, final_entry_for_risk)
+                        if reduce_qty_live and reduce_qty_live > 0:
+                            reduce_payload_live = {
+                                'category': 'linear',
+                                'symbol': sym,
+                                'side': 'Sell' if side == 'BUY' else 'Buy',
+                                'orderType': 'Market',
+                                'qty': _fmt_qty(reduce_qty_live, qty_step),
+                                'timeInForce': 'IOC',
+                                'reduceOnly': True,
+                                'closeOnTrigger': True,
+                            }
+                            reduce_res_live = _bybit_v5_request('POST', '/v5/order/create', reduce_payload_live)
+                            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'final_risk_reduce_payload': reduce_payload_live, 'final_risk_reduce_res': reduce_res_live})
+                            if int((reduce_res_live or {}).get('retCode', -1)) != 0:
+                                err = f"{(reduce_res_live or {}).get('retCode')} {(reduce_res_live or {}).get('retMsg')}"
+                                _autotrade_exec_mark(reserved_keys, 'FAILED', f'final_risk_cap_reduce_failed:{err}')
+                                return (False, f'final_risk_cap_reduce_failed ({err})')
+                            corrected = True
+                            final_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=3.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or final_pos
+                            qty_for_db = abs(float((_pos_size(final_pos) if final_pos else max(0.0, float(qty_for_db) - float(reduce_qty_live))) or 0.0))
+                            final_entry_for_risk = float((_pos_entry(final_pos) if final_pos else final_entry_for_risk) or final_entry_for_risk)
+                            final_risk = _autotrade_true_risk_usd(final_entry_for_risk, sl_for_order, qty_for_db, contract_size)
+                        if final_cap_usd > 0 and final_risk > (final_cap_usd * 1.0005):
+                            close_res = _autotrade_force_close_live_position(sym, side, qty_for_db)
+                            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'final_per_trade_risk_pct_exceeded_closed', 'risk_close_res': close_res})
+                            _autotrade_exec_mark(reserved_keys, 'FAILED', 'final_per_trade_risk_pct_exceeded')
+                            try:
+                                _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason=f'final_per_trade_risk_pct_exceeded actual={_risk_pct_from_amount(float(equity), float(final_risk)):.2f}% cap={hard_cap_pct_live:.2f}%')
+                            except Exception:
+                                pass
+                            return (False, 'final_per_trade_risk_pct_exceeded_closed')
+
             except Exception as exc:
                 try:
                     _LAST_AUTOTRADE_DETAIL[int(uid)].update({'final_risk_cap_check_error': f'{type(exc).__name__}: {exc}'})
@@ -9683,31 +9736,40 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                     pass
             else:
                 liq_reason = f'live_liq_unsafe_after_adjust liq={live_liq:g} sl={sl_for_order:g}'
-                try:
-                    close_payload = {
-                        'category': 'linear',
-                        'symbol': sym,
-                        'side': 'Sell' if side == 'BUY' else 'Buy',
-                        'orderType': 'Market',
-                        'qty': _fmt_qty(float(qty_for_db), qty_step),
-                        'timeInForce': 'IOC',
-                        'reduceOnly': True,
-                        'closeOnTrigger': True,
-                    }
-                    close_res = _bybit_v5_request('POST', '/v5/order/create', close_payload)
-                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_unsafe_closed', 'liq_close_payload': close_payload, 'liq_close_res': close_res})
-                except Exception as exc:
-                    close_res = {'retCode': -1, 'retMsg': f'{type(exc).__name__}: {exc}'}
+                if bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)) and not bool(globals().get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)):
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                        'reject_reason': 'live_liq_unsafe_not_closed_strict_tpsl_only',
+                        'live_liq_policy': 'strict_tpsl_only_no_market_close',
+                    })
+                    # Continue to attach/repair native TP/SL; do not create an
+                    # intermediate market close. The setup may be flagged in /autotrade_last.
+                else:
                     try:
-                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_unsafe_close_failed', 'liq_close_res': close_res})
+                        close_payload = {
+                            'category': 'linear',
+                            'symbol': sym,
+                            'side': 'Sell' if side == 'BUY' else 'Buy',
+                            'orderType': 'Market',
+                            'qty': _fmt_qty(float(qty_for_db), qty_step),
+                            'timeInForce': 'IOC',
+                            'reduceOnly': True,
+                            'closeOnTrigger': True,
+                        }
+                        close_res = _bybit_v5_request('POST', '/v5/order/create', close_payload)
+                        _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_unsafe_closed', 'liq_close_payload': close_payload, 'liq_close_res': close_res})
+                    except Exception as exc:
+                        close_res = {'retCode': -1, 'retMsg': f'{type(exc).__name__}: {exc}'}
+                        try:
+                            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_liq_unsafe_close_failed', 'liq_close_res': close_res})
+                        except Exception:
+                            pass
+                    _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_liq_unsafe_after_adjust')
+                    try:
+                        _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason=liq_reason)
                     except Exception:
                         pass
-                _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_liq_unsafe_after_adjust')
-                try:
-                    _admin_setup_lifecycle_merge(int(uid), setup_id, state='failed', last_reason=liq_reason)
-                except Exception:
-                    pass
-                return (False, 'live_liq_unsafe_closed')
+                    return (False, 'live_liq_unsafe_closed')
+
 
         s_live = _autotrade_clone_setup_for_execution(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
         trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened_pending_exit_attach')
@@ -9778,21 +9840,36 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             except Exception:
                 pass
         if not (sl_ok and tp_ok):
-            close_res = _autotrade_force_close_live_position(sym, side, qty=qty_for_db)
-            try:
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_exit_attach_failed_force_closed', 'force_close_res': close_res})
-            except Exception:
-                pass
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='failed', last_reason='live_exit_attach_failed_force_closed')
-            except Exception:
-                pass
-            try:
-                _autotrade_mark_trade_closed(str(trade_id), status='SL', reason='live_exit_attach_failed_force_closed')
-            except Exception:
-                pass
-            _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_attach_failed_force_closed')
-            return (False, f"live_exit_attach_failed_force_closed ({(close_res or {}).get('retCode')} {(close_res or {}).get('retMsg')})")
+            if bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)) and not bool(globals().get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)):
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                        'reject_reason': 'live_exit_attach_unconfirmed_not_closed_strict_tpsl_only',
+                        'exit_attach_policy': 'no_market_close_continue_with_repair_guardian',
+                    })
+                except Exception:
+                    pass
+                try:
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='executed_open', last_reason='exit_attach_unconfirmed_guardian_will_repair')
+                except Exception:
+                    pass
+                # Continue as opened. The guardian will retry native TP/SL repair; do not
+                # create a market close that is neither TP nor SL.
+            else:
+                close_res = _autotrade_force_close_live_position(sym, side, qty=qty_for_db)
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_exit_attach_failed_force_closed', 'force_close_res': close_res})
+                except Exception:
+                    pass
+                try:
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='failed', last_reason='live_exit_attach_failed_force_closed')
+                except Exception:
+                    pass
+                try:
+                    _autotrade_mark_trade_closed(str(trade_id), status='SL', reason='live_exit_attach_failed_force_closed')
+                except Exception:
+                    pass
+                _autotrade_exec_mark(reserved_keys, 'FAILED', 'live_exit_attach_failed_force_closed')
+                return (False, f"live_exit_attach_failed_force_closed ({(close_res or {}).get('retCode')} {(close_res or {}).get('retMsg')})")
 
         # Ver06: after Bybit TP/SL attachment/repair, re-read the actual exchange
         # position and stop. If the true SL-based risk is above the cap, reduce/close
@@ -9803,15 +9880,21 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             strict_cap = float(final_cap_usd or _autotrade_hard_risk_cap_usd(float(equity)) or allowed_risk_usd or 0.0)
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'post_attach_risk_detail': post_detail, 'post_attach_risk_cap_usd': float(strict_cap)})
             if strict_cap > 0 and float((post_detail or {}).get('risk_usd') or 0.0) > strict_cap * 1.0005:
-                rg = _autotrade_reduce_live_position_to_risk_cap(sym, side, strict_cap, reason='post_attach_risk_cap', live_pos=post_pos)
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'post_attach_risk_guard': rg})
-                if not bool((rg or {}).get('ok')) or str((rg or {}).get('action') or '').startswith('closed'):
-                    _autotrade_exec_mark(reserved_keys, 'FAILED', 'post_attach_risk_cap_closed')
-                    try:
-                        _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='failed', last_reason='post_attach_risk_cap_closed')
-                    except Exception:
-                        pass
-                    return (False, 'post_attach_risk_cap_closed')
+                if bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)) and not bool(globals().get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)):
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                        'post_attach_risk_over_cap_no_market_reduce': True,
+                        'post_attach_risk_policy': 'strict_tpsl_only_leave_native_tp_sl_to_manage',
+                    })
+                else:
+                    rg = _autotrade_reduce_live_position_to_risk_cap(sym, side, strict_cap, reason='post_attach_risk_cap', live_pos=post_pos)
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'post_attach_risk_guard': rg})
+                    if not bool((rg or {}).get('ok')) or str((rg or {}).get('action') or '').startswith('closed'):
+                        _autotrade_exec_mark(reserved_keys, 'FAILED', 'post_attach_risk_cap_closed')
+                        try:
+                            _admin_setup_lifecycle_merge(int(uid), setup_id, trade_id=str(trade_id), bybit_position_symbol=str(sym or ''), state='failed', last_reason='post_attach_risk_cap_closed')
+                        except Exception:
+                            pass
+                        return (False, 'post_attach_risk_cap_closed')
         except Exception as exc:
             try:
                 _LAST_AUTOTRADE_DETAIL[int(uid)].update({'post_attach_risk_guard_error': f'{type(exc).__name__}: {exc}'})
@@ -36368,6 +36451,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE = {'true' if bool(summary.get('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE')) else 'false'}",
             f"AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN = {int(summary.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 5))}x",
             f"AUTOTRADE_EMERGENCY_RISK_MAX_MULT = {float(summary.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', 2.0)):.2f}x",
+            f"AUTOTRADE_STRICT_TPSL_ONLY = {'true' if bool(summary.get('AUTOTRADE_STRICT_TPSL_ONLY', True)) else 'false'}",
+            f"AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = {'true' if bool(summary.get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)) else 'false'}",
+            f"AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = {'true' if bool(summary.get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)) else 'false'}",
+            f"AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = {'true' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)) else 'false'}",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
@@ -36385,6 +36472,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true",
             "• /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5",
             "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25",
+            "• Strict TP/SL lifecycle is ON by default: positions are not auto-closed/reduced at market except explicit /autotrade_flat_now",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
             "• /autotrade_config AUTOTRADE_MODE live",
@@ -43227,6 +43315,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'opened_ts': float(row.get('opened_ts') or ts or 0.0),
             'pnl': pnl,
             'parts': 1,
+            'closed_kind': 'OPEN',
         })
 
     for r in (closed_rows or []):
@@ -43255,6 +43344,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'pnl': pnl,
             'pnl_usdt': pnl,
             'parts': 1,
+            'closed_kind': _autotrade_report_closed_kind(row),
         })
 
     journal_rows = _autotrade_merge_position_report_rows(journal_rows)
@@ -43279,12 +43369,19 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         # Ver16: show every trade row. Time is explicitly converted to Melbourne
         # in _ts_txt(), and the long <pre> table is chunked safely by send_long_message.
         display = list(journal_rows)
-        table_rows = [[r.get('time') or _ts_txt(float(r.get('ts') or 0.0)), r.get('state'), r.get('symbol'), r.get('side'), r.get('family'), int(r.get('parts') or 1), f"{float(r.get('pnl') or 0.0):+.2f}"] for r in display]
+        def _exit_display(r: dict) -> str:
+            try:
+                if str(r.get('state') or '').upper() == 'OPEN':
+                    return 'OPEN'
+                return str(r.get('closed_kind') or _autotrade_report_closed_kind(r) or '-').upper()
+            except Exception:
+                return '-'
+        table_rows = [[r.get('time') or _ts_txt(float(r.get('ts') or 0.0)), r.get('state'), _exit_display(r), r.get('symbol'), r.get('side'), r.get('family'), int(r.get('parts') or 1), f"{float(r.get('pnl') or 0.0):+.2f}"] for r in display]
         table = tabulate(
             table_rows,
-            headers=['Mel Time', 'State', 'Sym', 'Side', 'Fam', 'Parts', 'PnL'],
+            headers=['Mel Time', 'State', 'Exit', 'Sym', 'Side', 'Fam', 'Parts', 'PnL'],
             tablefmt='plain',
-            colalign=('left', 'center', 'left', 'center', 'center', 'right', 'right'),
+            colalign=('left', 'center', 'center', 'left', 'center', 'center', 'right', 'right'),
         )
         raw_count = int(len(bot_positions or [])) + int(len(closed_rows or []))
         lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> merged position rows. Raw fragments: <b>{raw_count}</b>. Time: <b>Melbourne</b>.")
@@ -50320,10 +50417,13 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
                     if emerg_cap > 0:
                         rd = _autotrade_live_position_risk_detail(p)
                         if float((rd or {}).get('risk_usd') or 0.0) > emerg_cap * 1.0005:
-                            rg = _autotrade_reduce_live_position_to_risk_cap(_pos_symbol(p), _pos_side_text(p), emerg_cap, reason='guardian_emergency_risk_cap', live_pos=p)
-                            rg['checked'] = True
-                            rg['placement'] = 'guardian_emergency_risk_cap'
-                            repaired.append(rg)
+                            if bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)) and not bool(globals().get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)):
+                                repaired.append({'checked': True, 'placement': 'guardian_emergency_risk_cap', 'action': 'no_market_reduce_strict_tpsl_only', 'risk_detail': rd, 'cap_usd': float(emerg_cap)})
+                            else:
+                                rg = _autotrade_reduce_live_position_to_risk_cap(_pos_symbol(p), _pos_side_text(p), emerg_cap, reason='guardian_emergency_risk_cap', live_pos=p)
+                                rg['checked'] = True
+                                rg['placement'] = 'guardian_emergency_risk_cap'
+                                repaired.append(rg)
                 except Exception:
                     pass
             except Exception:
