@@ -3,6 +3,7 @@
 # - 15May_ver11: Controlled safe-leverage downgrade: setups needing practical lower leverage (e.g. 7x vs configured 10x) can open safely; very low required leverage remains blocked.
 # - 15May_ver10: Clean forward-test mode after dataset reset: removed default static symbol micro-blocks so symbols are active again; symbol blocks now only appear from new rolling evidence during the fresh test.
 # - 15May_ver09: /setup_matrix policy now shows the full configured combo universe with ON/PART/OFF status after clean test-data reset.
+# - 16May_ver14: Re-enabled explicit time-based AutoTrade exits: scheduled 09:45 Melbourne flat + max 8h hold guardian.
 # - 15May_ver07: Crisis hardening after poor 24h live results: safer dynamic risk range (±25%), stricter setup micro-guard, daily AutoTrade caps, pre-ASIA flatten job, and admin data-reset command.
 # - 14May_ver06: Added strict live risk/leverage guard: no silent leverage downgrade to 1x, post-attach exchange-risk verification, and guardian emergency reduction for oversized live positions.
 # - 14May_ver03: Added dynamic AutoTrade risk scoring/sizing: base risk from /autotrade_config scales 0.50x–1.50x by setup score (family/session/side/symbol/hour/regime/RR/volume/confidence), with daily/open caps still enforced.
@@ -463,6 +464,16 @@ AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY = 'emergency_risk_max_mult'
 # practical and safely above the minimum. Very low required leverage (e.g. 1x-4x)
 # is still skipped because it usually means the SL/liquidation geometry is too wide.
 AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY = 'safe_leverage_downgrade_min'
+# 16May_ver14: explicit time-exit controls. These are intentionally separate
+# from strict TP/SL safety: by default the bot still avoids mid-trade market
+# reductions, but it may close AutoTrade-owned positions at the configured daily
+# ASIA handover time and when a position exceeds the configured maximum hold time.
+AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY = 'flat_before_asia_enabled'
+AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY = 'flat_before_asia_hour'
+AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY = 'flat_before_asia_minute'
+AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY = 'max_position_hours_enabled'
+AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY = 'max_position_hours'
+AUTOTRADE_CFG_VER14_TIME_EXIT_POLICY_VERSION_KEY = 'ver14_time_exit_policy_version'
 AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY = 'ver11_leverage_policy_version'
 
 # 15May_ver07 safer live defaults after poor 24h forward-test result.
@@ -477,10 +488,13 @@ AUTOTRADE_VER07_MAX_OPEN_TRADES = int(os.environ.get('AUTOTRADE_VER07_MAX_OPEN_T
 AUTOTRADE_VER07_MAX_TRADES_PER_DAY = int(os.environ.get('AUTOTRADE_VER07_MAX_TRADES_PER_DAY', '8') or 8)
 AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT = float(os.environ.get('AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT', '0.80') or 0.80)
 
-AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)
+AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
 AUTOTRADE_FLAT_BEFORE_ASIA_HOUR = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9)
 AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45)
 AUTOTRADE_FLAT_CLOSE_ALL_LIVE = env_bool('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)
+AUTOTRADE_MAX_POSITION_HOURS_ENABLED = env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)
+AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8)
+AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', '600') or 600)
 AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
 AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '09:00-11:00') or '').split(',') if x.strip())
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
@@ -566,6 +580,11 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY: 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', True) else 0,
         AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '1.25') or 1.25),
         AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY: float(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '5') or 5),
+        AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY: 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True) else 0,
+        AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9),
+        AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45),
+        AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True) else 0,
+        AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8),
     }
     for k, v in defaults.items():
         try:
@@ -764,6 +783,46 @@ def _autotrade_emergency_risk_max_mult() -> float:
     return max(1.00, min(10.0, float(val)))
 
 
+
+def _autotrade_bool_cfg(key: str, env_name: str, default: bool) -> bool:
+    try:
+        raw = _autotrade_config_get(key, 1 if env_bool(env_name, bool(default)) else 0)
+        return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        return bool(default)
+
+
+def _autotrade_flat_before_asia_enabled() -> bool:
+    return _autotrade_bool_cfg(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
+
+
+def _autotrade_flat_before_asia_hour() -> int:
+    try:
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY, os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9')) or 9))
+    except Exception:
+        val = 9
+    return max(0, min(23, int(val)))
+
+
+def _autotrade_flat_before_asia_minute() -> int:
+    try:
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45')) or 45))
+    except Exception:
+        val = 45
+    return max(0, min(59, int(val)))
+
+
+def _autotrade_max_position_hours_enabled() -> bool:
+    return _autotrade_bool_cfg(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)
+
+
+def _autotrade_max_position_hours() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8')) or 8.0)
+    except Exception:
+        val = 8.0
+    return max(0.25, min(72.0, float(val)))
+
 def _autotrade_hard_risk_cap_usd(equity: float, multiplier: float | None = None) -> float:
     '''Hard per-position risk cap from base risk and dynamic max multiplier.'''
     try:
@@ -805,7 +864,11 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_STRICT_TPSL_ONLY': bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)),
         'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH': bool(globals().get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)),
         'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL': bool(globals().get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)),
-        'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED': bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)),
+        'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED': bool(_autotrade_flat_before_asia_enabled()),
+        'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR': int(_autotrade_flat_before_asia_hour()),
+        'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE': int(_autotrade_flat_before_asia_minute()),
+        'AUTOTRADE_MAX_POSITION_HOURS_ENABLED': bool(_autotrade_max_position_hours_enabled()),
+        'AUTOTRADE_MAX_POSITION_HOURS': float(_autotrade_max_position_hours()),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
     }
 
@@ -5438,14 +5501,14 @@ def _autotrade_close_owned_live_positions(uid: int, reason: str = 'scheduled_fla
 
 async def autotrade_flat_before_asia_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)):
+        if not bool(_autotrade_flat_before_asia_enabled()):
             return
         if not _autotrade_ready() or str(_autotrade_runtime_mode()).lower() != 'live':
             return
         uid = int(AUTOTRADE_OWNER_UID or 0)
         if uid <= 0:
             return
-        res = await to_thread_autotrade(_autotrade_close_owned_live_positions, uid, 'scheduled_flat_before_asia_09_45_melbourne', timeout=45)
+        res = await to_thread_autotrade(_autotrade_close_owned_live_positions, uid, f'scheduled_flat_before_asia_{_autotrade_flat_before_asia_hour():02d}_{_autotrade_flat_before_asia_minute():02d}_melbourne', timeout=60)
         closed = list((res or {}).get('closed') or [])
         if closed:
             try:
@@ -5456,6 +5519,81 @@ async def autotrade_flat_before_asia_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         try:
             _hb_touch('autotrade_flat_before_asia', ok=False, error=f'{type(exc).__name__}: {exc}', details='flat_job_error')
+        except Exception:
+            pass
+
+
+
+def _autotrade_close_stale_owned_live_positions(uid: int, max_age_hours: float | None = None, reason: str = 'max_position_age') -> dict:
+    """Close AutoTrade-owned live positions whose resolved open age exceeds max_age_hours."""
+    hours = float(max_age_hours if max_age_hours is not None else _autotrade_max_position_hours())
+    out = {'ok': True, 'reason': str(reason or 'max_position_age'), 'max_age_hours': hours, 'closed': [], 'skipped': [], 'errors': []}
+    try:
+        uid_i = int(uid or 0)
+        if uid_i <= 0:
+            out['ok'] = False
+            out['errors'].append('missing_owner_uid')
+            return out
+        now_ts = time.time()
+        live_positions = list(_bybit_get_open_positions_linear() or [])
+        journal_open = list(_autotrade_db_open_trades(uid_i) or [])
+        for p in live_positions:
+            try:
+                sym = _pos_symbol(p)
+                side = _pos_side_text(p)
+                tr = _autotrade_find_open_trade_for_live_position(uid_i, p, journal_open=journal_open)
+                if not tr and not bool(globals().get('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)):
+                    out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'no_matching_autotrade_journal'})
+                    continue
+                info = _autotrade_resolve_live_position_open_info(uid_i, p, journal_open=journal_open)
+                opened_ts = float((info or {}).get('opened_ts') or 0.0)
+                if opened_ts <= 0:
+                    out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'open_time_unknown'})
+                    continue
+                age_h = max(0.0, (now_ts - opened_ts) / 3600.0)
+                if age_h < hours:
+                    out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'not_old_enough', 'age_h': round(age_h, 2)})
+                    continue
+                qty = abs(float(_pos_size(p) or 0.0))
+                res = _autotrade_force_close_live_position(sym, side, qty=qty)
+                row = {'symbol': sym, 'side': side, 'qty': qty, 'age_h': round(age_h, 2), 'retCode': (res or {}).get('retCode'), 'retMsg': (res or {}).get('retMsg')}
+                out['closed'].append(row)
+                try:
+                    if tr and str(tr.get('trade_id') or ''):
+                        _autotrade_db_close_trade(str(tr.get('trade_id')), now_ts, 0.0, 'MAX_HOLD_TIME_EXIT', str(reason or 'max_position_age'))
+                except Exception:
+                    pass
+            except Exception as exc:
+                out['errors'].append(f'{type(exc).__name__}: {exc}')
+        if out['errors']:
+            out['ok'] = False
+        return out
+    except Exception as exc:
+        return {'ok': False, 'reason': str(reason or 'max_position_age'), 'max_age_hours': hours, 'closed': [], 'skipped': [], 'errors': [f'{type(exc).__name__}: {exc}']}
+
+
+async def autotrade_max_position_age_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic 8h max-hold guardian for AutoTrade-owned live positions."""
+    try:
+        if not bool(_autotrade_max_position_hours_enabled()):
+            return
+        if not _autotrade_ready() or str(_autotrade_runtime_mode()).lower() != 'live':
+            return
+        uid = int(AUTOTRADE_OWNER_UID or 0)
+        if uid <= 0:
+            return
+        hours = float(_autotrade_max_position_hours())
+        res = await to_thread_autotrade(_autotrade_close_stale_owned_live_positions, uid, hours, f'max_hold_{hours:.2f}h', timeout=60)
+        closed = list((res or {}).get('closed') or [])
+        if closed:
+            try:
+                msg = '⏱️ AutoTrade max-hold exit\n' + f"Max hold: {hours:.2f}h | Closed: {len(closed)}\n" + '\n'.join([f"• {x.get('symbol')} {x.get('side')} age={x.get('age_h')}h ret={x.get('retCode')}" for x in closed[:12]])
+                await context.bot.send_message(chat_id=uid, text=msg)
+            except Exception:
+                pass
+    except Exception as exc:
+        try:
+            _hb_touch('autotrade_max_position_age', ok=False, error=f'{type(exc).__name__}: {exc}', details='max_age_job_error')
         except Exception:
             pass
 
@@ -5486,8 +5624,8 @@ async def autotrade_flat_now_cmd(update: Update, context: ContextTypes.DEFAULT_T
 
 # Ver12: strict TP/SL-only lifecycle. AutoTrade should not close or partially
 # reduce a live position at market in the middle of a trade. A position should
-# normally finish only via native Bybit position TP or SL. Manual /autotrade_flat_now
-# remains available as an explicit owner action.
+# normally finish only via native Bybit position TP or SL. Manual /autotrade_flat_now and configured time exits
+# remain available as explicit owner-approved exceptions.
 AUTOTRADE_STRICT_TPSL_ONLY = env_bool('AUTOTRADE_STRICT_TPSL_ONLY', True)
 AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = env_bool('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)
 AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = env_bool('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)
@@ -35371,7 +35509,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "trade_id_reset": "Reset your own Trade ID numbering",
     "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
     "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
-    "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated. Dynamic keys: AUTOTRADE_DYNAMIC_RISK_ENABLED, AUTOTRADE_DYNAMIC_RISK_MIN_MULT, AUTOTRADE_DYNAMIC_RISK_MAX_MULT, AUTOTRADE_DYNAMIC_RISK_LOW_SCORE, AUTOTRADE_DYNAMIC_RISK_BASE_SCORE, AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE. Safety keys: AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE, AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN, AUTOTRADE_EMERGENCY_RISK_MAX_MULT",
+    "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated. Dynamic keys: AUTOTRADE_DYNAMIC_RISK_ENABLED, AUTOTRADE_DYNAMIC_RISK_MIN_MULT, AUTOTRADE_DYNAMIC_RISK_MAX_MULT, AUTOTRADE_DYNAMIC_RISK_LOW_SCORE, AUTOTRADE_DYNAMIC_RISK_BASE_SCORE, AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE. Safety keys: AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE, AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN, AUTOTRADE_EMERGENCY_RISK_MAX_MULT, AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED, AUTOTRADE_MAX_POSITION_HOURS",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
@@ -35406,7 +35544,7 @@ def build_help_text_admin() -> str:
         "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
         "AutoTrade matrix examples: /autotrade_report_overall 24 (daily), /autotrade_report_overall 168 (weekly).",
         "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90.",
-        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
+        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true | /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8 | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -36458,6 +36596,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = {'true' if bool(summary.get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)) else 'false'}",
             f"AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = {'true' if bool(summary.get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)) else 'false'}",
             f"AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = {'true' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)) else 'false'}",
+            f"AUTOTRADE_FLAT_BEFORE_ASIA_TIME = {int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9)):02d}:{int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 45)):02d} Melbourne",
+            f"AUTOTRADE_MAX_POSITION_HOURS_ENABLED = {'true' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_MAX_POSITION_HOURS = {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 8.0)):.2f}",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
@@ -36475,7 +36616,12 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true",
             "• /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5",
             "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25",
-            "• Strict TP/SL lifecycle is ON by default: positions are not auto-closed/reduced at market except explicit /autotrade_flat_now",
+            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true",
+            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_HOUR 9",
+            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE 45",
+            "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS_ENABLED true",
+            "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8",
+            "• Strict TP/SL lifecycle is ON, with owner-approved time exits: scheduled ASIA flat and max-hold guardian.",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
             "• /autotrade_config AUTOTRADE_MODE live",
@@ -36502,7 +36648,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED',
         'AUTOTRADE_DYNAMIC_RISK_ENABLED', 'AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 'AUTOTRADE_DYNAMIC_RISK_MAX_MULT',
         'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE',
-        'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', 'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT'
+        'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', 'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT',
+        'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE',
+        'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -36538,6 +36686,21 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT':
             val = max(1.0, min(10.0, float(value_raw)))
             _autotrade_config_set(AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY, val)
+        elif key == 'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR':
+            val = max(0, min(23, int(float(value_raw))))
+            _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY, val)
+        elif key == 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE':
+            val = max(0, min(59, int(float(value_raw))))
+            _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, val)
+        elif key == 'AUTOTRADE_MAX_POSITION_HOURS_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_MAX_POSITION_HOURS':
+            val = max(0.25, min(72.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, val)
         elif key == 'AUTOTRADE_OPEN_RISK_CAP_PCT':
             val = max(0.0, float(value_raw))
             _autotrade_config_set(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, val)
@@ -50257,7 +50420,7 @@ async def admin_reset_test_data_cmd(update: Update, context: ContextTypes.DEFAUL
             f"Deleted/cleared tables: {len(deleted)}\n"
             "Configs preserved: users, autotrade_config, strategy_config, email/session/tz/billing.\n"
             "Configured safety policy/micro-guard was re-seeded for the clean forward test.\n"
-            "Live Bybit positions were not closed. Use /open_trades and close manually or wait for the scheduled flat job."
+            "Live Bybit positions were not closed by reset. Use /open_trades, /autotrade_flat_now, or wait for the scheduled 09:45 Melbourne flat/max-hold job."
         )
     except Exception as exc:
         await update.message.reply_text(f"❌ admin_reset_test_data failed: {type(exc).__name__}: {exc}")
@@ -51454,14 +51617,14 @@ def main():
                 },
             )
 
-        if bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)):
+        if bool(_autotrade_flat_before_asia_enabled()):
             try:
                 from datetime import time as _dt_time
                 app.job_queue.run_daily(
                     autotrade_flat_before_asia_job,
                     time=_dt_time(
-                        hour=int(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9) or 9),
-                        minute=int(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 45) or 45),
+                        hour=int(_autotrade_flat_before_asia_hour()),
+                        minute=int(_autotrade_flat_before_asia_minute()),
                         tzinfo=MEL_TZ,
                     ),
                     name="autotrade_flat_before_asia_job",
@@ -51470,6 +51633,21 @@ def main():
             except Exception as _flat_sched_exc:
                 try:
                     logger.warning('autotrade flat-before-ASIA schedule failed: %s', _flat_sched_exc)
+                except Exception:
+                    pass
+
+        if bool(_autotrade_max_position_hours_enabled()):
+            try:
+                app.job_queue.run_repeating(
+                    autotrade_max_position_age_job,
+                    interval=max(300, int(globals().get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', 600) or 600)),
+                    first=180,
+                    name="autotrade_max_position_age_job",
+                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 600},
+                )
+            except Exception as _max_age_sched_exc:
+                try:
+                    logger.warning('autotrade max-position-age schedule failed: %s', _max_age_sched_exc)
                 except Exception:
                     pass
 
