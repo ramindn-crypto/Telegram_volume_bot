@@ -3,6 +3,7 @@
 # - 15May_ver11: Controlled safe-leverage downgrade: setups needing practical lower leverage (e.g. 7x vs configured 10x) can open safely; very low required leverage remains blocked.
 # - 15May_ver10: Clean forward-test mode after dataset reset: removed default static symbol micro-blocks so symbols are active again; symbol blocks now only appear from new rolling evidence during the fresh test.
 # - 15May_ver09: /setup_matrix policy now shows the full configured combo universe with ON/PART/OFF status after clean test-data reset.
+# - 17May_ver15: Hardened 09:45 Melbourne flat with catch-up guardian, synthetic owner fallback, and forced max-hold default back to 8h.
 # - 16May_ver14: Re-enabled explicit time-based AutoTrade exits: scheduled 09:45 Melbourne flat + max 8h hold guardian.
 # - 15May_ver07: Crisis hardening after poor 24h live results: safer dynamic risk range (±25%), stricter setup micro-guard, daily AutoTrade caps, pre-ASIA flatten job, and admin data-reset command.
 # - 14May_ver06: Added strict live risk/leverage guard: no silent leverage downgrade to 1x, post-attach exchange-risk verification, and guardian emergency reduction for oversized live positions.
@@ -474,6 +475,8 @@ AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY = 'flat_before_asia_minute'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY = 'max_position_hours_enabled'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY = 'max_position_hours'
 AUTOTRADE_CFG_VER14_TIME_EXIT_POLICY_VERSION_KEY = 'ver14_time_exit_policy_version'
+AUTOTRADE_CFG_VER15_TIME_EXIT_POLICY_VERSION_KEY = 'ver15_time_exit_policy_version'
+AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY = 'flat_before_asia_last_local_date'
 AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY = 'ver11_leverage_policy_version'
 
 # 15May_ver07 safer live defaults after poor 24h forward-test result.
@@ -492,6 +495,12 @@ AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLE
 AUTOTRADE_FLAT_BEFORE_ASIA_HOUR = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9)
 AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45)
 AUTOTRADE_FLAT_CLOSE_ALL_LIVE = env_bool('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)
+# Ver15: scheduled daily jobs can be missed after Render restarts/sleep.
+# A repeating catch-up guardian re-runs the 09:45 Melbourne flat once per local day.
+AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)
+AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_INTERVAL_SEC', '300') or 300)
+AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_GRACE_HOURS = float(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_GRACE_HOURS', '18') or 18)
+AUTOTRADE_FLAT_FALLBACK_UNMATCHED_AS_OWNED = env_bool('AUTOTRADE_FLAT_FALLBACK_UNMATCHED_AS_OWNED', True)
 AUTOTRADE_MAX_POSITION_HOURS_ENABLED = env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)
 AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8)
 AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', '600') or 600)
@@ -1025,6 +1034,33 @@ def _autotrade_apply_ver11_leverage_policy_defaults() -> None:
         _autotrade_config_set(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1)
         _autotrade_config_set(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, int(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '5') or 5))
         _autotrade_config_set(AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY, target_version)
+    except Exception:
+        pass
+
+
+def _autotrade_apply_ver15_time_exit_policy_defaults() -> None:
+    """Ver15: make the 09:45 flat reliable after deployment/reset.
+
+    This intentionally corrects stale user/runtime values from earlier versions where
+    max-hold could remain at 18h and the daily flat could be enabled in config but missed
+    by the exact run_daily scheduler.
+    """
+    try:
+        target_version = 'ver15_2026_05_17'
+        first_apply = str(_autotrade_config_get(AUTOTRADE_CFG_VER15_TIME_EXIT_POLICY_VERSION_KEY, '') or '').strip().lower() != target_version
+        if not first_apply:
+            return
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9))
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
+        try:
+            cur_hours = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, '8') or 8)
+        except Exception:
+            cur_hours = 8.0
+        if cur_hours <= 0 or cur_hours > 8.0:
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, 8.0)
+        _autotrade_config_set(AUTOTRADE_CFG_VER15_TIME_EXIT_POLICY_VERSION_KEY, target_version)
     except Exception:
         pass
 
@@ -3461,6 +3497,7 @@ try:
     _autotrade_apply_07may_safety_defaults()
     _autotrade_apply_ver07_safety_defaults()
     _autotrade_apply_ver11_leverage_policy_defaults()
+    _autotrade_apply_ver15_time_exit_policy_defaults()
 except Exception:
     pass
 
@@ -5463,21 +5500,59 @@ def _autotrade_entry_blackout_now(now_ts: float | None = None) -> tuple[bool, st
         return False, ''
 
 
-def _autotrade_close_owned_live_positions(uid: int, reason: str = 'scheduled_flat') -> dict:
+def _autotrade_close_owned_live_positions(uid: int, reason: str = 'scheduled_flat', max_opened_before_ts: float | None = None) -> dict:
+    """Close AutoTrade-owned live positions.
+
+    Ver15 hardening:
+    - Uses the same owner classification as /open_trades and /autotrade_debug, including
+      synthetic fallback for live Bybit positions when the journal was reset/cleared.
+    - Optional max_opened_before_ts is used by the catch-up flat so positions opened after
+      the 09:45 cutoff are not closed by a late catch-up run.
+    """
     out = {'ok': True, 'reason': str(reason or 'scheduled_flat'), 'closed': [], 'skipped': [], 'errors': []}
     try:
         uid_i = int(uid or 0)
         live_positions = list(_bybit_get_open_positions_linear() or [])
         journal_open = list(_autotrade_db_open_trades(uid_i) or [])
-        for p in live_positions:
+        try:
+            bot_positions, external_positions, _jr = _autotrade_collect_live_position_rows(
+                uid_i,
+                positions=live_positions,
+                journal_open=journal_open,
+                fallback_unmatched_as_owned=bool(globals().get('AUTOTRADE_FLAT_FALLBACK_UNMATCHED_AS_OWNED', True)),
+            )
+        except Exception:
+            bot_positions, external_positions = [], []
+            for p in live_positions:
+                tr = _autotrade_find_open_trade_for_live_position(uid_i, p, journal_open=journal_open)
+                if not tr and bool(globals().get('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)):
+                    tr = _autotrade_synthetic_live_trade_row(uid_i, p)
+                if tr:
+                    bot_positions.append((p, dict(tr)))
+                else:
+                    external_positions.append(p)
+
+        cutoff = float(max_opened_before_ts or 0.0)
+        for p, tr in (bot_positions or []):
             try:
                 sym = _pos_symbol(p)
                 side = _pos_side_text(p)
-                tr = _autotrade_find_open_trade_for_live_position(uid_i, p, journal_open=journal_open)
-                if not tr and not bool(globals().get('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)):
-                    out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'no_matching_autotrade_journal'})
-                    continue
+                if cutoff > 0:
+                    try:
+                        info = _autotrade_resolve_live_position_open_info(uid_i, p, journal_open=journal_open)
+                    except Exception:
+                        info = {}
+                    opened_ts = float((info or {}).get('opened_ts') or tr.get('opened_ts') or tr.get('created_ts') or 0.0)
+                    if opened_ts > cutoff:
+                        out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'opened_after_flat_cutoff', 'opened_ts': opened_ts, 'cutoff_ts': cutoff})
+                        continue
+                    if opened_ts <= 0:
+                        out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'open_time_unknown_for_catchup'})
+                        continue
                 qty = abs(float(_pos_size(p) or 0.0))
+                if qty <= 0:
+                    out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'zero_qty'})
+                    continue
                 res = _autotrade_force_close_live_position(sym, side, qty=qty)
                 row = {'symbol': sym, 'side': side, 'qty': qty, 'retCode': (res or {}).get('retCode'), 'retMsg': (res or {}).get('retMsg')}
                 out['closed'].append(row)
@@ -5488,6 +5563,12 @@ def _autotrade_close_owned_live_positions(uid: int, reason: str = 'scheduled_fla
                     pass
             except Exception as exc:
                 out['errors'].append(f'{type(exc).__name__}: {exc}')
+        if external_positions:
+            for p in external_positions[:12]:
+                try:
+                    out['skipped'].append({'symbol': _pos_symbol(p), 'side': _pos_side_text(p), 'reason': 'external_or_manual_position'})
+                except Exception:
+                    pass
         try:
             _autotrade_cancel_all_legacy_conditional_exit_orders(max_items=80)
         except Exception:
@@ -5509,6 +5590,10 @@ async def autotrade_flat_before_asia_job(context: ContextTypes.DEFAULT_TYPE):
         if uid <= 0:
             return
         res = await to_thread_autotrade(_autotrade_close_owned_live_positions, uid, f'scheduled_flat_before_asia_{_autotrade_flat_before_asia_hour():02d}_{_autotrade_flat_before_asia_minute():02d}_melbourne', timeout=60)
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY, datetime.now(MEL_TZ).strftime('%Y-%m-%d'))
+        except Exception:
+            pass
         closed = list((res or {}).get('closed') or [])
         if closed:
             try:
@@ -5522,6 +5607,87 @@ async def autotrade_flat_before_asia_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+
+
+def _autotrade_flat_before_asia_local_cutoff(now_dt: datetime | None = None) -> tuple[datetime, str]:
+    """Return today's configured Melbourne flat cutoff and local date string."""
+    try:
+        dt = now_dt or datetime.now(MEL_TZ)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=MEL_TZ)
+        h = int(_autotrade_flat_before_asia_hour())
+        m = int(_autotrade_flat_before_asia_minute())
+        cutoff = dt.replace(hour=h, minute=m, second=0, microsecond=0)
+        return cutoff, dt.strftime('%Y-%m-%d')
+    except Exception:
+        dt = datetime.now(MEL_TZ)
+        return dt.replace(hour=9, minute=45, second=0, microsecond=0), dt.strftime('%Y-%m-%d')
+
+
+def _autotrade_flat_before_asia_catchup_due(now_dt: datetime | None = None) -> tuple[bool, datetime, str, str]:
+    """Return whether the missed 09:45 Melbourne flat should be caught up now."""
+    try:
+        if not bool(_autotrade_flat_before_asia_enabled()):
+            return False, datetime.now(MEL_TZ), '', 'disabled'
+        if not bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)):
+            return False, datetime.now(MEL_TZ), '', 'catchup_disabled'
+        now = now_dt or datetime.now(MEL_TZ)
+        cutoff, date_s = _autotrade_flat_before_asia_local_cutoff(now)
+        if now < cutoff:
+            return False, cutoff, date_s, 'before_flat_time'
+        grace_h = max(1.0, float(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_GRACE_HOURS', 18) or 18))
+        if now > cutoff + timedelta(hours=grace_h):
+            return False, cutoff, date_s, 'outside_catchup_grace'
+        last = str(_autotrade_config_get(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY, '') or '').strip()
+        if last == date_s:
+            return False, cutoff, date_s, 'already_flat_today'
+        return True, cutoff, date_s, 'due'
+    except Exception as exc:
+        try:
+            return False, datetime.now(MEL_TZ), '', f'catchup_due_error:{type(exc).__name__}'
+        except Exception:
+            return False, datetime.now(timezone.utc), '', 'catchup_due_error'
+
+
+async def autotrade_flat_before_asia_catchup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Repeating safety net for missed 09:45 Melbourne scheduled flat.
+
+    Render restarts/sleeps or job-queue misfires can miss an exact run_daily event. This
+    guardian checks repeatedly after 09:45 and runs the flat once per Melbourne date. It
+    only closes positions opened before the configured cutoff, so a late catch-up does not
+    close legitimate new ASIA trades opened after the blackout window.
+    """
+    try:
+        if not _autotrade_ready() or str(_autotrade_runtime_mode()).lower() != 'live':
+            return
+        uid = int(AUTOTRADE_OWNER_UID or 0)
+        if uid <= 0:
+            return
+        due, cutoff, date_s, reason = _autotrade_flat_before_asia_catchup_due()
+        if not due:
+            return
+        cutoff_ts = cutoff.timestamp()
+        res = await to_thread_autotrade(_autotrade_close_owned_live_positions, uid, f'catchup_flat_before_asia_{date_s}', cutoff_ts, timeout=90)
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY, date_s)
+        except Exception:
+            pass
+        closed = list((res or {}).get('closed') or [])
+        skipped = list((res or {}).get('skipped') or [])
+        try:
+            msg = '🧹 AutoTrade 09:45 flat catch-up\n' + f"Date: {date_s} | Cutoff: {cutoff.strftime('%H:%M')} Melbourne\nClosed positions: {len(closed)}"
+            if skipped:
+                msg += f"\nSkipped: {len(skipped)}"
+            if closed:
+                msg += '\n' + '\n'.join([f"• {x.get('symbol')} {x.get('side')} ret={x.get('retCode')}" for x in closed[:12]])
+            await context.bot.send_message(chat_id=uid, text=msg)
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            _hb_touch('autotrade_flat_before_asia_catchup', ok=False, error=f'{type(exc).__name__}: {exc}', details='flat_catchup_error')
+        except Exception:
+            pass
 
 
 def _autotrade_close_stale_owned_live_positions(uid: int, max_age_hours: float | None = None, reason: str = 'max_position_age') -> dict:
@@ -35544,7 +35710,7 @@ def build_help_text_admin() -> str:
         "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
         "AutoTrade matrix examples: /autotrade_report_overall 24 (daily), /autotrade_report_overall 168 (weekly).",
         "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90.",
-        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true | /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8 | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
+        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true | /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8 | 09:45 catch-up guardian ON | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -36597,6 +36763,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = {'true' if bool(summary.get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)) else 'false'}",
             f"AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = {'true' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)) else 'false'}",
             f"AUTOTRADE_FLAT_BEFORE_ASIA_TIME = {int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9)):02d}:{int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 45)):02d} Melbourne",
+            f"AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP = {'true' if bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_MAX_POSITION_HOURS_ENABLED = {'true' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_MAX_POSITION_HOURS = {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 8.0)):.2f}",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
@@ -51633,6 +51800,21 @@ def main():
             except Exception as _flat_sched_exc:
                 try:
                     logger.warning('autotrade flat-before-ASIA schedule failed: %s', _flat_sched_exc)
+                except Exception:
+                    pass
+
+        if bool(_autotrade_flat_before_asia_enabled()) and bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)):
+            try:
+                app.job_queue.run_repeating(
+                    autotrade_flat_before_asia_catchup_job,
+                    interval=max(120, int(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_INTERVAL_SEC', 300) or 300)),
+                    first=60,
+                    name="autotrade_flat_before_asia_catchup_job",
+                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 900},
+                )
+            except Exception as _flat_catchup_sched_exc:
+                try:
+                    logger.warning('autotrade flat-before-ASIA catch-up schedule failed: %s', _flat_catchup_sched_exc)
                 except Exception:
                     pass
 
