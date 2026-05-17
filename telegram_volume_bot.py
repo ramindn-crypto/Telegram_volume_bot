@@ -477,6 +477,8 @@ AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY = 'max_position_hours_enabled'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY = 'max_position_hours'
 AUTOTRADE_CFG_VER14_TIME_EXIT_POLICY_VERSION_KEY = 'ver14_time_exit_policy_version'
 AUTOTRADE_CFG_VER15_TIME_EXIT_POLICY_VERSION_KEY = 'ver15_time_exit_policy_version'
+# Ver17: conservative risk accounting + enforce 8h max-hold after persisted configs from older builds.
+AUTOTRADE_CFG_VER17_TIME_RISK_POLICY_VERSION_KEY = 'ver17_time_risk_policy_version'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY = 'flat_before_asia_last_local_date'
 AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY = 'ver11_leverage_policy_version'
 
@@ -1074,6 +1076,30 @@ def _autotrade_apply_ver15_time_exit_policy_defaults() -> None:
         if cur_hours <= 0 or cur_hours > 8.0:
             _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, 8.0)
         _autotrade_config_set(AUTOTRADE_CFG_VER15_TIME_EXIT_POLICY_VERSION_KEY, target_version)
+    except Exception:
+        pass
+
+
+
+def _autotrade_apply_ver17_time_risk_policy_defaults() -> None:
+    """Ver17: keep time-exit policy enforced and make daily-risk accounting conservative.
+
+    Older persisted runtime configs could keep AUTOTRADE_MAX_POSITION_HOURS at 18 even
+    after the code default moved back to 8. This migration is intentionally versioned
+    after ver16 so it runs once on the deployed DB and re-aligns the live bot with the
+    intended policy: 09:45 Melbourne flat ON, 8h max hold ON.
+    """
+    try:
+        target_version = 'ver17_2026_05_17'
+        if str(_autotrade_config_get(AUTOTRADE_CFG_VER17_TIME_RISK_POLICY_VERSION_KEY, '') or '').strip().lower() == target_version:
+            return
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9))
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
+        # Force 8h for this tuning cycle. The admin can still change it later with /autotrade_config.
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8))
+        _autotrade_config_set(AUTOTRADE_CFG_VER17_TIME_RISK_POLICY_VERSION_KEY, target_version)
     except Exception:
         pass
 
@@ -3511,6 +3537,7 @@ try:
     _autotrade_apply_ver07_safety_defaults()
     _autotrade_apply_ver11_leverage_policy_defaults()
     _autotrade_apply_ver15_time_exit_policy_defaults()
+    _autotrade_apply_ver17_time_risk_policy_defaults()
 except Exception:
     pass
 
@@ -5716,16 +5743,33 @@ def _autotrade_close_stale_owned_live_positions(uid: int, max_age_hours: float |
         now_ts = time.time()
         live_positions = list(_bybit_get_open_positions_linear() or [])
         journal_open = list(_autotrade_db_open_trades(uid_i) or [])
-        for p in live_positions:
+        # Ver17: use the same fallback ownership classification as /open_trades and
+        # /autotrade_debug. This lets max-hold close old live AutoTrade positions even
+        # after journal/test data was reset.
+        try:
+            bot_positions, external_positions, _jr = _autotrade_collect_live_position_rows(
+                uid_i,
+                positions=live_positions,
+                journal_open=journal_open,
+                fallback_unmatched_as_owned=bool(globals().get('AUTOTRADE_FLAT_FALLBACK_UNMATCHED_AS_OWNED', True)),
+            )
+        except Exception:
+            bot_positions = []
+            external_positions = []
+            for _p in live_positions:
+                _tr = _autotrade_find_open_trade_for_live_position(uid_i, _p, journal_open=journal_open)
+                if not _tr and bool(globals().get('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)):
+                    _tr = _autotrade_synthetic_live_trade_row(uid_i, _p)
+                if _tr:
+                    bot_positions.append((_p, dict(_tr)))
+                else:
+                    external_positions.append(_p)
+        for p, tr in list(bot_positions or []):
             try:
                 sym = _pos_symbol(p)
                 side = _pos_side_text(p)
-                tr = _autotrade_find_open_trade_for_live_position(uid_i, p, journal_open=journal_open)
-                if not tr and not bool(globals().get('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)):
-                    out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'no_matching_autotrade_journal'})
-                    continue
                 info = _autotrade_resolve_live_position_open_info(uid_i, p, journal_open=journal_open)
-                opened_ts = float((info or {}).get('opened_ts') or 0.0)
+                opened_ts = float((info or {}).get('opened_ts') or tr.get('opened_ts') or tr.get('created_ts') or 0.0)
                 if opened_ts <= 0:
                     out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'open_time_unknown'})
                     continue
@@ -5744,6 +5788,11 @@ def _autotrade_close_stale_owned_live_positions(uid: int, max_age_hours: float |
                     pass
             except Exception as exc:
                 out['errors'].append(f'{type(exc).__name__}: {exc}')
+        try:
+            for _p in list(locals().get('external_positions', []) or [])[:12]:
+                out['skipped'].append({'symbol': _pos_symbol(_p), 'side': _pos_side_text(_p), 'reason': 'external_or_manual_position'})
+        except Exception:
+            pass
         if out['errors']:
             out['ok'] = False
         return out
@@ -7381,8 +7430,12 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
             })
         open_pnl = 0.0
 
+    # Ver17: conservative AutoTrade cap accounting. Charge ALL current live AT risk
+    # against the daily cap, not only positions opened after the day reset. This avoids
+    # old/carried positions making Daily risk used look artificially low.
     if float(live_open_risk_charged_today or 0.0) <= 0.0:
-        live_open_risk_charged_today = float(current_day_open_risk)
+        live_open_risk_charged_today = float(current_total_open_risk)
+    live_open_risk_charged_today = max(float(current_total_open_risk or 0.0), float(live_open_risk_charged_today or 0.0))
     raw_daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
     effective_daily_used_total, reset_credit = _risk_day_reset_effective_used(int(uid), user, raw_daily_used_total)
     remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(effective_daily_used_total))
@@ -16527,8 +16580,12 @@ def _autotrade_day_risk_metrics_quick(uid: int, equity: float) -> dict:
             })
         open_pnl = 0.0
 
+    # Ver17: conservative AutoTrade cap accounting. Charge ALL current live AT risk
+    # against the daily cap, not only positions opened after the day reset. This avoids
+    # old/carried positions making Daily risk used look artificially low.
     if float(live_open_risk_charged_today or 0.0) <= 0.0:
-        live_open_risk_charged_today = float(current_day_open_risk)
+        live_open_risk_charged_today = float(current_total_open_risk)
+    live_open_risk_charged_today = max(float(current_total_open_risk or 0.0), float(live_open_risk_charged_today or 0.0))
     raw_daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
     effective_daily_used_total, reset_credit = _risk_day_reset_effective_used(int(uid), user, raw_daily_used_total)
     remaining_raw = float('inf') if cap <= 0 else (float(cap) - float(effective_daily_used_total))
@@ -44283,7 +44340,8 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             mday['realized_pnl_today'] = float(_closed_report_pnl)
             mday['realized_loss_today'] = float(sum(abs(float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0)) for r in _closed_report_rows if float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0) < 0.0))
             # Recalculate daily used with realised PnL credit/debit.
-            _raw_used = max(0.0, float(snap.get('live_open_risk_charged_today') or snap.get('current_day_open_risk') or 0.0) - float(_closed_report_pnl))
+            # Ver17: use all live open AT risk, including carried positions.
+            _raw_used = max(0.0, float(snap.get('current_total_open_risk') or snap.get('live_open_risk_charged_today') or snap.get('current_day_open_risk') or 0.0) - float(_closed_report_pnl))
             _used_eff, _reset_credit = _risk_day_reset_effective_used(int(owner), user, _raw_used)
             snap['used_today'] = float(_used_eff)
             snap['used_today_raw'] = float(_raw_used)
@@ -44371,9 +44429,11 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
         f"Opened today (AT): {int(snap.get('positions_opened_today', 0) or 0)}/{('∞' if int(_autotrade_runtime_max_trades_per_day() or 0) <= 0 else int(_autotrade_runtime_max_trades_per_day()))} | Closed today (AT): {int(snap.get('positions_closed_today', 0) or 0)} | Open now (AT): {int(snap.get('open_positions_now', 0) or 0)}",
         f"Open risk now (AT): ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        f"Open PnL now (AT): ${float(mday.get('open_pnl') or 0.0):+.2f}",
+        (f"Risk split: current-day ${float(snap.get('current_day_open_risk', 0.0)):.2f} | carried ${float(snap.get('carried_open_risk', 0.0)):.2f}" if float(snap.get('carried_open_risk', 0.0) or 0.0) > 0 else None),
         (f"Ignored unmatched live positions (AT): {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
         f"Realised net today (AT): ${float(snap.get('pnl_today') or 0.0):+.2f}",
-        f"Daily risk used (AT) (open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
+        f"Daily risk used (AT) (all open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
         ('Daily risk remaining (AT): ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining (AT): ${float(snap.get('remaining_today')):.2f}"),
         SEP,
         'Email → executable lane',
