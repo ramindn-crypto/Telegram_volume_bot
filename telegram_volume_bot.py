@@ -1507,11 +1507,19 @@ SETUP_COMBO_DAILY_SAFETY_ENABLED = env_bool("SETUP_COMBO_DAILY_SAFETY_ENABLED", 
 SETUP_COMBO_DAILY_SAFETY_HOUR = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_HOUR", "10") or 10)
 SETUP_COMBO_DAILY_SAFETY_MINUTE = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MINUTE", "0") or 0)
 SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS", "24") or 24)
-SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED", "6") or 6)
-SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WR_MAX", "35") or 35)
-SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "-0.15") or -0.15)
-SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "-18") or -18)
-SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "1.5") or 1.5)
+SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED", "4") or 4)
+SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WR_MAX", "45") or 45)
+SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "0.05") or 0.05)
+SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "0") or 0)
+SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "1.25") or 1.25)
+# Ver23 profit-first safety loop: run the severe-loser safety pass during the day,
+# not only at the 10:00 tick. This keeps live policy aligned with the latest
+# executable-lane evidence while still expiring disables at the next weekly review.
+SETUP_COMBO_INTRADAY_SAFETY_ENABLED = env_bool("SETUP_COMBO_INTRADAY_SAFETY_ENABLED", True)
+SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS = float(os.environ.get("SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS", "3") or 3)
+SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED = env_bool("SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED", True)
+SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_COOLDOWN_SEC = int(os.environ.get("SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_COOLDOWN_SEC", "600") or 600)
+SETUP_COMBO_PROFIT_TARGET_WR = float(os.environ.get("SETUP_COMBO_PROFIT_TARGET_WR", "50") or 50)
 # Catch up missed policy reviews after Render restarts/redeploys. Without this, if the
 # service starts after the scheduled Sunday 23:00 or daily 10:00 tick, APScheduler waits
 # for the next cycle and a bad combo can stay live for another day/week.
@@ -1550,11 +1558,11 @@ SETUP_GENERATION_COOLDOWN_ANY_SIDE = env_bool("SETUP_GENERATION_COOLDOWN_ANY_SID
 EMAIL_SETUP_COOLDOWN_ANY_SIDE = env_bool("EMAIL_SETUP_COOLDOWN_ANY_SIDE", False)
 SETUP_COMBO_POLICY_BLOCK_WATCH = env_bool("SETUP_COMBO_POLICY_BLOCK_WATCH", False)
 SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "3") or 3)
-SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "6") or 6)
+SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "4") or 4)
 SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
 SETUP_COMBO_POLICY_DISABLE_WR = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_WR", "45") or 45)
 SETUP_COMBO_POLICY_KEEP_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_AVG_R", "0.05") or 0.05)
-SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "-0.10") or -0.10)
+SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "0.00") or 0.00)
 
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
 # matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
@@ -41014,10 +41022,12 @@ def _setup_combo_seed_interim_disable_policy() -> None:
 
 
 def _setup_combo_daily_safety_reason(row: dict) -> str:
-    """Return non-empty reason only for severe daily losers.
+    """Return non-empty reason only for live severe/profit-target losers.
 
-    This deliberately uses stricter rules than the weekly matrix so one noisy day cannot
-    overfit the live policy. Daily safety can only DISABLE temporarily; it never promotes.
+    Ver23 profit-first rule: disables are not based on WR alone.  The row must
+    have enough decided results and fail a combination of WR, AvgR, score and
+    SL-vs-TP imbalance checks.  The disable is temporary and expires at the
+    next Sunday 23:00 weekly review, so a combo can be re-tested later.
     """
     try:
         decided = int(row.get('decided') or 0)
@@ -41026,23 +41036,31 @@ def _setup_combo_daily_safety_reason(row: dict) -> str:
         wr = float(row.get('win_rate') or 0.0)
         avg_r = float(row.get('avg_r') or 0.0)
         score = float(row.get('score') or 0.0)
-        min_decided = max(1, int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED or 8))
+        min_decided = max(1, int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED or 4))
         if decided < min_decided:
             return ''
-        # Hard loser: very low WR and clearly negative R.
-        if wr <= float(SETUP_COMBO_DAILY_SAFETY_WR_MAX) and avg_r <= float(SETUP_COMBO_DAILY_SAFETY_AVGR_MAX):
-            return f'daily_safety: WR {wr:.1f}% and AvgR {avg_r:+.2f} with {decided} decided'
-        # SL-heavy loser: enough sample, stop-outs dominate TPs, and the average R is negative.
-        sl_tp_floor = max(2, int(math.ceil(float(tp) * float(SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT or 2.0))))
-        if sl >= sl_tp_floor and wr <= 35.0 and avg_r <= -0.15:
-            return f'daily_safety: SL-heavy ({sl} SL vs {tp} TP), WR {wr:.1f}%, AvgR {avg_r:+.2f}'
-        # Composite extreme negative score safety net.
-        if score <= float(SETUP_COMBO_DAILY_SAFETY_SCORE_MAX) and wr <= 30.0 and sl > tp:
-            return f'daily_safety: score {score:+.1f}, WR {wr:.1f}%, SL {sl} > TP {tp}'
+        target_wr = float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50)
+        wr_max = float(SETUP_COMBO_DAILY_SAFETY_WR_MAX)
+        avg_max = float(SETUP_COMBO_DAILY_SAFETY_AVGR_MAX)
+        score_max = float(SETUP_COMBO_DAILY_SAFETY_SCORE_MAX)
+        sl_tp_mult = float(SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT or 1.25)
+
+        # Hard loser: below the profit target with no R edge.
+        if wr <= wr_max and avg_r <= avg_max:
+            return f'daily_safety: profit-first fail, WR {wr:.1f}% < target {target_wr:.0f}% and AvgR {avg_r:+.2f} with {decided} decided'
+
+        # Composite weak score: catches low-WR/SL-heavy combos even when AvgR is slightly positive.
+        if score <= score_max and wr < target_wr and sl > tp:
+            return f'daily_safety: weak score {score:+.1f}, WR {wr:.1f}% below {target_wr:.0f}%, SL {sl} > TP {tp}'
+
+        # SL-heavy loser: stop-outs materially dominate TPs.
+        sl_tp_floor = max(2, int(math.ceil(float(tp) * sl_tp_mult)))
+        if sl >= sl_tp_floor and wr < target_wr and decided >= min_decided:
+            return f'daily_safety: SL-heavy ({sl} SL vs {tp} TP), WR {wr:.1f}% below {target_wr:.0f}%'
+
         return ''
     except Exception:
         return ''
-
 
 
 def _setup_combo_compact_family_from_runtime(family_value: str) -> str:
@@ -41717,6 +41735,26 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
             return False, str((cs.get(combo_side) or {}).get('reason') or f'combo-side {combo_side} blocked by edge guard')
         if sym and sym in sb:
             return False, str((sb.get(sym) or {}).get('reason') or f'symbol {sym} blocked by edge guard')
+        # Ver23 profit-first guard: if fresh edge data says the whole family/session
+        # is below target, block normal-quality setups even before the next scheduled
+        # policy tick catches up. Exceptional quality may still pass for discovery.
+        try:
+            combo_metrics = dict((data or {}).get('combo_metrics') or {})
+            cm = dict(combo_metrics.get(f'{fam}-{sess}') or {})
+            c_dec = int(cm.get('decided') or 0)
+            c_wr = float(cm.get('wr') or 0.0)
+            c_avg = float(cm.get('avg_r') or 0.0)
+            c_score = float(cm.get('score') or 0.0)
+            c_tp = int(cm.get('tp') or 0)
+            c_sl = int(cm.get('sl') or 0)
+            min_dec = max(4, int(globals().get('SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED', 4) or 4))
+            target_wr = float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50)
+            escape_q = float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92)
+            weak_combo = c_dec >= min_dec and c_wr < target_wr and (c_avg <= 0.05 or c_score <= 0.0 or c_sl >= max(2, int(math.ceil(max(1, c_tp) * 1.25))))
+            if weak_combo and q_v < escape_q:
+                return False, f'weak_combo_profit_guard {fam}-{sess}: WR {c_wr:.1f}% < {target_wr:.0f}%, AvgR {c_avg:+.2f}, score {c_score:+.1f}, n{c_dec}'
+        except Exception:
+            pass
         # Hour is normally a secondary filter, but ver07 escalates current bad hours:
         # only exceptional high-quality setups can pass in 10/11/13/18/19/23 Melbourne windows.
         if hour in hw:
@@ -42385,6 +42423,30 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
         return f"❌ setup_deep_analysis failed: {type(e).__name__}: {html.escape(str(e))}"
 
 
+_SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_LAST_TS = 0.0
+
+
+def _setup_combo_policy_view_maybe_auto_safety(uid: int) -> dict:
+    """Cooldown-limited policy reconciliation for admin /setup_matrix policy.
+
+    This keeps the visible live policy from drifting too far behind fresh 24h
+    executable-lane evidence. It uses the same temporary daily-safety disable
+    rows that expire at the next Sunday weekly review.
+    """
+    global _SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_LAST_TS
+    try:
+        if not bool(globals().get('SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED', True)):
+            return {'ok': False, 'reason': 'disabled'}
+        now_ts = float(time.time())
+        cd = max(60, int(globals().get('SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_COOLDOWN_SEC', 600) or 600))
+        if now_ts - float(_SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_LAST_TS or 0.0) < cd:
+            return {'ok': False, 'reason': 'cooldown'}
+        _SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_LAST_TS = now_ts
+        return _setup_combo_run_daily_safety_policy(int(uid or 0))
+    except Exception as exc:
+        return {'ok': False, 'reason': f'{type(exc).__name__}: {exc}'}
+
+
 def _setup_combo_policy_text(uid: int) -> str:
     """Human policy view.
 
@@ -42401,6 +42463,9 @@ def _setup_combo_policy_text(uid: int) -> str:
         owner_uid = int(uid or 0)
         if owner_uid <= 0:
             owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        # Ver23: reconcile stale WATCH policy with fresh profit-first safety evidence
+        # before rendering the policy view. Cooldown-limited and temporary-only.
+        _setup_combo_policy_view_maybe_auto_safety(int(owner_uid))
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
@@ -42586,6 +42651,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
             f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
+            f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             f"{guard_txt}\n{note}\n"
             f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, and the micro edge guard are enforceable.\n"
@@ -52388,6 +52454,26 @@ def main():
                     "misfire_grace_time": 1800,
                 },
             )
+
+        if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)):
+            try:
+                _intraday_interval = max(3600, int(float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3) * 3600))
+                app.job_queue.run_repeating(
+                    setup_combo_daily_safety_job,
+                    interval=_intraday_interval,
+                    first=900,
+                    name="setup_combo_intraday_safety_job",
+                    job_kwargs={
+                        "max_instances": 1,
+                        "coalesce": True,
+                        "misfire_grace_time": 1800,
+                    },
+                )
+            except Exception as _intraday_exc:
+                try:
+                    logger.warning('setup_combo_intraday_safety_schedule_failed: %s', _intraday_exc)
+                except Exception:
+                    pass
 
         if SETUP_COMBO_POLICY_CATCHUP_ENABLED and (SETUP_COMBO_REVIEW_ENABLED or SETUP_COMBO_DAILY_SAFETY_ENABLED):
             app.job_queue.run_once(
