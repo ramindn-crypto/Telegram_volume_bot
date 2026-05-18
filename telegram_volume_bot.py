@@ -1512,6 +1512,9 @@ SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY
 SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "0.05") or 0.05)
 SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "0") or 0)
 SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "1.25") or 1.25)
+# Ver24: faster temporary disable for zero-TP combos with repeated stop-outs.
+SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED", "3") or 3)
+SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL", "2") or 2)
 # Ver23 profit-first safety loop: run the severe-loser safety pass during the day,
 # not only at the 10:00 tick. This keeps live policy aligned with the latest
 # executable-lane evidence while still expiring disables at the next weekly review.
@@ -7524,6 +7527,26 @@ def _autotrade_performance_summary(rows: list[dict]) -> dict:
         'expectancy': expectancy,
     }
 
+def _autotrade_daily_used_from_open_and_realized(open_risk_usd: float, realized_net_usd: float) -> float:
+    """Conservative daily risk usage for AutoTrade.
+
+    Positive realised PnL should reduce remaining risk pressure; realised losses
+    should add to risk used.  Algebraically this is max(0, open_risk - realised_net),
+    but the split form avoids accidental sign inversions in display/report code.
+    """
+    try:
+        open_risk = max(0.0, float(open_risk_usd or 0.0))
+    except Exception:
+        open_risk = 0.0
+    try:
+        realised = float(realized_net_usd or 0.0)
+    except Exception:
+        realised = 0.0
+    realised_profit = max(0.0, realised)
+    realised_loss = max(0.0, -realised)
+    return max(0.0, open_risk + realised_loss - realised_profit)
+
+
 def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     """Compute authoritative AutoTrade day metrics using the configured trading-day window.
 
@@ -7683,7 +7706,7 @@ def _autotrade_day_risk_metrics(uid: int, equity: float) -> dict:
     if float(live_open_risk_charged_today or 0.0) <= 0.0:
         live_open_risk_charged_today = float(current_total_open_risk)
     live_open_risk_charged_today = max(float(current_total_open_risk or 0.0), float(live_open_risk_charged_today or 0.0))
-    raw_daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
+    raw_daily_used_total = _autotrade_daily_used_from_open_and_realized(float(live_open_risk_charged_today), float(realized_pnl_today))
     effective_daily_used_total, reset_credit = _risk_day_reset_effective_used(int(uid), user, raw_daily_used_total)
     remaining_raw = float("inf") if cap <= 0 else (float(cap) - float(effective_daily_used_total))
     over_by = abs(float(remaining_raw)) if cap > 0 and remaining_raw < 0 else 0.0
@@ -16866,7 +16889,7 @@ def _autotrade_day_risk_metrics_quick(uid: int, equity: float) -> dict:
     if float(live_open_risk_charged_today or 0.0) <= 0.0:
         live_open_risk_charged_today = float(current_total_open_risk)
     live_open_risk_charged_today = max(float(current_total_open_risk or 0.0), float(live_open_risk_charged_today or 0.0))
-    raw_daily_used_total = max(0.0, float(live_open_risk_charged_today) - float(realized_pnl_today))
+    raw_daily_used_total = _autotrade_daily_used_from_open_and_realized(float(live_open_risk_charged_today), float(realized_pnl_today))
     effective_daily_used_total, reset_credit = _risk_day_reset_effective_used(int(uid), user, raw_daily_used_total)
     remaining_raw = float('inf') if cap <= 0 else (float(cap) - float(effective_daily_used_total))
     over_by = abs(float(remaining_raw)) if cap > 0 and remaining_raw < 0 else 0.0
@@ -41037,6 +41060,11 @@ def _setup_combo_daily_safety_reason(row: dict) -> str:
         avg_r = float(row.get('avg_r') or 0.0)
         score = float(row.get('score') or 0.0)
         min_decided = max(1, int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED or 4))
+        zero_tp_min_decided = max(1, int(globals().get('SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED', 3) or 3))
+        zero_tp_min_sl = max(1, int(globals().get('SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL', 2) or 2))
+        # Ver24: clear 0-TP repeated losers do not need the full normal sample size.
+        if tp <= 0 and sl >= zero_tp_min_sl and decided >= zero_tp_min_decided:
+            return f'daily_safety: zero-TP severe loser ({tp} TP vs {sl} SL) with {decided} decided'
         if decided < min_decided:
             return ''
         target_wr = float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50)
@@ -44827,6 +44855,14 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     _max_trades_day_i = int(_autotrade_runtime_max_trades_per_day() or 0)
     _max_trades_day_txt = '∞' if _max_trades_day_i <= 0 else str(_max_trades_day_i)
 
+    _debug_open_risk_display = float(snap.get('current_total_open_risk', 0.0) or 0.0)
+    _debug_realised_display = float(snap.get('pnl_today') or 0.0)
+    _debug_risk_credit_display = float(snap.get('risk_reset_credit') or 0.0)
+    _debug_daily_used_raw = _autotrade_daily_used_from_open_and_realized(_debug_open_risk_display, _debug_realised_display)
+    _debug_daily_used_display = max(0.0, float(_debug_daily_used_raw) - float(_debug_risk_credit_display))
+    _debug_cap_display = float(snap.get('cap') or 0.0)
+    _debug_remaining_display = float('inf') if _debug_cap_display <= 0 else max(0.0, _debug_cap_display - _debug_daily_used_display)
+
     lines = [
         '🧪 AutoTrade Debug',
         HDR,
@@ -44837,13 +44873,13 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
         f"Opened today (AT): {_opened_today_i}/{_max_trades_day_txt} | Closed today (AT): {_closed_today_i} | Open now (AT): {_open_now_i}",
         (f"Open split (AT): current-day {_current_open_i} | carried {_carried_open_i}" if _carried_open_i > 0 else f"Open split (AT): current-day {_current_open_i} | carried 0"),
-        f"Open risk now (AT): ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
+        f"Open risk now (AT): ${_debug_open_risk_display:.2f}",
         f"Open PnL now (AT): ${float(mday.get('open_pnl') or 0.0):+.2f}",
         f"Risk split (AT): current-day ${float(snap.get('current_day_open_risk', 0.0)):.2f} | carried ${float(snap.get('carried_open_risk', 0.0)):.2f}",
         (f"Ignored unmatched live positions (AT): {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
-        f"Realised net today (AT): ${float(snap.get('pnl_today') or 0.0):+.2f}",
-        f"Daily risk used (AT) (all open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
-        ('Daily risk remaining (AT): ∞' if not math.isfinite(float(snap.get('remaining_today', float('inf')))) else f"Daily risk remaining (AT): ${float(snap.get('remaining_today')):.2f}"),
+        f"Realised net today (AT): ${_debug_realised_display:+.2f}",
+        f"Daily risk used (AT) (open risk + realised losses - realised profits): ${_debug_daily_used_display:.2f}",
+        ('Daily risk remaining (AT): ∞' if not math.isfinite(float(_debug_remaining_display)) else f"Daily risk remaining (AT): ${float(_debug_remaining_display):.2f}"),
         SEP,
         'Email → executable lane',
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
