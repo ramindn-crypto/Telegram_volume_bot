@@ -20,6 +20,7 @@
 # - Ver21: Autonomous email/autotrade setup pipeline runs independently from /screen.
 # - Ver14: made interim setup-combo policy seeding idempotent/quiet and downgraded manual-position conflict logs from WARNING to INFO.
 # - Ver17: added deep setup analytics, separated advisory vs live policy in /setup_matrix, added missed policy catch-up, and fixed /autotrade_report_overall open/closed fallback counts.
+# - 18May_ver18: clear setup/email/AutoTrade cooldown gates at the 09:45 Melbourne flat reset; include exchange-only closed PnL in reports as OTHER unless TP/SL is verified.
 # - Ver16b: strict verified TP/SL reporting; no raw exchange-only fallback rows in AutoTrade report by default; stop inferring TP/SL from PnL sign alone.
 # - 07May_v01: throttled autonomous screen sync, added DB-backed family/session edge matrix, and safety-clamped AutoTrade defaults.
 # - 07May_v04: setup generation/email duplicate cooldown reduced to 3 hours.
@@ -479,6 +480,10 @@ AUTOTRADE_CFG_VER14_TIME_EXIT_POLICY_VERSION_KEY = 'ver14_time_exit_policy_versi
 AUTOTRADE_CFG_VER15_TIME_EXIT_POLICY_VERSION_KEY = 'ver15_time_exit_policy_version'
 # Ver17: conservative risk accounting + enforce 8h max-hold after persisted configs from older builds.
 AUTOTRADE_CFG_VER17_TIME_RISK_POLICY_VERSION_KEY = 'ver17_time_risk_policy_version'
+# Ver18: timestamp marker used to ignore setup/email/autotrade cooldown history
+# before the daily 09:45 Melbourne flat reset. This preserves reports while
+# making the 10:00 ASIA session start fresh.
+AUTOTRADE_CFG_COOLDOWN_RESET_TS_KEY = 'cooldown_reset_after_ts'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY = 'flat_before_asia_last_local_date'
 AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY = 'ver11_leverage_policy_version'
 
@@ -508,7 +513,7 @@ AUTOTRADE_MAX_POSITION_HOURS_ENABLED = env_bool('AUTOTRADE_MAX_POSITION_HOURS_EN
 AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8)
 AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', '600') or 600)
 AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
-AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '09:00-11:00') or '').split(',') if x.strip())
+AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '09:00-10:05') or '').split(',') if x.strip())
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
@@ -532,9 +537,10 @@ AUTOTRADE_REPORT_POSITION_MERGE_WINDOW_SEC = int(os.environ.get("AUTOTRADE_REPOR
 # Ver16: strict AutoTrade reports. Do not silently turn any positive/negative
 # exchange PnL into TP/SL. Count TP/SL only when we have lifecycle/order proof
 # or the realised PnL is close to the expected risk/target value. Raw
-# exchange-only fallback rows are hidden by default because they may be manual,
-# legacy, or unmatched exchange closes.
-AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK = env_bool("AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK", False)
+# exchange-only fallback rows are included by default for PnL completeness, but are
+# labelled OTHER/FLAT unless TP/SL is verified. Set this false only if you want
+# strict journal-only reports.
+AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK = env_bool("AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK", True)
 AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = env_bool("AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL", True)
 AUTOTRADE_REPORT_TPSL_PNL_TOLERANCE_PCT = float(os.environ.get("AUTOTRADE_REPORT_TPSL_PNL_TOLERANCE_PCT", "0.35") or 0.35)
 AUTOTRADE_REPORT_TPSL_PNL_TOLERANCE_USD = float(os.environ.get("AUTOTRADE_REPORT_TPSL_PNL_TOLERANCE_USD", "2.00") or 2.0)
@@ -580,6 +586,64 @@ def _autotrade_config_set(key: str, value) -> None:
         pass
 
 
+
+
+def _autotrade_cooldown_reset_ts() -> float:
+    """Return the timestamp after which cooldown-producing history is valid."""
+    try:
+        return max(0.0, float(_autotrade_config_get(AUTOTRADE_CFG_COOLDOWN_RESET_TS_KEY, 0) or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _autotrade_clear_execution_cooldowns(uid: int, reason: str = 'asia_fresh_start') -> dict:
+    """Clear email/setup/autotrade cooldown gates without deleting report history.
+
+    Used after the 09:45 Melbourne flat so the 10:00 ASIA session starts with no
+    position and no stale cooldowns. It preserves reports by storing a reset marker
+    and making cooldown checks ignore older executable/generated/autotrade rows.
+    """
+    out = {'ok': True, 'reason': str(reason or ''), 'deleted_emailed_symbols': 0, 'reset_ts': float(time.time())}
+    try:
+        uid_i = int(uid or 0)
+        ids = []
+        if uid_i > 0:
+            ids.append(uid_i)
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        if owner_uid > 0 and owner_uid not in ids:
+            ids.append(owner_uid)
+        ids.append(0)
+        ids = list(dict.fromkeys([int(x) for x in ids if int(x or 0) >= 0]))
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            try:
+                q = ','.join(['?'] * len(ids))
+                cur.execute(f"DELETE FROM emailed_symbols WHERE user_id IN ({q})", tuple(ids))
+                out['deleted_emailed_symbols'] = int(cur.rowcount or 0)
+            except Exception:
+                pass
+            try:
+                q = ','.join(['?'] * len(ids))
+                params = [float(out['reset_ts']), 'expired_by_asia_cooldown_reset'] + ids
+                cur.execute(f"UPDATE autotrade_exec_guard SET status='EXPIRED', updated_ts=?, note=? WHERE uid IN ({q}) AND status IN ('PENDING','PLACED')", tuple(params))
+            except Exception:
+                pass
+            conn.commit()
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_COOLDOWN_RESET_TS_KEY, float(out['reset_ts']))
+        except Exception:
+            pass
+        try:
+            with _AUTOTRADE_RUNTIME_SYMBOL_LOCKS_GUARD:
+                _AUTOTRADE_RUNTIME_SYMBOL_LOCKS.clear()
+        except Exception:
+            pass
+        return out
+    except Exception as exc:
+        out['ok'] = False
+        out['error'] = f'{type(exc).__name__}: {exc}'
+        return out
+
 def _autotrade_bootstrap_runtime_config() -> None:
     defaults = {
         AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: float(AUTOTRADE_RISK_PER_TRADE_PCT),
@@ -601,7 +665,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '90') or 90),
         AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY: 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', True) else 0,
         AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '1.25') or 1.25),
-        AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY: float(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '5') or 5),
+        AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY: float(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '4') or 4),
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY: 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True) else 0,
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9),
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45),
@@ -791,7 +855,7 @@ def _autotrade_safe_leverage_downgrade_min() -> int:
     1x behaviour that caused confusing oversized-looking positions.
     """
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '5')) or 5)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '4')) or 4)
     except Exception:
         val = 5.0
     return max(1, min(20, int(round(float(val)))))
@@ -892,7 +956,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED': bool(_autotrade_max_position_hours_enabled()),
         'AUTOTRADE_MAX_POSITION_HOURS': float(_autotrade_max_position_hours()),
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL': bool(globals().get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)),
-        'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK': bool(globals().get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', False)),
+        'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK': bool(globals().get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
     }
 
@@ -1014,7 +1078,7 @@ def _autotrade_apply_ver07_safety_defaults() -> None:
         # Ver11 changed this policy to controlled downgrade: allow only if the
         # calculated safe leverage remains above the configured minimum.
         _autotrade_config_set(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1)
-        _autotrade_config_set(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, 5)
+        _autotrade_config_set(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, 4)
         _autotrade_config_set(AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY, 1.25)
         _cap_float(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, float(AUTOTRADE_VER07_OPEN_RISK_CAP_PCT), lower_is_ok=True)
         try:
@@ -1047,11 +1111,40 @@ def _autotrade_apply_ver11_leverage_policy_defaults() -> None:
         if not first_apply:
             return
         _autotrade_config_set(AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY, 1)
-        _autotrade_config_set(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, int(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '5') or 5))
+        _autotrade_config_set(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, int(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '4') or 4))
         _autotrade_config_set(AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY, target_version)
     except Exception:
         pass
 
+
+
+def _autotrade_apply_ver19_entry_execution_policy_defaults() -> None:
+    """Ver19: allow the ASIA session to restart after the 09:45 flat and reduce false AutoTrade skips.
+
+    Changes:
+    - Shrinks the default entry blackout from 09:00-11:00 to 09:00-10:05 Melbourne.
+      This preserves the pre-ASIA/noise guard but allows valid post-reset ASIA emails
+      such as 10:13 EDEN to autotrade.
+    - Lowers the controlled safe-leverage downgrade floor from 5x to 4x.  This still
+      blocks unsafe 1x/2x/3x cases, but allows practical 4x cases when the SL distance
+      requires it and dynamic risk remains small.
+    """
+    try:
+        target_version = 'ver19_2026_05_18'
+        first_apply = str(_autotrade_config_get('ver19_entry_execution_policy_version', '') or '').strip().lower() != target_version
+        if not first_apply:
+            return
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY, 4)
+        except Exception:
+            pass
+        try:
+            _autotrade_config_set('autotrade_entry_blackout_windows_note', '09:00-10:05 Melbourne default; env AUTOTRADE_ENTRY_BLACKOUT_WINDOWS can override')
+        except Exception:
+            pass
+        _autotrade_config_set('ver19_entry_execution_policy_version', target_version)
+    except Exception:
+        pass
 
 def _autotrade_apply_ver15_time_exit_policy_defaults() -> None:
     """Ver15: make the 09:45 flat reliable after deployment/reset.
@@ -3536,6 +3629,7 @@ try:
     _autotrade_apply_07may_safety_defaults()
     _autotrade_apply_ver07_safety_defaults()
     _autotrade_apply_ver11_leverage_policy_defaults()
+    _autotrade_apply_ver19_entry_execution_policy_defaults()
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
 except Exception:
@@ -5634,10 +5728,18 @@ async def autotrade_flat_before_asia_job(context: ContextTypes.DEFAULT_TYPE):
             _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY, datetime.now(MEL_TZ).strftime('%Y-%m-%d'))
         except Exception:
             pass
+        try:
+            cd_reset = _autotrade_clear_execution_cooldowns(uid, 'scheduled_flat_before_asia')
+        except Exception:
+            cd_reset = {}
         closed = list((res or {}).get('closed') or [])
-        if closed:
+        if closed or cd_reset:
             try:
-                msg = '🧹 AutoTrade scheduled flat before ASIA\n' + f"Closed positions: {len(closed)}\n" + '\n'.join([f"• {x.get('symbol')} {x.get('side')} ret={x.get('retCode')}" for x in closed[:12]])
+                msg = '🧹 AutoTrade scheduled flat before ASIA\n' + f"Closed positions: {len(closed)}"
+                if cd_reset:
+                    msg += f"\nCooldown reset: cleared {int((cd_reset or {}).get('deleted_emailed_symbols') or 0)} email/setup cooldown rows"
+                if closed:
+                    msg += '\n' + '\n'.join([f"• {x.get('symbol')} {x.get('side')} ret={x.get('retCode')}" for x in closed[:12]])
                 await context.bot.send_message(chat_id=uid, text=msg)
             except Exception:
                 pass
@@ -5712,10 +5814,16 @@ async def autotrade_flat_before_asia_catchup_job(context: ContextTypes.DEFAULT_T
             _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY, date_s)
         except Exception:
             pass
+        try:
+            cd_reset = _autotrade_clear_execution_cooldowns(uid, f'catchup_flat_before_asia_{date_s}')
+        except Exception:
+            cd_reset = {}
         closed = list((res or {}).get('closed') or [])
         skipped = list((res or {}).get('skipped') or [])
         try:
             msg = '🧹 AutoTrade 09:45 flat catch-up\n' + f"Date: {date_s} | Cutoff: {cutoff.strftime('%H:%M')} Melbourne\nClosed positions: {len(closed)}"
+            if cd_reset:
+                msg += f"\nCooldown reset: cleared {int((cd_reset or {}).get('deleted_emailed_symbols') or 0)} email/setup cooldown rows"
             if skipped:
                 msg += f"\nSkipped: {len(skipped)}"
             if closed:
@@ -5841,7 +5949,13 @@ async def autotrade_flat_now_cmd(update: Update, context: ContextTypes.DEFAULT_T
         closed = list((res or {}).get('closed') or [])
         skipped = list((res or {}).get('skipped') or [])
         errs = list((res or {}).get('errors') or [])
+        try:
+            cd_reset = _autotrade_clear_execution_cooldowns(owner, 'manual_autotrade_flat_now')
+        except Exception:
+            cd_reset = {}
         lines = ["🧹 AutoTrade flat now", HDR, f"Closed attempts: {len(closed)} | Skipped: {len(skipped)} | Errors: {len(errs)}"]
+        if cd_reset:
+            lines.append(f"Cooldown reset: cleared {int((cd_reset or {}).get('deleted_emailed_symbols') or 0)} email/setup cooldown rows")
         for x in closed[:15]:
             lines.append(f"• {x.get('symbol')} {x.get('side')} qty={x.get('qty')} ret={x.get('retCode')} {x.get('retMsg') or ''}")
         if errs:
@@ -8069,6 +8183,17 @@ def _autotrade_get_local_symbol_activity(uid: int, symbol: str) -> dict:
             out['latest_trade_ts'] = max(float(out['latest_trade_ts'] or 0.0), open_ts, close_ts)
             if status == 'OPEN':
                 opens.append(r)
+        try:
+            reset_ts = float(_autotrade_cooldown_reset_ts() or 0.0)
+            if reset_ts > 0:
+                if float(out.get('latest_open_ts') or 0.0) < reset_ts:
+                    out['latest_open_ts'] = 0.0
+                if float(out.get('latest_close_ts') or 0.0) < reset_ts:
+                    out['latest_close_ts'] = 0.0
+                if float(out.get('latest_trade_ts') or 0.0) < reset_ts:
+                    out['latest_trade_ts'] = 0.0
+        except Exception:
+            pass
         out['open_trades'] = opens
     except Exception:
         pass
@@ -8087,7 +8212,13 @@ def _autotrade_get_pending_symbol_guards(uid: int, symbol: str) -> list[dict]:
             rows = [dict(r) for r in c.fetchall()]
         for r in rows:
             status = str(r.get('status') or '').upper()
-            age = now - float(r.get('updated_ts') or 0.0)
+            upd_ts = float(r.get('updated_ts') or 0.0)
+            try:
+                if upd_ts < float(_autotrade_cooldown_reset_ts() or 0.0):
+                    continue
+            except Exception:
+                pass
+            age = now - upd_ts
             if status == 'PENDING' and age <= float(AUTOTRADE_SYMBOL_GUARD_TTL_SEC):
                 out.append(r)
             elif status == 'PLACED' and age <= float(AUTOTRADE_RECENT_SYMBOL_SYNC_SEC):
@@ -10320,11 +10451,11 @@ ALERT_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
-AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "6") or 6)
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "18") or 18)
 # Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
 # Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
 AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "60") or 60)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "35") or 35)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "55") or 55)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
 AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", True)
@@ -14370,6 +14501,11 @@ def symbol_recently_emailed(
         return False
 
     last_ts = float(row["emailed_ts"])
+    try:
+        if last_ts < float(_autotrade_cooldown_reset_ts() or 0.0):
+            return False
+    except Exception:
+        pass
     return (time.time() - last_ts) < (cooldown_hours * 3600.0)
 
 
@@ -14394,7 +14530,7 @@ def _email_symbol_recently_sent(user_id: int, symbol: str, side: str, session_na
         pass
     try:
         cooldown_sec = float(email_setup_cooldown_hours_for_session(session_name)) * 3600.0
-        cutoff = float(time.time() - cooldown_sec)
+        cutoff = max(float(time.time() - cooldown_sec), float(_autotrade_cooldown_reset_ts() or 0.0))
         sym = str(_bybit_linear_symbol(symbol) or '').upper()
         sd = str(side or '').upper().strip()
         if not sym or not sd:
@@ -14459,7 +14595,7 @@ def _setup_generation_symbol_recently_seen(user_id: int, symbol: str, side: str,
         cooldown_sec = float(setup_generation_cooldown_hours_for_session(session_name)) * 3600.0
         if cooldown_sec <= 0:
             return False
-        cutoff = float(time.time()) - cooldown_sec
+        cutoff = max(float(time.time()) - cooldown_sec, float(_autotrade_cooldown_reset_ts() or 0.0))
         sym, sd = _symbol_side_for_cooldown(symbol, side)
         sid = str(setup_id or '').strip()
         if not sym or not sd:
@@ -16060,6 +16196,11 @@ def symbol_flip_guard_active(
         return False
 
     last_ts = float(row["emailed_ts"])
+    try:
+        if last_ts < float(_autotrade_cooldown_reset_ts() or 0.0):
+            return False
+    except Exception:
+        pass
     return (time.time() - last_ts) < (cooldown_hours * 3600.0)
 
 
@@ -35783,7 +35924,7 @@ def build_help_text_admin() -> str:
         "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
         "AutoTrade matrix examples: /autotrade_report_overall 24 (daily), /autotrade_report_overall 168 (weekly).",
         "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90.",
-        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true | /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8 | 09:45 catch-up guardian ON | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
+        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 4 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true | /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8 | 09:45 catch-up guardian ON | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -36829,7 +36970,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DYNAMIC_RISK_SCORE = low {float(summary.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 40)):.0f} | base {float(summary.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 65)):.0f} | high {float(summary.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', 90)):.0f}",
             f"Effective risk range now ≈ {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.75)):.2f}%–{float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.25)):.2f}%",
             f"AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE = {'true' if bool(summary.get('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE')) else 'false'}",
-            f"AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN = {int(summary.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 5))}x",
+            f"AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN = {int(summary.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 4))}x",
             f"AUTOTRADE_EMERGENCY_RISK_MAX_MULT = {float(summary.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', 2.0)):.2f}x",
             f"AUTOTRADE_STRICT_TPSL_ONLY = {'true' if bool(summary.get('AUTOTRADE_STRICT_TPSL_ONLY', True)) else 'false'}",
             f"AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = {'true' if bool(summary.get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)) else 'false'}",
@@ -36840,7 +36981,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MAX_POSITION_HOURS_ENABLED = {'true' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_MAX_POSITION_HOURS = {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 8.0)):.2f}",
             f"AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = {'true' if bool(summary.get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)) else 'false'}",
-            f"AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK = {'true' if bool(summary.get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', False)) else 'false'}",
+            f"AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK = {'true' if bool(summary.get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)) else 'false'}",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
@@ -36856,7 +36997,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25",
             "• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true",
-            "• /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 5",
+            "• /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 4",
             "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_HOUR 9",
@@ -36864,7 +37005,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS_ENABLED true",
             "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8",
             "• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true",
-            "• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK false",
+            "• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK true",
             "• Strict TP/SL lifecycle is ON, with owner-approved time exits: scheduled ASIA flat and max-hold guardian.",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
@@ -43456,7 +43597,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
     # have no setup/trade id and can be manual, legacy, or unmatched exchange
     # closes, which made /autotrade_report show TP/SL rows with tiny/non-target PnL.
     seed_rows = list(lifecycle_rows or []) + list(journal_rows or []) + list(provisional_rows or [])
-    if bool(globals().get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', False)):
+    if bool(globals().get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)):
         seed_rows += list(exchange_fallback_rows or [])
     for base in seed_rows:
         try:
@@ -43776,7 +43917,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v16_verified_tpsl:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v18_cooldown_reset_exchange_pnl:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -44452,6 +44593,12 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(f"Recent sent setup-email batches (12h): {int(sent_email_batches_recent or 0)}")
     except Exception:
         pass
+    try:
+        reset_ts = float(_autotrade_cooldown_reset_ts() or 0.0)
+        if reset_ts > 0:
+            lines.append(f"Cooldown reset marker: {_fmt_dt_local(datetime.fromtimestamp(reset_ts, tz=timezone.utc))}")
+    except Exception:
+        pass
     if reasons and not ready:
         lines.extend([SEP, 'Blocking reasons'])
         for r in reasons[:6]:
@@ -44588,7 +44735,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v16_verified_tpsl:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v18_cooldown_reset_exchange_pnl:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -44708,7 +44855,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         HDR,
         f'Window: last {lookback_h}h (Melbourne)' + (f' | Now: {now_txt}' if now_txt else ''),
         f'Position rows: {total_trades} | Raw fragments merged: {raw_fragments} | TP: {total_tp} | SL: {total_sl} | Other: {total_other} | Open: {total_open} | WR: {wr:.1f}% | PnL: {total_pnl:+.2f} USDT',
-        'TP/SL counts require lifecycle/order proof or realised PnL close to the configured target/risk. In-between closes show as OTHER/FLAT and are not counted as TP/SL.',
+        'TP/SL counts require lifecycle/order proof or realised PnL close to the configured target/risk. Exchange-only closes are included in PnL as OTHER/FLAT unless verified.',
     ]
     if external_positions:
         lines.append(f'Ignored unmatched manual/external live positions: {len(external_positions)}')
