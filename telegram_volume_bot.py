@@ -44751,6 +44751,19 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             pass
 
+    # Ver21: make /autotrade_debug accounting explicit and non-ambiguous.
+    # "Opened today" is a journal/exchange activity count inside the current
+    # Melbourne trading-day window. The open-position split is live-position
+    # age/risk bucketing, so carried positions are shown separately instead of
+    # making the risk split look inconsistent.
+    _open_now_i = int(snap.get('open_positions_now', 0) or 0)
+    _carried_open_i = int(snap.get('inherited_open_positions', 0) or 0)
+    _current_open_i = max(0, int(_open_now_i) - int(_carried_open_i))
+    _opened_today_i = int(snap.get('positions_opened_today', 0) or 0)
+    _closed_today_i = int(snap.get('positions_closed_today', 0) or 0)
+    _max_trades_day_i = int(_autotrade_runtime_max_trades_per_day() or 0)
+    _max_trades_day_txt = '∞' if _max_trades_day_i <= 0 else str(_max_trades_day_i)
+
     lines = [
         '🧪 AutoTrade Debug',
         HDR,
@@ -44759,10 +44772,11 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         SEP,
         f"EquityAT: ${equity:.2f}",
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
-        f"Opened today (AT): {int(snap.get('positions_opened_today', 0) or 0)}/{('∞' if int(_autotrade_runtime_max_trades_per_day() or 0) <= 0 else int(_autotrade_runtime_max_trades_per_day()))} | Closed today (AT): {int(snap.get('positions_closed_today', 0) or 0)} | Open now (AT): {int(snap.get('open_positions_now', 0) or 0)}",
+        f"Opened today (AT): {_opened_today_i}/{_max_trades_day_txt} | Closed today (AT): {_closed_today_i} | Open now (AT): {_open_now_i}",
+        (f"Open split (AT): current-day {_current_open_i} | carried {_carried_open_i}" if _carried_open_i > 0 else f"Open split (AT): current-day {_current_open_i} | carried 0"),
         f"Open risk now (AT): ${float(snap.get('current_total_open_risk', 0.0)):.2f}",
         f"Open PnL now (AT): ${float(mday.get('open_pnl') or 0.0):+.2f}",
-        (f"Risk split: current-day ${float(snap.get('current_day_open_risk', 0.0)):.2f} | carried ${float(snap.get('carried_open_risk', 0.0)):.2f}" if float(snap.get('carried_open_risk', 0.0) or 0.0) > 0 else None),
+        f"Risk split (AT): current-day ${float(snap.get('current_day_open_risk', 0.0)):.2f} | carried ${float(snap.get('carried_open_risk', 0.0)):.2f}",
         (f"Ignored unmatched live positions (AT): {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
         f"Realised net today (AT): ${float(snap.get('pnl_today') or 0.0):+.2f}",
         f"Daily risk used (AT) (all open risk - realised net): ${float(snap.get('used_today') or 0.0):.2f}",
