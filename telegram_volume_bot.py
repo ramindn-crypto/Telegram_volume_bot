@@ -1507,11 +1507,11 @@ SETUP_COMBO_DAILY_SAFETY_ENABLED = env_bool("SETUP_COMBO_DAILY_SAFETY_ENABLED", 
 SETUP_COMBO_DAILY_SAFETY_HOUR = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_HOUR", "10") or 10)
 SETUP_COMBO_DAILY_SAFETY_MINUTE = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MINUTE", "0") or 0)
 SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS", "24") or 24)
-SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED", "8") or 8)
-SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WR_MAX", "25") or 25)
-SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "-0.40") or -0.40)
-SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "-40") or -40)
-SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "2.0") or 2.0)
+SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED", "6") or 6)
+SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WR_MAX", "35") or 35)
+SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "-0.15") or -0.15)
+SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "-18") or -18)
+SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "1.5") or 1.5)
 # Catch up missed policy reviews after Render restarts/redeploys. Without this, if the
 # service starts after the scheduled Sunday 23:00 or daily 10:00 tick, APScheduler waits
 # for the next cycle and a bad combo can stay live for another day/week.
@@ -36049,7 +36049,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "trade_id_reset": "Reset your own Trade ID numbering",
     "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
     "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
-    "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated, AutoTrade entry blackout, and global setup-generation blackout. Dynamic keys: AUTOTRADE_DYNAMIC_RISK_ENABLED, AUTOTRADE_DYNAMIC_RISK_MIN_MULT, AUTOTRADE_DYNAMIC_RISK_MAX_MULT, AUTOTRADE_DYNAMIC_RISK_LOW_SCORE, AUTOTRADE_DYNAMIC_RISK_BASE_SCORE, AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE. Safety keys: AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE, AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN, AUTOTRADE_EMERGENCY_RISK_MAX_MULT, AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED, AUTOTRADE_MAX_POSITION_HOURS, BLACKOUT_WINDOWS, SETUP_GENERATION_BLACKOUT_WINDOWS, AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL",
+    "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated, AutoTrade entry blackout, and global setup-generation blackout.",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
@@ -36077,14 +36077,11 @@ def _registered_command_names_from_source() -> set[str]:
 
 def build_help_text_admin() -> str:
     registered = _registered_command_names_from_source()
+    # Ver22: keep /help_admin compact. The long examples block above USERS & ACCESS
+    # made the admin help hard to scan on mobile; command-specific detail stays inside
+    # each command row below.
     lines = [
         "🛠 PulseFutures — Admin Command Guide",
-        "",
-        "Note: quick snapshot commands are cached so normal commands stay instant. Heavy run/diagnostic commands are grouped separately below.",
-        "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
-        "AutoTrade matrix examples: /autotrade_report_overall 24 (daily), /autotrade_report_overall 168 (weekly).",
-        "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90.",
-        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 4 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true | /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8 | /autotrade_config BLACKOUT_WINDOWS 10:00-10:45 | /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-10:45 | 09:45 catch-up guardian ON | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -44108,7 +44105,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v18_cooldown_reset_exchange_pnl:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v22_html_table:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -44865,6 +44862,22 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("📌 Open Positions (Bybit)")
     lines.append(HDR)
 
+    def _fam_for_open_row(tr: dict, p: dict | None = None) -> str:
+        try:
+            row = _setup_audit_merge_trade_setup_row(dict(tr or {}))
+            fam = _setup_audit_family_display(row, compact=True)
+            if fam and fam != '-':
+                return fam
+        except Exception:
+            pass
+        try:
+            fam = _setup_audit_family_display(dict(tr or {}), compact=True)
+            if fam and fam != '-':
+                return fam
+        except Exception:
+            pass
+        return 'F0'
+
     if is_admin:
         owner_uid = int(AUTOTRADE_OWNER_UID or uid)
         if str(_autotrade_runtime_mode()).lower() == "live":
@@ -44884,16 +44897,40 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_pnl = 0.0
         total_risk = 0.0
         lines.append('AutoTrade-owned positions')
+        table_txt = ''
         if not bot_positions:
             lines.append('• None')
         else:
+            table_rows = []
             for p, tr in bot_positions:
-                total_pnl += float(_pos_unreal_pnl(p) or 0.0)
-                total_risk += max(0.0, float(_estimate_position_risk_usd(p) or 0.0))
-                lines.append(_autotrade_render_open_position_compact_line(tr, live_pos=p))
-            lines.append(SEP)
-            lines.append(f"AutoTrade unrealised PnL: {total_pnl:+.2f} USDT")
-            lines.append(f"AutoTrade risk est: {total_risk:.2f} USDT")
+                sym = str(_pos_symbol(p) or (tr or {}).get('symbol') or '').upper().replace('/USDT:USDT','USDT')
+                if sym.endswith('USDT'):
+                    sym = sym[:-4]
+                side = str(_pos_side_text(p) or (tr or {}).get('side') or '').upper() or '-'
+                try:
+                    risk = max(0.0, float(_estimate_position_risk_usd(p) or 0.0))
+                except Exception:
+                    risk = 0.0
+                try:
+                    pnl = float(_pos_unreal_pnl(p) or 0.0)
+                except Exception:
+                    pnl = 0.0
+                fam = _fam_for_open_row(dict(tr or {}), p)
+                total_pnl += pnl
+                total_risk += risk
+                table_rows.append([sym or '-', side or '-', fam or '-', f"{risk:.2f}", f"{pnl:+.2f}"])
+            try:
+                table_txt = tabulate(
+                    table_rows,
+                    headers=['Symbol', 'Side', 'Fam', 'Risk', 'PnL'],
+                    tablefmt='plain',
+                    colalign=('left', 'center', 'center', 'right', 'right'),
+                )
+            except Exception:
+                table_txt = '\n'.join([' '.join(map(str, r)) for r in table_rows])
+            lines.append(f"Rows: {len(table_rows)}")
+            lines.append(f"AutoTrade unrealised PnL: {total_pnl:+.2f}")
+            lines.append(f"AutoTrade risk est: {total_risk:.2f}")
 
         manual_opens = db_open_trades(uid)
         lines.extend([SEP, f"Manual positions: {len(manual_opens)}"])
@@ -44905,17 +44942,33 @@ async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if external_positions:
             lines.extend([SEP, f"Unmatched live positions: {len(external_positions)}"])
+            ext_rows = []
             for p in external_positions[:12]:
-                lines.append(f"• {_pos_side_text(p)} {_pos_symbol(p)} | PnL {_pos_unreal_pnl(p):+.2f} USDT")
-    else:
-        manual_opens = db_open_trades(uid)
-        lines.append('Manual positions')
-        if not manual_opens:
-            lines.append('• None')
-        else:
-            for t in manual_opens[:12]:
-                lines.append(_manual_open_trade_compact_line(t))
+                sym = str(_pos_symbol(p) or '').upper()
+                if sym.endswith('USDT'):
+                    sym = sym[:-4]
+                ext_rows.append([sym or '-', _pos_side_text(p), f"{float(_pos_unreal_pnl(p) or 0.0):+.2f}"])
+            try:
+                ext_txt = tabulate(ext_rows, headers=['Symbol', 'Side', 'PnL'], tablefmt='plain', colalign=('left','center','right'))
+                lines.append('<pre>' + html.escape(ext_txt) + '</pre>')
+            except Exception:
+                for r in ext_rows:
+                    lines.append(' '.join(map(str, r)))
 
+        msg = "\n".join(html.escape(str(x)) if not str(x).startswith('<pre>') else str(x) for x in lines)
+        if table_txt:
+            # Ver22: table display, no internal Trade ID, no repeated USDT suffix.
+            msg = msg.replace('AutoTrade-owned positions', 'AutoTrade-owned positions\n<pre>' + html.escape(table_txt) + '</pre>')
+        await send_long_message(update, msg, parse_mode=ParseMode.HTML)
+        return
+
+    manual_opens = db_open_trades(uid)
+    lines.append('Manual positions')
+    if not manual_opens:
+        lines.append('• None')
+    else:
+        for t in manual_opens[:12]:
+            lines.append(_manual_open_trade_compact_line(t))
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
 async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -44940,7 +44993,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v18_cooldown_reset_exchange_pnl:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v22_html_table:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -45152,7 +45205,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("No autotrade lifecycle data found yet.")
         return
 
-    await update.message.reply_text(str(text_out))
+    await send_long_message(update, str(text_out), parse_mode=ParseMode.HTML)
 
 def _leader_base_override_ok(side: str, ch24: float, ch4: float, ch15: float, fut_vol_usd: float, pullback_ready: bool, pb_dist_pct: float, session_name: str) -> bool:
     """Allow post-expansion continuation entries after a clean 15m base/reclaim.
@@ -52403,7 +52456,11 @@ def main():
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 60,
+                # Ver22: Render can pause the event loop for >60s during deploy/cold-start
+                # pressure. A short grace produced noisy APScheduler missed-run warnings
+                # even though the next cache warmup runs normally. Give this non-critical
+                # cache job a wider grace window and coalesce missed runs.
+                "misfire_grace_time": 300,
             },
         )
 
