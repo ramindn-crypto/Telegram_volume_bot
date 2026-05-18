@@ -474,6 +474,15 @@ AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY = 'safe_leverage_downgrade_min'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY = 'flat_before_asia_enabled'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY = 'flat_before_asia_hour'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY = 'flat_before_asia_minute'
+# Ver20: admin-controlled Melbourne blackout windows. AutoTrade entry blackout
+# controls live Bybit entries; setup-generation blackout controls executable/email
+# setup creation for all users. Both are stored in autotrade_config so the admin
+# can change them live from Telegram without a redeploy.
+AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY = 'entry_blackout_enabled'
+AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY = 'entry_blackout_windows'
+SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY = 'setup_generation_blackout_enabled'
+SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY = 'setup_generation_blackout_windows'
+AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY = 'ver20_blackout_policy_version'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY = 'max_position_hours_enabled'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY = 'max_position_hours'
 AUTOTRADE_CFG_VER14_TIME_EXIT_POLICY_VERSION_KEY = 'ver14_time_exit_policy_version'
@@ -513,7 +522,9 @@ AUTOTRADE_MAX_POSITION_HOURS_ENABLED = env_bool('AUTOTRADE_MAX_POSITION_HOURS_EN
 AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8)
 AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', '600') or 600)
 AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
-AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '09:00-10:05') or '').split(',') if x.strip())
+AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
+SETUP_GENERATION_BLACKOUT_ENABLED = env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True)
+SETUP_GENERATION_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
@@ -669,6 +680,10 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY: 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True) else 0,
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9),
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45),
+        AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY: 1 if env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True) else 0,
+        AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY: str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
+        SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY: 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0,
+        SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
         AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8),
     }
@@ -909,6 +924,69 @@ def _autotrade_max_position_hours() -> float:
         val = 8.0
     return max(0.25, min(72.0, float(val)))
 
+
+def _normalise_melbourne_blackout_windows(value, default: str = '10:00-10:45') -> str:
+    """Return a validated comma-separated HH:MM-HH:MM window list.
+
+    Empty/off/none disables windows at the window-list level; the separate ENABLED
+    flags are still preferred for clarity. Invalid items are ignored so a typo in one
+    comma-separated window does not break the bot.
+    """
+    try:
+        raw = str(value if value is not None else default).strip()
+        if raw.lower() in {'', '-', 'none', 'off', 'false', '0'}:
+            return ''
+        out = []
+        for part in raw.replace(';', ',').split(','):
+            w = part.strip()
+            if not w or '-' not in w:
+                continue
+            a, b = w.split('-', 1)
+            def _hhmm(x):
+                h, m = [int(v) for v in str(x).strip().split(':')[:2]]
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError('bad hhmm')
+                return f'{h:02d}:{m:02d}'
+            out.append(f'{_hhmm(a)}-{_hhmm(b)}')
+        return ','.join(dict.fromkeys(out))
+    except Exception:
+        return str(default or '').strip()
+
+
+def _split_blackout_windows(value) -> tuple:
+    try:
+        return tuple(x.strip() for x in str(value or '').split(',') if x.strip())
+    except Exception:
+        return tuple()
+
+
+def _autotrade_entry_blackout_enabled() -> bool:
+    return _autotrade_bool_cfg(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
+
+
+def _autotrade_entry_blackout_windows() -> str:
+    try:
+        raw = _autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45'))
+    except Exception:
+        raw = os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45')
+    return _normalise_melbourne_blackout_windows(raw, default='10:00-10:45')
+
+
+def _setup_generation_blackout_enabled() -> bool:
+    try:
+        raw = _autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0)
+        return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        return bool(globals().get('SETUP_GENERATION_BLACKOUT_ENABLED', True))
+
+
+def _setup_generation_blackout_windows() -> str:
+    try:
+        raw = _autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45'))
+    except Exception:
+        raw = os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45')
+    return _normalise_melbourne_blackout_windows(raw, default='10:00-10:45')
+
 def _autotrade_hard_risk_cap_usd(equity: float, multiplier: float | None = None) -> float:
     '''Hard per-position risk cap from base risk and dynamic max multiplier.'''
     try:
@@ -953,6 +1031,10 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED': bool(_autotrade_flat_before_asia_enabled()),
         'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR': int(_autotrade_flat_before_asia_hour()),
         'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE': int(_autotrade_flat_before_asia_minute()),
+        'AUTOTRADE_ENTRY_BLACKOUT_ENABLED': bool(_autotrade_entry_blackout_enabled()),
+        'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS': str(_autotrade_entry_blackout_windows()),
+        'SETUP_GENERATION_BLACKOUT_ENABLED': bool(_setup_generation_blackout_enabled()),
+        'SETUP_GENERATION_BLACKOUT_WINDOWS': str(_setup_generation_blackout_windows()),
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED': bool(_autotrade_max_position_hours_enabled()),
         'AUTOTRADE_MAX_POSITION_HOURS': float(_autotrade_max_position_hours()),
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL': bool(globals().get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)),
@@ -1139,12 +1221,36 @@ def _autotrade_apply_ver19_entry_execution_policy_defaults() -> None:
         except Exception:
             pass
         try:
-            _autotrade_config_set('autotrade_entry_blackout_windows_note', '09:00-10:05 Melbourne default; env AUTOTRADE_ENTRY_BLACKOUT_WINDOWS can override')
+            _autotrade_config_set('autotrade_entry_blackout_windows_note', 'ver20 default is 10:00-10:45 Melbourne; /autotrade_config can override')
         except Exception:
             pass
         _autotrade_config_set('ver19_entry_execution_policy_version', target_version)
     except Exception:
         pass
+
+def _autotrade_apply_ver20_blackout_policy_defaults() -> None:
+    """Ver20: admin-configurable Melbourne blackout for both setup generation and AutoTrade.
+
+    Default is 10:00-10:45 Melbourne. This prevents fresh setup emails and AutoTrade
+    entries in the first noisy ASIA-reset window while still letting the 09:45 flat
+    finish and cooldowns clear. Values are persisted so the admin can adjust them with
+    /autotrade_config without redeploying.
+    """
+    try:
+        target_version = 'ver20_2026_05_18'
+        first_apply = str(_autotrade_config_get(AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY, '') or '').strip().lower() != target_version
+        if not first_apply:
+            return
+        default_w = _normalise_melbourne_blackout_windows(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45'), '10:00-10:45')
+        setup_w = _normalise_melbourne_blackout_windows(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', default_w), default_w)
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, default_w)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, setup_w)
+        _autotrade_config_set(AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY, target_version)
+    except Exception:
+        pass
+
 
 def _autotrade_apply_ver15_time_exit_policy_defaults() -> None:
     """Ver15: make the 09:45 flat reliable after deployment/reset.
@@ -3630,6 +3736,7 @@ try:
     _autotrade_apply_ver07_safety_defaults()
     _autotrade_apply_ver11_leverage_policy_defaults()
     _autotrade_apply_ver19_entry_execution_policy_defaults()
+    _autotrade_apply_ver20_blackout_policy_defaults()
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
 except Exception:
@@ -5619,19 +5726,37 @@ def _local_hhmm_in_window(hhmm: str, window: str) -> bool:
         return False
 
 
-def _autotrade_entry_blackout_now(now_ts: float | None = None) -> tuple[bool, str]:
+def _blackout_now_from_windows(enabled: bool, windows_value, reason_prefix: str, now_ts: float | None = None) -> tuple[bool, str]:
     try:
-        if not bool(globals().get('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)):
+        if not bool(enabled):
             return False, ''
         ts = float(now_ts if now_ts is not None else time.time())
         dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
         hhmm = dt.strftime('%H:%M')
-        for w in tuple(globals().get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', ()) or ()): 
+        for w in _split_blackout_windows(windows_value):
             if _local_hhmm_in_window(hhmm, str(w)):
-                return True, f'entry_blackout_{w}_melbourne'
+                return True, f'{reason_prefix}_{w}_melbourne'
         return False, ''
     except Exception:
         return False, ''
+
+
+def _autotrade_entry_blackout_now(now_ts: float | None = None) -> tuple[bool, str]:
+    return _blackout_now_from_windows(
+        bool(_autotrade_entry_blackout_enabled()),
+        _autotrade_entry_blackout_windows(),
+        'entry_blackout',
+        now_ts=now_ts,
+    )
+
+
+def _setup_generation_blackout_now(now_ts: float | None = None) -> tuple[bool, str]:
+    return _blackout_now_from_windows(
+        bool(_setup_generation_blackout_enabled()),
+        _setup_generation_blackout_windows(),
+        'setup_generation_blackout',
+        now_ts=now_ts,
+    )
 
 
 def _autotrade_close_owned_live_positions(uid: int, reason: str = 'scheduled_flat', max_opened_before_ts: float | None = None) -> dict:
@@ -8636,6 +8761,12 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
+        try:
+            _blk, _blk_reason = _setup_generation_blackout_now()
+            if _blk:
+                return (False, str(_blk_reason or 'setup_generation_blackout'))
+        except Exception:
+            pass
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
 
@@ -19703,6 +19834,22 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
         stats['combo_policy_skips'] = 0
         stats['edge_quality_skips'] = 0
         stats['cooldown_skips'] = 0
+        stats['setup_blackout_skips'] = 0
+        try:
+            _blk, _blk_reason = _setup_generation_blackout_now(now_ts)
+            if _blk:
+                stats['setup_blackout_skips'] = int(len(list(setups or [])) * max(1, len(target_uids)))
+                db_log_setup_pipeline_event(
+                    int(uid),
+                    stage='executable_setup_generation_blackout',
+                    status='skip',
+                    session=sess,
+                    mode=str(mode or ''),
+                    details={'reason': str(_blk_reason or 'setup_generation_blackout'), 'windows': _setup_generation_blackout_windows(), 'attempted_setups': len(list(setups or [])), 'target_uids': target_uids},
+                )
+                return stats
+        except Exception:
+            pass
         for s in (setups or []):
             sid = str(getattr(s, 'setup_id', '') or '').strip()
             sym = str(getattr(s, 'symbol', '') or '').upper()
@@ -20278,10 +20425,23 @@ def db_recent_generated_setups(user_id: int, source: str, lookback_hours: int = 
         return []
 
 def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
-    """Log a generated setup (from /screen) or a sent setup (email) for correlation."""
+    """Log a generated setup (from /screen) or a sent setup (email) for correlation.
+
+    Ver20: during the admin-defined setup-generation blackout, do not create new
+    setup rows for the production/audit lane. Market context snapshots may still be
+    shown by /screen, but no setup should enter generated/executable/email records.
+    """
     con = None
     ts_now = float(time.time())
     try:
+        try:
+            src_l = str(source or '').strip().lower()
+            if src_l in {'screen', 'exec', 'email', 'bigmove_email', 'executable', 'setup', 'autotrade'}:
+                _blk, _why = _setup_generation_blackout_now(ts_now)
+                if _blk:
+                    return
+        except Exception:
+            pass
         try:
             s = _research_finalize_setup(s, session_name=str(session or getattr(s, 'session', '') or ''))
         except Exception:
@@ -35889,7 +36049,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "trade_id_reset": "Reset your own Trade ID numbering",
     "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
     "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
-    "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated. Dynamic keys: AUTOTRADE_DYNAMIC_RISK_ENABLED, AUTOTRADE_DYNAMIC_RISK_MIN_MULT, AUTOTRADE_DYNAMIC_RISK_MAX_MULT, AUTOTRADE_DYNAMIC_RISK_LOW_SCORE, AUTOTRADE_DYNAMIC_RISK_BASE_SCORE, AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE. Safety keys: AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE, AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN, AUTOTRADE_EMERGENCY_RISK_MAX_MULT, AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED, AUTOTRADE_MAX_POSITION_HOURS, AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL",
+    "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated, AutoTrade entry blackout, and global setup-generation blackout. Dynamic keys: AUTOTRADE_DYNAMIC_RISK_ENABLED, AUTOTRADE_DYNAMIC_RISK_MIN_MULT, AUTOTRADE_DYNAMIC_RISK_MAX_MULT, AUTOTRADE_DYNAMIC_RISK_LOW_SCORE, AUTOTRADE_DYNAMIC_RISK_BASE_SCORE, AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE. Safety keys: AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE, AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN, AUTOTRADE_EMERGENCY_RISK_MAX_MULT, AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED, AUTOTRADE_MAX_POSITION_HOURS, BLACKOUT_WINDOWS, SETUP_GENERATION_BLACKOUT_WINDOWS, AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
@@ -35924,7 +36084,7 @@ def build_help_text_admin() -> str:
         "Setup matrix examples: /setup_matrix 24 (daily diagnostic), /setup_matrix 168 (weekly report/advisory), /setup_matrix policy (current live policy), /setup_matrix deep 168 (time/symbol/regime analytics), /setup_matrix safety (run severe-loser safety now).",
         "AutoTrade matrix examples: /autotrade_report_overall 24 (daily), /autotrade_report_overall 168 (weekly).",
         "Dynamic risk examples: /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65 | /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90.",
-        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 4 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true | /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8 | 09:45 catch-up guardian ON | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
+        "AutoTrade safety examples: /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true | /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 4 | /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25 | /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true | /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8 | /autotrade_config BLACKOUT_WINDOWS 10:00-10:45 | /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-10:45 | 09:45 catch-up guardian ON | /autotrade_flat_now | /admin_reset_test_data confirm. Micro-guard expiry: side blocks last until weekly review; static symbol blocks default to 24h.",
     ]
 
     for title, commands in ADMIN_HELP_GROUPS:
@@ -36978,6 +37138,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = {'true' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)) else 'false'}",
             f"AUTOTRADE_FLAT_BEFORE_ASIA_TIME = {int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9)):02d}:{int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 45)):02d} Melbourne",
             f"AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP = {'true' if bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_ENTRY_BLACKOUT_ENABLED = {'true' if bool(summary.get('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = {str(summary.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '-')} Melbourne",
+            f"SETUP_GENERATION_BLACKOUT_ENABLED = {'true' if bool(summary.get('SETUP_GENERATION_BLACKOUT_ENABLED', True)) else 'false'}",
+            f"SETUP_GENERATION_BLACKOUT_WINDOWS = {str(summary.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '-')} Melbourne",
             f"AUTOTRADE_MAX_POSITION_HOURS_ENABLED = {'true' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_MAX_POSITION_HOURS = {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 8.0)):.2f}",
             f"AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = {'true' if bool(summary.get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)) else 'false'}",
@@ -37002,6 +37166,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_HOUR 9",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE 45",
+            "• /autotrade_config BLACKOUT_WINDOWS 10:00-10:45   (sets both setup + autotrade blackout)",
+            "• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS 10:00-10:45",
+            "• /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-10:45",
+            "• /autotrade_config SETUP_GENERATION_BLACKOUT_ENABLED true",
             "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS_ENABLED true",
             "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8",
             "• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true",
@@ -37035,6 +37203,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE',
         'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', 'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT',
         'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE',
+        'BLACKOUT_ENABLED', 'BLACKOUT_WINDOWS',
+        'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS',
+        'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS',
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS',
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK'
     }:
@@ -37081,6 +37252,26 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE':
             val = max(0, min(59, int(float(value_raw))))
             _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, val)
+        elif key == 'BLACKOUT_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1 if val else 0)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if val else 0)
+        elif key == 'BLACKOUT_WINDOWS':
+            val = _normalise_melbourne_blackout_windows(value_raw, default='10:00-10:45')
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, val)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, val)
+        elif key == 'AUTOTRADE_ENTRY_BLACKOUT_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS':
+            val = _normalise_melbourne_blackout_windows(value_raw, default='10:00-10:45')
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, val)
+        elif key == 'SETUP_GENERATION_BLACKOUT_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if val else 0)
+        elif key == 'SETUP_GENERATION_BLACKOUT_WINDOWS':
+            val = _normalise_melbourne_blackout_windows(value_raw, default='10:00-10:45')
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, val)
         elif key == 'AUTOTRADE_MAX_POSITION_HOURS_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1 if val else 0)
@@ -47932,6 +48123,20 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         return False
 
     uid = int(user["user_id"])
+    try:
+        _blk, _blk_reason = _setup_generation_blackout_now()
+        if _blk:
+            try:
+                db_log_setup_pipeline_event(int(uid), stage='setup_email_blackout', status='skip', session=str((sess or {}).get('name') or ''), mode='email', details={'reason': str(_blk_reason or 'setup_generation_blackout'), 'windows': _setup_generation_blackout_windows(), 'setups': len(setups or [])})
+            except Exception:
+                pass
+            try:
+                _LAST_EMAIL_DECISION[int(uid)] = {'status': 'SKIP', 'picked': '-', 'when': datetime.now(_zoneinfo_or_default((user or {}).get('tz'))[0]).isoformat(timespec='seconds'), 'reasons': [str(_blk_reason or 'setup_generation_blackout')]}
+            except Exception:
+                pass
+            return False
+    except Exception:
+        pass
     tz, user_tz = _zoneinfo_or_default(user.get("tz") or user.get("timezone"))
 
     now_local = datetime.now(tz)
