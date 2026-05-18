@@ -44121,11 +44121,34 @@ def _autotrade_report_pnl_close_to_expected(row: dict, kind: str) -> bool:
         return False
 
 
+def _autotrade_report_pnl_sign_allows_kind(row: dict, kind: str) -> bool:
+    """Prevent impossible report labels: positive PnL must not be shown as SL and negative PnL must not be shown as TP.
+
+    Some exchange/order-history rows can say an SL order closed the position even when
+    the realised PnL is positive, e.g. moved stop, breakeven/profit-protect stop, partial
+    fragments, or stale lifecycle labels. User-facing reports must not label those as SL.
+    They should be TP only if they are close to the configured TP amount, otherwise OTHER.
+    """
+    try:
+        k = str(kind or '').upper().strip()
+        pnl = float(row.get('pnl') if row.get('pnl') is not None else row.get('pnl_usdt') or 0.0)
+        eps = float(globals().get('AUTOTRADE_REPORT_TPSL_SIGN_EPS_USD', 0.50) or 0.50)
+        if k == 'SL' and pnl > eps:
+            return False
+        if k == 'TP' and pnl < -eps:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _autotrade_report_has_direct_tpsl_proof(row: dict, kind: str) -> bool:
     """Direct lifecycle/order proof, not merely PnL sign."""
     try:
         k = str(kind or '').upper().strip()
         row = dict(row or {})
+        if not _autotrade_report_pnl_sign_allows_kind(row, k):
+            return False
         path = str(row.get('result_path') or row.get('outcome') or '').upper().strip()
         label = str(row.get('result_label') or '').upper().strip()
         close_reason = str(row.get('close_reason') or '').lower().strip()
@@ -44169,13 +44192,27 @@ def _autotrade_report_closed_kind(row: dict) -> str:
         if path in {'HIT_TP_THEN_BE_SL', 'HIT_TP_THEN_SL'}:
             return 'TP' if (not require or _autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP')) else 'OTHER'
         if path in {'TP', 'HIT_TP_WIN'} or label == 'TP':
-            return 'TP' if (not require or _autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP')) else 'OTHER'
+            if not require:
+                return 'TP' if _autotrade_report_pnl_sign_allows_kind(row, 'TP') else 'OTHER'
+            if _autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP'):
+                return 'TP'
+            # If a stale TP label actually closed near configured SL risk, show SL; otherwise OTHER.
+            return 'SL' if _autotrade_report_pnl_close_to_expected(row, 'SL') else 'OTHER'
         if path in {'SL', 'HIT_SL_LOSS'} or label == 'SL':
-            return 'SL' if (not require or _autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL')) else 'OTHER'
+            if not require:
+                return 'SL' if _autotrade_report_pnl_sign_allows_kind(row, 'SL') else 'OTHER'
+            if _autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL'):
+                return 'SL'
+            # If a stale SL label actually closed near configured TP target, show TP; otherwise OTHER.
+            return 'TP' if _autotrade_report_pnl_close_to_expected(row, 'TP') else 'OTHER'
         if require:
             pnl = float(row.get('pnl') if row.get('pnl') is not None else row.get('pnl_usdt') or 0.0)
             if abs(pnl) <= 1e-9:
                 return 'FLAT'
+            if _autotrade_report_pnl_close_to_expected(row, 'TP'):
+                return 'TP'
+            if _autotrade_report_pnl_close_to_expected(row, 'SL'):
+                return 'SL'
             return 'OTHER'
         pnl = float(row.get('pnl') if row.get('pnl') is not None else row.get('pnl_usdt') or 0.0)
         if pnl > 0:
@@ -44269,9 +44306,14 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
     for g in groups:
         try:
             votes = [str(x).upper() for x in (g.get('closed_kind_votes') or [])]
-            if votes.count('TP') > votes.count('SL') and (not bool(globals().get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)) or _autotrade_report_pnl_close_to_expected(g, 'TP') or _autotrade_report_has_direct_tpsl_proof(g, 'TP')):
+            require_tpsl = bool(globals().get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True))
+            if require_tpsl and _autotrade_report_pnl_close_to_expected(g, 'TP'):
                 kind = 'TP'
-            elif votes.count('SL') > 0 and (not bool(globals().get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)) or _autotrade_report_pnl_close_to_expected(g, 'SL') or _autotrade_report_has_direct_tpsl_proof(g, 'SL')):
+            elif require_tpsl and _autotrade_report_pnl_close_to_expected(g, 'SL'):
+                kind = 'SL'
+            elif votes.count('TP') > votes.count('SL') and (not require_tpsl or _autotrade_report_has_direct_tpsl_proof(g, 'TP')) and _autotrade_report_pnl_sign_allows_kind(g, 'TP'):
+                kind = 'TP'
+            elif votes.count('SL') > 0 and (not require_tpsl or _autotrade_report_has_direct_tpsl_proof(g, 'SL')) and _autotrade_report_pnl_sign_allows_kind(g, 'SL'):
                 kind = 'SL'
             elif any(v == 'FLAT' for v in votes):
                 kind = 'FLAT'
@@ -44300,7 +44342,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v22_html_table:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v26_signsafe:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
