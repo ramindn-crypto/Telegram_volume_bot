@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver38: Synced NORMAL/REVERSE strategy into AutoTrade reports, repaired report risk metadata recovery, and hardened setup-audit OPEN resolution/wording.
 # - Ver37: Added adaptive strategy router: strong combos trade NORMAL; weak/disabled combos trade REVERSE with reporting columns and DB metadata.
 # - Ver35: Removed hidden hard email/session caps, removed AutoTrade debug cap-note noise, restored /setup_audit visibility while keeping execution quality gates.
 # - Ver34: Restored user-requested AutoTrade forward-test defaults (50/day, 20 open, 12h hold, 1% drift, 15% daily cap).
@@ -8649,6 +8650,10 @@ def _autotrade_trade_insert_cols(cur, payload: dict, preferred_order: list[str])
         'regime_primary': live_payload.get('regime_primary') or '',
         'allocator_plan_id': live_payload.get('allocator_plan_id') or '',
         'param_set_id': live_payload.get('param_set_id') or '',
+        'setup_strategy': live_payload.get('setup_strategy') or live_payload.get('strategy') or live_payload.get('strategy_mode') or 'NORMAL',
+        'original_setup_id': live_payload.get('original_setup_id') or '',
+        'original_side': live_payload.get('original_side') or '',
+        'strategy_reason': live_payload.get('strategy_reason') or '',
     }
     for k, v in defaults.items():
         if k in cols and (k not in live_payload or live_payload.get(k) is None):
@@ -8690,6 +8695,10 @@ def _autotrade_trade_insert_cols(cur, payload: dict, preferred_order: list[str])
         if name not in live_payload:
             if pk or name_l in {'id', 'uuid', 'journal_id'}:
                 live_payload[name] = str(live_payload.get('trade_id') or f"AT-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}")
+            elif name_l in {'setup_strategy','strategy','strategy_mode'}:
+                live_payload[name] = str(live_payload.get('setup_strategy') or live_payload.get('strategy') or live_payload.get('strategy_mode') or 'NORMAL')
+            elif name_l in {'original_setup_id','original_side','strategy_reason','strategy_meta_json'}:
+                live_payload[name] = str(live_payload.get(name) or '')
             elif name_l in {'tp1', 'take_profit', 'target', 'target_price'}:
                 live_payload[name] = float(tp_val or 0.0)
             elif name_l in {'tp2', 'tp3', 'pnl', 'pnl_usdt', 'qty', 'entry', 'sl', 'tp', 'conf', 'quality_score', 'atr_pct', 'risk_usd', 'risk_pct', 'tp_usd', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp'} or any(t in col_type for t in ('INT', 'REAL', 'NUM', 'FLOAT', 'DOUBLE')):
@@ -8747,6 +8756,10 @@ def _autotrade_db_insert_open_trade_row(uid: int, trade_row: dict) -> str:
         'configured_risk_pct': float((trade_row or {}).get('configured_risk_pct') or 0.0),
         'allowed_risk_pct': float((trade_row or {}).get('allowed_risk_pct') or 0.0),
         'rr_tp': float((trade_row or {}).get('rr_tp') or 0.0),
+        'setup_strategy': _setup_strategy_label(trade_row or {}),
+        'original_setup_id': str((trade_row or {}).get('original_setup_id') or ''),
+        'original_side': str((trade_row or {}).get('original_side') or ''),
+        'strategy_reason': str((trade_row or {}).get('strategy_reason') or ''),
     }
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -8755,7 +8768,8 @@ def _autotrade_db_insert_open_trade_row(uid: int, trade_row: dict) -> str:
                 'trade_id','uid','opened_ts','created_ts','updated_ts','day_utc','session','setup_id','symbol','side',
                 'entry','sl','tp','tp1','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine',
                 'status','closed_ts','pnl_usdt','pnl','outcome','note','family_id','regime_primary','allocator_plan_id','param_set_id',
-                'risk_usd','risk_pct','tp_usd','risk_multiplier','dynamic_risk_score','configured_risk_pct','allowed_risk_pct','rr_tp'
+                'risk_usd','risk_pct','tp_usd','risk_multiplier','dynamic_risk_score','configured_risk_pct','allowed_risk_pct','rr_tp',
+                'setup_strategy','original_setup_id','original_side','strategy_reason'
             ]
             insert_cols, values = _autotrade_trade_insert_cols(cur, payload, preferred_order)
             placeholders = ','.join(['?'] * len(insert_cols))
@@ -9489,6 +9503,10 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
         'configured_risk_pct': float(report_meta.get('configured_risk_pct') or getattr(s, 'configured_risk_pct', 0.0) or 0.0),
         'allowed_risk_pct': float(report_meta.get('allowed_risk_pct') or getattr(s, 'allowed_risk_pct', 0.0) or 0.0),
         'rr_tp': float(report_meta.get('rr_tp') or getattr(s, 'rr_tp', 0.0) or 0.0),
+        'setup_strategy': _setup_strategy_label(s),
+        'original_setup_id': str(getattr(s, 'original_setup_id', '') or ''),
+        'original_side': str(getattr(s, 'original_side', '') or ''),
+        'strategy_reason': str(getattr(s, 'strategy_reason', '') or ''),
     }
 
     try:
@@ -9498,7 +9516,8 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
                 'trade_id','uid','opened_ts','created_ts','updated_ts','day_utc','session','setup_id','symbol','side',
                 'entry','sl','tp','tp1','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine',
                 'status','closed_ts','pnl_usdt','pnl','outcome','note','family_id','regime_primary','allocator_plan_id','param_set_id',
-                'risk_usd','risk_pct','tp_usd','risk_multiplier','dynamic_risk_score','configured_risk_pct','allowed_risk_pct','rr_tp'
+                'risk_usd','risk_pct','tp_usd','risk_multiplier','dynamic_risk_score','configured_risk_pct','allowed_risk_pct','rr_tp',
+                'setup_strategy','original_setup_id','original_side','strategy_reason'
             ]
             insert_cols, values = _autotrade_trade_insert_cols(c, payload, preferred_order)
             placeholders = ','.join(['?'] * len(insert_cols))
@@ -40833,10 +40852,14 @@ def _setup_audit_find_nearest_setup_row(symbol: str, side: str, ref_ts: float = 
                     cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
                     if cols:
                         fam_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in cols else "'' AS family_id"
+                        strategy_expr = "COALESCE(setup_strategy, '') AS setup_strategy" if 'setup_strategy' in cols else "'' AS setup_strategy"
+                        orig_id_expr = "COALESCE(original_setup_id, '') AS original_setup_id" if 'original_setup_id' in cols else "'' AS original_setup_id"
+                        orig_side_expr = "COALESCE(original_side, '') AS original_side" if 'original_side' in cols else "'' AS original_side"
+                        strategy_reason_expr = "COALESCE(strategy_reason, '') AS strategy_reason" if 'strategy_reason' in cols else "'' AS strategy_reason"
                         q = f"""
                             SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                                    fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
-                                   {fam_expr}, entry, sl, tp, alt_target_a, alt_target_b
+                                   {fam_expr}, {strategy_expr}, {orig_id_expr}, {orig_side_expr}, {strategy_reason_expr}, entry, sl, tp, alt_target_a, alt_target_b
                             FROM executable_setups
                             WHERE UPPER(side)=? AND UPPER(symbol) IN ({','.join(['?']*len(symbols))})
                         """
@@ -40861,11 +40884,15 @@ def _setup_audit_find_nearest_setup_row(symbol: str, side: str, ref_ts: float = 
                         alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
                         alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
                         fam_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in cols else "'' AS family_id"
+                        strategy_expr = "COALESCE(setup_strategy, '') AS setup_strategy" if 'setup_strategy' in cols else "'' AS setup_strategy"
+                        orig_id_expr = "COALESCE(original_setup_id, '') AS original_setup_id" if 'original_setup_id' in cols else "'' AS original_setup_id"
+                        orig_side_expr = "COALESCE(original_side, '') AS original_side" if 'original_side' in cols else "'' AS original_side"
+                        strategy_reason_expr = "COALESCE(strategy_reason, '') AS strategy_reason" if 'strategy_reason' in cols else "'' AS strategy_reason"
                         source_expr = 'UPPER(source)' if 'source' in cols else "'GEN'"
                         q = f"""
                             SELECT created_ts AS ts, 0 AS signal_created_ts, {source_expr} AS source, session, setup_id, symbol, {market_expr}, side, conf,
                                    fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
-                                   {fam_expr}, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
+                                   {fam_expr}, {strategy_expr}, {orig_id_expr}, {orig_side_expr}, {strategy_reason_expr}, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
                             FROM generated_setups
                             WHERE UPPER(side)=? AND UPPER(symbol) IN ({','.join(['?']*len(symbols))})
                         """
@@ -40909,10 +40936,14 @@ def _setup_audit_find_row_by_setup_id(setup_id: str) -> dict:
             try:
                 x_cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
                 x_family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
+                x_strategy_expr = "COALESCE(setup_strategy, '') AS setup_strategy" if 'setup_strategy' in x_cols else "'' AS setup_strategy"
+                x_orig_id_expr = "COALESCE(original_setup_id, '') AS original_setup_id" if 'original_setup_id' in x_cols else "'' AS original_setup_id"
+                x_orig_side_expr = "COALESCE(original_side, '') AS original_side" if 'original_side' in x_cols else "'' AS original_side"
+                x_strategy_reason_expr = "COALESCE(strategy_reason, '') AS strategy_reason" if 'strategy_reason' in x_cols else "'' AS strategy_reason"
                 row = cur.execute(f"""
                     SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
-                           {x_family_expr}, entry, sl, tp, alt_target_a, alt_target_b
+                           {x_family_expr}, {x_strategy_expr}, {x_orig_id_expr}, {x_orig_side_expr}, {x_strategy_reason_expr}, entry, sl, tp, alt_target_a, alt_target_b
                     FROM executable_setups
                     WHERE setup_id=?
                     ORDER BY executable_ts DESC
@@ -40946,8 +40977,100 @@ def _setup_audit_find_row_by_setup_id(setup_id: str) -> dict:
     return {}
 
 
+
+def _autotrade_report_find_nearest_trade_metadata(row: dict, uid: int | None = None) -> dict:
+    """Best-effort repair for report rows built from exchange close events.
+
+    Some Bybit closed-PnL rows arrive without the original bot journal fields.  For
+    reporting only, recover the nearest AutoTrade journal row by setup_id/trade_id or
+    symbol+side+time so Dyn/Risk%/Risk$/TP$/Strategy are not blank for fresh closes.
+    """
+    try:
+        rr = dict(row or {})
+        uid_i = int(uid or rr.get('uid') or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        sid = str(rr.get('setup_id') or '').strip()
+        tid = str(rr.get('trade_id') or '').strip()
+        sym = str(_bybit_linear_symbol(rr.get('symbol') or '')).upper().strip()
+        base = _symbol_base(sym)
+        side = str(rr.get('side') or '').upper().strip()
+        ref = float(rr.get('closed_ts') or rr.get('opened_ts') or rr.get('ts') or time.time())
+        if uid_i <= 0:
+            return {}
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            if tid and not tid.startswith(('exchange::', 'report::', 'prov::', 'manual::')):
+                r = cur.execute("SELECT * FROM autotrade_trades WHERE uid=? AND trade_id=? LIMIT 1", (uid_i, tid)).fetchone()
+                if r:
+                    return dict(r)
+            if sid:
+                r = cur.execute("SELECT * FROM autotrade_trades WHERE uid=? AND setup_id=? ORDER BY COALESCE(closed_ts, opened_ts, created_ts, 0) DESC LIMIT 1", (uid_i, sid)).fetchone()
+                if r:
+                    return dict(r)
+            if not sym or side not in {'BUY','SELL'}:
+                return {}
+            variants = list(dict.fromkeys([sym, base, str(rr.get('symbol') or '').upper().strip()]))
+            q = f"""
+                SELECT * FROM autotrade_trades
+                WHERE uid=?
+                  AND UPPER(side)=?
+                  AND UPPER(symbol) IN ({','.join(['?']*len(variants))})
+                  AND COALESCE(opened_ts, created_ts, 0) <= ?
+                  AND COALESCE(opened_ts, created_ts, 0) >= ?
+                ORDER BY ABS(COALESCE(NULLIF(closed_ts,0), opened_ts, created_ts, 0) - ?) ASC,
+                         ABS(COALESCE(opened_ts, created_ts, 0) - ?) ASC
+                LIMIT 1
+            """
+            params = [uid_i, side] + variants + [float(ref) + 2*3600.0, float(ref) - 36*3600.0, float(ref), float(ref)]
+            r = cur.execute(q, tuple(params)).fetchone()
+            return dict(r) if r else {}
+    except Exception:
+        return {}
+
+
+def _autotrade_report_fill_missing_from_trade_metadata(row: dict, uid: int | None = None) -> dict:
+    try:
+        out = dict(row or {})
+        meta = _autotrade_report_find_nearest_trade_metadata(out, uid=uid)
+        if not meta:
+            return out
+        numeric_keys = {
+            'entry','sl','tp','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct',
+            'risk_usd','risk_usdt','risk_pct','tp_usd','tp_usdt','risk_multiplier','dynamic_risk_score',
+            'configured_risk_pct','allowed_risk_pct','rr_tp','opened_ts'
+        }
+        text_keys = {
+            'trade_id','setup_id','family_id','engine','session','setup_strategy','strategy','strategy_mode',
+            'original_setup_id','original_side','strategy_reason','regime_primary','allocator_plan_id','param_set_id'
+        }
+        for k in numeric_keys:
+            try:
+                cur = float(out.get(k) or 0.0)
+                val = float(meta.get(k) or 0.0)
+                if cur <= 0 and val > 0:
+                    out[k] = val
+            except Exception:
+                pass
+        for k in text_keys:
+            try:
+                if not str(out.get(k) or '').strip() and str(meta.get(k) or '').strip():
+                    out[k] = meta.get(k)
+            except Exception:
+                pass
+        # Keep the exchange close PnL/timestamp as authoritative.
+        for k in ('closed_ts','pnl','pnl_usdt','outcome','note','close_reason','result_path','result_label','source_note'):
+            if k in (row or {}) and (row or {}).get(k) not in (None, ''):
+                out[k] = (row or {}).get(k)
+        return out
+    except Exception:
+        return dict(row or {})
+
 def _setup_audit_merge_trade_setup_row(trade_row: dict | None) -> dict:
     row = dict(trade_row or {})
+    try:
+        row = _autotrade_report_fill_missing_from_trade_metadata(row, uid=int(row.get('uid') or globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+    except Exception:
+        pass
     sid = str(row.get('setup_id') or '').strip()
     setup_row = {}
     if sid:
@@ -41333,6 +41456,8 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
             except Exception:
                 pass
 
+        # Last live/current price fallback. It catches active rows that just crossed TP/SL and prevents stale OPEN labels.
+        # Note: OPEN in setup audit means price path not yet hit TP/SL; it is not the same as an open AutoTrade position.
         # Last live/current price fallback. It catches active rows that just crossed TP/SL.
         quick = _setup_audit_result_from_cached_price_moves(rr, horizon_hours=horizon_hours)
         canon = _setup_audit_result_label(quick)
@@ -41609,7 +41734,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = still inside the result horizon.",
+        "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position).",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
@@ -45061,7 +45186,7 @@ def _autotrade_closed_report_rows(owner_uid: int, start_ts: float, end_ts: float
         sid = str(row.get('setup_id') or '').strip()
         payload = _signal_setup_eval_payload(sid) if sid else {}
         if payload:
-            for fld in ('symbol', 'side', 'entry', 'sl', 'tp', 'alt_target_a', 'alt_target_b', 'engine', 'session', 'conf', 'quality_score', 'atr_pct', 'family_id', 'regime_primary', 'allocator_plan_id', 'param_set_id'):
+            for fld in ('symbol', 'side', 'entry', 'sl', 'tp', 'alt_target_a', 'alt_target_b', 'engine', 'session', 'conf', 'quality_score', 'atr_pct', 'family_id', 'regime_primary', 'allocator_plan_id', 'param_set_id', 'setup_strategy', 'strategy', 'strategy_mode', 'original_setup_id', 'original_side', 'strategy_reason'):
                 cur = row.get(fld)
                 if fld in {'entry', 'sl', 'tp', 'alt_target_a', 'alt_target_b', 'quality_score', 'atr_pct'}:
                     try:
@@ -45870,6 +45995,7 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
             side = str(r.get('side') or '').upper().strip()
             fam = _family(r)
             sess = _autotrade_report_row_session(r)
+            strat = _setup_strategy_short_label(r)
             ts = float(r.get('ts') or r.get('closed_ts') or 0.0)
             pnl = float(r.get('pnl') if r.get('pnl') is not None else r.get('pnl_usdt') or 0.0)
             matched = None
@@ -45881,6 +46007,8 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
                 if str(g.get('symbol') or '') != sym or str(g.get('side') or '') != side or str(g.get('family') or '') != fam:
                     continue
                 if str(g.get('session') or '') != sess:
+                    continue
+                if _setup_strategy_short_label(g) != strat:
                     continue
                 gsid = str(g.get('setup_id') or '').strip()
                 gtid = str(g.get('trade_id') or '').strip()
@@ -45900,6 +46028,8 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
                 nr['side'] = side
                 nr['family'] = fam
                 nr['session'] = sess
+                nr['setup_strategy'] = _setup_strategy_label(r)
+                nr['strategy'] = nr['setup_strategy']
                 nr['pnl'] = float(pnl)
                 nr['parts'] = int(r.get('parts') or 1)
                 nr['first_ts'] = float(ts or 0.0)
@@ -45911,7 +46041,7 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
                 matched['pnl'] = float(matched.get('pnl') or 0.0) + float(pnl)
                 matched['pnl_usdt'] = float(matched.get('pnl') or 0.0)
                 # Preserve the best available execution/reporting metadata for the merged position.
-                for _mk in ('risk_usd', 'risk_pct', 'tp_usd', 'risk_usd_source', 'risk_pct_source', 'tp_usd_source', 'risk_report_quality', 'tp_report_quality', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'entry', 'sl', 'tp', 'qty', 'conf', 'fut_vol_usd', 'ch24', 'ch4', 'ch1'):
+                for _mk in ('risk_usd', 'risk_pct', 'tp_usd', 'risk_usd_source', 'risk_pct_source', 'tp_usd_source', 'risk_report_quality', 'tp_report_quality', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'entry', 'sl', 'tp', 'qty', 'conf', 'fut_vol_usd', 'ch24', 'ch4', 'ch1', 'setup_strategy', 'strategy', 'strategy_mode', 'original_setup_id', 'original_side', 'strategy_reason'):
                     try:
                         if float(matched.get(_mk) or 0.0) <= 0 and float(r.get(_mk) or 0.0) > 0:
                             matched[_mk] = r.get(_mk)
@@ -45960,7 +46090,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v31_metadata_reason_dyn:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v38_strategy_amounts:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -46045,6 +46175,8 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'state': 'OPEN',
             'symbol': _sym_display(row, _pos_symbol(p)),
             'side': side,
+            'setup_strategy': _setup_strategy_label(row),
+            'strategy': _setup_strategy_label(row),
             'family': _family_for_report(row),
             'session': _autotrade_report_row_session(row),
             'setup_id': str(row.get('setup_id') or ''),
@@ -46093,6 +46225,8 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'state': 'CLOSED',
             'symbol': _sym_display(row, r.get('symbol') or ''),
             'side': side,
+            'setup_strategy': _setup_strategy_label(row),
+            'strategy': _setup_strategy_label(row),
             'family': _family_for_report(row),
             'session': _autotrade_report_row_session(row),
             'setup_id': str(row.get('setup_id') or r.get('setup_id') or ''),
@@ -46215,6 +46349,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 _result_display(r),
                 r.get('symbol'),
                 r.get('side'),
+                _setup_strategy_short_label(r),
                 r.get('family'),
                 str(r.get('session') or '-'),
                 _autotrade_report_close_session(r),
@@ -46230,9 +46365,9 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             ])
         table = tabulate(
             table_rows,
-            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Fam', 'SesO', 'SesC', 'Conf', 'Dyn', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason', 'LossReason'],
+            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Strat', 'Fam', 'SesO', 'SesC', 'Conf', 'Dyn', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason', 'LossReason'],
             tablefmt='plain',
-            colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left', 'left'),
+            colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left', 'left'),
         )
         raw_count = int(len(bot_positions or [])) + int(len(closed_rows or []))
         lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> merged position rows. Raw fragments: <b>{raw_count}</b>. Time: <b>Melbourne</b>.")
@@ -46997,7 +47132,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v31_metadata_reason_matrix:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v38_strategy_matrix:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -47046,6 +47181,8 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
             'state': 'OPEN',
             'symbol': _sym_display(row, _pos_symbol(p)),
             'side': str(row.get('side') or _pos_side_text(p) or '').upper().strip() or '-',
+            'setup_strategy': _setup_strategy_label(row),
+            'strategy': _setup_strategy_label(row),
             'family': _family_for_report(row),
             'session': _autotrade_report_row_session(row),
             'pnl': float(_pos_unreal_pnl(p) or 0.0),
@@ -47065,6 +47202,8 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
             'state': 'CLOSED',
             'symbol': _sym_display(row, r.get('symbol') or ''),
             'side': str(row.get('side') or r.get('side') or '').upper().strip() or '-',
+            'setup_strategy': _setup_strategy_label(row),
+            'strategy': _setup_strategy_label(row),
             'family': _family_for_report(row),
             'session': _autotrade_report_row_session(row),
             'setup_id': str(row.get('setup_id') or r.get('setup_id') or ''),
@@ -47095,7 +47234,8 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     for r in merged:
         fam = str(r.get('family') or 'F0').upper().strip() or 'F0'
         sess = str(r.get('session') or _autotrade_report_row_session(r) or 'UNK').upper().strip() or 'UNK'
-        key = (fam, sess)
+        strat = _setup_strategy_short_label(r)
+        key = (fam, sess, strat)
         b = buckets[key]
         b['trades'] += 1
         b['parts'] += int(r.get('parts') or 1)
@@ -47145,7 +47285,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         return out
 
     table_rows = []
-    for (fam, sess), v in sorted(buckets.items(), key=lambda kv: (float(kv[1].get('pnl') or 0.0), int(kv[1].get('tp') or 0), -int(kv[1].get('sl') or 0)), reverse=True):
+    for (fam, sess, strat), v in sorted(buckets.items(), key=lambda kv: (float(kv[1].get('pnl') or 0.0), int(kv[1].get('tp') or 0), -int(kv[1].get('sl') or 0)), reverse=True):
         d = int(v.get('tp') or 0) + int(v.get('sl') or 0)
         wr_i = (int(v.get('tp') or 0) / d * 100.0) if d > 0 else 0.0
         try:
@@ -47156,6 +47296,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         table_rows.append([
             fam,
             sess,
+            strat,
             int(v.get('trades') or 0),
             int(v.get('tp') or 0),
             int(v.get('sl') or 0),
@@ -47167,9 +47308,9 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         ])
     table = tabulate(
         table_rows,
-        headers=['Fam', 'Ses', 'Trades', 'TP', 'SL', 'Other', 'Open', 'WR', 'PnL', 'TopLossReason'],
+        headers=['Fam', 'Ses', 'Strat', 'Trades', 'TP', 'SL', 'Other', 'Open', 'WR', 'PnL', 'TopLossReason'],
         tablefmt='plain',
-        colalign=('center', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'),
+        colalign=('center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'),
     )
     out = '\n'.join(lines) + '\n<pre>' + html.escape(table) + '</pre>'
     try:
