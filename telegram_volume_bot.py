@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver41: Fixed setup generation/execution sync: KEEP combos no longer get blocked by WATCH-only strict floors; /why now separates raw setup generation from final executable gate outcomes.
 # - Ver40: Promoted combo identity to Family-Session-Strategy (e.g. F8-NY-REV) across setup/audit/matrix/autotrade reports and strategy-router evidence.
 # - Ver38: Synced NORMAL/REVERSE strategy into AutoTrade reports, repaired report risk metadata recovery, and hardened setup-audit OPEN resolution/wording.
 # - Ver37: Added adaptive strategy router: strong combos trade NORMAL; weak/disabled combos trade REVERSE with reporting columns and DB metadata.
@@ -1871,6 +1872,15 @@ SETUP_FINAL_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_MIN_DYNAMIC_SC
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = env_bool("SETUP_FINAL_UNKNOWN_AS_WATCH", True)
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
+# Ver41: distinguish KEEP lanes from WATCH/probation lanes.
+# Earlier builds accidentally applied the WATCH-only 87/70 strict floors to KEEP rows too,
+# which could make raw setup generation look healthy in /why while nothing reached the
+# executable/email/autotrade lane. KEEP still requires complete data, valid price order,
+# volume, risk metrics and the micro-edge guard, but uses a separate moderate floor.
+SETUP_KEEP_MIN_CONF = int(os.environ.get("SETUP_KEEP_MIN_CONF", "84") or 84)
+SETUP_KEEP_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_KEEP_MIN_DYNAMIC_SCORE", "55") or 55)
+SETUP_REVERSE_PROBATION_MIN_CONF = int(os.environ.get("SETUP_REVERSE_PROBATION_MIN_CONF", "85") or 85)
+SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE", "60") or 60)
 # Ver35: /setup_audit is an analytical report and must not disappear just because
 # the live execution gate is strict. Execution/email/autotrade still use the final
 # quality gate; audit keeps visibility of stored setup outcomes for learning.
@@ -13882,6 +13892,8 @@ def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> No
     except Exception:
         pass
     st = str(status or "").strip() or "status"
+    if st == "setup_generated":
+        st = "raw_setup_generated"
     try:
         per = ctx.get("__per__")
         if not isinstance(per, dict):
@@ -13894,6 +13906,78 @@ def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> No
     except Exception:
         pass
     return
+
+
+def _setup_pipeline_recent_gate_summary(uid: int = 0, session: str = '', lookback_min: int = 45) -> dict:
+    """Summarise post-generation executable gate events for /why.
+
+    Raw scan reasons explain why a symbol did or did not produce a candidate. This
+    summary explains why generated candidates did or did not reach the executable
+    queue/email/autotrade lane.
+    """
+    out = {'rows': 0, 'persisted': 0, 'top_reasons': {}, 'recent': []}
+    try:
+        cutoff = float(time.time()) - max(60.0, float(lookback_min or 45) * 60.0)
+        ids = []
+        try:
+            if int(uid or 0) > 0:
+                ids.append(int(uid))
+        except Exception:
+            pass
+        try:
+            owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+            if owner_uid > 0 and owner_uid not in ids:
+                ids.append(owner_uid)
+        except Exception:
+            pass
+        if 0 not in ids:
+            ids.append(0)
+        reason_ctr = Counter()
+        recent = []
+        persisted = 0
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            qmarks = ','.join('?' for _ in ids)
+            params = [float(cutoff), *ids]
+            sql = f"SELECT event_ts, user_id, stage, status, session, mode, setup_id, symbol, side, details_json FROM setup_pipeline_events WHERE event_ts>=? AND user_id IN ({qmarks})"
+            if session:
+                sql += " AND UPPER(COALESCE(session,''))=?"
+                params.append(str(session).upper().strip())
+            sql += " ORDER BY event_ts DESC LIMIT 120"
+            rows = [dict(r) for r in cur.execute(sql, tuple(params)).fetchall()]
+        out['rows'] = len(rows)
+        for r in rows:
+            stg = str(r.get('stage') or '').strip()
+            status = str(r.get('status') or '').strip().lower()
+            details = {}
+            try:
+                details = json.loads(str(r.get('details_json') or '{}'))
+                if not isinstance(details, dict):
+                    details = {}
+            except Exception:
+                details = {}
+            if stg == 'executable_queue_write' and status == 'ok':
+                persisted += int(details.get('persisted') or 0)
+            if status in {'skip', 'error', 'partial_error'} or stg in {'executable_final_quality_gate','executable_edge_quality_guard','executable_generation_cooldown','executable_setup_generation_blackout'}:
+                reason = str(details.get('reason') or stg or 'unknown').strip()
+                if reason:
+                    reason_ctr[reason] += 1
+                    if len(recent) < 8:
+                        recent.append({
+                            'symbol': str(r.get('symbol') or '').upper().strip(),
+                            'side': str(r.get('side') or '').upper().strip(),
+                            'stage': stg,
+                            'reason': reason,
+                            'setup_id': str(r.get('setup_id') or '').strip(),
+                        })
+        out['persisted'] = int(persisted)
+        out['top_reasons'] = dict(reason_ctr.most_common(8))
+        out['recent'] = recent
+        return out
+    except Exception as exc:
+        out['error'] = f'{type(exc).__name__}: {exc}'
+        return out
 
 def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
     """Explain why setups were rejected in the most recent meaningful scan for this user.
@@ -14023,9 +14107,20 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
     lines.append(f"Recorded reject keys: {len(filtered_counts)}")
     if items:
         lines.append("")
-        lines.append("Top reasons (aggregate):")
+        lines.append("Raw scan reasons (pre-executable gate):")
         for k, v in items:
             lines.append(f"• {k} = {v}")
+    try:
+        pipe = _setup_pipeline_recent_gate_summary(int(uid), session=str(rec.get('session') or ''), lookback_min=45)
+        top_gate = dict((pipe or {}).get('top_reasons') or {})
+        if top_gate or int((pipe or {}).get('persisted') or 0) > 0:
+            lines.append("")
+            lines.append("Post-generation executable gate (last 45m):")
+            lines.append(f"• persisted executable rows: {int((pipe or {}).get('persisted') or 0)}")
+            for k, v in list(top_gate.items())[:8]:
+                lines.append(f"• {k} = {v}")
+    except Exception:
+        pass
     lines.append("")
     lines.append("Per-symbol (last known):")
     lines.extend(per_lines)
@@ -42912,16 +43007,113 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         return False, 'watch_strict_quality_exception', meta
 
 
+
+def _setup_execution_quality_baseline_allows(setup_or_row, session_name: str = '', user_id: int = 0, lane: str = 'KEEP') -> tuple[bool, str, dict]:
+    """Baseline executable validator for KEEP and REVERSE-probation lanes.
+
+    Ver41 split the final gate into two lanes:
+    - KEEP: already-positive edge; do not apply WATCH-only 87/70 floors.
+    - WATCH/unknown: still uses the strict probation gate.
+    - REVERSE: allowed for forward-testing weak normal combos, but still needs
+      complete data, valid geometry, volume, micro-guard, projected Risk$/TP$ and
+      moderate confidence/dynamic score floors.
+    """
+    meta = {}
+    try:
+        sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        fam, sess2 = _setup_combo_family_session_from_obj(setup_or_row, session_name=sess)
+        sess = str(sess or sess2 or '').upper().strip()
+        setup_id = str(_autotrade_setup_attr(setup_or_row, 'setup_id', '') or _autotrade_setup_attr(setup_or_row, 'id', '') or '').strip()
+        symbol = str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or _autotrade_setup_attr(setup_or_row, 'market_symbol', '') or '').upper().strip()
+        side = str(_autotrade_setup_attr(setup_or_row, 'side', '') or '').upper().strip()
+        conf = int(float(_autotrade_setup_attr(setup_or_row, 'conf', 0) or _autotrade_setup_attr(setup_or_row, 'confidence', 0) or 0))
+        quality = float(_autotrade_setup_attr(setup_or_row, 'quality_score', 0.0) or _autotrade_setup_attr(setup_or_row, 'score', 0.0) or 0.0)
+        entry = float(_autotrade_setup_attr(setup_or_row, 'entry', 0.0) or 0.0)
+        sl = float(_autotrade_setup_attr(setup_or_row, 'sl', 0.0) or 0.0)
+        tp = float(_setup_target_tp(setup_or_row, 0.0) or 0.0)
+        fut_vol = float(_autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or _autotrade_setup_attr(setup_or_row, 'vol_usd', 0.0) or 0.0)
+        rr = float(rr_to_tp(entry, sl, tp)) if entry > 0 and sl > 0 and tp > 0 else 0.0
+        strategy_label = _setup_strategy_label(setup_or_row)
+        lane_u = str(lane or '').upper().strip() or ('REVERSE' if strategy_label == 'REVERSE' else 'KEEP')
+        combo_strategy = _setup_combo_strategy_key(fam, sess, setup_or_row)
+        meta.update({'family': fam, 'session': sess, 'setup_id': setup_id, 'symbol': symbol, 'side': side, 'conf': conf, 'quality_score': quality, 'entry': entry, 'sl': sl, 'tp': tp, 'rr': rr, 'fut_vol_usd': fut_vol, 'setup_strategy': strategy_label, 'combo_strategy': combo_strategy, 'quality_lane': lane_u})
+
+        if not setup_id:
+            return False, 'baseline_missing_setup_id', meta
+        if not symbol or side not in {'BUY', 'SELL'}:
+            return False, 'baseline_missing_symbol_or_side', meta
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            return False, 'baseline_missing_session', meta
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            return False, 'baseline_incomplete_prices', meta
+        if side == 'BUY' and not (sl < entry < tp):
+            return False, 'baseline_invalid_buy_price_order', meta
+        if side == 'SELL' and not (tp < entry < sl):
+            return False, 'baseline_invalid_sell_price_order', meta
+        if rr <= 0:
+            return False, 'baseline_invalid_rr', meta
+        if not _setup_volume_ok(setup_or_row):
+            return False, 'baseline_below_min_volume', meta
+
+        if strategy_label == 'REVERSE' or lane_u.startswith('REV'):
+            min_conf = int(globals().get('SETUP_REVERSE_PROBATION_MIN_CONF', 85) or 85)
+            min_dyn = float(globals().get('SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE', 60) or 60)
+        else:
+            min_conf = int(globals().get('SETUP_KEEP_MIN_CONF', 84) or 84)
+            min_dyn = float(globals().get('SETUP_KEEP_MIN_DYNAMIC_SCORE', 55) or 55)
+        if conf < min_conf:
+            return False, f'baseline_conf_below_{min_conf}', meta
+
+        try:
+            edge_ok, edge_reason = _setup_edge_quality_guard_allows_setup(setup_or_row, sess, user_id=int(user_id or 0))
+            if not edge_ok:
+                return False, f'baseline_micro_edge_block:{edge_reason}', meta
+        except Exception:
+            pass
+
+        risk_uid = _setup_watch_policy_risk_uid(user_id)
+        try:
+            dyn = _autotrade_dynamic_risk_score(uid=int(risk_uid or 0), setup=setup_or_row, session_name=sess, regime=str(_autotrade_setup_attr(setup_or_row, 'regime_primary', '') or 'UNKNOWN'))
+        except Exception:
+            dyn = {'score': 0.0, 'multiplier': 1.0, 'components': ['dynamic_score_exception']}
+        dyn_score = float((dyn or {}).get('score') or 0.0)
+        meta['dynamic_score'] = dyn_score
+        meta['dynamic_components'] = list((dyn or {}).get('components') or [])[:8]
+        if dyn_score < min_dyn:
+            return False, f'baseline_dynamic_score_below_{min_dyn:.0f}', meta
+
+        risk_meta = _setup_watch_policy_projected_risk_metrics(setup_or_row, session_name=sess, user_id=int(risk_uid or 0), rr=rr, dynamic_score_info=dyn)
+        meta.update({
+            'risk_pct': float((risk_meta or {}).get('risk_pct') or 0.0),
+            'risk_usd': float((risk_meta or {}).get('risk_usd') or 0.0),
+            'tp_usd': float((risk_meta or {}).get('tp_usd') or 0.0),
+            'risk_source': str((risk_meta or {}).get('source') or ''),
+            'risk_uid': int((risk_meta or {}).get('risk_uid') or risk_uid or 0),
+        })
+        if bool(globals().get('SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS', True)):
+            if meta['risk_pct'] <= 0 or meta['risk_usd'] <= 0 or meta['tp_usd'] <= 0:
+                return False, 'baseline_missing_valid_risk_or_tp_dollars', meta
+
+        _setup_quality_gate_set_attr(setup_or_row, 'dynamic_risk_score', float(dyn_score))
+        _setup_quality_gate_set_attr(setup_or_row, 'risk_pct', float(meta.get('risk_pct') or 0.0))
+        _setup_quality_gate_set_attr(setup_or_row, 'risk_usd', float(meta.get('risk_usd') or 0.0))
+        _setup_quality_gate_set_attr(setup_or_row, 'tp_usd', float(meta.get('tp_usd') or 0.0))
+        _setup_quality_gate_set_attr(setup_or_row, 'rr_tp', float(rr))
+        return True, 'baseline_quality_ok', meta
+    except Exception as exc:
+        meta['error'] = f'{type(exc).__name__}: {exc}'
+        return False, 'baseline_quality_exception', meta
+
 def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
     """Shared final gate for executable queue, setup emails, AutoTrade and audit.
 
-    Ver32 rule:
-    - DISABLE always blocks.
-    - KEEP and WATCH are not enough by themselves; the setup must be complete,
-      high-confidence, dynamically strong, not weak by combo/symbol/hour evidence,
-      and have valid projected Risk%, Risk$, TP$, SL and TP.
-    - Unknown policy rows are treated as WATCH probation when
-      SETUP_FINAL_REQUIRE_POLICY_STATE is enabled.
+    Ver41 correction:
+    - DISABLE still blocks NORMAL, but may be routed to REVERSE for controlled testing.
+    - KEEP uses a KEEP baseline gate, not the WATCH-only 87/70 probation gate.
+    - WATCH/unknown NORMAL keeps the strict quality gate: Conf>=87, Dyn>=70,
+      no weak combo/symbol/hour and valid Risk$/TP$.
+    - REVERSE is treated as its own strategy edge and uses a moderate reverse
+      probation gate until it gathers enough evidence to KEEP or disable.
     """
     meta = {}
     try:
@@ -42939,7 +43131,8 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         enabled = int(info.get('enabled') or (1 if not found else 0)) == 1
         combo = str(info.get('combo') or f'{fam}-{sess}').upper().strip()
         strategy_label = _setup_strategy_label(setup_or_row)
-        meta.update({'family': fam, 'session': sess, 'combo': combo, 'combo_strategy': _setup_combo_strategy_key(fam, sess, setup_or_row), 'policy_found': found, 'policy_status': status, 'policy_enabled': enabled, 'setup_strategy': strategy_label})
+        combo_strategy = _setup_combo_strategy_key(fam, sess, setup_or_row)
+        meta.update({'family': fam, 'session': sess, 'combo': combo, 'combo_strategy': combo_strategy, 'policy_found': found, 'policy_status': status, 'policy_enabled': enabled, 'setup_strategy': strategy_label})
         try:
             _reason = str(_autotrade_setup_attr(setup_or_row, 'strategy_reason', '') or _setup_strategy_attr(setup_or_row, 'strategy_reason', '') or '').lower()
             if 'reverse_also_weak_block' in _reason:
@@ -42947,101 +43140,79 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         except Exception:
             pass
 
-        if status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled:
-            if not (strategy_label == 'REVERSE' and bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True))):
-                return False, 'final_combo_disabled', meta
+        disabled = status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled
+        if disabled and not (strategy_label == 'REVERSE' and bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True))):
+            return False, 'final_combo_disabled', meta
+        if disabled and strategy_label == 'REVERSE':
             meta['policy_bypassed_by_reverse'] = True
+
         if bool(globals().get('SETUP_FINAL_REQUIRE_POLICY_STATE', True)) and status not in {'KEEP', 'WATCH'}:
             if not (strategy_label == 'REVERSE' and status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}):
                 return False, f'final_policy_not_keep_or_watch:{status or "UNKNOWN"}', meta
 
-        # Use the stricter WATCH validator as the single executable/email/autotrade
-        # quality gate.  It checks complete data, price order, min confidence,
-        # micro edge blocks, weak combo/symbol/hour, dynamic score and Risk$/TP$.
+        # REVERSE is its own forward-test lane. Do not use normal combo's weak history
+        # to block the reverse signal before it gathers reverse-specific evidence.
+        if strategy_label == 'REVERSE':
+            ok, why, qmeta = _setup_execution_quality_baseline_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0), lane='REVERSE')
+            meta.update(dict(qmeta or {}))
+            if not ok:
+                return False, f'final_{why}', meta
+            return True, 'final_reverse_quality_ok', meta
+
+        # KEEP is an already-positive edge. It still must be complete and executable,
+        # but it must not be starved by WATCH-only strict floors.
+        if status == 'KEEP':
+            ok, why, qmeta = _setup_execution_quality_baseline_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0), lane='KEEP')
+            meta.update(dict(qmeta or {}))
+            if not ok:
+                return False, f'final_{why}', meta
+            return True, 'final_keep_quality_ok', meta
+
+        # WATCH/unknown NORMAL remains strict probation.
         ok, why, qmeta = _setup_watch_policy_strict_quality_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0))
         meta.update(dict(qmeta or {}))
         if not ok:
             return False, f'final_{why}', meta
-
-        # Ver32 hard floors are mirrored here so even a future change to the WATCH
-        # constants cannot silently loosen the final executable lane.
         conf = int(float(meta.get('conf') or _autotrade_setup_attr(setup_or_row, 'conf', 0) or 0))
         dyn_score = float(meta.get('dynamic_score') or _autotrade_setup_attr(setup_or_row, 'dynamic_risk_score', 0.0) or 0.0)
         if conf < int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87):
             return False, f'final_conf_below_{int(globals().get("SETUP_FINAL_MIN_CONF", 87) or 87)}', meta
         if dyn_score < float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):
             return False, f'final_dynamic_score_below_{float(globals().get("SETUP_FINAL_MIN_DYNAMIC_SCORE", 70) or 70):.0f}', meta
-        return True, 'final_quality_ok', meta
+        return True, 'final_watch_quality_ok', meta
     except Exception as exc:
         meta['error'] = f'{type(exc).__name__}: {exc}'
         return False, 'final_quality_gate_exception', meta
 
 def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> bool:
-    """Live gate for DB-learned family/session combinations.
+    """Live policy gate wrapper.
 
-    Ver31 WR-first rule:
-    - DISABLE/BLOCK/PAUSE/OFF rows always block executable queue, setup emails and AutoTrade.
-    - KEEP rows are allowed.
-    - WATCH rows are probationary: enabled/Exec=ON is not enough.  WATCH can pass
-      only through _setup_watch_policy_strict_quality_allows().
-    - Unknown combos are allowed so a fresh system can still discover edge.
+    Ver41: delegate to the shared final quality gate so email selection, executable
+    queue and AutoTrade all use the same KEEP/WATCH/REVERSE logic. This prevents
+    the old WATCH-only strict policy wrapper from blocking KEEP combos after raw
+    setup generation.
     """
     try:
         if not bool(globals().get('SETUP_COMBO_POLICY_LIVE_ENFORCE', True)):
             return True
-        info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
-        if not bool(info.get('found')):
-            # Ver32: no policy row means probation/WATCH, not automatic execution.
-            # This stops new/default WATCH combos becoming executable just because Exec=ON.
-            if bool(globals().get('SETUP_FINAL_UNKNOWN_AS_WATCH', True)):
-                ok, why, meta = _setup_watch_policy_strict_quality_allows(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
-                if not ok:
-                    try:
-                        db_log_setup_pipeline_event(
-                            int(user_id or 0),
-                            stage='unknown_watch_quality_gate',
-                            status='skip',
-                            session=str(session_name or ''),
-                            mode='quality_gate',
-                            setup_id=str(_autotrade_setup_attr(setup_or_row, 'setup_id', '') or _autotrade_setup_attr(setup_or_row, 'id', '') or ''),
-                            symbol=str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or ''),
-                            side=str(_autotrade_setup_attr(setup_or_row, 'side', '') or ''),
-                            details={'reason': str(why), **dict(meta or {})},
-                        )
-                    except Exception:
-                        pass
-                return bool(ok)
-            return True
-        status = str(info.get('status') or 'WATCH').upper().strip()
-        enabled = int(info.get('enabled') or 0) == 1
-        if status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled:
-            return False
-        if status == 'KEEP':
-            return True
-        if status == 'WATCH':
-            ok, why, meta = _setup_watch_policy_strict_quality_allows(setup_or_row, session_name=str(info.get('session') or session_name or ''), user_id=int(user_id or 0))
-            if not ok:
-                try:
-                    db_log_setup_pipeline_event(
-                        int(user_id or 0),
-                        stage='watch_combo_quality_gate',
-                        status='skip',
-                        session=str(info.get('session') or session_name or ''),
-                        mode='quality_gate',
-                        setup_id=str(_autotrade_setup_attr(setup_or_row, 'setup_id', '') or _autotrade_setup_attr(setup_or_row, 'id', '') or ''),
-                        symbol=str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or ''),
-                        side=str(_autotrade_setup_attr(setup_or_row, 'side', '') or ''),
-                        details={'reason': str(why), 'policy_status': status, 'combo': str(info.get('combo') or ''), **dict(meta or {})},
-                    )
-                except Exception:
-                    pass
-            return bool(ok)
-        # Any future non-KEEP positive status remains conservative unless explicitly allowed.
-        if status in {'ALLOW', 'ON', 'ACTIVE'}:
-            return True
-        return False
+        ok, why, meta = _setup_final_quality_gate_allows_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
+        if not ok:
+            try:
+                db_log_setup_pipeline_event(
+                    int(user_id or 0),
+                    stage='combo_policy_final_gate',
+                    status='skip',
+                    session=str(session_name or ''),
+                    mode='quality_gate',
+                    setup_id=str(_autotrade_setup_attr(setup_or_row, 'setup_id', '') or _autotrade_setup_attr(setup_or_row, 'id', '') or ''),
+                    symbol=str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or ''),
+                    side=str(_autotrade_setup_attr(setup_or_row, 'side', '') or ''),
+                    details={'reason': str(why or 'final_quality_gate_blocked'), **dict(meta or {})},
+                )
+            except Exception:
+                pass
+        return bool(ok)
     except Exception:
-        # Conservative default: do not let a policy-evaluation bug open a WATCH/DISABLE lane.
         return False
 
 
@@ -48340,8 +48511,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # -----------------------------------------------------
     # Shared Top Setup gate (applies to BOTH /screen and email)
     # -----------------------------------------------------
+    gate_source = 'screen' if str(mode or '').lower().strip() == 'exec' else mode
     try:
-        gate_source = 'screen' if str(mode or '').lower().strip() == 'exec' else mode
         ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=gate_source, session_name=session_name)[0]]
     except Exception:
         pass
