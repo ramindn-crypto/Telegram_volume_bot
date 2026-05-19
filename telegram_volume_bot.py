@@ -19,6 +19,7 @@
 # - Ver17: BigMove alerts now immediately generate and send matching F8 setup emails; /screen uses setup-email timestamp.
 # - Ver21: Autonomous email/autotrade setup pipeline runs independently from /screen.
 # - Ver14: made interim setup-combo policy seeding idempotent/quiet and downgraded manual-position conflict logs from WARNING to INFO.
+# - Ver27: improved AutoTrade reporting with comprehensive open/close/risk/reason table and profit/loss sane TP/SL classification.
 # - Ver17: added deep setup analytics, separated advisory vs live policy in /setup_matrix, added missed policy catch-up, and fixed /autotrade_report_overall open/closed fallback counts.
 # - 18May_ver18: clear setup/email/AutoTrade cooldown gates at the 09:45 Melbourne flat reset; include exchange-only closed PnL in reports as OTHER unless TP/SL is verified.
 # - Ver16b: strict verified TP/SL reporting; no raw exchange-only fallback rows in AutoTrade report by default; stop inferring TP/SL from PnL sign alone.
@@ -40714,7 +40715,16 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         else:
             open_n += 1
         sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
-        table_rows.append([sym, side, sess_row, int(float(r.get('conf') or 0.0)), family_code, result])
+        ts = _setup_audit_row_ts(r)
+        try:
+            ttxt = datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if ts > 0 else '-'
+        except Exception:
+            ttxt = '-'
+        try:
+            volm = float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0) / 1e6
+        except Exception:
+            volm = 0.0
+        table_rows.append([ttxt, sym, side, sess_row, family_code, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n + nohit_n
     wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
@@ -40730,9 +40740,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Sym', 'Side', 'Ses', 'Conf', 'Fam', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Ses', 'Fam', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'center', 'center', 'right', 'center', 'center'),
+        colalign=('left', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
@@ -44070,6 +44080,109 @@ def _autotrade_report_row_session(row: dict) -> str:
 
 
 
+
+def _autotrade_report_money(v, blank: str = '-') -> str:
+    try:
+        x = float(v or 0.0)
+        if abs(x) < 1e-9:
+            return blank
+        return f"{x:.2f}"
+    except Exception:
+        return blank
+
+
+def _autotrade_report_pct(v, blank: str = '-') -> str:
+    try:
+        x = float(v or 0.0)
+        if abs(x) < 1e-9:
+            return blank
+        return f"{x:.2f}%"
+    except Exception:
+        return blank
+
+
+def _autotrade_report_close_session(row: dict) -> str:
+    try:
+        ts = float((row or {}).get('closed_ts') or (row or {}).get('last_ts') or (row or {}).get('ts') or 0.0)
+        if ts > 0:
+            return _session_label_from_ts(ts)
+    except Exception:
+        pass
+    return '-'
+
+
+def _autotrade_report_is_before_asia_close(row: dict) -> bool:
+    """True when a close belongs to the daily pre-ASIA flat/zero-carry process."""
+    try:
+        note = str((row or {}).get('note') or (row or {}).get('close_reason') or (row or {}).get('source_note') or '').upper()
+        if any(k in note for k in ('BEFORE_ASIA', 'SCHEDULED_FLAT', 'FLAT_BEFORE_ASIA', 'ZERO_CARRYOVER', 'COOLDOWN RESET')):
+            return True
+        ts = float((row or {}).get('closed_ts') or (row or {}).get('last_ts') or (row or {}).get('ts') or 0.0)
+        if ts <= 0:
+            return False
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+        # The scheduled job is 09:45, but Render/catch-up can close a few minutes later.
+        return (dt.hour == 9 and 40 <= dt.minute <= 59) or (dt.hour == 10 and 0 <= dt.minute <= 5)
+    except Exception:
+        return False
+
+
+def _autotrade_report_exit_reason(row: dict, result: str | None = None) -> str:
+    """Short user-facing close reason used by /autotrade_report.
+
+    Result is the trading outcome (TP/SL/FLAT/OPEN). Reason explains how it closed
+    (target, stop, pre-ASIA flat, max hold, profit close, loss close, etc.).
+    """
+    try:
+        row = dict(row or {})
+        res = str(result or row.get('closed_kind') or '').upper().strip()
+        if str(row.get('state') or '').upper().strip() == 'OPEN' or res == 'OPEN':
+            return 'OPEN'
+        note_raw = str(row.get('note') or row.get('close_reason') or row.get('source_note') or row.get('result_label') or '').strip()
+        note = note_raw.upper()
+        if _autotrade_report_is_before_asia_close(row):
+            return 'CLOSED_BEFORE_ASIA'
+        if 'MAX_POSITION' in note or 'MAX_HOLD' in note or 'MAX-HOLD' in note:
+            return 'MAX_HOLD'
+        if res == 'TP':
+            if _autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP'):
+                return 'TP_TARGET'
+            return 'PROFIT_CLOSE'
+        if res == 'SL':
+            if _autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL'):
+                return 'SL_STOP'
+            return 'LOSS_CLOSE'
+        if res == 'FLAT':
+            return 'FLAT_CLOSE'
+        if note_raw:
+            return _setup_audit_short_text(note_raw.replace('exchange_closed_pnl_fallback', 'EXCHANGE_CLOSE'), 22).upper().replace(' ', '_')
+        return 'OTHER_CLOSE'
+    except Exception:
+        return 'OTHER_CLOSE'
+
+
+def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
+    """Add risk_usd/risk_pct/tp_usd estimates where possible for reporting."""
+    out = dict(row or {})
+    try:
+        risk_usd = 0.0
+        for k in ('risk_usd', 'risk_usdt', 'risk', 'risk_est', 'estimated_risk_usd', 'target_risk_usd'):
+            try:
+                risk_usd = max(risk_usd, abs(float(out.get(k) or 0.0)))
+            except Exception:
+                pass
+        targets = _autotrade_report_expected_pnl_targets(out) or {}
+        if risk_usd <= 0:
+            risk_usd = abs(float(targets.get('SL') or 0.0))
+        out['risk_usd'] = float(risk_usd or 0.0)
+        eq = float(equity or 0.0)
+        out['risk_pct'] = (risk_usd / eq * 100.0) if eq > 0 and risk_usd > 0 else float(out.get('risk_pct') or 0.0)
+        tp_usd = abs(float(targets.get('TP') or 0.0))
+        out['tp_usd'] = tp_usd
+    except Exception:
+        pass
+    return out
+
 def _autotrade_report_expected_pnl_targets(row: dict) -> dict:
     """Expected TP/SL PnL from the setup geometry."""
     row = dict(row or {})
@@ -44173,51 +44286,35 @@ def _autotrade_report_has_direct_tpsl_proof(row: dict, kind: str) -> bool:
 
 
 def _autotrade_report_closed_kind(row: dict) -> str:
-    """Return TP/SL/FLAT/OTHER for realised AutoTrade reporting.
+    """Return the realised outcome label for AutoTrade reporting.
 
-    Ver16: never classify a close as TP/SL from the sign of PnL alone. In strict
-    mode, TP/SL requires direct lifecycle/order proof or realised PnL close to
-    the expected target. In-between closes show as OTHER/FLAT.
+    Ver27: TP/SL reporting is profit/loss sane. Direct TP/SL proof still wins,
+    but exchange-only/in-between closes are not left as OTHER when the realised
+    PnL clearly says profit or loss. The reason column separately explains
+    CLOSED_BEFORE_ASIA, MAX_HOLD, PROFIT_CLOSE, LOSS_CLOSE, etc.
     """
     try:
         row = dict(row or {})
+        if str(row.get('state') or '').upper().strip() == 'OPEN':
+            return 'OPEN'
         path = str(row.get('result_path') or row.get('outcome') or '').upper().strip()
         label = str(row.get('result_label') or '').upper().strip()
-        note = str(row.get('note') or row.get('close_reason') or '').upper().strip()
-        if path == 'OPEN' or str(row.get('state') or '').upper().strip() == 'OPEN':
-            return 'OPEN'
-        if 'FLAT' in note or 'SCHEDULED_FLAT' in note or 'MAX_POSITION_AGE' in note:
-            return 'FLAT'
-        require = bool(globals().get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True))
-        if path in {'HIT_TP_THEN_BE_SL', 'HIT_TP_THEN_SL'}:
-            return 'TP' if (not require or _autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP')) else 'OTHER'
-        if path in {'TP', 'HIT_TP_WIN'} or label == 'TP':
-            if not require:
-                return 'TP' if _autotrade_report_pnl_sign_allows_kind(row, 'TP') else 'OTHER'
-            if _autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP'):
-                return 'TP'
-            # If a stale TP label actually closed near configured SL risk, show SL; otherwise OTHER.
-            return 'SL' if _autotrade_report_pnl_close_to_expected(row, 'SL') else 'OTHER'
-        if path in {'SL', 'HIT_SL_LOSS'} or label == 'SL':
-            if not require:
-                return 'SL' if _autotrade_report_pnl_sign_allows_kind(row, 'SL') else 'OTHER'
-            if _autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL'):
-                return 'SL'
-            # If a stale SL label actually closed near configured TP target, show TP; otherwise OTHER.
-            return 'TP' if _autotrade_report_pnl_close_to_expected(row, 'TP') else 'OTHER'
-        if require:
-            pnl = float(row.get('pnl') if row.get('pnl') is not None else row.get('pnl_usdt') or 0.0)
-            if abs(pnl) <= 1e-9:
-                return 'FLAT'
-            if _autotrade_report_pnl_close_to_expected(row, 'TP'):
-                return 'TP'
-            if _autotrade_report_pnl_close_to_expected(row, 'SL'):
-                return 'SL'
-            return 'OTHER'
         pnl = float(row.get('pnl') if row.get('pnl') is not None else row.get('pnl_usdt') or 0.0)
-        if pnl > 0:
+        eps = float(globals().get('AUTOTRADE_REPORT_TPSL_SIGN_EPS_USD', 0.50) or 0.50)
+
+        # Direct/near-target proof is kept, but still cannot contradict PnL sign.
+        if path in {'HIT_TP_THEN_BE_SL', 'HIT_TP_THEN_SL', 'TP', 'HIT_TP_WIN'} or label == 'TP':
+            if _autotrade_report_pnl_sign_allows_kind(row, 'TP') and (_autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP')):
+                return 'TP'
+        if path in {'SL', 'HIT_SL_LOSS'} or label == 'SL':
+            if _autotrade_report_pnl_sign_allows_kind(row, 'SL') and (_autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL')):
+                return 'SL'
+
+        # If the report row is exchange-only or closed by a time/flat rule, classify
+        # the realised outcome by PnL sign so the analytics table remains useful.
+        if pnl > eps:
             return 'TP'
-        if pnl < 0:
+        if pnl < -eps:
             return 'SL'
         return 'FLAT'
     except Exception:
@@ -44301,25 +44398,14 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
         except Exception:
             groups.append(dict(r))
 
-    # Decide merged TP/SL after summing PnL. Ver16 does not classify from
-    # PnL sign alone; TP/SL must be verified or close to expected target/risk.
+    # Decide merged realised result after summing PnL. Ver27 uses sign-sane
+    # realised outcome classification so profitable exchange/time closes are not
+    # reported as OTHER and losing exchange/time closes are not reported as TP.
     for g in groups:
         try:
-            votes = [str(x).upper() for x in (g.get('closed_kind_votes') or [])]
-            require_tpsl = bool(globals().get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True))
-            if require_tpsl and _autotrade_report_pnl_close_to_expected(g, 'TP'):
-                kind = 'TP'
-            elif require_tpsl and _autotrade_report_pnl_close_to_expected(g, 'SL'):
-                kind = 'SL'
-            elif votes.count('TP') > votes.count('SL') and (not require_tpsl or _autotrade_report_has_direct_tpsl_proof(g, 'TP')) and _autotrade_report_pnl_sign_allows_kind(g, 'TP'):
-                kind = 'TP'
-            elif votes.count('SL') > 0 and (not require_tpsl or _autotrade_report_has_direct_tpsl_proof(g, 'SL')) and _autotrade_report_pnl_sign_allows_kind(g, 'SL'):
-                kind = 'SL'
-            elif any(v == 'FLAT' for v in votes):
-                kind = 'FLAT'
-            else:
-                kind = 'OTHER'
+            kind = _autotrade_report_closed_kind(g)
             g['closed_kind'] = kind
+            g['exit_reason'] = _autotrade_report_exit_reason(g, kind)
             if kind == 'TP':
                 g['result_path'] = 'HIT_TP_WIN'; g['result_label'] = 'TP'
             elif kind == 'SL':
@@ -44342,7 +44428,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v26_signsafe:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v27_comprehensive:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -44358,6 +44444,10 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         pass
     now_ts = float(time.time())
     start_ts = now_ts - float(lookback_h) * 3600.0
+    try:
+        _report_equity = float(_effective_equity_for_risk(_autotrade_user_settings(owner_uid), prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
+    except Exception:
+        _report_equity = 0.0
 
     open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
     bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(owner_uid, positions=open_positions, fallback_unmatched_as_owned=True)
@@ -44408,6 +44498,11 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
 
     for p, tr in (bot_positions or []):
         row = _setup_audit_merge_trade_setup_row(tr)
+        try:
+            row['risk_usd'] = float(_estimate_position_risk_usd(p) or row.get('risk_usd') or 0.0)
+        except Exception:
+            pass
+        row = _autotrade_report_enrich_amounts(row, _report_equity)
         side = str(row.get('side') or _pos_side_text(p) or '').upper().strip() or '-'
         pnl = float(_pos_unreal_pnl(p) or 0.0)
         total_open += pnl
@@ -44425,11 +44520,18 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'opened_ts': float(row.get('opened_ts') or ts or 0.0),
             'pnl': pnl,
             'parts': 1,
+            'risk_usd': float(row.get('risk_usd') or 0.0),
+            'risk_pct': float(row.get('risk_pct') or 0.0),
+            'tp_usd': float(row.get('tp_usd') or 0.0),
+            'close_reason': 'OPEN',
+            'note': str(row.get('note') or ''),
             'closed_kind': 'OPEN',
+            'exit_reason': 'OPEN',
         })
 
     for r in (closed_rows or []):
         row = _setup_audit_merge_trade_setup_row(r)
+        row = _autotrade_report_enrich_amounts(row, _report_equity)
         side = str(row.get('side') or r.get('side') or '').upper().strip() or '-'
         try:
             pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
@@ -44451,10 +44553,17 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'closed_ts': float(row.get('closed_ts') or r.get('closed_ts') or ts or 0.0),
             'result_path': str(row.get('result_path') or r.get('result_path') or ''),
             'result_label': str(row.get('result_label') or r.get('result_label') or ''),
+            'close_reason': str(row.get('close_reason') or r.get('close_reason') or ''),
+            'note': str(row.get('note') or r.get('note') or ''),
+            'source_note': str(row.get('source_note') or r.get('source_note') or ''),
             'pnl': pnl,
             'pnl_usdt': pnl,
             'parts': 1,
+            'risk_usd': float(row.get('risk_usd') or 0.0),
+            'risk_pct': float(row.get('risk_pct') or 0.0),
+            'tp_usd': float(row.get('tp_usd') or 0.0),
             'closed_kind': _autotrade_report_closed_kind(row),
+            'exit_reason': _autotrade_report_exit_reason(row),
         })
 
     journal_rows = _autotrade_merge_position_report_rows(journal_rows)
@@ -44468,7 +44577,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
         f"Trades: <b>{len(journal_rows)}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
-        "Exit: TP/SL only when verified by lifecycle/order proof or realised PnL close to configured target/risk. In-between closes show OTHER/FLAT.",
+        "Result: TP=profitable/target close, SL=losing/stop close, FLAT=near-zero. Reason shows TP_TARGET, SL_STOP, CLOSED_BEFORE_ASIA, MAX_HOLD, PROFIT_CLOSE, or LOSS_CLOSE.",
     ]
     if external_positions:
         lines.append(f"Ignored unmatched manual/external live positions: <b>{len(external_positions)}</b>")
@@ -44480,19 +44589,43 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         # Ver16: show every trade row. Time is explicitly converted to Melbourne
         # in _ts_txt(), and the long <pre> table is chunked safely by send_long_message.
         display = list(journal_rows)
-        def _exit_display(r: dict) -> str:
+        def _result_display(r: dict) -> str:
             try:
                 if str(r.get('state') or '').upper() == 'OPEN':
                     return 'OPEN'
                 return str(r.get('closed_kind') or _autotrade_report_closed_kind(r) or '-').upper()
             except Exception:
                 return '-'
-        table_rows = [[r.get('time') or _ts_txt(float(r.get('ts') or 0.0)), r.get('state'), _exit_display(r), r.get('symbol'), r.get('side'), r.get('family'), int(r.get('parts') or 1), f"{float(r.get('pnl') or 0.0):+.2f}"] for r in display]
+        def _reason_display(r: dict) -> str:
+            try:
+                return str(r.get('exit_reason') or _autotrade_report_exit_reason(r, _result_display(r)) or '-')
+            except Exception:
+                return '-'
+        table_rows = []
+        for r in display:
+            open_ts = float(r.get('opened_ts') or r.get('ts') or 0.0)
+            close_ts = float(r.get('closed_ts') or r.get('last_ts') or 0.0) if str(r.get('state') or '').upper() != 'OPEN' else 0.0
+            table_rows.append([
+                _ts_txt(open_ts),
+                _ts_txt(close_ts) if close_ts > 0 else '-',
+                _result_display(r),
+                r.get('symbol'),
+                r.get('side'),
+                r.get('family'),
+                str(r.get('session') or '-'),
+                _autotrade_report_close_session(r),
+                _autotrade_report_pct(r.get('risk_pct')),
+                _autotrade_report_money(r.get('risk_usd')),
+                _autotrade_report_money(r.get('tp_usd')),
+                int(r.get('parts') or 1),
+                f"{float(r.get('pnl') or 0.0):+.2f}",
+                _reason_display(r),
+            ])
         table = tabulate(
             table_rows,
-            headers=['Mel Time', 'State', 'Exit', 'Sym', 'Side', 'Fam', 'Parts', 'PnL'],
+            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Fam', 'SesO', 'SesC', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason'],
             tablefmt='plain',
-            colalign=('left', 'center', 'center', 'left', 'center', 'center', 'right', 'right'),
+            colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'left'),
         )
         raw_count = int(len(bot_positions or [])) + int(len(closed_rows or []))
         lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> merged position rows. Raw fragments: <b>{raw_count}</b>. Time: <b>Melbourne</b>.")
@@ -45247,7 +45380,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v22_html_table:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v27_result_reason:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -45367,7 +45500,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         HDR,
         f'Window: last {lookback_h}h (Melbourne)' + (f' | Now: {now_txt}' if now_txt else ''),
         f'Position rows: {total_trades} | Raw fragments merged: {raw_fragments} | TP: {total_tp} | SL: {total_sl} | Other: {total_other} | Open: {total_open} | WR: {wr:.1f}% | PnL: {total_pnl:+.2f} USDT',
-        'TP/SL counts require lifecycle/order proof or realised PnL close to the configured target/risk. Exchange-only closes are included in PnL as OTHER/FLAT unless verified.',
+        'TP/SL counts are realised outcomes: positive closes count as TP/win, negative closes count as SL/loss. Time exits such as the 09:45/09:55 pre-ASIA flat are tracked in the detailed report Reason column.',
     ]
     if external_positions:
         lines.append(f'Ignored unmatched manual/external live positions: {len(external_positions)}')
