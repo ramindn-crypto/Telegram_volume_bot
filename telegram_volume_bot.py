@@ -1978,15 +1978,17 @@ SETUP_COMBO_WATCH_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_MIN_CONF", "8
 SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE", "70") or 70)
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF", "85") or 85)
 SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE", "80") or 80)
-# Ver47: starvation-safe scout lane. This is NOT a loose normal lane: it only lets
-# one of the near-quality 84-confidence candidates survive when it also has strong
-# dynamic score, good RR and enough volume. It keeps the system learning instead of
+# Ver47: starvation-safe scout lane.
+# Ver48: make the scout lane executable-safe instead of starvation-prone: default volume 15M,
+# dynamic score 84, RR 1.40; broad global-side micro-edge is advisory by default. This is NOT a loose normal lane: it only lets
+# one of the near-quality 84-confidence candidates survive when it also has solid
+# dynamic score, good RR and at least 15M 24h volume. It keeps the system learning instead of
 # sitting at 0 executable rows for hours, while preserving WR-first controls.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = env_bool("SETUP_COMBO_WATCH_SCOUT_ENABLED", True)
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_CONF", "84") or 84)
-SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE", "88") or 88)
-SETUP_COMBO_WATCH_SCOUT_MIN_RR = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_RR", "1.50") or 1.50)
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "20000000") or 20000000)
+SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE", "84") or 84)
+SETUP_COMBO_WATCH_SCOUT_MIN_RR = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_RR", "1.40") or 1.40)
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
 SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
 # Ver32 WR-first final gate: the executable lane itself is now quality-gated,
 # not only the downstream email/autotrade consumer.  This keeps /setup_audit,
@@ -1998,9 +2000,9 @@ SETUP_FINAL_ADAPTIVE_MIN_CONF = int(os.environ.get("SETUP_FINAL_ADAPTIVE_MIN_CON
 SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE", "80") or 80)
 SETUP_FINAL_SCOUT_ENABLED = env_bool("SETUP_FINAL_SCOUT_ENABLED", True)
 SETUP_FINAL_SCOUT_MIN_CONF = int(os.environ.get("SETUP_FINAL_SCOUT_MIN_CONF", "84") or 84)
-SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE", "88") or 88)
-SETUP_FINAL_SCOUT_MIN_RR = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_RR", "1.50") or 1.50)
-SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "20000000") or 20000000)
+SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE", "84") or 84)
+SETUP_FINAL_SCOUT_MIN_RR = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_RR", "1.40") or 1.40)
+SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = True  # Ver44: hard safety; unknown/new strategy combos enter WATCH probation, never hard-block as UNKNOWN
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
@@ -2120,7 +2122,10 @@ SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple(x.strip() for x in str(os.environ.get
     "10:00,11:00,13:00,19:00"
 ) or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = int(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_CONF", "83") or 83)
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "20000000") or 20000000)
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "15000000") or 15000000)
+# Ver48: global BUY/SELL edge can be noisy and stale after introducing NORMAL/REVERSE strategy routing.
+# Keep combo/symbol/hour blocks strict, but make broad global-side blocking advisory by default.
+SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = env_bool("SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED", False)
 SETUP_EDGE_GUARD_BAD_HOUR_MIN_QUALITY = float(os.environ.get("SETUP_EDGE_GUARD_BAD_HOUR_MIN_QUALITY", "90") or 90)
 SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED", "12") or 12)
 SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX", "32") or 32)
@@ -43160,8 +43165,8 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         adaptive_min_conf = int(globals().get('SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF', 85) or 85)
         scout_enabled = bool(globals().get('SETUP_COMBO_WATCH_SCOUT_ENABLED', True))
         scout_min_conf = int(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_CONF', 84) or 84)
-        scout_min_rr = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_RR', 1.50) or 1.50)
-        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 20000000) or 20000000)
+        scout_min_rr = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_RR', 1.40) or 1.40)
+        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
         # Ver47: do not kill 84-86 confidence candidates before dynamic risk is
         # calculated. They may pass only via the stronger near/scout dynamic-score
         # lane; sub-scout confidence is still blocked immediately.
@@ -43171,8 +43176,14 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         meta['watch_near_conf_candidate'] = bool(conf < min_conf)
         meta['watch_scout_candidate'] = bool(scout_enabled and conf < adaptive_min_conf and conf >= scout_min_conf)
         if conf < adaptive_min_conf:
-            if not (scout_enabled and conf >= scout_min_conf and rr >= scout_min_rr and fut_vol >= scout_min_vol):
+            if not scout_enabled:
                 return False, f'watch_conf_below_{adaptive_min_conf}', meta
+            if conf < scout_min_conf:
+                return False, f'watch_conf_below_{scout_min_conf}', meta
+            if rr < scout_min_rr:
+                return False, f'watch_scout_rr_below_{scout_min_rr:.2f}', meta
+            if fut_vol < scout_min_vol:
+                return False, f'watch_scout_vol_below_{scout_min_vol/1_000_000:.0f}M', meta
 
         # Enforce the same micro edge blocks used by /setup_matrix deep analysis.
         try:
@@ -43238,7 +43249,7 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         meta['dynamic_components'] = list((dyn or {}).get('components') or [])[:8]
         min_dyn = float(globals().get('SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE', 70) or 70)
         near_conf_dyn = float(globals().get('SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80)
-        scout_dyn = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE', 88) or 88)
+        scout_dyn = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE', 84) or 84)
         if bool(meta.get('watch_scout_candidate')):
             if dyn_score < scout_dyn:
                 return False, f'watch_scout_dynamic_score_below_{scout_dyn:.0f}', meta
@@ -43471,14 +43482,22 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         final_near_dyn = float(globals().get('SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80)
         scout_enabled = bool(globals().get('SETUP_FINAL_SCOUT_ENABLED', True))
         scout_min_conf = int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)
-        scout_dyn = float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 88) or 88)
-        scout_rr = float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.50) or 1.50)
-        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 20000000) or 20000000)
+        scout_dyn = float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 84) or 84)
+        scout_rr = float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.40) or 1.40)
+        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
         fut_vol = float(meta.get('fut_vol_usd') or _autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or 0.0)
         rr = float(meta.get('rr') or 0.0)
         if conf < final_adaptive_min_conf:
-            if not (scout_enabled and conf >= scout_min_conf and dyn_score >= scout_dyn and rr >= scout_rr and fut_vol >= scout_vol):
+            if not scout_enabled:
                 return False, f'final_conf_below_{final_adaptive_min_conf}', meta
+            if conf < scout_min_conf:
+                return False, f'final_conf_below_{scout_min_conf}', meta
+            if dyn_score < scout_dyn:
+                return False, f'final_scout_dynamic_score_below_{scout_dyn:.0f}', meta
+            if rr < scout_rr:
+                return False, f'final_scout_rr_below_{scout_rr:.2f}', meta
+            if fut_vol < scout_vol:
+                return False, f'final_scout_vol_below_{scout_vol/1_000_000:.0f}M', meta
             meta['final_scout_conf_pass'] = f'conf_{conf}_dyn_{dyn_score:.0f}_rr_{rr:.2f}_vol_{fut_vol/1_000_000:.1f}M'
         elif conf < final_min_conf:
             if dyn_score < final_near_dyn:
@@ -43818,7 +43837,7 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         except Exception:
             pass
         try:
-            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 30000000) or 30000000)
+            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 15000000) or 15000000)
             if min_vol > 0 and vol_v > 0 and vol_v < min_vol and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
                 return False, f'strict_min_volume_block vol=${vol_v/1_000_000:.1f}M<{min_vol/1_000_000:.0f}M'
         except Exception:
@@ -43828,7 +43847,16 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
             sm = dict(side_metrics.get(side) or {})
             if int(sm.get('decided') or 0) >= int(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED', 12) or 12):
                 if float(sm.get('wr') or 0.0) <= float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX', 32) or 32) and float(sm.get('avg_r') or 0.0) < 0 and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
-                    return False, f'weak_global_side_block {side}: WR {float(sm.get("wr") or 0.0):.1f}%, AvgR {float(sm.get("avg_r") or 0.0):+.2f}, quality {q_v:.0f}'
+                    reason = f'weak_global_side_block {side}: WR {float(sm.get("wr") or 0.0):.1f}%, AvgR {float(sm.get("avg_r") or 0.0):+.2f}, quality {q_v:.0f}'
+                    if bool(globals().get('SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED', False)):
+                        return False, reason
+                    # Ver48: with NORMAL/REVERSE strategy routing, a broad BUY/SELL side
+                    # block can starve all candidates based on old normal-direction evidence.
+                    # Keep it as diagnostic only; combo, symbol and hour guards still hard-block.
+                    try:
+                        _setup_quality_gate_set_attr(setup_or_row, 'global_side_guard_note', reason)
+                    except Exception:
+                        pass
         except Exception:
             pass
         if combo_side in cs:
@@ -44782,7 +44810,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy (e.g. F8-NY-REV), <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}/Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f} OR Conf≥{int(globals().get('SETUP_FINAL_ADAPTIVE_MIN_CONF', 85) or 85)}/Dyn≥{float(globals().get('SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80):.0f} OR scout Conf≥{int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)}/Dyn≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 88) or 88):.0f}/RR≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.5) or 1.5):.1f}/Vol≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 20000000) or 20000000)/1_000_000:.0f}M, no weak combo/symbol/hour and valid Risk/SL/TP, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
+            f"Legend: <b>Combo</b>=Family-Session-Strategy (e.g. F8-NY-REV), <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}/Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f} OR Conf≥{int(globals().get('SETUP_FINAL_ADAPTIVE_MIN_CONF', 85) or 85)}/Dyn≥{float(globals().get('SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80):.0f} OR scout Conf≥{int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)}/Dyn≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 84) or 84):.0f}/RR≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.4) or 1.4):.1f}/Vol≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 15000000) or 15000000)/1_000_000:.0f}M, no weak combo/symbol/hour and valid Risk/SL/TP, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
