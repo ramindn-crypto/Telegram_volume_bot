@@ -2015,6 +2015,8 @@ SETUP_KEEP_MIN_CONF = int(os.environ.get("SETUP_KEEP_MIN_CONF", "84") or 84)
 SETUP_KEEP_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_KEEP_MIN_DYNAMIC_SCORE", "55") or 55)
 SETUP_REVERSE_PROBATION_MIN_CONF = int(os.environ.get("SETUP_REVERSE_PROBATION_MIN_CONF", "85") or 85)
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE", "60") or 60)
+SETUP_BASELINE_DISCOVERY_MIN_RR = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_RR", "1.25") or 1.25)
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_VOL_USD", "15000000") or 15000000)
 # Ver35: /setup_audit is an analytical report and must not disappear just because
 # the live execution gate is strict. Execution/email/autotrade still use the final
 # quality gate; audit keeps visibility of stored setup outcomes for learning.
@@ -2135,18 +2137,35 @@ SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE = float(os.environ.get("SETUP_EDGE_GUA
 # Ver49 hard runtime defaults: Render can retain stale environment values from older
 # builds.  These are intentionally forced in code so the live executable lane matches
 # /setup_matrix policy and does not starve at zero setups.
+#
+# Ver50: the live screenshots still showed 0 persisted executable rows because the
+# KEEP/REVERSE baseline lane was hard-blocking on Conf<85 and Dyn<60 before the
+# scout lane could help.  The system needs controlled forward-testing now, not a
+# frozen bot.  Keep real blockers (disabled combos, bad SL/TP/RR, weak symbol/combo/
+# hour, cooldown, risk caps), but lower the discovery lane just enough to persist
+# measurable setups for /setup_audit and AutoTrade learning.  Minimum liquidity stays
+# 15M, not 10M.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = True
-SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 83
-SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 70.0
-SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.30
+SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 82
+SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 55.0
+SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.25
 SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
-SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = 70.0
+SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 84
+SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
 SETUP_FINAL_SCOUT_ENABLED = True
-SETUP_FINAL_SCOUT_MIN_CONF = 83
-SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 70.0
-SETUP_FINAL_SCOUT_MIN_RR = 1.30
+SETUP_FINAL_SCOUT_MIN_CONF = 82
+SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 55.0
+SETUP_FINAL_SCOUT_MIN_RR = 1.25
 SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
-SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = 70.0
+SETUP_FINAL_ADAPTIVE_MIN_CONF = 84
+SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
+SETUP_KEEP_MIN_CONF = 80
+SETUP_KEEP_MIN_DYNAMIC_SCORE = 45.0
+SETUP_REVERSE_PROBATION_MIN_CONF = 80
+SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 45.0
+SETUP_BASELINE_DISCOVERY_MIN_RR = 1.25
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
+SETUP_EDGE_GUARD_STRICT_MIN_CONF = 80
 SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 15000000.0
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = False
 
@@ -43348,6 +43367,16 @@ def _setup_execution_quality_baseline_allows(setup_or_row, session_name: str = '
             return False, 'baseline_invalid_sell_price_order', meta
         if rr <= 0:
             return False, 'baseline_invalid_rr', meta
+        # Ver50 controlled discovery floor: after relaxing baseline Conf/Dyn, keep
+        # geometry/liquidity quality strict enough for real forward testing.
+        min_base_rr = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_RR', 1.25) or 1.25)
+        min_base_vol = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_VOL_USD', 15000000.0) or 15000000.0)
+        meta['baseline_discovery_min_rr'] = float(min_base_rr)
+        meta['baseline_discovery_min_vol_usd'] = float(min_base_vol)
+        if rr < min_base_rr:
+            return False, f'baseline_rr_below_{min_base_rr:.2f}', meta
+        if fut_vol < min_base_vol:
+            return False, f'baseline_vol_below_{min_base_vol/1_000_000:.0f}M', meta
         if not _setup_volume_ok(setup_or_row):
             return False, 'baseline_below_min_volume', meta
 
