@@ -1320,6 +1320,52 @@ def _autotrade_apply_ver17_time_risk_policy_defaults() -> None:
         pass
 
 
+
+def _autotrade_apply_ver32_quality_defaults() -> None:
+    """Ver32 WR-first live defaults.
+
+    Forward-test output showed too many executable/email/autotrade setups and poor
+    realised WR.  This migration caps AutoTrade entries/day and hardens the shared
+    final quality gate without deleting user/email/API/session configuration.
+    """
+    try:
+        target_version = 'ver32_2026_05_19_quality_gate'
+        if str(_autotrade_config_get('ver32_quality_gate_policy_version', '') or '').strip().lower() == target_version:
+            return
+        try:
+            cur = int(float(_autotrade_config_get(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, 0) or 0))
+        except Exception:
+            cur = 0
+        target = max(1, int(globals().get('AUTOTRADE_VER32_MAX_TRADES_PER_DAY', 5) or 5))
+        if cur <= 0 or cur > target:
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(target))
+        try:
+            cfg = load_strategy_config(force=True)
+            changed = False
+            # Keep discovery in /setup_matrix, but make live executable/email stricter.
+            if float(cfg.get('quality_score_min_email', 0) or 0) < 72.0:
+                cfg['quality_score_min_email'] = 72.0
+                changed = True
+            if float(cfg.get('min_rr_tp', 0) or 0) < 1.40:
+                cfg['min_rr_tp'] = 1.40
+                changed = True
+            cfg['ver32_quality_gate_enabled'] = True
+            cfg['goal_profile_target_setups_per_day_lo'] = 3.0
+            cfg['goal_profile_target_setups_per_day_hi'] = 5.0
+            cfg['target_setups_per_day_lo'] = 3.0
+            cfg['target_setups_per_day_hi'] = 5.0
+            cfg['governor_target_lo'] = 3.0
+            cfg['governor_target_hi'] = 5.0
+            changed = True
+            if changed:
+                save_strategy_config(cfg)
+                apply_strategy_config(cfg)
+        except Exception:
+            pass
+        _autotrade_config_set('ver32_quality_gate_policy_version', target_version)
+    except Exception:
+        pass
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -1584,7 +1630,20 @@ SETUP_COMBO_WATCH_STRICT_QUALITY_GATE = env_bool("SETUP_COMBO_WATCH_STRICT_QUALI
 SETUP_COMBO_WATCH_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_MIN_CONF", "87") or 87)
 SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE", "70") or 70)
 SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
-SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "3") or 3)
+# Ver32 WR-first final gate: the executable lane itself is now quality-gated,
+# not only the downstream email/autotrade consumer.  This keeps /setup_audit,
+# /setup_matrix, setup emails and AutoTrade aligned around the same 50%+ WR target.
+SETUP_FINAL_QUALITY_GATE_ENABLED = env_bool("SETUP_FINAL_QUALITY_GATE_ENABLED", True)
+SETUP_FINAL_MIN_CONF = int(os.environ.get("SETUP_FINAL_MIN_CONF", "87") or 87)
+SETUP_FINAL_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_MIN_DYNAMIC_SCORE", "70") or 70)
+SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
+SETUP_FINAL_UNKNOWN_AS_WATCH = env_bool("SETUP_FINAL_UNKNOWN_AS_WATCH", True)
+SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
+SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE = env_bool("SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE", True)
+AUTOTRADE_VER32_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER32_MAX_TRADES_PER_DAY", "5") or 5)
+EMAIL_VER32_HARD_MAX_PER_DAY = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_DAY", "5") or 5)
+EMAIL_VER32_HARD_MAX_PER_SESSION = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_SESSION", "3") or 3)
+SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "8") or 8)
 SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "4") or 4)
 SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
 SETUP_COMBO_POLICY_DISABLE_WR = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_WR", "45") or 45)
@@ -2433,7 +2492,9 @@ LEADERS_N = 10
 
 # ✅ More setups on /screen (UX), while email stays strict
 SETUPS_N = int(os.environ.get("SETUPS_N", "5") or 5)
-EMAIL_SETUPS_N = int(os.environ.get("EMAIL_SETUPS_N", "2") or 2)
+EMAIL_SETUPS_N = int(os.environ.get("EMAIL_SETUPS_N", "1") or 1)
+# Ver32: one setup per email batch by default; users can only lower/raise by env up to this hard max.
+EMAIL_SETUPS_N = max(1, min(int(EMAIL_SETUPS_N or 1), int(os.environ.get("EMAIL_SETUPS_N_HARD_MAX", "1") or 1)))
 
 # ✅ Global setup quality floor (Premium & Selective)
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "72"))
@@ -3774,6 +3835,7 @@ try:
     _autotrade_apply_ver20_blackout_policy_defaults()
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
+    _autotrade_apply_ver32_quality_defaults()
 except Exception:
     pass
 
@@ -8948,10 +9010,11 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
         try:
             policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
-            if not _setup_combo_policy_allows_setup(s, sess, user_id=policy_uid):
-                return (False, 'combo_policy_quality_gate_blocked')
+            final_ok, final_why, _final_meta = _setup_final_quality_gate_allows_setup(s, sess, user_id=policy_uid)
+            if not final_ok:
+                return (False, str(final_why or 'final_quality_gate_blocked'))
         except Exception:
-            return (False, 'combo_policy_gate_exception')
+            return (False, 'final_quality_gate_exception')
 
         source_kind_u = str(getattr(s, "source_kind", "") or "").lower().strip()
         family_u = str(getattr(s, "family_id", "") or getattr(s, "engine", "") or "").upper().strip()
@@ -20002,21 +20065,17 @@ def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: flo
     )
     rows = [dict(r) for r in (cur.fetchall() or [])]
     con.close()
-    # Filter already-persisted stale bad-edge setups before email/autotrade consume them.
-    # This keeps the executable lane synchronized with the same micro guard used at persistence time.
+    # Filter already-persisted stale/old rows before email/autotrade consume them.
+    # Ver32 uses the same final gate as live generation, so old low-confidence rows
+    # from pre-patch deployments no longer leak into email or AutoTrade.
     out = []
     for r in rows:
         try:
-            if not _setup_combo_policy_allows_setup(r, str(r.get('session') or session_name or ''), user_id=int(user_id or 0)):
+            final_ok, _final_why, _final_meta = _setup_final_quality_gate_allows_setup(r, str(r.get('session') or session_name or ''), user_id=int(user_id or 0))
+            if not final_ok:
                 continue
         except Exception:
             continue
-        try:
-            allowed, _reason = _setup_edge_quality_guard_allows_setup(r, str(r.get('session') or session_name or ''), user_id=int(user_id or 0))
-            if not allowed:
-                continue
-        except Exception:
-            pass
         out.append(r)
         if len(out) >= int(limit or 10):
             break
@@ -20079,22 +20138,24 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
             for _target_uid in target_uids:
                 stats['attempted'] += 1
                 try:
-                    if not _setup_combo_policy_allows_setup(s, sess, user_id=int(_target_uid)):
+                    final_ok, final_why, final_meta = _setup_final_quality_gate_allows_setup(s, sess, user_id=int(_target_uid))
+                    if not final_ok:
                         stats['combo_policy_skips'] += 1
                         db_log_setup_pipeline_event(
                             int(_target_uid),
-                            stage='executable_combo_policy',
+                            stage='executable_final_quality_gate',
                             status='skip',
                             session=sess,
                             mode=str(mode or ''),
                             setup_id=sid,
                             symbol=sym,
                             side=side,
-                            details={'reason': 'family_session_combo_disabled_by_edge_matrix', 'source_kind': str(source_kind or 'executable_setups')},
+                            details={'reason': str(final_why or 'final_quality_gate_blocked'), 'source_kind': str(source_kind or 'executable_setups'), **dict(final_meta or {})},
                         )
                         continue
                 except Exception:
-                    pass
+                    stats['combo_policy_skips'] += 1
+                    continue
                 try:
                     _edge_allowed, _edge_reason = _setup_edge_quality_guard_allows_setup(s, sess, user_id=int(_target_uid))
                     if not _edge_allowed:
@@ -32466,10 +32527,11 @@ def is_executable_setup_eligible(
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
         try:
             policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
-            if not _setup_combo_policy_allows_setup(s, sess, user_id=policy_uid):
-                return (False, 'combo_policy_quality_gate_blocked')
+            final_ok, final_why, _final_meta = _setup_final_quality_gate_allows_setup(s, sess, user_id=policy_uid)
+            if not final_ok:
+                return (False, str(final_why or 'final_quality_gate_blocked'))
         except Exception:
-            return (False, 'combo_policy_gate_exception')
+            return (False, 'final_quality_gate_exception')
 
         cfg_live = load_strategy_config(force=False)
         exec_engine_b_enabled = _cfg_bool((cfg_live or {}).get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
@@ -34962,6 +35024,22 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
         day_cap = int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))
     except Exception:
         day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
+
+    # Ver32 quality-over-quantity safety cap.  A stored value of 0 still means
+    # "unlimited by user config", but the live bot applies this hard effective
+    # cap so setup emails do not flood the executable/autotrade lane.
+    try:
+        hard_day = int(globals().get('EMAIL_VER32_HARD_MAX_PER_DAY', 5) or 5)
+        if hard_day > 0:
+            day_cap = hard_day if day_cap <= 0 else min(int(day_cap), int(hard_day))
+    except Exception:
+        pass
+    try:
+        hard_sess = int(globals().get('EMAIL_VER32_HARD_MAX_PER_SESSION', 3) or 3)
+        if hard_sess > 0:
+            session_cap = hard_sess if session_cap <= 0 else min(int(session_cap), int(hard_sess))
+    except Exception:
+        pass
 
     current_sess = None
     current_session_key = ''
@@ -40746,6 +40824,14 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                 rr['setup_id'] = _setup_audit_unique_key(rr)
             if not _setup_volume_ok(float(rr.get('fut_vol_usd') or 0.0)):
                 continue
+            if bool(globals().get('SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE', True)):
+                try:
+                    sess_rr = str(rr.get('session') or rr.get('source_session') or '').upper().strip()
+                    final_ok, _final_why, _final_meta = _setup_final_quality_gate_allows_setup(rr, sess_rr, user_id=int(uid or 0))
+                    if not final_ok:
+                        continue
+                except Exception:
+                    continue
             cleaned.append(rr)
         except Exception:
             continue
@@ -41596,6 +41682,16 @@ def _setup_combo_policy_valid_for_enforcement(pol: dict | None) -> bool:
         kind = str(pol.get('policy_kind') or 'manual').lower().strip()
         if kind not in {'scheduled', 'interim', 'emergency', 'daily_safety'}:
             return False
+        # Ver32: daily safety may only enforce when enough decided samples existed
+        # at the time the row was written.  Old low-sample daily_safety rows from
+        # previous builds are ignored automatically instead of blocking live lanes.
+        if kind == 'daily_safety':
+            try:
+                min_dec = max(8, int(globals().get('SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED', 8) or 8))
+                if int(pol.get('last_decided') or 0) < min_dec:
+                    return False
+            except Exception:
+                return False
         expires_ts = float(pol.get('expires_ts') or 0.0)
         if expires_ts > 0 and float(time.time()) > expires_ts:
             return False
@@ -41810,7 +41906,11 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
             c_score = float(cm.get('score') or 0.0)
             c_tp = int(cm.get('tp') or 0)
             c_sl = int(cm.get('sl') or 0)
-            min_dec = max(4, int(globals().get('SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED', 8) or 8))
+            # Final WATCH/KEEP quality gate can reject a weak combo earlier than
+            # daily_safety disables it.  Daily safety still needs 8+ decided samples
+            # before writing a DISABLE row; this only prevents new executable/email/AT
+            # entries from weak probation lanes.
+            min_dec = max(3, int(globals().get('SETUP_FINAL_WEAK_COMBO_MIN_DECIDED', 3) or 3))
             target_wr = float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50)
             weak_combo = c_dec >= min_dec and c_wr < target_wr and (c_avg <= 0.05 or c_score <= 0.0 or c_sl >= max(2, int(math.ceil(max(1, c_tp) * 1.25))))
             if weak_combo:
@@ -41852,6 +41952,61 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         meta['error'] = f'{type(exc).__name__}: {exc}'
         return False, 'watch_strict_quality_exception', meta
 
+
+def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    """Shared final gate for executable queue, setup emails, AutoTrade and audit.
+
+    Ver32 rule:
+    - DISABLE always blocks.
+    - KEEP and WATCH are not enough by themselves; the setup must be complete,
+      high-confidence, dynamically strong, not weak by combo/symbol/hour evidence,
+      and have valid projected Risk%, Risk$, TP$, SL and TP.
+    - Unknown policy rows are treated as WATCH probation when
+      SETUP_FINAL_REQUIRE_POLICY_STATE is enabled.
+    """
+    meta = {}
+    try:
+        if not bool(globals().get('SETUP_FINAL_QUALITY_GATE_ENABLED', True)):
+            return True, 'final_quality_gate_disabled', meta
+        sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        fam, sess2 = _setup_combo_family_session_from_obj(setup_or_row, session_name=sess)
+        sess = str(sess or sess2 or '').upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            return False, 'final_missing_session', meta
+
+        info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
+        found = bool(info.get('found'))
+        status = str(info.get('status') or ('WATCH' if bool(globals().get('SETUP_FINAL_UNKNOWN_AS_WATCH', True)) else 'UNKNOWN')).upper().strip()
+        enabled = int(info.get('enabled') or (1 if not found else 0)) == 1
+        combo = str(info.get('combo') or f'{fam}-{sess}').upper().strip()
+        meta.update({'family': fam, 'session': sess, 'combo': combo, 'policy_found': found, 'policy_status': status, 'policy_enabled': enabled})
+
+        if status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled:
+            return False, 'final_combo_disabled', meta
+        if bool(globals().get('SETUP_FINAL_REQUIRE_POLICY_STATE', True)) and status not in {'KEEP', 'WATCH'}:
+            return False, f'final_policy_not_keep_or_watch:{status or "UNKNOWN"}', meta
+
+        # Use the stricter WATCH validator as the single executable/email/autotrade
+        # quality gate.  It checks complete data, price order, min confidence,
+        # micro edge blocks, weak combo/symbol/hour, dynamic score and Risk$/TP$.
+        ok, why, qmeta = _setup_watch_policy_strict_quality_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0))
+        meta.update(dict(qmeta or {}))
+        if not ok:
+            return False, f'final_{why}', meta
+
+        # Ver32 hard floors are mirrored here so even a future change to the WATCH
+        # constants cannot silently loosen the final executable lane.
+        conf = int(float(meta.get('conf') or _autotrade_setup_attr(setup_or_row, 'conf', 0) or 0))
+        dyn_score = float(meta.get('dynamic_score') or _autotrade_setup_attr(setup_or_row, 'dynamic_risk_score', 0.0) or 0.0)
+        if conf < int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87):
+            return False, f'final_conf_below_{int(globals().get("SETUP_FINAL_MIN_CONF", 87) or 87)}', meta
+        if dyn_score < float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):
+            return False, f'final_dynamic_score_below_{float(globals().get("SETUP_FINAL_MIN_DYNAMIC_SCORE", 70) or 70):.0f}', meta
+        return True, 'final_quality_ok', meta
+    except Exception as exc:
+        meta['error'] = f'{type(exc).__name__}: {exc}'
+        return False, 'final_quality_gate_exception', meta
+
 def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> bool:
     """Live gate for DB-learned family/session combinations.
 
@@ -41867,6 +42022,26 @@ def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_
             return True
         info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
         if not bool(info.get('found')):
+            # Ver32: no policy row means probation/WATCH, not automatic execution.
+            # This stops new/default WATCH combos becoming executable just because Exec=ON.
+            if bool(globals().get('SETUP_FINAL_UNKNOWN_AS_WATCH', True)):
+                ok, why, meta = _setup_watch_policy_strict_quality_allows(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
+                if not ok:
+                    try:
+                        db_log_setup_pipeline_event(
+                            int(user_id or 0),
+                            stage='unknown_watch_quality_gate',
+                            status='skip',
+                            session=str(session_name or ''),
+                            mode='quality_gate',
+                            setup_id=str(_autotrade_setup_attr(setup_or_row, 'setup_id', '') or _autotrade_setup_attr(setup_or_row, 'id', '') or ''),
+                            symbol=str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or ''),
+                            side=str(_autotrade_setup_attr(setup_or_row, 'side', '') or ''),
+                            details={'reason': str(why), **dict(meta or {})},
+                        )
+                    except Exception:
+                        pass
+                return bool(ok)
             return True
         status = str(info.get('status') or 'WATCH').upper().strip()
         enabled = int(info.get('enabled') or 0) == 1
