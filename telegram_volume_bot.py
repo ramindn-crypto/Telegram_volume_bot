@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver29: AutoTrade report now avoids fake legacy risk/TP values, makes Reason/LossReason analytically useful, and aligns overall top-loss reasons with the detailed journal.
 # - Ver28: AutoTrade report now persists/displays real dynamic Risk%, Risk$ and TP$; adds CloseReason + LossReason taxonomy; /autotrade_report_overall uses the same classifier and top loss reason.
 # - 15May_ver12: Enforced strict TP/SL-only lifecycle: no automatic mid-trade market closes/reductions for risk correction, exit-attach lag, or opposite F8 signals; report now shows TP/SL/OPEN exit type.
 # - 15May_ver11: Controlled safe-leverage downgrade: setups needing practical lower leverage (e.g. 7x vs configured 10x) can open safely; very low required leverage remains blocked.
@@ -44213,10 +44214,9 @@ AUTOTRADE_REPORT_LOSS_REASON_CHOICES = (
 def _autotrade_report_loss_reason(row: dict) -> str:
     """Best-effort analytical loss reason for continuous improvement.
 
-    This is not fake exchange data: direct SL/time/max-hold evidence wins.  The
-    remaining labels are deterministic inferences from the stored setup features
-    and current policy/micro-guard state, so the weekly/daily optimizer can group
-    losses by practical causes instead of a useless generic LOSS_CLOSE.
+    Ver29: direct SL proof no longer stops the analysis immediately.  The report
+    already has Result=SL; LossReason should explain the likely *cause* so the
+    policy engine and weekly review can tighten the right variable.
     """
     try:
         row = dict(row or {})
@@ -44225,8 +44225,6 @@ def _autotrade_report_loss_reason(row: dict) -> str:
             return 'CLOSED_BEFORE_ASIA_LOSS'
         if 'MAX_POSITION' in note or 'MAX_HOLD' in note or 'MAX-HOLD' in note:
             return 'MAX_HOLD_LOSS'
-        if _autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL'):
-            return 'SL_HIT'
 
         sym = str(row.get('symbol') or '').upper().replace('USDT', '')
         side = str(row.get('side') or '').upper().strip()
@@ -44234,7 +44232,8 @@ def _autotrade_report_loss_reason(row: dict) -> str:
         sess = str(row.get('session') or row.get('open_session') or '').upper().strip()
         combo = f"{fam}-{sess}" if fam and sess else ''
 
-        # Current enforced/guard evidence.
+        # Enforced policy / micro-edge evidence first: this is usually the most
+        # actionable reason for the next week/day adjustment.
         try:
             disabled = set(_setup_combo_disabled_set(int(row.get('uid') or AUTOTRADE_OWNER_UID or 0)) or set())
             if combo and combo in disabled:
@@ -44265,21 +44264,25 @@ def _autotrade_report_loss_reason(row: dict) -> str:
         except Exception:
             pass
 
+        # Setup mechanics: identify if stop placement or entry quality was the likely problem.
         entry = float(row.get('entry') or 0.0)
         sl = float(row.get('sl') or 0.0)
         if entry > 0 and sl > 0:
             sl_pct = abs(entry - sl) / max(abs(entry), 1e-12) * 100.0
-            # Below ~1.2% is often noise-level for small/mid-cap crypto.  For bigger caps,
-            # the same label still points to stop placement rather than signal direction.
             if sl_pct < 1.20:
                 return 'TIGHT_SL'
-            if sl_pct > 0:
-                try:
-                    atr_pct = float(row.get('atr_pct') or 0.0)
-                    if atr_pct > 0 and sl_pct < max(0.65 * atr_pct, 0.8):
-                        return 'TIGHT_SL'
-                except Exception:
-                    pass
+            try:
+                atr_pct = float(row.get('atr_pct') or 0.0)
+                if atr_pct > 0 and sl_pct < max(0.65 * atr_pct, 0.8):
+                    return 'TIGHT_SL'
+            except Exception:
+                pass
+            # Very wide SL that still loses often means the entry was too late/chased.
+            try:
+                if sl_pct > 8.0 and abs(float(row.get('ch15') or 0.0)) > 1.5:
+                    return 'BAD_ENTRY'
+            except Exception:
+                pass
 
         try:
             drift = float(row.get('entry_drift_adverse_pct') or row.get('entry_delta_pct') or 0.0)
@@ -44309,10 +44312,13 @@ def _autotrade_report_loss_reason(row: dict) -> str:
                 return 'LOW_VOLUME'
         except Exception:
             pass
+
+        # Only keep SL_HIT when no better actionable cause can be inferred.
+        if _autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL'):
+            return 'SL_HIT'
         return 'LOSS_CLOSE'
     except Exception:
         return 'LOSS_CLOSE'
-
 
 def _autotrade_report_exit_reason(row: dict, result: str | None = None) -> str:
     """Short user-facing close reason used by /autotrade_report.
@@ -44340,7 +44346,9 @@ def _autotrade_report_exit_reason(row: dict, result: str | None = None) -> str:
                 return 'MAX_HOLD_LOSS'
             return 'MAX_HOLD'
         if res == 'TP':
-            return 'TP_HIT'
+            if _autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP'):
+                return 'TP_HIT'
+            return 'PROFIT_CLOSE'
         if res == 'SL':
             return _autotrade_report_loss_reason(row)
         if res == 'FLAT':
@@ -44352,36 +44360,41 @@ def _autotrade_report_exit_reason(row: dict, result: str | None = None) -> str:
         return 'OTHER_CLOSE'
 
 def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
-    """Add authoritative risk_usd/risk_pct/tp_usd estimates where possible.
+    """Add reporting risk/TP amounts without inventing fake legacy values.
 
-    Priority:
-    1) stored execution metadata persisted by ver28 (risk_usd/risk_pct/tp_usd),
-    2) actual setup geometry × executed/closed qty,
-    3) lifecycle risk_usdt,
-    4) last-resort percentage-to-dollar conversion.
-
-    This prevents /autotrade_report from displaying the base config risk (for example
-    1.50%) for every row when dynamic risk actually sized each trade differently.
+    Ver29 rule:
+    - show Risk$/TP$ only when they come from stored execution metadata or
+      actual position geometry (entry/SL/TP x executed qty x contract size),
+    - do NOT convert a generic/default risk percentage into a fake dollar amount
+      for old rows, because that corrupts continuous improvement analysis,
+    - keep source flags so the Telegram table can hide unknown legacy values
+      instead of showing base-config placeholders such as 1.50% / 29.04.
     """
     out = dict(row or {})
     try:
         eq = float(equity or 0.0)
 
-        def _num(*keys, absval: bool = False) -> float:
-            best = 0.0
+        def _first_num(keys, absval: bool = False) -> tuple[float, str]:
             for k in keys:
                 try:
-                    v = float(out.get(k) or 0.0)
+                    raw = out.get(k)
+                    if raw in (None, ''):
+                        continue
+                    v = float(raw or 0.0)
                     if absval:
                         v = abs(v)
-                    if v > best:
-                        best = v
+                    if v > 0:
+                        return float(v), str(k)
                 except Exception:
                     pass
-            return float(best or 0.0)
+            return 0.0, ''
 
-        risk_usd = _num('risk_usd', 'risk_usdt', 'risk', 'risk_est', 'estimated_risk_usd', 'target_risk_usd', 'filled_risk_usd', 'risk_actual_usd', absval=True)
-        tp_usd = _num('tp_usd', 'tp_usdt', 'target_tp_usd', 'expected_tp_usd', absval=True)
+        amount_keys = ('risk_usd', 'risk_usdt', 'filled_risk_usd', 'risk_actual_usd', 'target_risk_usd', 'estimated_risk_usd', 'risk_est')
+        tp_amount_keys = ('tp_usd', 'tp_usdt', 'target_tp_usd', 'expected_tp_usd')
+        risk_usd, risk_src_key = _first_num(amount_keys, absval=True)
+        tp_usd, tp_src_key = _first_num(tp_amount_keys, absval=True)
+        risk_src = 'stored_amount' if risk_usd > 0 else ''
+        tp_src = 'stored_amount' if tp_usd > 0 else ''
 
         entry = float(out.get('entry') or 0.0)
         sl = float(out.get('sl') or 0.0)
@@ -44399,40 +44412,54 @@ def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
         if entry > 0 and sl > 0 and qty > 0:
             geom_risk = abs(entry - sl) * qty * cs
             if geom_risk > 0:
-                # Geometry from actual qty is the most reliable dollar risk for old rows.
-                risk_usd = geom_risk
+                risk_usd = float(geom_risk)
+                risk_src = 'geometry_qty'
         if entry > 0 and tp > 0 and qty > 0:
             geom_tp = abs(tp - entry) * qty * cs
             if geom_tp > 0:
-                tp_usd = geom_tp
-        elif tp_usd <= 0 and risk_usd > 0:
-            rr = 0.0
+                tp_usd = float(geom_tp)
+                tp_src = 'geometry_qty'
+        elif tp_usd <= 0 and risk_usd > 0 and entry > 0 and sl > 0 and tp > 0:
             try:
-                rr = abs(tp - entry) / max(abs(entry - sl), 1e-12) if entry > 0 and sl > 0 and tp > 0 else float(out.get('rr_tp') or out.get('rr_tp_target') or 0.0)
+                rr = abs(tp - entry) / max(abs(entry - sl), 1e-12)
             except Exception:
-                rr = 0.0
+                rr = float(out.get('rr_tp') or out.get('rr_tp_target') or 0.0)
             if rr > 0:
-                tp_usd = risk_usd * rr
+                tp_usd = float(risk_usd) * float(rr)
+                tp_src = 'rr_from_real_risk'
 
-        # Last resort: if lifecycle only has a risk percentage, show a dollar estimate
-        # rather than a blank. Do not let this override real geometry/stored risk.
-        raw_risk_pct = 0.0
-        for k in ('risk_pct', 'filled_risk_pct', 'risk_actual_pct', 'allowed_risk_pct'):
-            try:
-                raw_risk_pct = max(raw_risk_pct, float(out.get(k) or 0.0))
-            except Exception:
-                pass
-        if risk_usd <= 0 and eq > 0 and raw_risk_pct > 0:
-            risk_usd = eq * (raw_risk_pct / 100.0)
-        risk_pct = float(out.get('risk_pct') or 0.0)
+        pct_keys_actual = ('risk_actual_pct', 'filled_risk_pct')
+        pct_actual, pct_actual_key = _first_num(pct_keys_actual, absval=True)
+        raw_allowed_pct, raw_allowed_key = _first_num(('allowed_risk_pct',), absval=True)
+        raw_risk_pct, raw_risk_key = _first_num(('risk_pct',), absval=True)
+
+        risk_pct = 0.0
+        risk_pct_src = ''
         if risk_usd > 0 and eq > 0:
             risk_pct = (risk_usd / eq) * 100.0
-        elif risk_pct <= 0:
+            risk_pct_src = 'risk_usd_equity'
+        elif pct_actual > 0:
+            risk_pct = pct_actual
+            risk_pct_src = pct_actual_key
+        elif raw_risk_pct > 0 and (float(out.get('dynamic_risk_score') or 0.0) > 0 or float(out.get('risk_multiplier') or 0.0) > 0):
+            # Risk percentage persisted with dynamic-risk metadata is useful even if
+            # quantity is missing; a plain old/base risk_pct without that context is not.
             risk_pct = raw_risk_pct
+            risk_pct_src = raw_risk_key
+        elif raw_allowed_pct > 0 and (float(out.get('dynamic_risk_score') or 0.0) > 0 or float(out.get('risk_multiplier') or 0.0) > 0):
+            risk_pct = raw_allowed_pct
+            risk_pct_src = raw_allowed_key
 
+        # Never create Risk$ from a generic percentage only.  That was the cause of
+        # repeated fake legacy values (for example 29.04) in the report.
         out['risk_usd'] = float(risk_usd or 0.0)
         out['risk_pct'] = float(risk_pct or 0.0)
         out['tp_usd'] = float(tp_usd or 0.0)
+        out['risk_usd_source'] = str(risk_src or '')
+        out['risk_pct_source'] = str(risk_pct_src or '')
+        out['tp_usd_source'] = str(tp_src or '')
+        out['risk_report_quality'] = 'real' if risk_src in {'stored_amount', 'geometry_qty'} else ('pct_only' if risk_pct > 0 else 'unknown')
+        out['tp_report_quality'] = 'real' if tp_src in {'stored_amount', 'geometry_qty', 'rr_from_real_risk'} else 'unknown'
         if tp > 0:
             out['tp'] = float(tp)
         if risk_usd > 0 and tp_usd > 0:
@@ -44655,7 +44682,7 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
                 matched['pnl'] = float(matched.get('pnl') or 0.0) + float(pnl)
                 matched['pnl_usdt'] = float(matched.get('pnl') or 0.0)
                 # Preserve the best available execution/reporting metadata for the merged position.
-                for _mk in ('risk_usd', 'risk_pct', 'tp_usd', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'entry', 'sl', 'tp', 'qty', 'conf', 'fut_vol_usd', 'ch24', 'ch4', 'ch1'):
+                for _mk in ('risk_usd', 'risk_pct', 'tp_usd', 'risk_usd_source', 'risk_pct_source', 'tp_usd_source', 'risk_report_quality', 'tp_report_quality', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'entry', 'sl', 'tp', 'qty', 'conf', 'fut_vol_usd', 'ch24', 'ch4', 'ch1'):
                     try:
                         if float(matched.get(_mk) or 0.0) <= 0 and float(r.get(_mk) or 0.0) > 0:
                             matched[_mk] = r.get(_mk)
@@ -44704,7 +44731,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v28_risk_reason:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v29_real_risk_reason:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -44808,6 +44835,13 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'risk_usd': float(row.get('risk_usd') or 0.0),
             'risk_pct': float(row.get('risk_pct') or 0.0),
             'tp_usd': float(row.get('tp_usd') or 0.0),
+            'risk_usd_source': str(row.get('risk_usd_source') or ''),
+            'risk_pct_source': str(row.get('risk_pct_source') or ''),
+            'tp_usd_source': str(row.get('tp_usd_source') or ''),
+            'risk_report_quality': str(row.get('risk_report_quality') or ''),
+            'tp_report_quality': str(row.get('tp_report_quality') or ''),
+            'dynamic_risk_score': float(row.get('dynamic_risk_score') or 0.0),
+            'risk_multiplier': float(row.get('risk_multiplier') or 0.0),
             'close_reason': 'OPEN',
             'note': str(row.get('note') or ''),
             'closed_kind': 'OPEN',
@@ -44856,6 +44890,13 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'risk_usd': float(row.get('risk_usd') or 0.0),
             'risk_pct': float(row.get('risk_pct') or 0.0),
             'tp_usd': float(row.get('tp_usd') or 0.0),
+            'risk_usd_source': str(row.get('risk_usd_source') or ''),
+            'risk_pct_source': str(row.get('risk_pct_source') or ''),
+            'tp_usd_source': str(row.get('tp_usd_source') or ''),
+            'risk_report_quality': str(row.get('risk_report_quality') or ''),
+            'tp_report_quality': str(row.get('tp_report_quality') or ''),
+            'dynamic_risk_score': float(row.get('dynamic_risk_score') or r.get('dynamic_risk_score') or 0.0),
+            'risk_multiplier': float(row.get('risk_multiplier') or r.get('risk_multiplier') or 0.0),
             'closed_kind': _autotrade_report_closed_kind(row),
             'exit_reason': _autotrade_report_exit_reason(row),
         })
@@ -44893,7 +44934,12 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 return '-'
         def _reason_display(r: dict) -> str:
             try:
-                return str(r.get('exit_reason') or _autotrade_report_exit_reason(r, _result_display(r)) or '-')
+                res = _result_display(r)
+                # For losing trades this must be the actionable improvement cause,
+                # not just a generic "SL_HIT".  TP rows still show hit/profit.
+                if str(res).upper() == 'SL':
+                    return _autotrade_report_loss_reason(r)
+                return str(r.get('exit_reason') or _autotrade_report_exit_reason(r, res) or '-')
             except Exception:
                 return '-'
         def _loss_reason_display(r: dict) -> str:
@@ -44901,6 +44947,31 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 if str(_result_display(r)).upper() == 'SL':
                     return _autotrade_report_loss_reason(r)
                 return '-'
+            except Exception:
+                return '-'
+        def _real_money_cell(r: dict, key: str) -> str:
+            try:
+                qkey = 'risk_report_quality' if key == 'risk_usd' else 'tp_report_quality'
+                src = str(r.get(f'{key}_source') or '').strip()
+                qual = str(r.get(qkey) or '').strip().lower()
+                if qual != 'real' and src not in {'stored_amount', 'geometry_qty', 'rr_from_real_risk'}:
+                    return '-'
+                return _autotrade_report_money(r.get(key))
+            except Exception:
+                return '-'
+        def _real_pct_cell(r: dict) -> str:
+            try:
+                qual = str(r.get('risk_report_quality') or '').strip().lower()
+                src = str(r.get('risk_pct_source') or '').strip()
+                if qual not in {'real', 'pct_only'} and src not in {'risk_usd_equity', 'risk_actual_pct', 'filled_risk_pct'}:
+                    return '-'
+                return _autotrade_report_pct(r.get('risk_pct'))
+            except Exception:
+                return '-'
+        def _dyn_cell(r: dict) -> str:
+            try:
+                v = float(r.get('dynamic_risk_score') or 0.0)
+                return f'{v:.0f}' if v > 0 else '-'
             except Exception:
                 return '-'
         table_rows = []
@@ -44916,9 +44987,11 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 r.get('family'),
                 str(r.get('session') or '-'),
                 _autotrade_report_close_session(r),
-                _autotrade_report_pct(r.get('risk_pct')),
-                _autotrade_report_money(r.get('risk_usd')),
-                _autotrade_report_money(r.get('tp_usd')),
+                int(float(r.get('conf') or 0.0)) if float(r.get('conf') or 0.0) > 0 else '-',
+                _dyn_cell(r),
+                _real_pct_cell(r),
+                _real_money_cell(r, 'risk_usd'),
+                _real_money_cell(r, 'tp_usd'),
                 int(r.get('parts') or 1),
                 f"{float(r.get('pnl') or 0.0):+.2f}",
                 _reason_display(r),
@@ -44926,9 +44999,9 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             ])
         table = tabulate(
             table_rows,
-            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Fam', 'SesO', 'SesC', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason', 'LossReason'],
+            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Fam', 'SesO', 'SesC', 'Conf', 'Dyn', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason', 'LossReason'],
             tablefmt='plain',
-            colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'left', 'left'),
+            colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left', 'left'),
         )
         raw_count = int(len(bot_positions or [])) + int(len(closed_rows or []))
         lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> merged position rows. Raw fragments: <b>{raw_count}</b>. Time: <b>Melbourne</b>.")
@@ -45683,7 +45756,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v28_reason_matrix:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v29_real_risk_reason_matrix:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
