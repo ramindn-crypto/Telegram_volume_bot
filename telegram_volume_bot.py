@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver33: Synced WR-first live limits: WATCH rows display as GATED, AutoTrade hard-caps max open/day, max-hold and drift, and /autotrade_debug now explains email-cap blocking.
 # - Ver31: Final WR-first quality gate: WATCH combos are no longer executable by Exec=ON alone; only KEEP or strict WATCH candidates can reach executable queue/email/AutoTrade.
 # - Ver31: AutoTrade report loss reasons no longer label missing legacy/setup metadata as LOW_CONFIDENCE; added MISSING_SETUP_DATA and refreshed report caches.
 # - Ver30: AutoTrade debug daily risk used now reconciles open risk minus realised net profit/loss; report Dyn column infers a score when only dynamic risk% is stored.
@@ -1366,6 +1367,92 @@ def _autotrade_apply_ver32_quality_defaults() -> None:
     except Exception:
         pass
 
+
+def _autotrade_apply_ver33_wr_first_caps() -> None:
+    """Ver33 WR-first runtime caps and display sync.
+
+    Ver32 correctly added a strict quality gate, but live runtime config could still
+    show stale values such as max_open=20, max_trades/day=0, max_hold=18h and
+    entry_drift=1.5%.  That makes the system look unsynchronised and can allow too
+    many live attempts if caps are reset manually.  Ver33 clamps only trading risk
+    and throughput controls; it does not remove users, emails, sessions, timezone,
+    API credentials, or reporting tables.
+    """
+    try:
+        target_version = 'ver33_2026_05_19_wr_first_caps'
+        if str(_autotrade_config_get('ver33_wr_first_caps_policy_version', '') or '').strip().lower() == target_version:
+            return
+
+        max_day = max(1, int(globals().get('AUTOTRADE_VER33_MAX_TRADES_PER_DAY', 5) or 5))
+        max_open = max(1, int(globals().get('AUTOTRADE_VER33_MAX_OPEN_TRADES', 4) or 4))
+        max_hours = max(0.5, float(globals().get('AUTOTRADE_VER33_MAX_POSITION_HOURS', 8) or 8))
+        max_drift = max(0.05, float(globals().get('AUTOTRADE_VER33_MAX_ENTRY_DRIFT_PCT', 0.80) or 0.80))
+        day_cap_pct = max(0.5, float(globals().get('AUTOTRADE_VER33_DAILY_CAP_PCT', 6.0) or 6.0))
+
+        def _cap_int_cfg(key: str, target: int) -> None:
+            try:
+                cur = int(float(_autotrade_config_get(key, 0) or 0))
+            except Exception:
+                cur = 0
+            if cur <= 0 or cur > int(target):
+                _autotrade_config_set(key, int(target))
+
+        def _cap_float_cfg(key: str, target: float) -> None:
+            try:
+                cur = float(_autotrade_config_get(key, 0) or 0)
+            except Exception:
+                cur = 0.0
+            if cur <= 0 or cur > float(target):
+                _autotrade_config_set(key, float(target))
+
+        _cap_int_cfg(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(max_day))
+        _cap_int_cfg(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, int(max_open))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
+        _cap_float_cfg(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, float(max_hours))
+        _cap_float_cfg(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, float(max_drift))
+
+        # Keep AutoTrade daily risk consistent with 5 entries/day at about 0.8%-1.0%
+        # effective risk each. If the admin has already set a smaller cap, preserve it.
+        try:
+            mode, val = _autotrade_daily_cap_settings()
+            if str(mode or 'PCT').upper() != 'PCT' or float(val or 0.0) <= 0 or float(val or 0.0) > float(day_cap_pct):
+                _autotrade_set_daily_cap_settings('PCT', float(day_cap_pct))
+        except Exception:
+            pass
+
+        try:
+            cfg = load_strategy_config(force=True)
+            changed = False
+            # These are quality floors only; /screen/reporting still keep full analytics.
+            for k, target in {
+                'quality_score_min_email': 74.0,
+                'min_rr_tp': 1.40,
+                'goal_profile_target_setups_per_day_lo': 3.0,
+                'goal_profile_target_setups_per_day_hi': 5.0,
+                'target_setups_per_day_lo': 3.0,
+                'target_setups_per_day_hi': 5.0,
+                'governor_target_lo': 3.0,
+                'governor_target_hi': 5.0,
+            }.items():
+                try:
+                    cur = float(cfg.get(k, 0) or 0)
+                    if cur <= 0 or (k in {'quality_score_min_email', 'min_rr_tp'} and cur < float(target)) or (k not in {'quality_score_min_email', 'min_rr_tp'} and abs(cur - float(target)) > 1e-9):
+                        cfg[k] = float(target)
+                        changed = True
+                except Exception:
+                    cfg[k] = float(target)
+                    changed = True
+            cfg['ver33_wr_first_caps_enabled'] = True
+            if changed:
+                save_strategy_config(cfg)
+                apply_strategy_config(cfg)
+        except Exception:
+            pass
+
+        _autotrade_config_set('ver33_wr_first_caps_policy_version', target_version)
+    except Exception:
+        pass
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -1643,6 +1730,13 @@ SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE = env_bool("SETUP_AUDIT_APPLY_FINAL_QUALITY
 AUTOTRADE_VER32_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER32_MAX_TRADES_PER_DAY", "5") or 5)
 EMAIL_VER32_HARD_MAX_PER_DAY = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_DAY", "5") or 5)
 EMAIL_VER32_HARD_MAX_PER_SESSION = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_SESSION", "3") or 3)
+# Ver33 WR-first operating caps. These are runtime caps, not API/email/session deletion.
+# They keep live AutoTrade aligned with the 3-5 trades/day quality target.
+AUTOTRADE_VER33_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER33_MAX_TRADES_PER_DAY", "5") or 5)
+AUTOTRADE_VER33_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER33_MAX_OPEN_TRADES", "4") or 4)
+AUTOTRADE_VER33_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER33_MAX_POSITION_HOURS", "8") or 8)
+AUTOTRADE_VER33_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER33_MAX_ENTRY_DRIFT_PCT", "0.80") or 0.80)
+AUTOTRADE_VER33_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER33_DAILY_CAP_PCT", "6.0") or 6.0)
 SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "8") or 8)
 SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "4") or 4)
 SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
@@ -3836,6 +3930,7 @@ try:
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
     _autotrade_apply_ver32_quality_defaults()
+    _autotrade_apply_ver33_wr_first_caps()
 except Exception:
     pass
 
@@ -43248,8 +43343,20 @@ def _setup_combo_policy_text(uid: int) -> str:
                     live_state = 'TIGHTEN'
                     partial_count += 1
                 else:
-                    exec_state = 'ON'
-                    live_state = 'WATCH'
+                    # Ver33 display sync: WATCH is not automatically executable.
+                    # With the strict gate enabled, it is a probation lane and only
+                    # passes when the per-setup final quality gate succeeds.
+                    pol_status = str((pol or raw_pol or {}).get('status') or '').upper().strip()
+                    adv_status = str(score.get('action') or '').upper().strip()
+                    if pol_status == 'KEEP' or (not pol and adv_status == 'KEEP'):
+                        exec_state = 'KEEP'
+                        live_state = 'KEEP' if pol_status == 'KEEP' else 'WATCH'
+                    elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
+                        exec_state = 'GATE'
+                        live_state = 'WATCH'
+                    else:
+                        exec_state = 'ON'
+                        live_state = 'WATCH'
                     active_count += 1
 
                 if buy_block and sell_block:
@@ -43277,7 +43384,7 @@ def _setup_combo_policy_text(uid: int) -> str:
 
         # Show disabled/tightened rows first, then active rows by family/session. This makes
         # the safety state obvious while still showing every currently available combo.
-        order_rank = {'OFF': 0, 'PART': 1, 'ON': 2}
+        order_rank = {'OFF': 0, 'PART': 1, 'GATE': 2, 'KEEP': 3, 'ON': 4}
         def _row_key(row):
             combo = str(row[0])
             fam, sess = combo.split('-', 1) if '-' in combo else (combo, '')
@@ -43291,8 +43398,8 @@ def _setup_combo_policy_text(uid: int) -> str:
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
         note = (
-            f"Visible combos: <b>{len(table_rows)}</b> | Active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>ON</b>=active, <b>PART</b>=only one side is blocked by micro guard, <b>OFF</b>=fully disabled."
+            f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
+            f"Legend: <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}, Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f}, no weak combo/symbol/hour and valid Risk/SL/TP, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
@@ -43301,7 +43408,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             f"{guard_txt}\n{note}\n"
-            f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, and the micro edge guard are enforceable.\n"
+            f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, the micro edge guard, and the final WATCH quality gate are enforceable.\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -46064,7 +46171,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Daily risk used (AT) (open risk - realised net): ${_debug_daily_used_display:.2f}",
         ('Daily risk remaining (AT): ∞' if not math.isfinite(float(_debug_remaining_display)) else f"Daily risk remaining (AT): ${float(_debug_remaining_display):.2f}"),
         SEP,
-        'Email → executable lane',
+        'Email / AutoTrade entry gate',
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
         f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
         f"Session email cap: {session_cap_txt} (configured)",
@@ -46072,7 +46179,9 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Daily email cap: {day_cap_txt} (configured)",
         f"Emails sent today: {int(email_gate.get('sent_today', 0) or 0)}",
         f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
-        f"Executable lane: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
+        f"Email/AutoTrade gate: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
+        ("Gate note: cap reached means no further setup emails or email-triggered AutoTrade entries until the session/day counter resets." if (not bool(email_gate.get('gate_open')) and ('cap_reached' in str(gate_reason or ''))) else None),
+        ("Gate note: counters can show sent > cap immediately after a new stricter cap is deployed; the gate still blocks new entries now." if (not bool(email_gate.get('gate_open')) and ('cap_reached' in str(gate_reason or '')) and (int(email_gate.get('sent_in_session', 0) or 0) > int(email_gate.get('session_cap', 0) or 0) > 0 or int(email_gate.get('sent_today', 0) or 0) > int(email_gate.get('day_cap', 0) or 0) > 0)) else None),
         f"Recent emailed setups (unique, 12h): {emailed_recent}",
         f"Recent executable setups (unique sym/side, 12h): {exec_recent}",
     ]
