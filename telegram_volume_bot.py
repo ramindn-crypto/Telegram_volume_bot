@@ -1539,6 +1539,59 @@ def _autotrade_apply_ver35_no_hidden_email_caps() -> None:
     except Exception:
         pass
 
+
+
+def _autotrade_apply_ver36_user_runtime_defaults_resync() -> None:
+    """Ver36: force the user's forward-test AutoTrade defaults once.
+
+    Ver35 removed hidden email caps, but the deployed DB can still hold older runtime
+    values such as max_position_hours=18, max_trades_per_day=0 and entry_drift=1.50.
+    This migration writes the requested defaults once, then leaves the values editable
+    through /autotrade_config.
+    """
+    try:
+        target_version = 'ver36_2026_05_19_user_runtime_defaults_resync'
+        reapply = env_bool('AUTOTRADE_VER36_REAPPLY_DEFAULTS', False)
+        if (not reapply) and str(_autotrade_config_get('ver36_user_runtime_defaults_resync_version', '') or '').strip().lower() == target_version:
+            return
+        if not bool(globals().get('AUTOTRADE_VER36_FORCE_DEFAULTS_ON_DEPLOY', True)):
+            _autotrade_config_set('ver36_user_runtime_defaults_resync_version', target_version)
+            return
+
+        max_day = max(1, int(globals().get('AUTOTRADE_VER36_MAX_TRADES_PER_DAY', 50) or 50))
+        max_open = max(1, int(globals().get('AUTOTRADE_VER36_MAX_OPEN_TRADES', 20) or 20))
+        max_hours = max(0.25, min(72.0, float(globals().get('AUTOTRADE_VER36_MAX_POSITION_HOURS', 12) or 12)))
+        max_drift = max(0.0, float(globals().get('AUTOTRADE_VER36_MAX_ENTRY_DRIFT_PCT', 1.0) or 1.0))
+        day_cap_pct = max(0.0, float(globals().get('AUTOTRADE_VER36_DAILY_CAP_PCT', 15.0) or 15.0))
+
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(max_day))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, int(max_open))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, float(max_hours))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, float(max_drift))
+        _autotrade_set_daily_cap_settings('PCT', float(day_cap_pct))
+
+        try:
+            cfg = load_strategy_config(force=True)
+            cfg['ver36_user_runtime_defaults_resync_enabled'] = True
+            cfg['ver36_autotrade_forward_test_defaults'] = {
+                'max_trades_per_day': int(max_day),
+                'max_open_trades': int(max_open),
+                'max_position_hours': float(max_hours),
+                'max_entry_drift_pct': float(max_drift),
+                'daily_risk_cap_pct': float(day_cap_pct),
+                'telegram_editable': True,
+                'note': 'Applied once on deploy; later /autotrade_config edits are preserved unless AUTOTRADE_VER36_REAPPLY_DEFAULTS=1.',
+            }
+            save_strategy_config(cfg)
+            apply_strategy_config(cfg)
+        except Exception:
+            pass
+
+        _autotrade_config_set('ver36_user_runtime_defaults_resync_version', target_version)
+    except Exception:
+        pass
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -1836,6 +1889,14 @@ AUTOTRADE_VER34_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER34_MAX_OPEN_T
 AUTOTRADE_VER34_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER34_MAX_POSITION_HOURS", "12") or 12)
 AUTOTRADE_VER34_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER34_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
 AUTOTRADE_VER34_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER34_DAILY_CAP_PCT", "15.0") or 15.0)
+# Ver36: re-sync user-requested AutoTrade runtime defaults after stale persisted DB values.
+# These are applied once on deploy and remain editable via /autotrade_config.
+AUTOTRADE_VER36_FORCE_DEFAULTS_ON_DEPLOY = env_bool("AUTOTRADE_VER36_FORCE_DEFAULTS_ON_DEPLOY", True)
+AUTOTRADE_VER36_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER36_MAX_TRADES_PER_DAY", "50") or 50)
+AUTOTRADE_VER36_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER36_MAX_OPEN_TRADES", "20") or 20)
+AUTOTRADE_VER36_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER36_MAX_POSITION_HOURS", "12") or 12)
+AUTOTRADE_VER36_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER36_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
+AUTOTRADE_VER36_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER36_DAILY_CAP_PCT", "15.0") or 15.0)
 SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "8") or 8)
 SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "4") or 4)
 SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
@@ -4032,6 +4093,7 @@ try:
     _autotrade_apply_ver33_wr_first_caps()
     _autotrade_apply_ver34_user_requested_defaults()
     _autotrade_apply_ver35_no_hidden_email_caps()
+    _autotrade_apply_ver36_user_runtime_defaults_resync()
 except Exception:
     pass
 
