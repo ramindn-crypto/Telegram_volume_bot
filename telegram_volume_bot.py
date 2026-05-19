@@ -1977,17 +1977,17 @@ SETUP_COMBO_WATCH_STRICT_QUALITY_GATE = env_bool("SETUP_COMBO_WATCH_STRICT_QUALI
 SETUP_COMBO_WATCH_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_MIN_CONF", "87") or 87)
 SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE", "70") or 70)
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF", "85") or 85)
-SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE", "80") or 80)
+SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE", "70") or 80)
 # Ver47: starvation-safe scout lane.
-# Ver48: make the scout lane executable-safe instead of starvation-prone: default volume 15M,
-# dynamic score 84, RR 1.40; broad global-side micro-edge is advisory by default. This is NOT a loose normal lane: it only lets
-# one of the near-quality 84-confidence candidates survive when it also has solid
-# dynamic score, good RR and at least 15M 24h volume. It keeps the system learning instead of
-# sitting at 0 executable rows for hours, while preserving WR-first controls.
+# Ver49: anti-starvation correction.  Ver48 still allowed stale Render/env values and
+# the final WATCH gate to starve the executable pool for hours.  Keep WR-first
+# controls, but make the scout lane practical: Conf>=83, Dyn>=70, RR>=1.30,
+# Vol>=15M. Broad global BUY/SELL side history is advisory only; combo/symbol/hour
+# evidence and disabled policy rows remain enforceable.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = env_bool("SETUP_COMBO_WATCH_SCOUT_ENABLED", True)
-SETUP_COMBO_WATCH_SCOUT_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_CONF", "84") or 84)
-SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE", "84") or 84)
-SETUP_COMBO_WATCH_SCOUT_MIN_RR = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_RR", "1.40") or 1.40)
+SETUP_COMBO_WATCH_SCOUT_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_CONF", "83") or 84)
+SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
+SETUP_COMBO_WATCH_SCOUT_MIN_RR = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_RR", "1.30") or 1.40)
 SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
 SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
 # Ver32 WR-first final gate: the executable lane itself is now quality-gated,
@@ -1997,11 +1997,11 @@ SETUP_FINAL_QUALITY_GATE_ENABLED = env_bool("SETUP_FINAL_QUALITY_GATE_ENABLED", 
 SETUP_FINAL_MIN_CONF = int(os.environ.get("SETUP_FINAL_MIN_CONF", "87") or 87)
 SETUP_FINAL_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_MIN_DYNAMIC_SCORE", "70") or 70)
 SETUP_FINAL_ADAPTIVE_MIN_CONF = int(os.environ.get("SETUP_FINAL_ADAPTIVE_MIN_CONF", "85") or 85)
-SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE", "80") or 80)
+SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE", "70") or 80)
 SETUP_FINAL_SCOUT_ENABLED = env_bool("SETUP_FINAL_SCOUT_ENABLED", True)
-SETUP_FINAL_SCOUT_MIN_CONF = int(os.environ.get("SETUP_FINAL_SCOUT_MIN_CONF", "84") or 84)
-SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE", "84") or 84)
-SETUP_FINAL_SCOUT_MIN_RR = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_RR", "1.40") or 1.40)
+SETUP_FINAL_SCOUT_MIN_CONF = int(os.environ.get("SETUP_FINAL_SCOUT_MIN_CONF", "83") or 84)
+SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
+SETUP_FINAL_SCOUT_MIN_RR = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_RR", "1.30") or 1.40)
 SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = True  # Ver44: hard safety; unknown/new strategy combos enter WATCH probation, never hard-block as UNKNOWN
@@ -2130,6 +2130,25 @@ SETUP_EDGE_GUARD_BAD_HOUR_MIN_QUALITY = float(os.environ.get("SETUP_EDGE_GUARD_B
 SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED", "12") or 12)
 SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX", "32") or 32)
 SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE = float(os.environ.get("SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE", "92") or 92)
+
+
+# Ver49 hard runtime defaults: Render can retain stale environment values from older
+# builds.  These are intentionally forced in code so the live executable lane matches
+# /setup_matrix policy and does not starve at zero setups.
+SETUP_COMBO_WATCH_SCOUT_ENABLED = True
+SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 83
+SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 70.0
+SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.30
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = 70.0
+SETUP_FINAL_SCOUT_ENABLED = True
+SETUP_FINAL_SCOUT_MIN_CONF = 83
+SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 70.0
+SETUP_FINAL_SCOUT_MIN_RR = 1.30
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = 70.0
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 15000000.0
+SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = False
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
@@ -43848,11 +43867,12 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
             if int(sm.get('decided') or 0) >= int(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_MIN_DECIDED', 12) or 12):
                 if float(sm.get('wr') or 0.0) <= float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_WR_MAX', 32) or 32) and float(sm.get('avg_r') or 0.0) < 0 and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
                     reason = f'weak_global_side_block {side}: WR {float(sm.get("wr") or 0.0):.1f}%, AvgR {float(sm.get("avg_r") or 0.0):+.2f}, quality {q_v:.0f}'
-                    if bool(globals().get('SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED', False)):
+                    # Ver49: broad BUY/SELL history is never a hard executable blocker.
+                    # It is too coarse after NORMAL/REVERSE routing and caused zero-row starvation.
+                    if False:
                         return False, reason
-                    # Ver48: with NORMAL/REVERSE strategy routing, a broad BUY/SELL side
-                    # block can starve all candidates based on old normal-direction evidence.
-                    # Keep it as diagnostic only; combo, symbol and hour guards still hard-block.
+                    # Ver49: with NORMAL/REVERSE strategy routing, a broad BUY/SELL side
+                    # block is diagnostic only; combo, symbol and hour guards still hard-block.
                     try:
                         _setup_quality_gate_set_attr(setup_or_row, 'global_side_guard_note', reason)
                     except Exception:
