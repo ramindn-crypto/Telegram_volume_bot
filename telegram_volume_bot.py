@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
 # - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
 # - Ver44: Hard-fixed UNKNOWN Family-Session-Strategy policy fallback so new NOR/REV/MON combos always enter WATCH probation instead of being blocked as UNKNOWN; cleaned /why stale UNKNOWN policy gate noise.
@@ -2203,6 +2204,47 @@ FINAL_PIPELINE_LOCKED_MIN_CONF = int(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_C
 FINAL_PIPELINE_LOCKED_MIN_RR = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_RR", "1.20") or 1.20)
 FINAL_PIPELINE_LOCKED_MIN_VOL_USD = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_VOL_USD", "15000000") or 15000000)
 FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE", "35") or 35)
+
+# Ver52 EXECUTABLE_QUEUE_UNBLOCK: hard runtime override.
+# Render can keep old env values after many rapid deploys.  Force the live module to
+# use the same starvation-safe values everywhere.  This does not bypass SL/TP geometry,
+# liquidity, disabled NORMAL policy, cooldowns, daily/open risk caps, or Bybit order
+# verification.  It only prevents the legacy baseline/WATCH confidence/RR/dynamic floors
+# from leaving screen/email/autotrade with zero persisted executable rows.
+VER52_EXECUTABLE_QUEUE_UNBLOCK = True
+VER52_MIN_CONF = 72
+VER52_MIN_RR = 1.05
+VER52_MIN_VOL_USD = 15000000.0
+VER52_MIN_DYNAMIC_SCORE = 0.0
+SETUP_FINAL_MIN_CONF = 82
+SETUP_FINAL_MIN_DYNAMIC_SCORE = 35.0
+SETUP_FINAL_ADAPTIVE_MIN_CONF = 78
+SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = 25.0
+SETUP_FINAL_SCOUT_ENABLED = True
+SETUP_FINAL_SCOUT_MIN_CONF = VER52_MIN_CONF
+SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = VER52_MIN_DYNAMIC_SCORE
+SETUP_FINAL_SCOUT_MIN_RR = VER52_MIN_RR
+SETUP_FINAL_SCOUT_MIN_VOL_USD = VER52_MIN_VOL_USD
+SETUP_COMBO_WATCH_MIN_CONF = 82
+SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = 35.0
+SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 78
+SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = 25.0
+SETUP_COMBO_WATCH_SCOUT_ENABLED = True
+SETUP_COMBO_WATCH_SCOUT_MIN_CONF = VER52_MIN_CONF
+SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = VER52_MIN_DYNAMIC_SCORE
+SETUP_COMBO_WATCH_SCOUT_MIN_RR = VER52_MIN_RR
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = VER52_MIN_VOL_USD
+SETUP_KEEP_MIN_CONF = VER52_MIN_CONF
+SETUP_KEEP_MIN_DYNAMIC_SCORE = VER52_MIN_DYNAMIC_SCORE
+SETUP_REVERSE_PROBATION_MIN_CONF = VER52_MIN_CONF
+SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = VER52_MIN_DYNAMIC_SCORE
+SETUP_BASELINE_DISCOVERY_MIN_RR = VER52_MIN_RR
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = VER52_MIN_VOL_USD
+FINAL_PIPELINE_LOCKED_ENABLED = True
+FINAL_PIPELINE_LOCKED_MIN_CONF = VER52_MIN_CONF
+FINAL_PIPELINE_LOCKED_MIN_RR = VER52_MIN_RR
+FINAL_PIPELINE_LOCKED_MIN_VOL_USD = VER52_MIN_VOL_USD
+FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = VER52_MIN_DYNAMIC_SCORE
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
@@ -21086,6 +21128,9 @@ def _setup_executable_details_json(s, session: str = '') -> str:
             'strategy': _setup_strategy_label(s),
             'strategy_mode': _setup_strategy_label(s),
             'strategy_reason': str(getattr(s, 'strategy_reason', '') or ''),
+            'final_pipeline_locked_scout': bool(getattr(s, 'final_pipeline_locked_scout', False)),
+            'ver52_executable_unblock': bool(getattr(s, 'ver52_executable_unblock', False)),
+            'final_pipeline_locked_reason': str(getattr(s, 'final_pipeline_locked_reason', '') or ''),
             'original_setup_id': str(getattr(s, 'original_setup_id', '') or ''),
             'original_side': str(getattr(s, 'original_side', '') or ''),
             'original_sl': float(getattr(s, 'original_sl', 0.0) or 0.0),
@@ -21352,21 +21397,25 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                     stats['combo_policy_skips'] += 1
                     continue
                 try:
-                    _edge_allowed, _edge_reason = _setup_edge_quality_guard_allows_setup(s_eff, sess, user_id=int(_target_uid))
-                    if not _edge_allowed:
-                        stats['edge_quality_skips'] = int(stats.get('edge_quality_skips', 0) or 0) + 1
-                        db_log_setup_pipeline_event(
-                            int(_target_uid),
-                            stage='executable_edge_quality_guard',
-                            status='skip',
-                            session=sess,
-                            mode=str(mode or ''),
-                            setup_id=sid,
-                            symbol=sym,
-                            side=side,
-                            details={'reason': str(_edge_reason or 'edge_quality_guard_block'), 'source_kind': str(source_kind or 'executable_setups')},
-                        )
-                        continue
+                    # Ver52: do not apply the micro-edge guard twice.  The shared
+                    # final gate above has already decided whether a controlled
+                    # scout is safe enough to enter the executable queue.
+                    if not (bool(_autotrade_setup_attr(s_eff, 'final_pipeline_locked_scout', False)) or bool(_autotrade_setup_attr(s_eff, 'ver52_executable_unblock', False))):
+                        _edge_allowed, _edge_reason = _setup_edge_quality_guard_allows_setup(s_eff, sess, user_id=int(_target_uid))
+                        if not _edge_allowed:
+                            stats['edge_quality_skips'] = int(stats.get('edge_quality_skips', 0) or 0) + 1
+                            db_log_setup_pipeline_event(
+                                int(_target_uid),
+                                stage='executable_edge_quality_guard',
+                                status='skip',
+                                session=sess,
+                                mode=str(mode or ''),
+                                setup_id=sid,
+                                symbol=sym,
+                                side=side,
+                                details={'reason': str(_edge_reason or 'edge_quality_guard_block'), 'source_kind': str(source_kind or 'executable_setups')},
+                            )
+                            continue
                 except Exception:
                     pass
                 try:
@@ -43548,7 +43597,12 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
         except Exception:
             dyn = {'score': float(quality or conf or 0.0), 'multiplier': 1.0, 'components': ['dynamic_score_exception_fallback']}
         dyn_score = float((dyn or {}).get('score') or 0.0)
-        if dyn_score <= 0 and quality > 0:
+        if bool(globals().get('VER52_EXECUTABLE_QUEUE_UNBLOCK', False)):
+            # Ver52: dynamic risk score is advisory in the starvation-unblock lane.
+            # Use the best available quality/confidence evidence so a non-zero but
+            # stale/penalty-heavy dynamic score cannot freeze all executable rows.
+            dyn_score = float(max(float(dyn_score or 0.0), float(quality or 0.0), float(conf or 0.0)))
+        elif dyn_score <= 0 and quality > 0:
             dyn_score = float(quality)
         meta['dynamic_score'] = dyn_score
         meta['dynamic_components'] = list((dyn or {}).get('components') or [])[:8]
@@ -43568,6 +43622,7 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
                 return False, f'{reason_prefix}_missing_valid_risk_or_tp_dollars', meta
 
         _setup_quality_gate_set_attr(setup_or_row, 'final_pipeline_locked_scout', True)
+        _setup_quality_gate_set_attr(setup_or_row, 'ver52_executable_unblock', bool(globals().get('VER52_EXECUTABLE_QUEUE_UNBLOCK', False)))
         _setup_quality_gate_set_attr(setup_or_row, 'final_pipeline_locked_reason', str(reason_prefix))
         _setup_quality_gate_set_attr(setup_or_row, 'dynamic_risk_score', float(dyn_score))
         _setup_quality_gate_set_attr(setup_or_row, 'risk_pct', float(meta.get('risk_pct') or 0.0))
@@ -43648,6 +43703,27 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
             status = 'WATCH'
             meta['policy_status'] = 'WATCH'
             meta['policy_status_coerced'] = True
+
+        # Ver52: run the controlled executable-unblock scout before old KEEP/WATCH
+        # baseline floors. This is the key fix for the live zero-pool loop seen in
+        # /why: raw setups were being generated, then rejected by legacy
+        # final_baseline_conf/RR/dynamic gates.  Hard disabled NORMAL combos are
+        # already blocked above; REVERSE may still forward-test disabled weak combos.
+        if bool(globals().get('VER52_EXECUTABLE_QUEUE_UNBLOCK', False)):
+            try:
+                unblock_ok, unblock_why, unblock_meta = _final_pipeline_locked_scout_allows(
+                    setup_or_row,
+                    session_name=sess,
+                    user_id=int(user_id or 0),
+                    reason_prefix='ver52_executable_unblock',
+                )
+                meta.update(dict(unblock_meta or {}))
+                meta['ver52_unblock_attempted'] = True
+                if unblock_ok:
+                    return True, str(unblock_why or 'ver52_executable_unblock_ok'), meta
+                meta['ver52_unblock_reject'] = str(unblock_why or '')
+            except Exception as _v52_exc:
+                meta['ver52_unblock_error'] = f'{type(_v52_exc).__name__}: {_v52_exc}'
 
         # REVERSE is its own forward-test lane. Do not use normal combo's weak history
         # to block the reverse signal before it gathers reverse-specific evidence.
