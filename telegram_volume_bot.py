@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver37: Added adaptive strategy router: strong combos trade NORMAL; weak/disabled combos trade REVERSE with reporting columns and DB metadata.
 # - Ver35: Removed hidden hard email/session caps, removed AutoTrade debug cap-note noise, restored /setup_audit visibility while keeping execution quality gates.
 # - Ver34: Restored user-requested AutoTrade forward-test defaults (50/day, 20 open, 12h hold, 1% drift, 15% daily cap).
 # - Ver33: Synced WR-first live limits: WATCH rows display as GATED, AutoTrade hard-caps max open/day, max-hold and drift, and /autotrade_debug now explains email-cap blocking.
@@ -161,6 +162,7 @@ import sys
 import time
 import logging
 import math
+import copy
 import inspect
 from decimal import Decimal, ROUND_UP, ROUND_DOWN, ROUND_HALF_UP
 
@@ -1060,6 +1062,8 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL': bool(globals().get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)),
         'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK': bool(globals().get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
+        'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)),
+        'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)),
     }
 
 
@@ -1897,6 +1901,31 @@ AUTOTRADE_VER36_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER36_MAX_OPEN_T
 AUTOTRADE_VER36_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER36_MAX_POSITION_HOURS", "12") or 12)
 AUTOTRADE_VER36_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER36_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
 AUTOTRADE_VER36_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER36_DAILY_CAP_PCT", "15.0") or 15.0)
+# Ver37 adaptive strategy router.
+# Strong combos keep the original NORMAL direction. Weak / disabled combos are
+# forward-tested in REVERSE direction (BUY->SELL, SELL->BUY) so the bot can learn
+# whether the old losing signal is a useful contra-signal. These values are editable
+# with /autotrade_config and visible in /setup_matrix policy + /setup_audit.
+SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED = env_bool("SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED", True)
+SETUP_ADAPTIVE_REVERSE_FOR_DISABLED = env_bool("SETUP_ADAPTIVE_REVERSE_FOR_DISABLED", True)
+SETUP_ADAPTIVE_REVERSE_SUFFIX = str(os.environ.get("SETUP_ADAPTIVE_REVERSE_SUFFIX", "RV") or "RV").strip().upper()
+SETUP_ADAPTIVE_WEAK_MIN_DECIDED = int(os.environ.get("SETUP_ADAPTIVE_WEAK_MIN_DECIDED", "2") or 2)
+SETUP_ADAPTIVE_STRONG_MIN_DECIDED = int(os.environ.get("SETUP_ADAPTIVE_STRONG_MIN_DECIDED", "2") or 2)
+SETUP_ADAPTIVE_STRONG_WR = float(os.environ.get("SETUP_ADAPTIVE_STRONG_WR", "55") or 55)
+SETUP_ADAPTIVE_STRONG_AVG_R = float(os.environ.get("SETUP_ADAPTIVE_STRONG_AVG_R", "0.05") or 0.05)
+SETUP_ADAPTIVE_REVERSE_WR_MAX = float(os.environ.get("SETUP_ADAPTIVE_REVERSE_WR_MAX", "50") or 50)
+SETUP_ADAPTIVE_REVERSE_AVG_R_MAX = float(os.environ.get("SETUP_ADAPTIVE_REVERSE_AVG_R_MAX", "0.05") or 0.05)
+SETUP_ADAPTIVE_TIGHTEN_REVERSE_MIN_DECIDED = int(os.environ.get("SETUP_ADAPTIVE_TIGHTEN_REVERSE_MIN_DECIDED", "4") or 4)
+SETUP_ADAPTIVE_TIGHTEN_REVERSE_WR_MAX = float(os.environ.get("SETUP_ADAPTIVE_TIGHTEN_REVERSE_WR_MAX", "45") or 45)
+try:
+    _v = _autotrade_config_get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', None)
+    if _v is not None:
+        SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED = str(_v).strip().lower() in {'1', 'true', 'yes', 'on'}
+    _v = _autotrade_config_get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', None)
+    if _v is not None:
+        SETUP_ADAPTIVE_REVERSE_FOR_DISABLED = str(_v).strip().lower() in {'1', 'true', 'yes', 'on'}
+except Exception:
+    pass
 SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "8") or 8)
 SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "4") or 4)
 SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
@@ -2213,6 +2242,287 @@ def _setup_target_tp(obj, default: float = 0.0) -> float:
         return float(_resolve_single_tp(entry, sl, getattr(obj, 'tp', None), getattr(obj, 'alt_target_a', None), getattr(obj, 'alt_target_b', None), str(getattr(obj, 'side', '') or '')) or default)
     except Exception:
         return float(default or 0.0)
+
+# =========================================================
+# VER37 ADAPTIVE STRATEGY ROUTER (NORMAL / REVERSE)
+# =========================================================
+def _setup_strategy_db_migrate() -> None:
+    """Add strategy metadata columns used by ver37 reporting and execution routing."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            table_cols = {
+                'signals': {
+                    'setup_strategy': "TEXT NOT NULL DEFAULT 'NORMAL'",
+                    'original_setup_id': "TEXT NOT NULL DEFAULT ''",
+                    'original_side': "TEXT NOT NULL DEFAULT ''",
+                    'strategy_reason': "TEXT NOT NULL DEFAULT ''",
+                },
+                'generated_setups': {
+                    'setup_strategy': "TEXT NOT NULL DEFAULT 'NORMAL'",
+                    'original_setup_id': "TEXT NOT NULL DEFAULT ''",
+                    'original_side': "TEXT NOT NULL DEFAULT ''",
+                    'strategy_reason': "TEXT NOT NULL DEFAULT ''",
+                },
+                'executable_setups': {
+                    'setup_strategy': "TEXT NOT NULL DEFAULT 'NORMAL'",
+                    'original_setup_id': "TEXT NOT NULL DEFAULT ''",
+                    'original_side': "TEXT NOT NULL DEFAULT ''",
+                    'strategy_reason': "TEXT NOT NULL DEFAULT ''",
+                },
+                'autotrade_trades': {
+                    'setup_strategy': "TEXT NOT NULL DEFAULT 'NORMAL'",
+                    'original_setup_id': "TEXT NOT NULL DEFAULT ''",
+                    'original_side': "TEXT NOT NULL DEFAULT ''",
+                    'strategy_reason': "TEXT NOT NULL DEFAULT ''",
+                },
+            }
+            for table, cols in table_cols.items():
+                try:
+                    existing = {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+                    if not existing:
+                        continue
+                    for col, ddl in cols.items():
+                        if col not in existing:
+                            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                            existing.add(col)
+                except Exception:
+                    continue
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _setup_strategy_normalize(value: str = '') -> str:
+    try:
+        v = str(value or '').strip().upper().replace('-', '_')
+        if v in {'REV', 'REVERSE', 'INVERSE', 'RV'}:
+            return 'REVERSE'
+        if v in {'N', 'NORMAL', 'ORIGINAL', 'BASE'}:
+            return 'NORMAL'
+        if v in {'TIGHTEN', 'DISABLE', 'BLOCK', 'MONITOR'}:
+            return v
+    except Exception:
+        pass
+    return 'NORMAL'
+
+
+def _setup_strategy_attr(setup_or_row, name: str, default=None):
+    try:
+        if isinstance(setup_or_row, dict):
+            if name in setup_or_row:
+                return setup_or_row.get(name, default)
+            dj = setup_or_row.get('details_json')
+            if dj:
+                try:
+                    obj = json.loads(str(dj or '{}'))
+                    if isinstance(obj, dict) and name in obj:
+                        return obj.get(name, default)
+                except Exception:
+                    pass
+            return default
+        return getattr(setup_or_row, name, default)
+    except Exception:
+        return default
+
+
+def _setup_strategy_set_attr(setup_or_row, name: str, value) -> None:
+    try:
+        if isinstance(setup_or_row, dict):
+            setup_or_row[name] = value
+        else:
+            setattr(setup_or_row, name, value)
+    except Exception:
+        pass
+
+
+def _setup_strategy_label(setup_or_row) -> str:
+    try:
+        raw = _setup_strategy_attr(setup_or_row, 'setup_strategy', '') or _setup_strategy_attr(setup_or_row, 'strategy', '') or _setup_strategy_attr(setup_or_row, 'strategy_mode', '')
+        if raw:
+            return _setup_strategy_normalize(str(raw))
+        sid = str(_setup_strategy_attr(setup_or_row, 'setup_id', '') or _setup_strategy_attr(setup_or_row, 'id', '') or '').upper().strip()
+        suffix = str(globals().get('SETUP_ADAPTIVE_REVERSE_SUFFIX', 'RV') or 'RV').upper().strip()
+        if sid.endswith('-' + suffix) or sid.endswith('_' + suffix):
+            return 'REVERSE'
+    except Exception:
+        pass
+    return 'NORMAL'
+
+
+def _setup_strategy_short_label(setup_or_row) -> str:
+    return 'REV' if _setup_strategy_label(setup_or_row) == 'REVERSE' else 'NOR'
+
+
+def _setup_strategy_combo_metrics(setup_or_row, session_name: str = '', user_id: int = 0) -> dict:
+    """Return current family/session evidence used to choose NORMAL vs REVERSE."""
+    out = {'combo': '', 'family': '', 'session': '', 'decided': 0, 'tp': 0, 'sl': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': 0.0, 'policy_status': '', 'policy_enabled': 1, 'policy_found': False}
+    try:
+        fam, sess2 = _setup_combo_family_session_from_obj(setup_or_row, session_name=session_name)
+        sess = str(session_name or sess2 or _setup_strategy_attr(setup_or_row, 'session', '') or _setup_strategy_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        combo = f"{str(fam or 'F0').upper().strip()}-{str(sess or '-').upper().strip()}"
+        out.update({'family': str(fam or 'F0').upper().strip(), 'session': str(sess or '-').upper().strip(), 'combo': combo})
+        try:
+            info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0)) or {}
+            out['policy_found'] = bool(info.get('found'))
+            out['policy_status'] = str(info.get('status') or '').upper().strip()
+            out['policy_enabled'] = 1 if int(info.get('enabled') or (1 if not info.get('found') else 0)) == 1 else 0
+            pol = dict(info.get('policy') or {})
+            if pol:
+                out['decided'] = int(pol.get('last_decided') or out['decided'])
+                out['wr'] = float(pol.get('last_win_rate') or out['wr'])
+                out['avg_r'] = float(pol.get('last_avg_r') or out['avg_r'])
+                out['score'] = float(pol.get('last_score') or out['score'])
+        except Exception:
+            pass
+        try:
+            data = _setup_edge_guard_build(int(user_id or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False) or {}
+            cm = dict((data.get('combo_metrics') or {}).get(combo) or {})
+            if cm:
+                out['decided'] = int(cm.get('decided') or out['decided'])
+                out['tp'] = int(cm.get('tp') or out.get('tp') or 0)
+                out['sl'] = int(cm.get('sl') or out.get('sl') or 0)
+                out['wr'] = float(cm.get('wr') or out['wr'])
+                out['avg_r'] = float(cm.get('avg_r') or out['avg_r'])
+                out['score'] = float(cm.get('score') or out['score'])
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return out
+
+
+def _setup_strategy_decision_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[str, str, dict]:
+    """Choose NORMAL for strong positive combos and REVERSE for weak/disabled combos."""
+    meta = _setup_strategy_combo_metrics(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
+    try:
+        if not bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)):
+            return 'NORMAL', 'strategy_router_disabled', meta
+        status = str(meta.get('policy_status') or '').upper().strip()
+        enabled = int(meta.get('policy_enabled') or 0) == 1
+        decided = int(meta.get('decided') or 0)
+        tp = int(meta.get('tp') or 0)
+        sl = int(meta.get('sl') or 0)
+        wr = float(meta.get('wr') or 0.0)
+        avg_r = float(meta.get('avg_r') or 0.0)
+        score = float(meta.get('score') or 0.0)
+        strong_min = max(1, int(globals().get('SETUP_ADAPTIVE_STRONG_MIN_DECIDED', 2) or 2))
+        weak_min = max(1, int(globals().get('SETUP_ADAPTIVE_WEAK_MIN_DECIDED', 2) or 2))
+        strong_wr = float(globals().get('SETUP_ADAPTIVE_STRONG_WR', 55) or 55)
+        strong_avg = float(globals().get('SETUP_ADAPTIVE_STRONG_AVG_R', 0.05) or 0.05)
+        reverse_wr = float(globals().get('SETUP_ADAPTIVE_REVERSE_WR_MAX', 50) or 50)
+        reverse_avg = float(globals().get('SETUP_ADAPTIVE_REVERSE_AVG_R_MAX', 0.05) or 0.05)
+        if (status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled) and bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)):
+            return 'REVERSE', f"disabled_combo_routed_to_reverse:{meta.get('combo','-')}", meta
+        if decided >= strong_min and wr >= strong_wr and avg_r >= strong_avg and tp >= sl:
+            return 'NORMAL', f"strong_combo_keep_normal:WR{wr:.1f}:AvgR{avg_r:+.2f}:n{decided}", meta
+        if decided >= weak_min and (wr < reverse_wr or avg_r <= reverse_avg or score <= 0.0 or sl > tp):
+            return 'REVERSE', f"weak_combo_route_reverse:WR{wr:.1f}:AvgR{avg_r:+.2f}:n{decided}", meta
+        if status == 'KEEP':
+            return 'NORMAL', f"policy_keep_normal:{meta.get('combo','-')}", meta
+        return 'NORMAL', f"monitor_normal_until_decided:n{decided}", meta
+    except Exception as exc:
+        meta['error'] = f'{type(exc).__name__}: {exc}'
+        return 'NORMAL', 'strategy_router_error_normal', meta
+
+
+def _setup_strategy_reverse_setup(setup, session_name: str = '', user_id: int = 0, reason: str = '', meta: dict | None = None):
+    """Return a reversed copy of a setup: BUY->SELL / SELL->BUY, old SL becomes TP and old TP becomes SL."""
+    try:
+        side = str(_setup_strategy_attr(setup, 'side', '') or '').upper().strip()
+        entry = float(_setup_strategy_attr(setup, 'entry', 0.0) or 0.0)
+        old_sl = float(_setup_strategy_attr(setup, 'sl', 0.0) or 0.0)
+        old_tp = float(_setup_target_tp(setup, 0.0) or 0.0)
+        if side not in {'BUY', 'SELL'} or entry <= 0 or old_sl <= 0 or old_tp <= 0:
+            _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
+            _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_not_possible_bad_levels')
+            return setup
+        new_side = 'SELL' if side == 'BUY' else 'BUY'
+        new_sl = old_tp
+        new_tp = old_sl
+        if new_side == 'BUY' and not (new_sl < entry < new_tp):
+            _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
+            _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_invalid_buy_geometry')
+            return setup
+        if new_side == 'SELL' and not (new_tp < entry < new_sl):
+            _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
+            _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_invalid_sell_geometry')
+            return setup
+        try:
+            rev = copy.copy(setup)
+        except Exception:
+            try:
+                rev = dict(setup)
+            except Exception:
+                rev = setup
+        old_sid = str(_setup_strategy_attr(setup, 'setup_id', '') or _setup_strategy_attr(setup, 'id', '') or make_setup_id(str(_setup_strategy_attr(setup, 'symbol', '') or ''), new_side)).strip()
+        suffix = str(globals().get('SETUP_ADAPTIVE_REVERSE_SUFFIX', 'RV') or 'RV').strip().upper()
+        new_sid = old_sid if old_sid.upper().endswith('-' + suffix) else f"{old_sid}-{suffix}"
+        for name, value in {
+            'setup_id': new_sid,
+            'id': new_sid,
+            'side': new_side,
+            'sl': float(new_sl),
+            'tp': float(new_tp),
+            'alt_target_a': 0.0,
+            'alt_target_b': 0.0,
+            'setup_strategy': 'REVERSE',
+            'strategy': 'REVERSE',
+            'strategy_mode': 'REVERSE',
+            'strategy_reason': str(reason or 'weak_combo_reverse'),
+            'original_setup_id': old_sid,
+            'original_side': side,
+            'original_sl': float(old_sl),
+            'original_tp': float(old_tp),
+            'normal_signal_side': side,
+            'strategy_meta_json': json.dumps(dict(meta or {}), separators=(',', ':'), ensure_ascii=False)[:1500],
+        }.items():
+            _setup_strategy_set_attr(rev, name, value)
+        try:
+            setattr(rev, 'trend', 'BULLISH' if new_side == 'BUY' else 'BEARISH')
+            setattr(rev, 'structure', getattr(rev, 'trend'))
+        except Exception:
+            pass
+        return rev
+    except Exception:
+        try:
+            _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
+            _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_exception_fallback_normal')
+        except Exception:
+            pass
+        return setup
+
+
+def _setup_adaptive_strategy_route_setup(setup, session_name: str = '', user_id: int = 0):
+    """Apply ver37 NORMAL/REVERSE router to an individual setup object."""
+    try:
+        if _setup_strategy_label(setup) == 'REVERSE':
+            return setup
+        decision, reason, meta = _setup_strategy_decision_for_setup(setup, session_name=session_name, user_id=int(user_id or 0))
+        if decision == 'REVERSE':
+            return _setup_strategy_reverse_setup(setup, session_name=session_name, user_id=int(user_id or 0), reason=reason, meta=meta)
+        _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
+        _setup_strategy_set_attr(setup, 'strategy', 'NORMAL')
+        _setup_strategy_set_attr(setup, 'strategy_mode', 'NORMAL')
+        _setup_strategy_set_attr(setup, 'strategy_reason', reason)
+        return setup
+    except Exception:
+        return setup
+
+
+def _setup_strategy_for_combo_metrics(setups: int = 0, decided: int = 0, tp: int = 0, sl: int = 0, wr: float = 0.0, avg_r: float = 0.0, status: str = 'WATCH', enabled: int = 1) -> str:
+    try:
+        status_u = str(status or '').upper().strip()
+        if bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) and (status_u in {'DISABLE','BLOCK','PAUSE','OFF'} or int(enabled or 0) == 0):
+            return 'REV'
+        if int(decided or 0) >= int(globals().get('SETUP_ADAPTIVE_STRONG_MIN_DECIDED', 2) or 2) and float(wr or 0.0) >= float(globals().get('SETUP_ADAPTIVE_STRONG_WR', 55) or 55) and float(avg_r or 0.0) >= float(globals().get('SETUP_ADAPTIVE_STRONG_AVG_R', 0.05) or 0.05) and int(tp or 0) >= int(sl or 0):
+            return 'NOR'
+        if int(decided or 0) >= int(globals().get('SETUP_ADAPTIVE_WEAK_MIN_DECIDED', 2) or 2) and (float(wr or 0.0) < float(globals().get('SETUP_ADAPTIVE_REVERSE_WR_MAX', 50) or 50) or float(avg_r or 0.0) <= float(globals().get('SETUP_ADAPTIVE_REVERSE_AVG_R_MAX', 0.05) or 0.05) or int(sl or 0) > int(tp or 0)):
+            return 'REV'
+        return 'MON'
+    except Exception:
+        return 'MON'
+
 
 _LAST_SCAN_UNIVERSE = []
 _LAST_SCAN_UNIVERSE = []  # bases used for setups in last scan (for /why + filtering)
@@ -14347,6 +14657,10 @@ def db_init():
             'exec_score': "REAL NOT NULL DEFAULT 0",
             'validation_state': "TEXT NOT NULL DEFAULT 'approved'",
             'challenger_flag': "INTEGER NOT NULL DEFAULT 0",
+            'setup_strategy': "TEXT NOT NULL DEFAULT 'NORMAL'",
+            'original_setup_id': "TEXT NOT NULL DEFAULT ''",
+            'original_side': "TEXT NOT NULL DEFAULT ''",
+            'strategy_reason': "TEXT NOT NULL DEFAULT ''",
         }
         for _col, _ddl in exec_add_cols.items():
             if _col not in x_cols:
@@ -14417,6 +14731,10 @@ def db_init():
             'regime_primary': "TEXT NOT NULL DEFAULT ''",
             'allocator_plan_id': "TEXT NOT NULL DEFAULT ''",
             'param_set_id': "TEXT NOT NULL DEFAULT ''",
+            'setup_strategy': "TEXT NOT NULL DEFAULT 'NORMAL'",
+            'original_setup_id': "TEXT NOT NULL DEFAULT ''",
+            'original_side': "TEXT NOT NULL DEFAULT ''",
+            'strategy_reason': "TEXT NOT NULL DEFAULT ''",
         }
         for _col, _ddl in gen_add_cols.items():
             if _col not in g_cols:
@@ -19978,6 +20296,10 @@ def db_insert_signal(s: Setup, user_id: int | None = None):
             float(_setup_target_tp(s, 0.0) or 0.0), 0.0, 0.0, s.fut_vol_usd, s.ch24, s.ch4, s.ch1, s.ch15
         ))
     try:
+        _setup_strategy_db_migrate()
+    except Exception:
+        pass
+    try:
         cur.execute(
             """UPDATE signals SET family_id=?, family_version=?, regime_id=?, regime_primary=?, allocator_plan_id=?, param_set_id=?
                    WHERE setup_id=?
@@ -19989,6 +20311,19 @@ def db_insert_signal(s: Setup, user_id: int | None = None):
                 str(getattr(s, 'regime_primary', '') or ''),
                 str(getattr(s, 'allocator_plan_id', '') or ''),
                 str(getattr(s, 'param_set_id', '') or ''),
+                str(getattr(s, 'setup_id', '') or ''),
+            ),
+        )
+    except Exception:
+        pass
+    try:
+        cur.execute(
+            """UPDATE signals SET setup_strategy=?, original_setup_id=?, original_side=?, strategy_reason=? WHERE setup_id=?""",
+            (
+                _setup_strategy_label(s),
+                str(getattr(s, 'original_setup_id', '') or ''),
+                str(getattr(s, 'original_side', '') or ''),
+                str(getattr(s, 'strategy_reason', '') or '')[:500],
                 str(getattr(s, 'setup_id', '') or ''),
             ),
         )
@@ -20174,6 +20509,14 @@ def _setup_executable_details_json(s, session: str = '') -> str:
             'exec_score': float(getattr(s, 'exec_score', 0.0) or 0.0),
             'validation_state': str(getattr(s, 'validation_state', '') or 'approved'),
             'challenger_flag': bool(getattr(s, 'challenger_flag', False)),
+            'setup_strategy': _setup_strategy_label(s),
+            'strategy': _setup_strategy_label(s),
+            'strategy_mode': _setup_strategy_label(s),
+            'strategy_reason': str(getattr(s, 'strategy_reason', '') or ''),
+            'original_setup_id': str(getattr(s, 'original_setup_id', '') or ''),
+            'original_side': str(getattr(s, 'original_side', '') or ''),
+            'original_sl': float(getattr(s, 'original_sl', 0.0) or 0.0),
+            'original_tp': float(getattr(s, 'original_tp', 0.0) or 0.0),
         }
         return json.dumps(details, separators=(",", ":"), ensure_ascii=False)
     except Exception:
@@ -20252,6 +20595,20 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
                 float(getattr(s, 'exec_score', 0.0) or 0.0) if s is not None else 0.0,
                 str(getattr(s, 'validation_state', '') or 'approved') if s is not None else 'approved',
                 int(bool(getattr(s, 'challenger_flag', False))) if s is not None else 0,
+                int(user_id), sid,
+            ),
+        )
+    except Exception:
+        pass
+    try:
+        _setup_strategy_db_migrate()
+        cur.execute(
+            """UPDATE executable_setups SET setup_strategy=?, original_setup_id=?, original_side=?, strategy_reason=? WHERE user_id=? AND setup_id=?""",
+            (
+                _setup_strategy_label(s) if s is not None else 'NORMAL',
+                str(getattr(s, 'original_setup_id', '') or '') if s is not None else '',
+                str(getattr(s, 'original_side', '') or '') if s is not None else '',
+                str(getattr(s, 'strategy_reason', '') or '')[:500] if s is not None else '',
                 int(user_id), sid,
             ),
         )
@@ -20396,7 +20753,14 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
             for _target_uid in target_uids:
                 stats['attempted'] += 1
                 try:
-                    final_ok, final_why, final_meta = _setup_final_quality_gate_allows_setup(s, sess, user_id=int(_target_uid))
+                    s_eff = _setup_adaptive_strategy_route_setup(s, sess, int(_target_uid))
+                except Exception:
+                    s_eff = s
+                sid = str(getattr(s_eff, 'setup_id', '') or '').strip()
+                sym = str(getattr(s_eff, 'symbol', '') or '').upper()
+                side = str(getattr(s_eff, 'side', '') or '').upper()
+                try:
+                    final_ok, final_why, final_meta = _setup_final_quality_gate_allows_setup(s_eff, sess, user_id=int(_target_uid))
                     if not final_ok:
                         stats['combo_policy_skips'] += 1
                         db_log_setup_pipeline_event(
@@ -20415,7 +20779,7 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                     stats['combo_policy_skips'] += 1
                     continue
                 try:
-                    _edge_allowed, _edge_reason = _setup_edge_quality_guard_allows_setup(s, sess, user_id=int(_target_uid))
+                    _edge_allowed, _edge_reason = _setup_edge_quality_guard_allows_setup(s_eff, sess, user_id=int(_target_uid))
                     if not _edge_allowed:
                         stats['edge_quality_skips'] = int(stats.get('edge_quality_skips', 0) or 0) + 1
                         db_log_setup_pipeline_event(
@@ -20455,17 +20819,17 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                     pass
                 if int(_target_uid) > 0:
                     try:
-                        db_insert_signal(s, user_id=int(_target_uid))
+                        db_insert_signal(s_eff, user_id=int(_target_uid))
                     except Exception as e:
                         stats['signal_errors'] += 1
                         if len(stats['errors']) < 6:
                             stats['errors'].append(f"signal:{sid or sym}:{type(e).__name__}")
                     try:
-                        db_log_generated_setup(int(_target_uid), "exec", sess, s)
+                        db_log_generated_setup(int(_target_uid), "exec", sess, s_eff)
                     except Exception:
                         pass
                 try:
-                    db_mark_executable_setup(int(_target_uid), sid, sess, float(now_ts), s=s, source_kind=str(source_kind or 'executable_setups'))
+                    db_mark_executable_setup(int(_target_uid), sid, sess, float(now_ts), s=s_eff, source_kind=str(source_kind or 'executable_setups'))
                     stats['persisted'] += 1
                 except Exception as e:
                     stats['queue_errors'] += 1
@@ -20561,6 +20925,12 @@ def _executable_rows_to_setup_objects(rows: List[dict], session_name: str = '') 
                 exec_score=float(row.get('exec_score') or 0.0),
                 validation_state=str(row.get('validation_state') or 'approved'),
                 challenger_flag=bool(int(row.get('challenger_flag') or 0)),
+                setup_strategy=str(row.get('setup_strategy') or ''),
+                strategy=str(row.get('setup_strategy') or ''),
+                strategy_mode=str(row.get('setup_strategy') or ''),
+                strategy_reason=str(row.get('strategy_reason') or ''),
+                original_setup_id=str(row.get('original_setup_id') or ''),
+                original_side=str(row.get('original_side') or ''),
             )
             item = _research_finalize_setup(item, session_name=str(row.get('session') or session_name or ''))
             out.append(item)
@@ -20987,6 +21357,10 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
             s = _research_finalize_setup(s, session_name=str(session or getattr(s, 'session', '') or ''))
         except Exception:
             pass
+        try:
+            _setup_strategy_db_migrate()
+        except Exception:
+            pass
         con = db_connect()
         cur = con.cursor()
         cur.execute(
@@ -21028,6 +21402,21 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
                     str(getattr(s, 'regime_primary', '') or ''),
                     str(getattr(s, 'allocator_plan_id', '') or ''),
                     str(getattr(s, 'param_set_id', '') or ''),
+                ),
+            )
+        except Exception:
+            pass
+        try:
+            cur.execute(
+                """UPDATE generated_setups
+                       SET setup_strategy=?, original_setup_id=?, original_side=?, strategy_reason=?
+                       WHERE rowid = last_insert_rowid()
+                """,
+                (
+                    _setup_strategy_label(s),
+                    str(getattr(s, 'original_setup_id', '') or ''),
+                    str(getattr(s, 'original_side', '') or ''),
+                    str(getattr(s, 'strategy_reason', '') or '')[:500],
                 ),
             )
         except Exception:
@@ -37716,6 +38105,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
             f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
+            f"SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED = {'true' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'false'}",
+            f"SETUP_ADAPTIVE_REVERSE_FOR_DISABLED = {'true' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'false'}",
             "",
             "Examples:",
             "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.0   (base risk)",
@@ -37746,6 +38137,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
             "• /autotrade_config AUTOTRADE_ISOLATED true",
+            "• /autotrade_config SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED true",
+            "• /autotrade_config SETUP_ADAPTIVE_REVERSE_FOR_DISABLED true",
             "",
             "Note: daily cap mode stays under /dailycapAT pct|usd <value>.",
         ]
@@ -37769,7 +38162,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS',
         'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS',
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS',
-        'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK'
+        'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
+        'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -37875,6 +38269,14 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK'] = bool(val)
+        elif key == 'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED'] = bool(val)
+            _autotrade_config_set('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 1 if val else 0)
+        elif key == 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['SETUP_ADAPTIVE_REVERSE_FOR_DISABLED'] = bool(val)
+            _autotrade_config_set('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 1 if val else 0)
         else:
             raise ValueError('unsupported key')
     except Exception as e:
@@ -40590,6 +40992,8 @@ def _setup_audit_payload_from_row(row: dict) -> dict:
         out['tp'] = float(_resolve_single_tp(out['entry'], out['sl'], out.get('tp'), out.get('alt_target_a'), out.get('alt_target_b'), out.get('side')) or 0.0)
         out['alt_target_a'] = 0.0
         out['alt_target_b'] = 0.0
+        out['setup_strategy'] = _setup_strategy_label(out)
+        out['strategy'] = out['setup_strategy']
     except Exception:
         pass
     return out
@@ -41025,10 +41429,14 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                         x_cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
                         if x_cols:
                             x_family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
+                            x_strategy_expr = "COALESCE(setup_strategy, '') AS setup_strategy" if 'setup_strategy' in x_cols else "'' AS setup_strategy"
+                            x_orig_id_expr = "COALESCE(original_setup_id, '') AS original_setup_id" if 'original_setup_id' in x_cols else "'' AS original_setup_id"
+                            x_orig_side_expr = "COALESCE(original_side, '') AS original_side" if 'original_side' in x_cols else "'' AS original_side"
+                            x_strategy_reason_expr = "COALESCE(strategy_reason, '') AS strategy_reason" if 'strategy_reason' in x_cols else "'' AS strategy_reason"
                             cur.execute(f"""
                                 SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                                        fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
-                                       {x_family_expr}, entry, sl, tp, alt_target_a, alt_target_b
+                                       {x_family_expr}, {x_strategy_expr}, {x_orig_id_expr}, {x_orig_side_expr}, {x_strategy_reason_expr}, entry, sl, tp, alt_target_a, alt_target_b
                                 FROM executable_setups
                                 {where}
                                 ORDER BY executable_ts DESC{lim_clause}
@@ -41045,6 +41453,10 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                             alt_a_expr = 'alt_target_a' if 'alt_target_a' in cols else '0 AS alt_target_a'
                             alt_b_expr = 'alt_target_b' if 'alt_target_b' in cols else '0 AS alt_target_b'
                             family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in cols else "'' AS family_id"
+                            strategy_expr = "COALESCE(setup_strategy, '') AS setup_strategy" if 'setup_strategy' in cols else "'' AS setup_strategy"
+                            orig_id_expr = "COALESCE(original_setup_id, '') AS original_setup_id" if 'original_setup_id' in cols else "'' AS original_setup_id"
+                            orig_side_expr = "COALESCE(original_side, '') AS original_side" if 'original_side' in cols else "'' AS original_side"
+                            strategy_reason_expr = "COALESCE(strategy_reason, '') AS strategy_reason" if 'strategy_reason' in cols else "'' AS strategy_reason"
                             source_expr = 'UPPER(source)' if 'source' in cols else "'GEN'"
                             params = [int(uid)]
                             where = "WHERE user_id=?"
@@ -41054,7 +41466,7 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                             cur.execute(f"""
                                 SELECT created_ts AS ts, 0 AS signal_created_ts, {source_expr} AS source, session, setup_id, symbol, {market_expr}, side, conf,
                                        fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
-                                       {family_expr}, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
+                                       {family_expr}, {strategy_expr}, {orig_id_expr}, {orig_side_expr}, {strategy_reason_expr}, entry, sl, tp, {alt_a_expr}, {alt_b_expr}, {reason_expr}
                                 FROM generated_setups
                                 {where}
                                 ORDER BY created_ts DESC{lim_clause}
@@ -41170,7 +41582,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
             volm = float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0) / 1e6
         except Exception:
             volm = 0.0
-        table_rows.append([ttxt, sym, side, sess_row, family_code, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
+        table_rows.append([ttxt, sym, side, _setup_strategy_short_label(r), sess_row, family_code, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n + nohit_n
     wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
@@ -41186,9 +41598,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Ses', 'Fam', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Strat', 'Ses', 'Fam', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
@@ -42121,7 +42533,8 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         tp = float(_setup_target_tp(setup_or_row, 0.0) or 0.0)
         fut_vol = float(_autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or _autotrade_setup_attr(setup_or_row, 'vol_usd', 0.0) or 0.0)
         rr = float(rr_to_tp(entry, sl, tp)) if entry > 0 and sl > 0 and tp > 0 else 0.0
-        meta.update({'family': fam, 'session': sess, 'setup_id': setup_id, 'symbol': symbol, 'side': side, 'conf': conf, 'quality_score': quality, 'entry': entry, 'sl': sl, 'tp': tp, 'rr': rr, 'fut_vol_usd': fut_vol})
+        strategy_label = _setup_strategy_label(setup_or_row)
+        meta.update({'family': fam, 'session': sess, 'setup_id': setup_id, 'symbol': symbol, 'side': side, 'conf': conf, 'quality_score': quality, 'entry': entry, 'sl': sl, 'tp': tp, 'rr': rr, 'fut_vol_usd': fut_vol, 'setup_strategy': strategy_label})
 
         if not setup_id:
             return False, 'watch_missing_setup_id', meta
@@ -42148,7 +42561,10 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         try:
             edge_ok, edge_reason = _setup_edge_quality_guard_allows_setup(setup_or_row, sess, user_id=int(user_id or 0))
             if not edge_ok:
-                return False, f'watch_micro_edge_block:{edge_reason}', meta
+                if strategy_label == 'REVERSE':
+                    meta['reverse_bypassed_micro_edge_reason'] = str(edge_reason)
+                else:
+                    return False, f'watch_micro_edge_block:{edge_reason}', meta
         except Exception:
             pass
 
@@ -42159,11 +42575,20 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
             combo_side_k = f'{fam_k}-{sess_k}-{side_k}'
             meta.update({'combo_key': combo_k, 'combo_side_key': combo_side_k, 'symbol_key': sym_k, 'hour_key': hour_k})
             if combo_side_k in dict(data.get('combo_side_block') or {}):
-                return False, f'watch_weak_combo_side:{combo_side_k}', meta
+                if strategy_label == 'REVERSE':
+                    meta['reverse_bypassed_combo_side_block'] = combo_side_k
+                else:
+                    return False, f'watch_weak_combo_side:{combo_side_k}', meta
             if sym_k and sym_k in dict(data.get('symbol_block') or {}):
-                return False, f'watch_weak_symbol:{sym_k}', meta
+                if strategy_label == 'REVERSE':
+                    meta['reverse_bypassed_symbol_block'] = sym_k
+                else:
+                    return False, f'watch_weak_symbol:{sym_k}', meta
             if hour_k in dict(data.get('hour_watch') or {}):
-                return False, f'watch_weak_hour:{hour_k}', meta
+                if strategy_label == 'REVERSE':
+                    meta['reverse_bypassed_hour_watch'] = hour_k
+                else:
+                    return False, f'watch_weak_hour:{hour_k}', meta
             cm = dict((data.get('combo_metrics') or {}).get(combo_k) or {})
             c_dec = int(cm.get('decided') or 0)
             c_wr = float(cm.get('wr') or 0.0)
@@ -42179,7 +42604,10 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
             target_wr = float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50)
             weak_combo = c_dec >= min_dec and c_wr < target_wr and (c_avg <= 0.05 or c_score <= 0.0 or c_sl >= max(2, int(math.ceil(max(1, c_tp) * 1.25))))
             if weak_combo:
-                return False, f'watch_weak_combo:{combo_k}:WR{c_wr:.1f}:AvgR{c_avg:+.2f}:n{c_dec}', meta
+                if strategy_label == 'REVERSE':
+                    meta['reverse_bypassed_original_weak_combo'] = f'{combo_k}:WR{c_wr:.1f}:AvgR{c_avg:+.2f}:n{c_dec}'
+                else:
+                    return False, f'watch_weak_combo:{combo_k}:WR{c_wr:.1f}:AvgR{c_avg:+.2f}:n{c_dec}', meta
         except Exception:
             pass
 
@@ -42244,12 +42672,16 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         status = str(info.get('status') or ('WATCH' if bool(globals().get('SETUP_FINAL_UNKNOWN_AS_WATCH', True)) else 'UNKNOWN')).upper().strip()
         enabled = int(info.get('enabled') or (1 if not found else 0)) == 1
         combo = str(info.get('combo') or f'{fam}-{sess}').upper().strip()
-        meta.update({'family': fam, 'session': sess, 'combo': combo, 'policy_found': found, 'policy_status': status, 'policy_enabled': enabled})
+        strategy_label = _setup_strategy_label(setup_or_row)
+        meta.update({'family': fam, 'session': sess, 'combo': combo, 'policy_found': found, 'policy_status': status, 'policy_enabled': enabled, 'setup_strategy': strategy_label})
 
         if status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled:
-            return False, 'final_combo_disabled', meta
+            if not (strategy_label == 'REVERSE' and bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True))):
+                return False, 'final_combo_disabled', meta
+            meta['policy_bypassed_by_reverse'] = True
         if bool(globals().get('SETUP_FINAL_REQUIRE_POLICY_STATE', True)) and status not in {'KEEP', 'WATCH'}:
-            return False, f'final_policy_not_keep_or_watch:{status or "UNKNOWN"}', meta
+            if not (strategy_label == 'REVERSE' and status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}):
+                return False, f'final_policy_not_keep_or_watch:{status or "UNKNOWN"}', meta
 
         # Use the stricter WATCH validator as the single executable/email/autotrade
         # quality gate.  It checks complete data, price order, min confidence,
@@ -42609,6 +43041,7 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         cs = dict((data or {}).get('combo_side_block') or {})
         sb = dict((data or {}).get('symbol_block') or {})
         hw = dict((data or {}).get('hour_watch') or {})
+        strategy_label = _setup_strategy_label(setup_or_row)
         # Ver07 setup-volume governor: forward testing produced too many low/medium
         # quality executable rows. Apply conservative global floors before old bad
         # rows can reach email/autotrade.
@@ -42644,9 +43077,11 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         except Exception:
             pass
         if combo_side in cs:
-            return False, str((cs.get(combo_side) or {}).get('reason') or f'combo-side {combo_side} blocked by edge guard')
+            if strategy_label != 'REVERSE':
+                return False, str((cs.get(combo_side) or {}).get('reason') or f'combo-side {combo_side} blocked by edge guard')
         if sym and sym in sb:
-            return False, str((sb.get(sym) or {}).get('reason') or f'symbol {sym} blocked by edge guard')
+            if strategy_label != 'REVERSE':
+                return False, str((sb.get(sym) or {}).get('reason') or f'symbol {sym} blocked by edge guard')
         # Ver23 profit-first guard: if fresh edge data says the whole family/session
         # is below target, block normal-quality setups even before the next scheduled
         # policy tick catches up. Exceptional quality may still pass for discovery.
@@ -42664,7 +43099,8 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
             escape_q = float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92)
             weak_combo = c_dec >= min_dec and c_wr < target_wr and (c_avg <= 0.05 or c_score <= 0.0 or c_sl >= max(2, int(math.ceil(max(1, c_tp) * 1.25))))
             if weak_combo and q_v < escape_q:
-                return False, f'weak_combo_profit_guard {fam}-{sess}: WR {c_wr:.1f}% < {target_wr:.0f}%, AvgR {c_avg:+.2f}, score {c_score:+.1f}, n{c_dec}'
+                if strategy_label != 'REVERSE':
+                    return False, f'weak_combo_profit_guard {fam}-{sess}: WR {c_wr:.1f}% < {target_wr:.0f}%, AvgR {c_avg:+.2f}, score {c_score:+.1f}, n{c_dec}'
         except Exception:
             pass
         # Hour is normally a secondary filter, but ver07 escalates current bad hours:
@@ -42675,7 +43111,8 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
             except Exception:
                 min_q = 90.0
             if q_v < min_q or fam in {'F1', 'F2', 'F3', 'F6'}:
-                return False, str((hw.get(hour) or {}).get('reason') or f'hour {hour} blocked unless quality>={min_q:.0f}; fam={fam}, quality={q_v:.0f}')
+                if strategy_label != 'REVERSE':
+                    return False, str((hw.get(hour) or {}).get('reason') or f'hour {hour} blocked unless quality>={min_q:.0f}; fam={fam}, quality={q_v:.0f}')
         return True, 'ok'
     except Exception as exc:
         return True, f'guard_error_allowed:{type(exc).__name__}: {exc}'
@@ -42982,12 +43419,14 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
         tmp = {'setups': total, 'decided': decided, 'tp': tp, 'sl': sl, 'nohit': nohit, 'open': op, 'wr': wr, 'avg_r': avg_r}
         action, enabled_next, notes, score = _setup_combo_action_for_stats(tmp, hours)
         action, enabled_next, notes, score, guard_txt = _setup_combo_adjust_action_for_side_split(st, side_stats, _fam, _sess, action, enabled_next, notes, score)
+        strategy_rec = _setup_strategy_for_combo_metrics(total, decided, tp, sl, wr, avg_r, action, enabled_next)
         out_rows.append({
             'family': _fam, 'session': _sess, 'combo': f'{_fam}-{_sess}', 'setups': total, 'decided': decided,
             'tp': tp, 'sl': sl, 'nohit': nohit, 'open': op, 'win_rate': wr, 'avg_r': avg_r,
             'avg_conf': avg_conf, 'avg_quality': avg_quality, 'avg_volume_m': avg_vol_m,
             'score': score, 'action': action, 'enabled_next': int(enabled_next), 'notes': notes,
             'guard': guard_txt,
+            'strategy': strategy_rec,
         })
     out_rows.sort(key=lambda x: (int(x.get('enabled_next') or 0), float(x.get('score') or 0.0), float(x.get('win_rate') or 0.0), int(x.get('decided') or 0)), reverse=True)
     run_id = 'SCM-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
@@ -43547,8 +43986,9 @@ def _setup_combo_policy_text(uid: int) -> str:
                 kind_txt = _setup_combo_policy_kind_label(kind_src, short=True) if kind_src and kind_src != '-' else '-'
                 if not pol and raw_pol and float(raw_pol.get('expires_ts') or 0.0) > 0:
                     kind_txt = 'expired'
+                strat_txt = _setup_strategy_for_combo_metrics(set_v, dec_v, int(score.get('tp') or 0), int(score.get('sl') or 0), wr_v, avg_v, live_state, 0 if exec_state == 'OFF' else 1)
                 table_rows.append([
-                    combo, exec_state, live_state, side_txt,
+                    combo, exec_state, live_state, strat_txt, side_txt,
                     set_v, dec_v, f'{wr_v:.1f}%', f'{avg_v:+.2f}', adv, kind_txt,
                 ])
 
@@ -43562,14 +44002,14 @@ def _setup_combo_policy_text(uid: int) -> str:
             sess_n = sess_order.index(sess) if sess in sess_order else 99
             return (order_rank.get(str(row[1]), 9), fam_n, sess_n, combo)
         table_rows = sorted(table_rows, key=_row_key)
-        table = tabulate(table_rows, headers=['Combo','Exec','Live','SideBlock','Set','Dec','WR','AvgR','Adv','Kind'], tablefmt='plain')
+        table = tabulate(table_rows, headers=['Combo','Exec','Live','Strat','SideBlock','Set','Dec','WR','AvgR','Adv','Kind'], tablefmt='plain')
 
         info = _setup_combo_latest_policy_update_info(int(owner_uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}, Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f}, no weak combo/symbol/hour and valid Risk/SL/TP, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
+            f"Legend: <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}, Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f}, no weak combo/symbol/hour and valid Risk/SL/TP, <b>Strat</b>: NOR=normal, REV=reverse, MON=monitor, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
@@ -43578,7 +44018,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             f"{guard_txt}\n{note}\n"
-            f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, the micro edge guard, and the final WATCH quality gate are enforceable.\n"
+            f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, the micro edge guard, the final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable.\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -43867,7 +44307,8 @@ def _setup_audit_overall_text(uid: int) -> str:
         sid = str(r.get('setup_id') or '').strip()
         ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=0.0)
         result = _setup_audit_result_label(ev.get('result'))
-        item = fam_stats.setdefault((fam, sess_row), {'family': fam, 'session': sess_row, 'total': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0})
+        strat = _setup_strategy_short_label(r)
+        item = fam_stats.setdefault((fam, sess_row, strat), {'family': fam, 'session': sess_row, 'strategy': strat, 'total': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0})
         item['total'] += 1
         item['tp'] += 1 if result == 'TP' else 0
         item['sl'] += 1 if result == 'SL' else 0
@@ -43876,9 +44317,10 @@ def _setup_audit_overall_text(uid: int) -> str:
 
     table_rows = []
     total_setups = total_tp = total_sl = total_nohit = total_open = 0
-    for (_fam_key, _sess_key), st in sorted(fam_stats.items(), key=lambda kv: (int(kv[1].get('total') or 0), str(kv[1].get('family') or ''), str(kv[1].get('session') or '')), reverse=True):
+    for (_fam_key, _sess_key, _strat_key), st in sorted(fam_stats.items(), key=lambda kv: (int(kv[1].get('total') or 0), str(kv[1].get('family') or ''), str(kv[1].get('session') or ''), str(kv[1].get('strategy') or '')), reverse=True):
         fam = str(st.get('family') or _fam_key or '-')
         sess_row = str(st.get('session') or _sess_key or '-')
+        strat_row = str(st.get('strategy') or _strat_key or '-')
         total = int(st.get('total') or 0)
         tp = int(st.get('tp') or 0)
         sl = int(st.get('sl') or 0)
@@ -43891,7 +44333,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         total_sl += sl
         total_nohit += nohit
         total_open += op
-        table_rows.append([fam, sess_row, total, tp, sl, nohit, op, f"{wr:.1f}%"])
+        table_rows.append([fam, sess_row, strat_row, total, tp, sl, nohit, op, f"{wr:.1f}%"])
     decided_total = total_tp + total_sl + total_nohit
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
     win = _setup_audit_window_summary(rows)
@@ -43925,9 +44367,9 @@ def _setup_audit_overall_text(uid: int) -> str:
     ]
     table = tabulate(
         table_rows,
-        headers=['Fam', 'Ses', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
+        headers=['Fam', 'Ses', 'Strat', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
         tablefmt='plain',
-        colalign=('center', 'center', 'right', 'right', 'right', 'right', 'right', 'right'),
+        colalign=('center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
