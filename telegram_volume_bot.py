@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver45: Closed the executable-starvation loop: WATCH/probation now has an adaptive quality gate (Conf>=87/Dyn>=70 OR Conf>=85/Dyn>=80) so good near-threshold candidates are not killed forever; /why no longer gets stuck on final_watch_conf_below_87 only.
 # - Ver44: Hard-fixed UNKNOWN Family-Session-Strategy policy fallback so new NOR/REV/MON combos always enter WATCH probation instead of being blocked as UNKNOWN; cleaned /why stale UNKNOWN policy gate noise.
 # - Ver42: Fixed raw-candidate -> adaptive strategy routing before executable gate; /why now exposes screen/email post-gate reject reasons instead of vague refresh counters.
 # - Ver41: Fixed setup generation/execution sync: KEEP combos no longer get blocked by WATCH-only strict floors; /why now separates raw setup generation from final executable gate outcomes.
@@ -1910,8 +1911,15 @@ SETUP_COMBO_POLICY_BLOCK_WATCH = env_bool("SETUP_COMBO_POLICY_BLOCK_WATCH", Fals
 # KEEP remains the normal lane. WATCH is a probation lane and must pass these
 # stricter filters before it can be persisted, emailed, or autotraded.
 SETUP_COMBO_WATCH_STRICT_QUALITY_GATE = env_bool("SETUP_COMBO_WATCH_STRICT_QUALITY_GATE", True)
+# Ver45: avoid executable starvation.  Primary WATCH gate remains 87/70, but a
+# near-threshold candidate can pass if it is still high-confidence (85+) and has
+# a stronger dynamic score (80+).  This keeps quality-first behaviour while
+# preventing hours of 0 persisted executable rows when the market is producing
+# many 85-86 confidence candidates.
 SETUP_COMBO_WATCH_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_MIN_CONF", "87") or 87)
 SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE", "70") or 70)
+SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF", "85") or 85)
+SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE", "80") or 80)
 SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
 # Ver32 WR-first final gate: the executable lane itself is now quality-gated,
 # not only the downstream email/autotrade consumer.  This keeps /setup_audit,
@@ -1919,6 +1927,8 @@ SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RIS
 SETUP_FINAL_QUALITY_GATE_ENABLED = env_bool("SETUP_FINAL_QUALITY_GATE_ENABLED", True)
 SETUP_FINAL_MIN_CONF = int(os.environ.get("SETUP_FINAL_MIN_CONF", "87") or 87)
 SETUP_FINAL_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_MIN_DYNAMIC_SCORE", "70") or 70)
+SETUP_FINAL_ADAPTIVE_MIN_CONF = int(os.environ.get("SETUP_FINAL_ADAPTIVE_MIN_CONF", "85") or 85)
+SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE", "80") or 80)
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = True  # Ver44: hard safety; unknown/new strategy combos enter WATCH probation, never hard-block as UNKNOWN
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
@@ -43074,8 +43084,15 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
             return False, 'watch_below_min_volume', meta
 
         min_conf = int(globals().get('SETUP_COMBO_WATCH_MIN_CONF', 87) or 87)
-        if conf < min_conf:
-            return False, f'watch_conf_below_{min_conf}', meta
+        adaptive_min_conf = int(globals().get('SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF', 85) or 85)
+        # Ver45: do not kill all 85-86 confidence candidates before dynamic risk
+        # scoring is even calculated.  They may pass later only if Dyn is stronger
+        # than the normal WATCH threshold.
+        meta['watch_primary_min_conf'] = min_conf
+        meta['watch_adaptive_min_conf'] = adaptive_min_conf
+        meta['watch_near_conf_candidate'] = bool(conf < min_conf)
+        if conf < adaptive_min_conf:
+            return False, f'watch_conf_below_{adaptive_min_conf}', meta
 
         # Enforce the same micro edge blocks used by /setup_matrix deep analysis.
         try:
@@ -43140,7 +43157,12 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         meta['dynamic_score'] = dyn_score
         meta['dynamic_components'] = list((dyn or {}).get('components') or [])[:8]
         min_dyn = float(globals().get('SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE', 70) or 70)
-        if dyn_score < min_dyn:
+        near_conf_dyn = float(globals().get('SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80)
+        if bool(meta.get('watch_near_conf_candidate')):
+            if dyn_score < near_conf_dyn:
+                return False, f'watch_near_conf_dynamic_score_below_{near_conf_dyn:.0f}', meta
+            meta['watch_adaptive_conf_pass'] = f'conf_{conf}_dyn_{dyn_score:.0f}'
+        elif dyn_score < min_dyn:
             return False, f'watch_dynamic_score_below_{min_dyn:.0f}', meta
 
         risk_meta = _setup_watch_policy_projected_risk_metrics(setup_or_row, session_name=sess, user_id=int(risk_uid or 0), rr=rr, dynamic_score_info=dyn)
@@ -43358,10 +43380,18 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
             return False, f'final_{why}', meta
         conf = int(float(meta.get('conf') or _autotrade_setup_attr(setup_or_row, 'conf', 0) or 0))
         dyn_score = float(meta.get('dynamic_score') or _autotrade_setup_attr(setup_or_row, 'dynamic_risk_score', 0.0) or 0.0)
-        if conf < int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87):
-            return False, f'final_conf_below_{int(globals().get("SETUP_FINAL_MIN_CONF", 87) or 87)}', meta
-        if dyn_score < float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):
-            return False, f'final_dynamic_score_below_{float(globals().get("SETUP_FINAL_MIN_DYNAMIC_SCORE", 70) or 70):.0f}', meta
+        final_min_conf = int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)
+        final_adaptive_min_conf = int(globals().get('SETUP_FINAL_ADAPTIVE_MIN_CONF', 85) or 85)
+        final_min_dyn = float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70)
+        final_near_dyn = float(globals().get('SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80)
+        if conf < final_adaptive_min_conf:
+            return False, f'final_conf_below_{final_adaptive_min_conf}', meta
+        if conf < final_min_conf:
+            if dyn_score < final_near_dyn:
+                return False, f'final_near_conf_dynamic_score_below_{final_near_dyn:.0f}', meta
+            meta['final_adaptive_conf_pass'] = f'conf_{conf}_dyn_{dyn_score:.0f}'
+        elif dyn_score < final_min_dyn:
+            return False, f'final_dynamic_score_below_{final_min_dyn:.0f}', meta
         return True, 'final_watch_quality_ok', meta
     except Exception as exc:
         meta['error'] = f'{type(exc).__name__}: {exc}'
@@ -44658,7 +44688,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy (e.g. F8-NY-REV), <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}, Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f}, no weak combo/symbol/hour and valid Risk/SL/TP, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
+            f"Legend: <b>Combo</b>=Family-Session-Strategy (e.g. F8-NY-REV), <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}/Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f} OR Conf≥{int(globals().get('SETUP_FINAL_ADAPTIVE_MIN_CONF', 85) or 85)}/Dyn≥{float(globals().get('SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80):.0f}, no weak combo/symbol/hour and valid Risk/SL/TP, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
