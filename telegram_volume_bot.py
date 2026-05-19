@@ -1,5 +1,5 @@
 # CHANGE SUMMARY
-# - Ver45: Closed the executable-starvation loop: WATCH/probation now has an adaptive quality gate (Conf>=87/Dyn>=70 OR Conf>=85/Dyn>=80) so good near-threshold candidates are not killed forever; /why no longer gets stuck on final_watch_conf_below_87 only.
+# - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
 # - Ver44: Hard-fixed UNKNOWN Family-Session-Strategy policy fallback so new NOR/REV/MON combos always enter WATCH probation instead of being blocked as UNKNOWN; cleaned /why stale UNKNOWN policy gate noise.
 # - Ver42: Fixed raw-candidate -> adaptive strategy routing before executable gate; /why now exposes screen/email post-gate reject reasons instead of vague refresh counters.
 # - Ver41: Fixed setup generation/execution sync: KEEP combos no longer get blocked by WATCH-only strict floors; /why now separates raw setup generation from final executable gate outcomes.
@@ -50902,6 +50902,73 @@ def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, s
     except Exception:
         return 0
 
+
+def _setup_email_presend_executable_filter(user_id: int, session_name: str, setups: list, lane: str = 'email') -> tuple[list, Counter]:
+    """Return only setup rows that can be both emailed and autotrade-consumed.
+
+    Ver46: the last loop came from BigMove/setup-email delivery accepting rows that
+    AutoTrade later rejected with final_* / micro-edge reasons.  This helper is the
+    single pre-send guard used by normal setup emails, BigMove/F8 setup emails and the
+    immediate after-email AutoTrade trigger.  It routes NORMAL/REVERSE first and then
+    runs the exact executable gate that AutoTrade uses.
+    """
+    reasons = Counter()
+    out = []
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        owner_uid = 0
+    # Use the owner evidence when the email recipient is the live owner/admin, because
+    # AutoTrade consumes the owner lane. This keeps email, /screen and AT decisions synced.
+    try:
+        gate_uid = owner_uid if owner_uid > 0 and (uid == owner_uid or is_admin_user(uid)) else uid
+    except Exception:
+        gate_uid = owner_uid or uid
+    sess = str(session_name or '').upper().strip()
+    if sess not in {'ASIA', 'LON', 'NY'}:
+        sess = str(session_name or '').upper().strip()
+    seen = set()
+    for raw in list(setups or []):
+        try:
+            eff = _setup_route_candidate_for_executable_lane(raw, sess, int(gate_uid or uid or 0))
+            try:
+                setattr(eff, 'source_session', sess)
+                if not getattr(eff, 'session', None):
+                    setattr(eff, 'session', sess)
+            except Exception:
+                pass
+            sym = str(getattr(eff, 'symbol', '') or '').upper().strip()
+            side = str(getattr(eff, 'side', '') or '').upper().strip()
+            sid = str(getattr(eff, 'setup_id', '') or getattr(eff, 'id', '') or '').strip()
+            try:
+                key = (sid or sym, side, round(float(getattr(eff, 'entry', 0.0) or 0.0), 8), round(float(getattr(eff, 'sl', 0.0) or 0.0), 8), round(float(_setup_target_tp(eff, 0.0) or 0.0), 8))
+            except Exception:
+                key = (sid or sym, side)
+            if key in seen:
+                continue
+            seen.add(key)
+            ok, why = is_executable_setup_eligible(eff, session_name=sess)
+            if not ok:
+                reasons[str(why or 'not_executable')] += 1
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_presend_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(why or 'not_executable'), 'gate_uid': int(gate_uid or 0)})
+                except Exception:
+                    pass
+                continue
+            out.append(eff)
+        except Exception as exc:
+            reasons[f'presend_gate_exception:{type(exc).__name__}'] += 1
+            continue
+    try:
+        db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_presend_gate', status='ok' if out else 'empty', session=sess, mode=str(lane or 'email'), details={'input': len(list(setups or [])), 'eligible': len(out), 'top_reasons': _pipeline_top_reasons(reasons, 8), 'gate_uid': int(gate_uid or 0)})
+    except Exception:
+        pass
+    return list(out or []), reasons
+
 def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
     """
     One email containing multiple setups.
@@ -50937,6 +51004,36 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
         live_sess = "NONE"
     sess_name = str(sess.get("name") or "")
     display_session = (live_sess if live_sess != "NONE" else "NY") if sess_name == "UNLIMITED" else sess_name
+
+    # Ver46: final sync guard.  Do not send a setup email unless the exact routed
+    # setup can also enter the executable/AutoTrade lane now.  This prevents
+    # /screen from showing an emailed setup that /autotrade_last immediately skips
+    # for final_watch_micro_edge_block / weak symbol / policy reasons.
+    try:
+        _filtered, _filter_reasons = _setup_email_presend_executable_filter(int(uid), str(display_session or sess_name or ''), list(setups or []), lane='setup_email')
+        if not _filtered:
+            try:
+                _LAST_EMAIL_DECISION[int(uid)] = {
+                    'status': 'SKIP',
+                    'picked': '-',
+                    'when': datetime.now(tz).isoformat(timespec='seconds'),
+                    'reasons': ['presend_executable_gate_empty', f"top_reasons={dict((_filter_reasons or Counter()).most_common(5))}"],
+                }
+            except Exception:
+                pass
+            return False
+        setups = list(_filtered or [])
+    except Exception as _pre_exc:
+        try:
+            _LAST_EMAIL_DECISION[int(uid)] = {
+                'status': 'ERROR',
+                'picked': '-',
+                'when': datetime.now(tz).isoformat(timespec='seconds'),
+                'reasons': [f'presend_executable_gate_exception:{type(_pre_exc).__name__}: {_pre_exc}'],
+            }
+        except Exception:
+            pass
+        return False
 
     first = setups[0]
     subject = f"PulseFutures • {display_session} • {first.side} {first.symbol}"
@@ -51863,6 +51960,21 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     setattr(stp, 'engine', 'F8')
                 except Exception:
                     pass
+
+            # Ver46: BigMove/F8 setup emails must obey the same executable gate as
+            # normal setup emails and AutoTrade.  The market-event BigMove alert may
+            # still be sent independently, but the tradable F8 setup email is blocked
+            # if the final gate/micro-edge guard would reject it.
+            try:
+                setups, _bm_gate_reasons = _setup_email_presend_executable_filter(int(uid), sess_u, list(setups or []), lane='bigmove_setup_email')
+            except Exception:
+                setups, _bm_gate_reasons = [], Counter({'bigmove_presend_gate_exception': 1})
+            if not setups:
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', status='empty', session=sess_u, mode='bigmove_setup_email', details={'tag': str(tag or ''), 'top_reasons': _pipeline_top_reasons(_bm_gate_reasons, 8)})
+                except Exception:
+                    pass
+                return [], False
 
             try:
                 user_for_email = get_user(int(uid)) or {'user_id': int(uid), 'tz': _default_user_tz_name()}
@@ -54573,6 +54685,29 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                                 setattr(_s, 'created_ts', time.time())
                         except Exception:
                             pass
+                    try:
+                        _valid_for_at, _at_gate_reasons = _setup_email_presend_executable_filter(owner_uid, sess, list(chosen_list or []), lane='autotrade_after_email')
+                    except Exception:
+                        _valid_for_at, _at_gate_reasons = [], Counter({'autotrade_after_email_presend_exception': 1})
+                    if not _valid_for_at:
+                        try:
+                            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                                'status': 'SKIP',
+                                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                'reason': 'emailed_setups_failed_final_gate_before_autotrade',
+                                'session': sess,
+                                'mode': str(_autotrade_runtime_mode()).lower(),
+                                'top_reasons': dict((_at_gate_reasons or Counter()).most_common(5)),
+                                'trigger': 'email_sent_immediate',
+                            }
+                        except Exception:
+                            pass
+                        try:
+                            db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email_presend_gate', status='empty', session=sess, mode='autotrade', details={'top_reasons': _pipeline_top_reasons(_at_gate_reasons, 8), 'input': len(list(chosen_list or []))})
+                        except Exception:
+                            pass
+                        return
+                    chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
                         cache_delete(f"autotrade_db_setups:{owner_uid}:{sess}:12:5")
