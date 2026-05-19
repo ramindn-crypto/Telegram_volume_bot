@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver53 yver53: fixes post-unblock execution gaps: removes MON from combo identity (NOR/REV only), routes weak combos to REV earlier, lets AutoTrade execute already queued/emailed setups during setup-generation blackout, retries Bybit leverage at exchange max, and continues candidate attempts after leverage/setup-specific skips.
 # - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
 # - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
@@ -2246,6 +2247,15 @@ FINAL_PIPELINE_LOCKED_MIN_RR = VER52_MIN_RR
 FINAL_PIPELINE_LOCKED_MIN_VOL_USD = VER52_MIN_VOL_USD
 FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = VER52_MIN_DYNAMIC_SCORE
 
+# Ver53 yver53: Strategy identity is executable only, not advisory.  Do not
+# create Family-Session-MON combo keys; undecided/probation combos trade as NOR
+# until evidence makes them REV.  Route weak combos to REV after one decided loss
+# so reverse forward-testing starts quickly instead of waiting through multiple SLs.
+VER53_NOR_REV_ONLY_STRATEGY_IDENTITY = True
+SETUP_ADAPTIVE_WEAK_MIN_DECIDED = 1
+SETUP_ADAPTIVE_STRONG_MIN_DECIDED = max(2, int(globals().get('SETUP_ADAPTIVE_STRONG_MIN_DECIDED', 2) or 2))
+AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH = int(os.environ.get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', '5') or 5)
+
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
 
@@ -2567,10 +2577,10 @@ def _setup_strategy_normalize(value: str = '') -> str:
         v = str(value or '').strip().upper().replace('-', '_')
         if v in {'REV', 'REVERSE', 'INVERSE', 'RV'}:
             return 'REVERSE'
-        if v in {'N', 'NORMAL', 'ORIGINAL', 'BASE'}:
+        # Ver53: MON/MONITOR/TIGHTEN/DISABLE/BLOCK are policy/advisory states,
+        # not executable strategy identities.  Combo keys must be NOR or REV only.
+        if v in {'N', 'NORMAL', 'ORIGINAL', 'BASE', 'NOR', 'MON', 'MONITOR', 'TIGHTEN', 'DISABLE', 'BLOCK'}:
             return 'NORMAL'
-        if v in {'TIGHTEN', 'DISABLE', 'BLOCK', 'MONITOR'}:
-            return v
     except Exception:
         pass
     return 'NORMAL'
@@ -2631,21 +2641,21 @@ def _setup_strategy_full_label_from_short(value: str = '') -> str:
         if v in {'NOR', 'NORMAL', 'N', 'ORIGINAL', 'BASE'}:
             return 'NORMAL'
         if v in {'MON', 'MONITOR'}:
-            return 'MONITOR'
+            return 'NORMAL'
     except Exception:
         pass
     return 'NORMAL'
 
 
 def _setup_strategy_suffix(setup_or_row=None, value: str | None = None) -> str:
-    """Compact strategy suffix for combo identity: NOR / REV / MON."""
+    """Compact executable strategy suffix for combo identity: NOR / REV only."""
     try:
         if value is not None:
             vv = str(value or '').upper().strip()
             if vv in {'REV', 'REVERSE', 'RV', 'INVERSE'}:
                 return 'REV'
             if vv in {'MON', 'MONITOR'}:
-                return 'MON'
+                return 'NOR'
             if vv in {'NOR', 'NORMAL', 'N', 'ORIGINAL', 'BASE'}:
                 return 'NOR'
         return 'REV' if _setup_strategy_label(setup_or_row) == 'REVERSE' else 'NOR'
@@ -2993,9 +3003,9 @@ def _setup_strategy_for_combo_metrics(setups: int = 0, decided: int = 0, tp: int
             return 'NOR'
         if int(decided or 0) >= int(globals().get('SETUP_ADAPTIVE_WEAK_MIN_DECIDED', 2) or 2) and (float(wr or 0.0) < float(globals().get('SETUP_ADAPTIVE_REVERSE_WR_MAX', 50) or 50) or float(avg_r or 0.0) <= float(globals().get('SETUP_ADAPTIVE_REVERSE_AVG_R_MAX', 0.05) or 0.05) or int(sl or 0) > int(tp or 0)):
             return 'REV'
-        return 'MON'
+        return 'NOR'
     except Exception:
-        return 'MON'
+        return 'NOR'
 
 
 _LAST_SCAN_UNIVERSE = []
@@ -5148,22 +5158,66 @@ def _autotrade_liq_safety_plan(entry: float, sl: float, side: str, configured_le
 
 
 def _autotrade_set_symbol_leverage_safe(symbol: str, leverage: int | float) -> tuple[bool, str, dict]:
-    """Best-effort Bybit V5 leverage setter. Accepts 'not modified' as OK."""
-    try:
-        sym = _bybit_linear_symbol(symbol)
-        lev = max(1, int(float(leverage or 1)))
+    """Best-effort Bybit V5 leverage setter. Accepts 'not modified' as OK.
+
+    Ver53: Bybit can reject a liquidation-safe downgrade when the requested
+    leverage is still above the symbol/risk-tier maximum, for example:
+    `cannot set leverage [700] gt maxLeverage [500] by risk limit`.
+    The numbers are Bybit's 100x leverage units, so [700]=7x and [500]=5x.
+    In that case retry once at the exchange maximum instead of skipping the setup.
+    Lower leverage is safer for liquidation distance, so this preserves the liq guard.
+    """
+    def _lev_x_from_bybit_units(raw) -> int:
+        try:
+            v = float(raw)
+            if v >= 100:
+                return max(1, int(math.floor(v / 100.0)))
+            return max(1, int(math.floor(v)))
+        except Exception:
+            return 0
+
+    def _post(lev_x: int):
         payload = {
             'category': 'linear',
             'symbol': sym,
-            'buyLeverage': str(lev),
-            'sellLeverage': str(lev),
+            'buyLeverage': str(int(max(1, lev_x))),
+            'sellLeverage': str(int(max(1, lev_x))),
         }
-        res = _bybit_v5_request('POST', '/v5/position/set-leverage', payload)
+        return _bybit_v5_request('POST', '/v5/position/set-leverage', payload)
+
+    try:
+        sym = _bybit_linear_symbol(symbol)
+        lev = max(1, int(float(leverage or 1)))
+        res = _post(lev)
         code = int((res or {}).get('retCode', -1))
         msg = str((res or {}).get('retMsg') or '')
         low = msg.lower()
         if code == 0 or 'not modified' in low or 'same leverage' in low:
             return True, msg or 'ok', (res or {})
+
+        retry_lev = 0
+        try:
+            nums = re.findall(r'\[(\d+(?:\.\d+)?)\]', msg)
+            # Usually [requested_units] then [max_units].  Use the last bracket as max.
+            if nums and ('maxleverage' in low or 'risk limit' in low or code == 110013):
+                retry_lev = _lev_x_from_bybit_units(nums[-1])
+        except Exception:
+            retry_lev = 0
+        if retry_lev > 0 and retry_lev < lev:
+            res2 = _post(retry_lev)
+            code2 = int((res2 or {}).get('retCode', -1))
+            msg2 = str((res2 or {}).get('retMsg') or '')
+            low2 = msg2.lower()
+            if code2 == 0 or 'not modified' in low2 or 'same leverage' in low2:
+                try:
+                    if isinstance(res2, dict):
+                        res2.setdefault('_ver53_actual_leverage', int(retry_lev))
+                        res2.setdefault('_ver53_retry_from_leverage', int(lev))
+                except Exception:
+                    pass
+                return True, f'exchange_max_downgrade_{lev}x_to_{retry_lev}x: {msg2 or "ok"}', (res2 or {})
+            return False, f'{code2} {msg2} after_exchange_max_retry_{retry_lev}x'.strip(), (res2 or {})
+
         return False, f'{code} {msg}'.strip(), (res or {})
     except Exception as exc:
         return False, f'{type(exc).__name__}: {exc}', {}
@@ -10062,12 +10116,9 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
-        try:
-            _blk, _blk_reason = _setup_generation_blackout_now()
-            if _blk:
-                return (False, str(_blk_reason or 'setup_generation_blackout'))
-        except Exception:
-            pass
+        # Ver53: setup-generation blackout only stops creating new setups.
+        # It must not invalidate already persisted/emailed executable rows that
+        # AutoTrade is trying to consume before their entry window expires.
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
         try:
@@ -10819,6 +10870,7 @@ def _autotrade_should_try_next_after_skip(reason: str) -> bool:
         'blocked_duplicate_inflight_lock', 'blocked_by_cooldown',
         'blocked_by_recent_symbol_trade', 'blocked_by_existing_local_trade_state',
         'post_fill_risk_breach', 'exchange_reject', 'no_sltp',
+        'leverage_set_failed_for_liq_guard', 'configured_leverage_not_safe',
     )
     return any(tok in r for tok in retry_tokens)
 
@@ -55145,10 +55197,12 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                     except Exception:
                         continue
             attempted = 0
+            placed_count = 0
             attempts_meta = []
             ok = False
             reason = 'no_setups_after_email'
-            for cand in list(db_setups or [])[:5]:
+            max_batch_places = max(1, int(globals().get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', 5) or 5))
+            for cand in list(db_setups or [])[:max_batch_places]:
                 attempted += 1
                 try:
                     attempts_meta.append({
@@ -55180,13 +55234,18 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 except Exception:
                     pass
                 if ok:
-                    break
+                    placed_count += 1
+                    if placed_count >= max_batch_places:
+                        break
+                    # Continue through the just-emailed batch while normal risk/open-trade
+                    # caps still allow it, so AutoTrade does not fall behind emails.
+                    continue
                 if not _autotrade_should_try_next_after_skip(reason):
                     break
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                'status': 'PLACED' if ok else 'SKIP',
+                'status': 'PLACED' if placed_count > 0 else 'SKIP',
                 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                'reason': '' if ok else str(reason or 'no_tradable_setup'),
+                'reason': (f'placed_{placed_count}_from_email_batch' if placed_count > 0 else str(reason or 'no_tradable_setup')),
                 'attempted': int(attempted),
                 'session': sess,
                 'mode': str(_autotrade_runtime_mode()).lower(),
@@ -55195,7 +55254,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 'trigger': 'email_sent_immediate',
             }
             try:
-                db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email', status='placed' if ok else 'skip', session=sess, mode='autotrade', details={'reason': reason, 'attempted': attempted, 'candidates': attempts_meta[:5]})
+                db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email', status='placed' if placed_count > 0 else 'skip', session=sess, mode='autotrade', details={'reason': reason, 'attempted': attempted, 'placed': int(placed_count), 'candidates': attempts_meta[:5]})
             except Exception:
                 pass
     except Exception as e:
