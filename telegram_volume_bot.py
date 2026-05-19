@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
 # - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
 # - Ver44: Hard-fixed UNKNOWN Family-Session-Strategy policy fallback so new NOR/REV/MON combos always enter WATCH probation instead of being blocked as UNKNOWN; cleaned /why stale UNKNOWN policy gate noise.
 # - Ver42: Fixed raw-candidate -> adaptive strategy routing before executable gate; /why now exposes screen/email post-gate reject reasons instead of vague refresh counters.
@@ -2165,9 +2166,43 @@ SETUP_REVERSE_PROBATION_MIN_CONF = 80
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 45.0
 SETUP_BASELINE_DISCOVERY_MIN_RR = 1.25
 SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
-SETUP_EDGE_GUARD_STRICT_MIN_CONF = 80
+SETUP_EDGE_GUARD_STRICT_MIN_CONF = 78
 SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 15000000.0
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = False
+
+# Ver51 FINAL_PIPELINE_LOCKED: forward-test starvation guard.
+# Keep liquidity at 15M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
+# floors freeze the executable queue at zero during live sessions.  The daily/weekly
+# policy will still learn and tighten from results.
+SETUP_FINAL_MIN_CONF = 84
+SETUP_FINAL_MIN_DYNAMIC_SCORE = 50.0
+SETUP_FINAL_ADAPTIVE_MIN_CONF = 82
+SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = 45.0
+SETUP_FINAL_SCOUT_ENABLED = True
+SETUP_FINAL_SCOUT_MIN_CONF = 78
+SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 35.0
+SETUP_FINAL_SCOUT_MIN_RR = 1.20
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_COMBO_WATCH_MIN_CONF = 84
+SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = 50.0
+SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 82
+SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = 45.0
+SETUP_COMBO_WATCH_SCOUT_ENABLED = True
+SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 78
+SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 35.0
+SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.20
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_KEEP_MIN_CONF = 78
+SETUP_KEEP_MIN_DYNAMIC_SCORE = 35.0
+SETUP_REVERSE_PROBATION_MIN_CONF = 78
+SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 35.0
+SETUP_BASELINE_DISCOVERY_MIN_RR = 1.20
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
+FINAL_PIPELINE_LOCKED_ENABLED = env_bool("FINAL_PIPELINE_LOCKED_ENABLED", True)
+FINAL_PIPELINE_LOCKED_MIN_CONF = int(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_CONF", "78") or 78)
+FINAL_PIPELINE_LOCKED_MIN_RR = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_RR", "1.20") or 1.20)
+FINAL_PIPELINE_LOCKED_MIN_VOL_USD = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_VOL_USD", "15000000") or 15000000)
+FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE", "35") or 35)
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
@@ -33715,6 +33750,15 @@ def is_executable_setup_eligible(
             final_ok, final_why, _final_meta = _setup_final_quality_gate_allows_setup(s, sess, user_id=policy_uid)
             if not final_ok:
                 return (False, str(final_why or 'final_quality_gate_blocked'))
+            # Ver51 FINAL_PIPELINE_LOCKED: if the shared final gate explicitly accepted
+            # a starvation-safe scout candidate, do not let old duplicated legacy
+            # session/engine floors block the same setup later.  Autotrade risk, caps,
+            # cooldowns, max open/day and Bybit SL/TP attachment still run downstream.
+            try:
+                if bool(_autotrade_setup_attr(s, 'final_pipeline_locked_scout', False)):
+                    return (True, 'ok')
+            except Exception:
+                pass
         except Exception:
             return (False, 'final_quality_gate_exception')
 
@@ -43429,6 +43473,112 @@ def _setup_execution_quality_baseline_allows(setup_or_row, session_name: str = '
         meta['error'] = f'{type(exc).__name__}: {exc}'
         return False, 'baseline_quality_exception', meta
 
+
+def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', user_id: int = 0, reason_prefix: str = 'final_pipeline_locked') -> tuple[bool, str, dict]:
+    """Ver51 shared starvation-safe gate used by screen/email/autotrade.
+
+    This is not a quality bypass. It is the final fallback when older WATCH/dynamic/
+    micro-edge gates would otherwise leave the executable queue at zero.  It requires:
+    valid symbol/side/session, valid single TP/SL geometry, minimum 15M volume,
+    RR>=1.20, confidence>=78, projected risk/TP dollars, and no true disabled-normal
+    policy state.  NORMAL setups in disabled combos still must be routed to REVERSE first.
+    """
+    meta = {}
+    try:
+        if not bool(globals().get('FINAL_PIPELINE_LOCKED_ENABLED', True)):
+            return False, 'final_pipeline_locked_disabled', meta
+        sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        fam, sess2 = _setup_combo_family_session_from_obj(setup_or_row, session_name=sess)
+        sess = str(sess or sess2 or '').upper().strip()
+        setup_id = str(_autotrade_setup_attr(setup_or_row, 'setup_id', '') or _autotrade_setup_attr(setup_or_row, 'id', '') or '').strip()
+        symbol = str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or _autotrade_setup_attr(setup_or_row, 'market_symbol', '') or '').upper().strip()
+        side = str(_autotrade_setup_attr(setup_or_row, 'side', '') or '').upper().strip()
+        conf = int(float(_autotrade_setup_attr(setup_or_row, 'conf', 0) or _autotrade_setup_attr(setup_or_row, 'confidence', 0) or 0))
+        quality = float(_autotrade_setup_attr(setup_or_row, 'quality_score', 0.0) or _autotrade_setup_attr(setup_or_row, 'score', 0.0) or conf or 0.0)
+        entry = float(_autotrade_setup_attr(setup_or_row, 'entry', 0.0) or 0.0)
+        sl = float(_autotrade_setup_attr(setup_or_row, 'sl', 0.0) or 0.0)
+        tp = float(_setup_target_tp(setup_or_row, 0.0) or 0.0)
+        fut_vol = float(_autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or _autotrade_setup_attr(setup_or_row, 'vol_usd', 0.0) or 0.0)
+        rr = float(rr_to_tp(entry, sl, tp)) if entry > 0 and sl > 0 and tp > 0 else 0.0
+        strategy_label = _setup_strategy_label(setup_or_row)
+        combo_strategy = _setup_combo_strategy_key(fam, sess, setup_or_row)
+        meta.update({'family': fam, 'session': sess, 'setup_id': setup_id, 'symbol': symbol, 'side': side, 'conf': conf, 'quality_score': quality, 'entry': entry, 'sl': sl, 'tp': tp, 'rr': rr, 'fut_vol_usd': fut_vol, 'setup_strategy': strategy_label, 'combo_strategy': combo_strategy})
+
+        if not setup_id:
+            return False, f'{reason_prefix}_missing_setup_id', meta
+        if not symbol or side not in {'BUY', 'SELL'}:
+            return False, f'{reason_prefix}_missing_symbol_or_side', meta
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            return False, f'{reason_prefix}_missing_session', meta
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            return False, f'{reason_prefix}_incomplete_prices', meta
+        if side == 'BUY' and not (sl < entry < tp):
+            return False, f'{reason_prefix}_invalid_buy_geometry', meta
+        if side == 'SELL' and not (tp < entry < sl):
+            return False, f'{reason_prefix}_invalid_sell_geometry', meta
+
+        min_vol = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_VOL_USD', 15000000.0) or 15000000.0)
+        min_rr = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_RR', 1.20) or 1.20)
+        min_conf = int(globals().get('FINAL_PIPELINE_LOCKED_MIN_CONF', 78) or 78)
+        min_dyn = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE', 35.0) or 35.0)
+        meta.update({'final_locked_min_vol_usd': min_vol, 'final_locked_min_rr': min_rr, 'final_locked_min_conf': min_conf, 'final_locked_min_dyn': min_dyn})
+        if fut_vol < min_vol:
+            return False, f'{reason_prefix}_vol_below_{min_vol/1_000_000:.0f}M', meta
+        if rr < min_rr:
+            return False, f'{reason_prefix}_rr_below_{min_rr:.2f}', meta
+        if conf < min_conf:
+            return False, f'{reason_prefix}_conf_below_{min_conf}', meta
+
+        # Do not bypass true policy disable for NORMAL. Disabled combos must first be
+        # converted by the adaptive router into the REVERSE lane.
+        try:
+            info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0)) or {}
+            raw_status = str(info.get('status') or '').upper().strip()
+            status = _setup_policy_effective_status(raw_status, found=bool(info.get('found')))
+            enabled = int(info.get('enabled') or (1 if not info.get('found') else 0)) == 1
+            meta.update({'policy_status': status, 'policy_status_raw': raw_status or ('UNKNOWN' if not info.get('found') else ''), 'policy_found': bool(info.get('found')), 'policy_enabled': enabled})
+            if (status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled) and strategy_label != 'REVERSE':
+                return False, f'{reason_prefix}_normal_combo_disabled', meta
+        except Exception as exc:
+            meta['policy_lookup_error'] = f'{type(exc).__name__}: {exc}'
+
+        risk_uid = _setup_watch_policy_risk_uid(user_id)
+        try:
+            dyn = _autotrade_dynamic_risk_score(uid=int(risk_uid or 0), setup=setup_or_row, session_name=sess, regime=str(_autotrade_setup_attr(setup_or_row, 'regime_primary', '') or 'UNKNOWN'))
+        except Exception:
+            dyn = {'score': float(quality or conf or 0.0), 'multiplier': 1.0, 'components': ['dynamic_score_exception_fallback']}
+        dyn_score = float((dyn or {}).get('score') or 0.0)
+        if dyn_score <= 0 and quality > 0:
+            dyn_score = float(quality)
+        meta['dynamic_score'] = dyn_score
+        meta['dynamic_components'] = list((dyn or {}).get('components') or [])[:8]
+        if dyn_score < min_dyn:
+            return False, f'{reason_prefix}_dynamic_score_below_{min_dyn:.0f}', meta
+
+        risk_meta = _setup_watch_policy_projected_risk_metrics(setup_or_row, session_name=sess, user_id=int(risk_uid or 0), rr=rr, dynamic_score_info=dyn)
+        meta.update({
+            'risk_pct': float((risk_meta or {}).get('risk_pct') or 0.0),
+            'risk_usd': float((risk_meta or {}).get('risk_usd') or 0.0),
+            'tp_usd': float((risk_meta or {}).get('tp_usd') or 0.0),
+            'risk_source': str((risk_meta or {}).get('source') or ''),
+            'risk_uid': int((risk_meta or {}).get('risk_uid') or risk_uid or 0),
+        })
+        if bool(globals().get('SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS', True)):
+            if meta['risk_pct'] <= 0 or meta['risk_usd'] <= 0 or meta['tp_usd'] <= 0:
+                return False, f'{reason_prefix}_missing_valid_risk_or_tp_dollars', meta
+
+        _setup_quality_gate_set_attr(setup_or_row, 'final_pipeline_locked_scout', True)
+        _setup_quality_gate_set_attr(setup_or_row, 'final_pipeline_locked_reason', str(reason_prefix))
+        _setup_quality_gate_set_attr(setup_or_row, 'dynamic_risk_score', float(dyn_score))
+        _setup_quality_gate_set_attr(setup_or_row, 'risk_pct', float(meta.get('risk_pct') or 0.0))
+        _setup_quality_gate_set_attr(setup_or_row, 'risk_usd', float(meta.get('risk_usd') or 0.0))
+        _setup_quality_gate_set_attr(setup_or_row, 'tp_usd', float(meta.get('tp_usd') or 0.0))
+        _setup_quality_gate_set_attr(setup_or_row, 'rr_tp', float(rr))
+        return True, f'{reason_prefix}_ok', meta
+    except Exception as exc:
+        meta['error'] = f'{type(exc).__name__}: {exc}'
+        return False, f'{reason_prefix}_exception', meta
+
 def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
     """Shared final gate for executable queue, setup emails, AutoTrade and audit.
 
@@ -43505,6 +43655,10 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
             ok, why, qmeta = _setup_execution_quality_baseline_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0), lane='REVERSE')
             meta.update(dict(qmeta or {}))
             if not ok:
+                scout_ok, scout_why, scout_meta = _final_pipeline_locked_scout_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0), reason_prefix='final_reverse_pipeline_locked')
+                meta.update(dict(scout_meta or {}))
+                if scout_ok:
+                    return True, scout_why, meta
                 return False, f'final_{why}', meta
             return True, 'final_reverse_quality_ok', meta
 
@@ -43514,6 +43668,10 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
             ok, why, qmeta = _setup_execution_quality_baseline_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0), lane='KEEP')
             meta.update(dict(qmeta or {}))
             if not ok:
+                scout_ok, scout_why, scout_meta = _final_pipeline_locked_scout_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0), reason_prefix='final_keep_pipeline_locked')
+                meta.update(dict(scout_meta or {}))
+                if scout_ok:
+                    return True, scout_why, meta
                 return False, f'final_{why}', meta
             return True, 'final_keep_quality_ok', meta
 
@@ -43521,6 +43679,10 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         ok, why, qmeta = _setup_watch_policy_strict_quality_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0))
         meta.update(dict(qmeta or {}))
         if not ok:
+            scout_ok, scout_why, scout_meta = _final_pipeline_locked_scout_allows(setup_or_row, session_name=sess, user_id=int(user_id or 0), reason_prefix='final_watch_pipeline_locked')
+            meta.update(dict(scout_meta or {}))
+            if scout_ok:
+                return True, scout_why, meta
             return False, f'final_{why}', meta
         conf = int(float(meta.get('conf') or _autotrade_setup_attr(setup_or_row, 'conf', 0) or 0))
         dyn_score = float(meta.get('dynamic_score') or _autotrade_setup_attr(setup_or_row, 'dynamic_risk_score', 0.0) or 0.0)
