@@ -764,16 +764,28 @@ def _autotrade_runtime_max_open_trades() -> int:
 def _autotrade_runtime_max_trades_per_day() -> int:
     """AutoTrade-only daily trade count cap.
 
-    0 means unlimited. This is intentionally separate from the user's /limits
-    maxtrades value, which is for manual journal/risk workflows only.
+    Ver47: the requested production default is 50/day. Older DB snapshots can
+    still contain 0 from the previous "unlimited" era, which makes
+    /autotrade_debug show 6/∞ and weakens the WR-first learning loop. Treat a
+    stored 0/blank as the configured default unless the operator explicitly sets
+    AUTOTRADE_ALLOW_UNLIMITED_MAX_TRADES_PER_DAY=1 in the environment.
     """
     try:
-        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, AUTOTRADE_MAX_TRADES_PER_DAY) or AUTOTRADE_MAX_TRADES_PER_DAY))
+        raw = _autotrade_config_get(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, None)
+        if raw is None or str(raw).strip() == '':
+            val = int(AUTOTRADE_MAX_TRADES_PER_DAY)
+        else:
+            val = int(float(raw))
     except Exception:
         try:
             val = int(AUTOTRADE_MAX_TRADES_PER_DAY)
         except Exception:
-            val = 0
+            val = 50
+    if int(val) <= 0 and not env_bool('AUTOTRADE_ALLOW_UNLIMITED_MAX_TRADES_PER_DAY', False):
+        try:
+            return max(1, int(globals().get('AUTOTRADE_VER34_MAX_TRADES_PER_DAY', AUTOTRADE_MAX_TRADES_PER_DAY) or 50))
+        except Exception:
+            return 50
     return max(0, int(val))
 
 
@@ -1650,6 +1662,52 @@ def _autotrade_apply_ver43_runtime_defaults_resync() -> None:
     except Exception:
         pass
 
+
+
+def _autotrade_apply_ver47_runtime_defaults_resync() -> None:
+    """Ver47: final resync of user-requested AutoTrade throughput defaults.
+
+    This cleans stale DB values left by older builds while keeping Telegram edits
+    possible after deploy. It intentionally does not touch users, email/API
+    settings, sessions, timezone or history tables.
+    """
+    try:
+        target_version = 'ver47_2026_05_19_runtime_defaults_resync'
+        reapply = env_bool('AUTOTRADE_VER47_REAPPLY_DEFAULTS', False)
+        if (not reapply) and str(_autotrade_config_get('ver47_runtime_defaults_resync_version', '') or '').strip().lower() == target_version:
+            return
+        max_day = max(1, int(globals().get('AUTOTRADE_VER34_MAX_TRADES_PER_DAY', 50) or 50))
+        max_open = max(1, int(globals().get('AUTOTRADE_VER34_MAX_OPEN_TRADES', 20) or 20))
+        max_hours = max(0.25, min(72.0, float(globals().get('AUTOTRADE_VER34_MAX_POSITION_HOURS', 12) or 12)))
+        max_drift = max(0.0, float(globals().get('AUTOTRADE_VER34_MAX_ENTRY_DRIFT_PCT', 1.0) or 1.0))
+        day_cap_pct = max(0.0, float(globals().get('AUTOTRADE_VER34_DAILY_CAP_PCT', 15.0) or 15.0))
+        if not env_bool('AUTOTRADE_ALLOW_UNLIMITED_MAX_TRADES_PER_DAY', False):
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(max_day))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, int(max_open))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, float(max_hours))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, float(max_drift))
+        _autotrade_set_daily_cap_settings('PCT', float(day_cap_pct))
+        try:
+            cfg = load_strategy_config(force=True)
+            cfg['ver47_runtime_defaults_resync_enabled'] = True
+            cfg['ver47_autotrade_forward_test_defaults'] = {
+                'max_trades_per_day': int(max_day),
+                'max_open_trades': int(max_open),
+                'max_position_hours': float(max_hours),
+                'max_entry_drift_pct': float(max_drift),
+                'daily_risk_cap_pct': float(day_cap_pct),
+                'telegram_editable': True,
+            }
+            save_strategy_config(cfg)
+            apply_strategy_config(cfg)
+        except Exception:
+            pass
+        _autotrade_config_set('ver47_runtime_defaults_resync_version', target_version)
+    except Exception:
+        pass
+
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -1920,6 +1978,15 @@ SETUP_COMBO_WATCH_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_MIN_CONF", "8
 SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE", "70") or 70)
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF", "85") or 85)
 SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE", "80") or 80)
+# Ver47: starvation-safe scout lane. This is NOT a loose normal lane: it only lets
+# one of the near-quality 84-confidence candidates survive when it also has strong
+# dynamic score, good RR and enough volume. It keeps the system learning instead of
+# sitting at 0 executable rows for hours, while preserving WR-first controls.
+SETUP_COMBO_WATCH_SCOUT_ENABLED = env_bool("SETUP_COMBO_WATCH_SCOUT_ENABLED", True)
+SETUP_COMBO_WATCH_SCOUT_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_CONF", "84") or 84)
+SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE", "88") or 88)
+SETUP_COMBO_WATCH_SCOUT_MIN_RR = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_RR", "1.50") or 1.50)
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "20000000") or 20000000)
 SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
 # Ver32 WR-first final gate: the executable lane itself is now quality-gated,
 # not only the downstream email/autotrade consumer.  This keeps /setup_audit,
@@ -1929,6 +1996,11 @@ SETUP_FINAL_MIN_CONF = int(os.environ.get("SETUP_FINAL_MIN_CONF", "87") or 87)
 SETUP_FINAL_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_MIN_DYNAMIC_SCORE", "70") or 70)
 SETUP_FINAL_ADAPTIVE_MIN_CONF = int(os.environ.get("SETUP_FINAL_ADAPTIVE_MIN_CONF", "85") or 85)
 SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE", "80") or 80)
+SETUP_FINAL_SCOUT_ENABLED = env_bool("SETUP_FINAL_SCOUT_ENABLED", True)
+SETUP_FINAL_SCOUT_MIN_CONF = int(os.environ.get("SETUP_FINAL_SCOUT_MIN_CONF", "84") or 84)
+SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE", "88") or 88)
+SETUP_FINAL_SCOUT_MIN_RR = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_RR", "1.50") or 1.50)
+SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "20000000") or 20000000)
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = True  # Ver44: hard safety; unknown/new strategy combos enter WATCH probation, never hard-block as UNKNOWN
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
@@ -4687,6 +4759,7 @@ try:
     _autotrade_apply_ver35_no_hidden_email_caps()
     _autotrade_apply_ver36_user_runtime_defaults_resync()
     _autotrade_apply_ver43_runtime_defaults_resync()
+    _autotrade_apply_ver47_runtime_defaults_resync()
 except Exception:
     pass
 
@@ -38523,7 +38596,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
             f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
-            f"AUTOTRADE_MAX_TRADES_PER_DAY = {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0))} (0 = unlimited)",
+            f"AUTOTRADE_MAX_TRADES_PER_DAY = {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0))} (default 50; env can allow 0=unlimited)",
             f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
             f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
@@ -38554,7 +38627,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
             "• /autotrade_config AUTOTRADE_MODE live",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
-            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (0 = unlimited)",
+            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (default; env can allow 0=unlimited)",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
@@ -43085,14 +43158,21 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
 
         min_conf = int(globals().get('SETUP_COMBO_WATCH_MIN_CONF', 87) or 87)
         adaptive_min_conf = int(globals().get('SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF', 85) or 85)
-        # Ver45: do not kill all 85-86 confidence candidates before dynamic risk
-        # scoring is even calculated.  They may pass later only if Dyn is stronger
-        # than the normal WATCH threshold.
+        scout_enabled = bool(globals().get('SETUP_COMBO_WATCH_SCOUT_ENABLED', True))
+        scout_min_conf = int(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_CONF', 84) or 84)
+        scout_min_rr = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_RR', 1.50) or 1.50)
+        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 20000000) or 20000000)
+        # Ver47: do not kill 84-86 confidence candidates before dynamic risk is
+        # calculated. They may pass only via the stronger near/scout dynamic-score
+        # lane; sub-scout confidence is still blocked immediately.
         meta['watch_primary_min_conf'] = min_conf
         meta['watch_adaptive_min_conf'] = adaptive_min_conf
+        meta['watch_scout_min_conf'] = scout_min_conf
         meta['watch_near_conf_candidate'] = bool(conf < min_conf)
+        meta['watch_scout_candidate'] = bool(scout_enabled and conf < adaptive_min_conf and conf >= scout_min_conf)
         if conf < adaptive_min_conf:
-            return False, f'watch_conf_below_{adaptive_min_conf}', meta
+            if not (scout_enabled and conf >= scout_min_conf and rr >= scout_min_rr and fut_vol >= scout_min_vol):
+                return False, f'watch_conf_below_{adaptive_min_conf}', meta
 
         # Enforce the same micro edge blocks used by /setup_matrix deep analysis.
         try:
@@ -43158,7 +43238,12 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         meta['dynamic_components'] = list((dyn or {}).get('components') or [])[:8]
         min_dyn = float(globals().get('SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE', 70) or 70)
         near_conf_dyn = float(globals().get('SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80)
-        if bool(meta.get('watch_near_conf_candidate')):
+        scout_dyn = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE', 88) or 88)
+        if bool(meta.get('watch_scout_candidate')):
+            if dyn_score < scout_dyn:
+                return False, f'watch_scout_dynamic_score_below_{scout_dyn:.0f}', meta
+            meta['watch_scout_conf_pass'] = f'conf_{conf}_dyn_{dyn_score:.0f}_rr_{rr:.2f}_vol_{fut_vol/1_000_000:.1f}M'
+        elif bool(meta.get('watch_near_conf_candidate')):
             if dyn_score < near_conf_dyn:
                 return False, f'watch_near_conf_dynamic_score_below_{near_conf_dyn:.0f}', meta
             meta['watch_adaptive_conf_pass'] = f'conf_{conf}_dyn_{dyn_score:.0f}'
@@ -43384,9 +43469,18 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         final_adaptive_min_conf = int(globals().get('SETUP_FINAL_ADAPTIVE_MIN_CONF', 85) or 85)
         final_min_dyn = float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70)
         final_near_dyn = float(globals().get('SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80)
+        scout_enabled = bool(globals().get('SETUP_FINAL_SCOUT_ENABLED', True))
+        scout_min_conf = int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)
+        scout_dyn = float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 88) or 88)
+        scout_rr = float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.50) or 1.50)
+        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 20000000) or 20000000)
+        fut_vol = float(meta.get('fut_vol_usd') or _autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or 0.0)
+        rr = float(meta.get('rr') or 0.0)
         if conf < final_adaptive_min_conf:
-            return False, f'final_conf_below_{final_adaptive_min_conf}', meta
-        if conf < final_min_conf:
+            if not (scout_enabled and conf >= scout_min_conf and dyn_score >= scout_dyn and rr >= scout_rr and fut_vol >= scout_vol):
+                return False, f'final_conf_below_{final_adaptive_min_conf}', meta
+            meta['final_scout_conf_pass'] = f'conf_{conf}_dyn_{dyn_score:.0f}_rr_{rr:.2f}_vol_{fut_vol/1_000_000:.1f}M'
+        elif conf < final_min_conf:
             if dyn_score < final_near_dyn:
                 return False, f'final_near_conf_dynamic_score_below_{final_near_dyn:.0f}', meta
             meta['final_adaptive_conf_pass'] = f'conf_{conf}_dyn_{dyn_score:.0f}'
@@ -44688,7 +44782,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy (e.g. F8-NY-REV), <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}/Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f} OR Conf≥{int(globals().get('SETUP_FINAL_ADAPTIVE_MIN_CONF', 85) or 85)}/Dyn≥{float(globals().get('SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80):.0f}, no weak combo/symbol/hour and valid Risk/SL/TP, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
+            f"Legend: <b>Combo</b>=Family-Session-Strategy (e.g. F8-NY-REV), <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}/Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f} OR Conf≥{int(globals().get('SETUP_FINAL_ADAPTIVE_MIN_CONF', 85) or 85)}/Dyn≥{float(globals().get('SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80):.0f} OR scout Conf≥{int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)}/Dyn≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 88) or 88):.0f}/RR≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.5) or 1.5):.1f}/Vol≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 20000000) or 20000000)/1_000_000:.0f}M, no weak combo/symbol/hour and valid Risk/SL/TP, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
@@ -49476,13 +49570,15 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     src_session_u = str(getattr(item, 'source_session', '') or getattr(item, 'session', '') or '').upper().strip()
                     if sess and src_session_u and src_session_u not in {'', sess}:
                         continue
-                    if source_name == 'emailed':
-                        ok_exec = _basic_valid(item)
-                    else:
-                        try:
+                    try:
+                        if source_name == 'emailed':
+                            ok_basic = _basic_valid(item)
+                            ok_final, _why_final, _meta_final = _setup_final_quality_gate_allows_setup(item, session_name=sess, user_id=int(uid)) if ok_basic else (False, 'screen_emailed_basic_invalid', {})
+                            ok_exec = bool(ok_basic and ok_final)
+                        else:
                             ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=sess)
-                        except Exception:
-                            ok_exec, _why_exec = False, 'screen_recent_exec_gate_exception'
+                    except Exception:
+                        ok_exec = False
                     if not ok_exec:
                         continue
                     if not used_source_name:
