@@ -1,4 +1,6 @@
 # CHANGE SUMMARY
+# - Ver35: Removed hidden hard email/session caps, removed AutoTrade debug cap-note noise, restored /setup_audit visibility while keeping execution quality gates.
+# - Ver34: Restored user-requested AutoTrade forward-test defaults (50/day, 20 open, 12h hold, 1% drift, 15% daily cap).
 # - Ver33: Synced WR-first live limits: WATCH rows display as GATED, AutoTrade hard-caps max open/day, max-hold and drift, and /autotrade_debug now explains email-cap blocking.
 # - Ver31: Final WR-first quality gate: WATCH combos are no longer executable by Exec=ON alone; only KEEP or strict WATCH candidates can reach executable queue/email/AutoTrade.
 # - Ver31: AutoTrade report loss reasons no longer label missing legacy/setup metadata as LOW_CONFIDENCE; added MISSING_SETUP_DATA and refreshed report caches.
@@ -1508,6 +1510,35 @@ def _autotrade_apply_ver34_user_requested_defaults() -> None:
     except Exception:
         pass
 
+
+
+def _autotrade_apply_ver35_no_hidden_email_caps() -> None:
+    """Ver35: remove hidden hard setup-email caps and keep audit/reporting visible.
+
+    User-facing /limits remain the source of truth for setup email caps. This
+    migration does not delete email counters or setup history; it only records the
+    policy version and keeps ver34 AutoTrade throughput defaults intact.
+    """
+    try:
+        target_version = 'ver35_2026_05_19_no_hidden_email_caps'
+        if str(_autotrade_config_get('ver35_no_hidden_email_caps_version', '') or '').strip().lower() == target_version:
+            return
+        # Re-assert the user-requested forward-test runtime defaults in case a
+        # stale DB still has the earlier ver33 risk caps. These remain editable
+        # via /autotrade_config after deployment.
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(globals().get('AUTOTRADE_VER34_MAX_TRADES_PER_DAY', 50) or 50))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, int(globals().get('AUTOTRADE_VER34_MAX_OPEN_TRADES', 20) or 20))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, float(globals().get('AUTOTRADE_VER34_MAX_POSITION_HOURS', 12) or 12))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, float(globals().get('AUTOTRADE_VER34_MAX_ENTRY_DRIFT_PCT', 1.0) or 1.0))
+            _autotrade_set_daily_cap_settings('PCT', float(globals().get('AUTOTRADE_VER34_DAILY_CAP_PCT', 15.0) or 15.0))
+        except Exception:
+            pass
+        _autotrade_config_set('ver35_no_hidden_email_caps_version', target_version)
+    except Exception:
+        pass
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -1781,10 +1812,17 @@ SETUP_FINAL_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_MIN_DYNAMIC_SC
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = env_bool("SETUP_FINAL_UNKNOWN_AS_WATCH", True)
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
-SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE = env_bool("SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE", True)
+# Ver35: /setup_audit is an analytical report and must not disappear just because
+# the live execution gate is strict. Execution/email/autotrade still use the final
+# quality gate; audit keeps visibility of stored setup outcomes for learning.
+SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE = env_bool("SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE", False)
 AUTOTRADE_VER32_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER32_MAX_TRADES_PER_DAY", "50") or 50)
-EMAIL_VER32_HARD_MAX_PER_DAY = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_DAY", "5") or 5)
-EMAIL_VER32_HARD_MAX_PER_SESSION = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_SESSION", "3") or 3)
+# Ver35: no hidden hard email caps. User-visible /limits values control email caps:
+# emailcap=0 and emaildaycap=0 mean unlimited. Keep optional emergency hard caps
+# behind an explicit env flag only.
+EMAIL_HARD_CAPS_ENABLED = env_bool("EMAIL_HARD_CAPS_ENABLED", False)
+EMAIL_VER32_HARD_MAX_PER_DAY = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_DAY", "0") or 0)
+EMAIL_VER32_HARD_MAX_PER_SESSION = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_SESSION", "0") or 0)
 # Ver33 WR-first operating caps. These are runtime caps, not API/email/session deletion.
 # Ver34 keeps these open by default for forward testing while the quality gates improve WR.
 AUTOTRADE_VER33_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER33_MAX_TRADES_PER_DAY", "50") or 50)
@@ -3993,6 +4031,7 @@ try:
     _autotrade_apply_ver32_quality_defaults()
     _autotrade_apply_ver33_wr_first_caps()
     _autotrade_apply_ver34_user_requested_defaults()
+    _autotrade_apply_ver35_no_hidden_email_caps()
 except Exception:
     pass
 
@@ -35182,21 +35221,22 @@ def _email_runtime_limits_snapshot(uid: int, user: dict) -> dict:
     except Exception:
         day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
 
-    # Ver32 quality-over-quantity safety cap.  A stored value of 0 still means
-    # "unlimited by user config", but the live bot applies this hard effective
-    # cap so setup emails do not flood the executable/autotrade lane.
-    try:
-        hard_day = int(globals().get('EMAIL_VER32_HARD_MAX_PER_DAY', 5) or 5)
-        if hard_day > 0:
-            day_cap = hard_day if day_cap <= 0 else min(int(day_cap), int(hard_day))
-    except Exception:
-        pass
-    try:
-        hard_sess = int(globals().get('EMAIL_VER32_HARD_MAX_PER_SESSION', 3) or 3)
-        if hard_sess > 0:
-            session_cap = hard_sess if session_cap <= 0 else min(int(session_cap), int(hard_sess))
-    except Exception:
-        pass
+    # Ver35: do not apply hidden hard email caps by default.
+    # /limits emailcap 0 and /limits emaildaycap 0 must mean unlimited.
+    # Optional emergency caps are only active when EMAIL_HARD_CAPS_ENABLED=1.
+    if bool(globals().get('EMAIL_HARD_CAPS_ENABLED', False)):
+        try:
+            hard_day = int(globals().get('EMAIL_VER32_HARD_MAX_PER_DAY', 0) or 0)
+            if hard_day > 0:
+                day_cap = hard_day if day_cap <= 0 else min(int(day_cap), int(hard_day))
+        except Exception:
+            pass
+        try:
+            hard_sess = int(globals().get('EMAIL_VER32_HARD_MAX_PER_SESSION', 0) or 0)
+            if hard_sess > 0:
+                session_cap = hard_sess if session_cap <= 0 else min(int(session_cap), int(hard_sess))
+        except Exception:
+            pass
 
     current_sess = None
     current_session_key = ''
@@ -41026,7 +41066,13 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit, dedup=True)
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not rows:
-        return f"🧪 <b>Setup Audit</b>\n{HDR}\nNo unique setups above ${min_vol_m:.0f}M volume in the last {hours}h.\n\nUse <code>/setup_audit h</code> for the guide."
+        return (
+            f"🧪 <b>Setup Audit</b>\n{HDR}\n"
+            f"No stored setup rows above ${min_vol_m:.0f}M volume in the last {hours}h.\n"
+            f"This is an analytics-data message only; it does not mean setup generation is blocked. "
+            f"Check <code>/email_decision</code>, <code>/why</code>, and <code>/screen</code> for current live scan status.\n\n"
+            f"Use <code>/setup_audit h</code> for the guide."
+        )
 
     audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
     candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
@@ -46242,8 +46288,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Emails sent today: {int(email_gate.get('sent_today', 0) or 0)}",
         f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
         f"Email/AutoTrade gate: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
-        ("Gate note: cap reached means no further setup emails or email-triggered AutoTrade entries until the session/day counter resets." if (not bool(email_gate.get('gate_open')) and ('cap_reached' in str(gate_reason or ''))) else None),
-        ("Gate note: counters can show sent > cap immediately after a new stricter cap is deployed; the gate still blocks new entries now." if (not bool(email_gate.get('gate_open')) and ('cap_reached' in str(gate_reason or '')) and (int(email_gate.get('sent_in_session', 0) or 0) > int(email_gate.get('session_cap', 0) or 0) > 0 or int(email_gate.get('sent_today', 0) or 0) > int(email_gate.get('day_cap', 0) or 0) > 0)) else None),
         f"Recent emailed setups (unique, 12h): {emailed_recent}",
         f"Recent executable setups (unique sym/side, 12h): {exec_recent}",
     ]
