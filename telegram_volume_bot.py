@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver31: AutoTrade report loss reasons no longer label missing legacy/setup metadata as LOW_CONFIDENCE; added MISSING_SETUP_DATA and refreshed report caches.
 # - Ver30: AutoTrade debug daily risk used now reconciles open risk minus realised net profit/loss; report Dyn column infers a score when only dynamic risk% is stored.
 # - Ver29: AutoTrade report now avoids fake legacy risk/TP values, makes Reason/LossReason analytically useful, and aligns overall top-loss reasons with the detailed journal.
 # - Ver28: AutoTrade report now persists/displays real dynamic Risk%, Risk$ and TP$; adds CloseReason + LossReason taxonomy; /autotrade_report_overall uses the same classifier and top loss reason.
@@ -44208,6 +44209,7 @@ AUTOTRADE_REPORT_LOSS_REASON_CHOICES = (
     'COUNTER_TREND',          # setup side fought the 24h/4h/1h direction
     'LOW_CONFIDENCE',         # confidence was below the stronger live threshold
     'LOW_VOLUME',             # volume was above floor but still thin for AutoTrade quality
+    'MISSING_SETUP_DATA',     # legacy/unmatched row lacks setup metadata; do not pretend it was low-confidence
     'LOSS_CLOSE',             # exchange closed at loss but exact failure mode is unknown
 )
 
@@ -44232,6 +44234,12 @@ def _autotrade_report_loss_reason(row: dict) -> str:
         fam = _setup_audit_family_display(row, compact=True)
         sess = str(row.get('session') or row.get('open_session') or '').upper().strip()
         combo = f"{fam}-{sess}" if fam and sess else ''
+        try:
+            conf_val = int(float(row.get('conf') or row.get('confidence') or 0.0))
+        except Exception:
+            conf_val = 0
+        has_setup_id = bool(str(row.get('setup_id') or '').strip())
+        has_core_setup_prices = float(row.get('entry') or 0.0) > 0 and float(row.get('sl') or 0.0) > 0
 
         # Enforced policy / micro-edge evidence first: this is usually the most
         # actionable reason for the next week/day adjustment.
@@ -44264,6 +44272,13 @@ def _autotrade_report_loss_reason(row: dict) -> str:
                     return 'WEAK_HOUR'
         except Exception:
             pass
+
+        # If an older/exchange fallback row has no setup context, say that honestly.
+        # Do not mislabel missing metadata as LOW_CONFIDENCE; that corrupts the
+        # continuous-improvement loop by making legacy/unmatched rows look like
+        # a confidence-threshold problem.
+        if (not has_setup_id) and (fam in {'', '-', 'F0', 'UNK'} or conf_val <= 0) and (not has_core_setup_prices):
+            return 'MISSING_SETUP_DATA'
 
         # Setup mechanics: identify if stop placement or entry quality was the likely problem.
         entry = float(row.get('entry') or 0.0)
@@ -44303,7 +44318,9 @@ def _autotrade_report_loss_reason(row: dict) -> str:
             pass
 
         try:
-            if int(float(row.get('conf') or row.get('confidence') or 0.0)) < 83:
+            # LOW_CONFIDENCE is only valid when a real confidence value exists.
+            # Missing legacy metadata is reported as MISSING_SETUP_DATA instead.
+            if 0 < int(conf_val) < 83:
                 return 'LOW_CONFIDENCE'
         except Exception:
             pass
@@ -44786,7 +44803,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v30_real_risk_reason_dyn:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v31_metadata_reason_dyn:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -44968,7 +44985,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
         f"Trades: <b>{len(journal_rows)}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
         "Result: TP=win/profitable close, SL=loss, FLAT=near-zero. Reason separates TP_HIT, SL_HIT, CLOSED_BEFORE_ASIA_WIN/LOSS, MAX_HOLD, and inferred loss causes.",
-        "LossReason choices: SL_HIT, CLOSED_BEFORE_ASIA_LOSS, MAX_HOLD_LOSS, WEAK_COMBO, WEAK_SYMBOL, WEAK_HOUR, TIGHT_SL, BAD_ENTRY, COUNTER_TREND, LOW_CONFIDENCE, LOW_VOLUME, LOSS_CLOSE.",
+        "LossReason choices: SL_HIT, CLOSED_BEFORE_ASIA_LOSS, MAX_HOLD_LOSS, WEAK_COMBO, WEAK_SYMBOL, WEAK_HOUR, TIGHT_SL, BAD_ENTRY, COUNTER_TREND, LOW_CONFIDENCE, LOW_VOLUME, MISSING_SETUP_DATA, LOSS_CLOSE.",
     ]
     if external_positions:
         lines.append(f"Ignored unmatched manual/external live positions: <b>{len(external_positions)}</b>")
@@ -45823,7 +45840,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v29_real_risk_reason_matrix:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v31_metadata_reason_matrix:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
