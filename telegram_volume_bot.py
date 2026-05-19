@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver31: Final WR-first quality gate: WATCH combos are no longer executable by Exec=ON alone; only KEEP or strict WATCH candidates can reach executable queue/email/AutoTrade.
 # - Ver31: AutoTrade report loss reasons no longer label missing legacy/setup metadata as LOW_CONFIDENCE; added MISSING_SETUP_DATA and refreshed report caches.
 # - Ver30: AutoTrade debug daily risk used now reconciles open risk minus realised net profit/loss; report Dyn column infers a score when only dynamic risk% is stored.
 # - Ver29: AutoTrade report now avoids fake legacy risk/TP values, makes Reason/LossReason analytically useful, and aligns overall top-loss reasons with the detailed journal.
@@ -1523,14 +1524,14 @@ SETUP_COMBO_DAILY_SAFETY_ENABLED = env_bool("SETUP_COMBO_DAILY_SAFETY_ENABLED", 
 SETUP_COMBO_DAILY_SAFETY_HOUR = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_HOUR", "10") or 10)
 SETUP_COMBO_DAILY_SAFETY_MINUTE = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MINUTE", "0") or 0)
 SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS", "24") or 24)
-SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED", "4") or 4)
+SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED", "8") or 8)
 SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WR_MAX", "45") or 45)
 SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "0.05") or 0.05)
 SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "0") or 0)
 SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "1.25") or 1.25)
 # Ver24: faster temporary disable for zero-TP combos with repeated stop-outs.
-SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED", "3") or 3)
-SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL", "2") or 2)
+SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED", "8") or 8)
+SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL", "4") or 4)
 # Ver23 profit-first safety loop: run the severe-loser safety pass during the day,
 # not only at the 10:00 tick. This keeps live policy aligned with the latest
 # executable-lane evidence while still expiring disables at the next weekly review.
@@ -1576,6 +1577,13 @@ EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS = float(os.environ.get("EMAIL_SETUP_SYMBOL_COO
 SETUP_GENERATION_COOLDOWN_ANY_SIDE = env_bool("SETUP_GENERATION_COOLDOWN_ANY_SIDE", False)
 EMAIL_SETUP_COOLDOWN_ANY_SIDE = env_bool("EMAIL_SETUP_COOLDOWN_ANY_SIDE", False)
 SETUP_COMBO_POLICY_BLOCK_WATCH = env_bool("SETUP_COMBO_POLICY_BLOCK_WATCH", False)
+# Ver31 final quality gate: WATCH combos are not executable just because enabled/Exec=ON.
+# KEEP remains the normal lane. WATCH is a probation lane and must pass these
+# stricter filters before it can be persisted, emailed, or autotraded.
+SETUP_COMBO_WATCH_STRICT_QUALITY_GATE = env_bool("SETUP_COMBO_WATCH_STRICT_QUALITY_GATE", True)
+SETUP_COMBO_WATCH_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_MIN_CONF", "87") or 87)
+SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE", "70") or 70)
+SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
 SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "3") or 3)
 SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "4") or 4)
 SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
@@ -8938,6 +8946,12 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
             pass
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
+        try:
+            policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+            if not _setup_combo_policy_allows_setup(s, sess, user_id=policy_uid):
+                return (False, 'combo_policy_quality_gate_blocked')
+        except Exception:
+            return (False, 'combo_policy_gate_exception')
 
         source_kind_u = str(getattr(s, "source_kind", "") or "").lower().strip()
         family_u = str(getattr(s, "family_id", "") or getattr(s, "engine", "") or "").upper().strip()
@@ -19992,6 +20006,11 @@ def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: flo
     # This keeps the executable lane synchronized with the same micro guard used at persistence time.
     out = []
     for r in rows:
+        try:
+            if not _setup_combo_policy_allows_setup(r, str(r.get('session') or session_name or ''), user_id=int(user_id or 0)):
+                continue
+        except Exception:
+            continue
         try:
             allowed, _reason = _setup_edge_quality_guard_allows_setup(r, str(r.get('session') or session_name or ''), user_id=int(user_id or 0))
             if not allowed:
@@ -32445,6 +32464,12 @@ def is_executable_setup_eligible(
             return (False, "session_not_supported")
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
+        try:
+            policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+            if not _setup_combo_policy_allows_setup(s, sess, user_id=policy_uid):
+                return (False, 'combo_policy_quality_gate_blocked')
+        except Exception:
+            return (False, 'combo_policy_gate_exception')
 
         cfg_live = load_strategy_config(force=False)
         exec_engine_b_enabled = _cfg_bool((cfg_live or {}).get("execution_engine_b_email_enabled", EXECUTION_ENGINE_B_EMAIL_ENABLED), bool(EXECUTION_ENGINE_B_EMAIL_ENABLED))
@@ -41240,9 +41265,9 @@ def _setup_combo_daily_safety_reason(row: dict) -> str:
         wr = float(row.get('win_rate') or 0.0)
         avg_r = float(row.get('avg_r') or 0.0)
         score = float(row.get('score') or 0.0)
-        min_decided = max(1, int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED or 4))
-        zero_tp_min_decided = max(1, int(globals().get('SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED', 3) or 3))
-        zero_tp_min_sl = max(1, int(globals().get('SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL', 2) or 2))
+        min_decided = max(8, int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED or 8))
+        zero_tp_min_decided = max(8, int(globals().get('SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED', 8) or 8))
+        zero_tp_min_sl = max(4, int(globals().get('SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL', 4) or 4))
         # Ver24: clear 0-TP repeated losers do not need the full normal sample size.
         if tp <= 0 and sl >= zero_tp_min_sl and decided >= zero_tp_min_decided:
             return f'daily_safety: zero-TP severe loser ({tp} TP vs {sl} SL) with {decided} decided'
@@ -41598,18 +41623,21 @@ def _setup_combo_family_session_from_obj(setup_or_row, session_name: str = '') -
         return 'F0', str(session_name or '-').upper().strip() or '-'
 
 
-def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> bool:
-    """Live gate for DB-learned family/session combinations.
 
-    Unknown combinations are allowed so a new bot does not starve itself before it has data.
-    Only explicit DISABLE/BLOCK/PAUSE rows are blocked unless SETUP_COMBO_POLICY_BLOCK_WATCH=1.
+def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> dict:
+    """Return the active family/session policy row for this setup, if any.
+
+    Used by executable queue, email, AutoTrade, /setup_matrix policy view and report
+    consumers so all lanes use the same enforceable policy state.
     """
+    out = {'found': False, 'policy': None, 'family': 'F0', 'session': str(session_name or '').upper().strip() or '-', 'status': 'UNKNOWN', 'enabled': 1, 'combo': ''}
     try:
-        if not bool(globals().get('SETUP_COMBO_POLICY_LIVE_ENFORCE', True)):
-            return True
         fam, sess = _setup_combo_family_session_from_obj(setup_or_row, session_name=session_name)
+        fam = str(fam or 'F0').upper().strip()
+        sess = str(sess or '-').upper().strip()
+        out.update({'family': fam, 'session': sess, 'combo': f'{fam}-{sess}'})
         if sess in {'', '-', 'NONE'} or fam in {'', '-', 'F0'}:
-            return True
+            return out
         rows = _setup_combo_policy_cache_rows(force=False)
         uid = int(user_id or 0)
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
@@ -41619,24 +41647,259 @@ def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_
         if owner_uid > 0 and owner_uid not in candidates:
             candidates.append(owner_uid)
         candidates.append(0)
-        pol = None
         for cu in candidates:
             pol = rows.get((int(cu), fam, sess))
             if pol:
-                break
-        if not pol:
+                if not _setup_combo_policy_valid_for_enforcement(pol):
+                    continue
+                status = str(pol.get('status') or 'WATCH').upper().strip()
+                enabled = 1 if int(pol.get('enabled') or 0) == 1 else 0
+                out.update({'found': True, 'policy': dict(pol or {}), 'status': status, 'enabled': enabled})
+                return out
+        return out
+    except Exception as exc:
+        out.update({'found': False, 'error': f'{type(exc).__name__}: {exc}'})
+        return out
+
+
+def _setup_quality_gate_set_attr(setup_or_row, name: str, value) -> None:
+    try:
+        if isinstance(setup_or_row, dict):
+            setup_or_row[name] = value
+        else:
+            setattr(setup_or_row, name, value)
+    except Exception:
+        pass
+
+
+def _setup_watch_policy_risk_uid(user_id: int = 0) -> int:
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    if uid > 0:
+        return uid
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        if owner_uid > 0:
+            return owner_uid
+    except Exception:
+        pass
+    return 0
+
+
+def _setup_watch_policy_projected_risk_metrics(setup_or_row, session_name: str = '', user_id: int = 0, rr: float = 0.0, dynamic_score_info: dict | None = None) -> dict:
+    """Best-effort projected Risk%, Risk$ and TP$ for strict WATCH qualification.
+
+    WATCH combos are probationary.  They must be auditable before email/autotrade:
+    valid setup geometry, positive dynamic risk score, and positive projected risk
+    and reward values using the AutoTrade owner's current risk configuration.
+    """
+    out = {'risk_pct': 0.0, 'risk_usd': 0.0, 'tp_usd': 0.0, 'equity': 0.0, 'risk_uid': 0, 'source': 'none'}
+    try:
+        # Reuse already-attached report metrics when available.
+        stored_risk_usd = float(_autotrade_setup_attr(setup_or_row, 'risk_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'risk_usdt', 0.0) or _autotrade_setup_attr(setup_or_row, 'allowed_risk_usd', 0.0) or 0.0)
+        stored_risk_pct = float(_autotrade_setup_attr(setup_or_row, 'risk_pct', 0.0) or _autotrade_setup_attr(setup_or_row, 'allowed_risk_pct', 0.0) or 0.0)
+        stored_tp_usd = float(_autotrade_setup_attr(setup_or_row, 'tp_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'tp_usdt', 0.0) or 0.0)
+        if stored_risk_usd > 0 and stored_risk_pct > 0 and stored_tp_usd > 0:
+            out.update({'risk_pct': stored_risk_pct, 'risk_usd': stored_risk_usd, 'tp_usd': stored_tp_usd, 'source': 'stored'})
+            return out
+    except Exception:
+        pass
+    try:
+        risk_uid = _setup_watch_policy_risk_uid(user_id)
+        out['risk_uid'] = int(risk_uid)
+        if risk_uid <= 0:
+            return out
+        user = get_user(int(risk_uid)) or {}
+        equity = float(_effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
+        out['equity'] = float(equity)
+        if equity <= 0:
+            return out
+        base_risk_usd = float(_autotrade_per_trade_risk_usd(int(risk_uid), float(equity)) or 0.0)
+        if base_risk_usd <= 0:
+            return out
+        mult = 1.0
+        try:
+            if dynamic_score_info:
+                mult = float((dynamic_score_info or {}).get('multiplier') or 1.0)
+        except Exception:
+            mult = 1.0
+        risk_usd = max(0.0, float(base_risk_usd) * max(0.0, float(mult or 1.0)))
+        risk_pct = float(_risk_pct_from_amount(float(equity), float(risk_usd))) if equity > 0 else 0.0
+        tp_usd = float(risk_usd) * max(0.0, float(rr or 0.0))
+        out.update({'risk_pct': float(risk_pct), 'risk_usd': float(risk_usd), 'tp_usd': float(tp_usd), 'source': 'projected_autotrade_owner'})
+        return out
+    except Exception as exc:
+        out['error'] = f'{type(exc).__name__}: {exc}'
+        return out
+
+
+def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    """Strict probation gate for WATCH combos.
+
+    Required for Ver31 WR-first behaviour:
+    - WATCH does not mean executable merely because enabled/Exec=ON.
+    - WATCH may pass only when confidence, dynamic score, risk/reward metrics and
+      micro-edge guards are all clean.
+    """
+    meta = {}
+    try:
+        if not bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
+            return True, 'watch_strict_gate_disabled', meta
+        sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        fam, sess2 = _setup_combo_family_session_from_obj(setup_or_row, session_name=sess)
+        sess = str(sess or sess2 or '').upper().strip()
+        setup_id = str(_autotrade_setup_attr(setup_or_row, 'setup_id', '') or _autotrade_setup_attr(setup_or_row, 'id', '') or '').strip()
+        symbol = str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or _autotrade_setup_attr(setup_or_row, 'market_symbol', '') or '').upper().strip()
+        side = str(_autotrade_setup_attr(setup_or_row, 'side', '') or '').upper().strip()
+        conf = int(float(_autotrade_setup_attr(setup_or_row, 'conf', 0) or _autotrade_setup_attr(setup_or_row, 'confidence', 0) or 0))
+        quality = float(_autotrade_setup_attr(setup_or_row, 'quality_score', 0.0) or _autotrade_setup_attr(setup_or_row, 'score', 0.0) or 0.0)
+        entry = float(_autotrade_setup_attr(setup_or_row, 'entry', 0.0) or 0.0)
+        sl = float(_autotrade_setup_attr(setup_or_row, 'sl', 0.0) or 0.0)
+        tp = float(_setup_target_tp(setup_or_row, 0.0) or 0.0)
+        fut_vol = float(_autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or _autotrade_setup_attr(setup_or_row, 'vol_usd', 0.0) or 0.0)
+        rr = float(rr_to_tp(entry, sl, tp)) if entry > 0 and sl > 0 and tp > 0 else 0.0
+        meta.update({'family': fam, 'session': sess, 'setup_id': setup_id, 'symbol': symbol, 'side': side, 'conf': conf, 'quality_score': quality, 'entry': entry, 'sl': sl, 'tp': tp, 'rr': rr, 'fut_vol_usd': fut_vol})
+
+        if not setup_id:
+            return False, 'watch_missing_setup_id', meta
+        if not symbol or side not in {'BUY', 'SELL'}:
+            return False, 'watch_missing_symbol_or_side', meta
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            return False, 'watch_missing_session', meta
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            return False, 'watch_incomplete_prices', meta
+        if side == 'BUY' and not (sl < entry < tp):
+            return False, 'watch_invalid_buy_price_order', meta
+        if side == 'SELL' and not (tp < entry < sl):
+            return False, 'watch_invalid_sell_price_order', meta
+        if rr <= 0:
+            return False, 'watch_invalid_rr', meta
+        if not _setup_volume_ok(setup_or_row):
+            return False, 'watch_below_min_volume', meta
+
+        min_conf = int(globals().get('SETUP_COMBO_WATCH_MIN_CONF', 87) or 87)
+        if conf < min_conf:
+            return False, f'watch_conf_below_{min_conf}', meta
+
+        # Enforce the same micro edge blocks used by /setup_matrix deep analysis.
+        try:
+            edge_ok, edge_reason = _setup_edge_quality_guard_allows_setup(setup_or_row, sess, user_id=int(user_id or 0))
+            if not edge_ok:
+                return False, f'watch_micro_edge_block:{edge_reason}', meta
+        except Exception:
+            pass
+
+        try:
+            data = _setup_edge_guard_build(int(user_id or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False) or {}
+            fam_k, sess_k, side_k, sym_k, hour_k = _setup_edge_guard_setup_key(setup_or_row, session_name=sess)
+            combo_k = f'{fam_k}-{sess_k}'
+            combo_side_k = f'{fam_k}-{sess_k}-{side_k}'
+            meta.update({'combo_key': combo_k, 'combo_side_key': combo_side_k, 'symbol_key': sym_k, 'hour_key': hour_k})
+            if combo_side_k in dict(data.get('combo_side_block') or {}):
+                return False, f'watch_weak_combo_side:{combo_side_k}', meta
+            if sym_k and sym_k in dict(data.get('symbol_block') or {}):
+                return False, f'watch_weak_symbol:{sym_k}', meta
+            if hour_k in dict(data.get('hour_watch') or {}):
+                return False, f'watch_weak_hour:{hour_k}', meta
+            cm = dict((data.get('combo_metrics') or {}).get(combo_k) or {})
+            c_dec = int(cm.get('decided') or 0)
+            c_wr = float(cm.get('wr') or 0.0)
+            c_avg = float(cm.get('avg_r') or 0.0)
+            c_score = float(cm.get('score') or 0.0)
+            c_tp = int(cm.get('tp') or 0)
+            c_sl = int(cm.get('sl') or 0)
+            min_dec = max(4, int(globals().get('SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED', 8) or 8))
+            target_wr = float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50)
+            weak_combo = c_dec >= min_dec and c_wr < target_wr and (c_avg <= 0.05 or c_score <= 0.0 or c_sl >= max(2, int(math.ceil(max(1, c_tp) * 1.25))))
+            if weak_combo:
+                return False, f'watch_weak_combo:{combo_k}:WR{c_wr:.1f}:AvgR{c_avg:+.2f}:n{c_dec}', meta
+        except Exception:
+            pass
+
+        risk_uid = _setup_watch_policy_risk_uid(user_id)
+        try:
+            dyn = _autotrade_dynamic_risk_score(uid=int(risk_uid or 0), setup=setup_or_row, session_name=sess, regime=str(_autotrade_setup_attr(setup_or_row, 'regime_primary', '') or 'UNKNOWN'))
+        except Exception:
+            dyn = {'score': 0.0, 'multiplier': 1.0, 'components': ['dynamic_score_exception']}
+        dyn_score = float((dyn or {}).get('score') or 0.0)
+        meta['dynamic_score'] = dyn_score
+        meta['dynamic_components'] = list((dyn or {}).get('components') or [])[:8]
+        min_dyn = float(globals().get('SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE', 70) or 70)
+        if dyn_score < min_dyn:
+            return False, f'watch_dynamic_score_below_{min_dyn:.0f}', meta
+
+        risk_meta = _setup_watch_policy_projected_risk_metrics(setup_or_row, session_name=sess, user_id=int(risk_uid or 0), rr=rr, dynamic_score_info=dyn)
+        meta.update({
+            'risk_pct': float((risk_meta or {}).get('risk_pct') or 0.0),
+            'risk_usd': float((risk_meta or {}).get('risk_usd') or 0.0),
+            'tp_usd': float((risk_meta or {}).get('tp_usd') or 0.0),
+            'risk_source': str((risk_meta or {}).get('source') or ''),
+            'risk_uid': int((risk_meta or {}).get('risk_uid') or risk_uid or 0),
+        })
+        if bool(globals().get('SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS', True)):
+            if meta['risk_pct'] <= 0 or meta['risk_usd'] <= 0 or meta['tp_usd'] <= 0:
+                return False, 'watch_missing_valid_risk_or_tp_dollars', meta
+
+        _setup_quality_gate_set_attr(setup_or_row, 'dynamic_risk_score', float(dyn_score))
+        _setup_quality_gate_set_attr(setup_or_row, 'risk_pct', float(meta.get('risk_pct') or 0.0))
+        _setup_quality_gate_set_attr(setup_or_row, 'risk_usd', float(meta.get('risk_usd') or 0.0))
+        _setup_quality_gate_set_attr(setup_or_row, 'tp_usd', float(meta.get('tp_usd') or 0.0))
+        _setup_quality_gate_set_attr(setup_or_row, 'rr_tp', float(rr))
+        return True, 'watch_strict_quality_ok', meta
+    except Exception as exc:
+        meta['error'] = f'{type(exc).__name__}: {exc}'
+        return False, 'watch_strict_quality_exception', meta
+
+def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> bool:
+    """Live gate for DB-learned family/session combinations.
+
+    Ver31 WR-first rule:
+    - DISABLE/BLOCK/PAUSE/OFF rows always block executable queue, setup emails and AutoTrade.
+    - KEEP rows are allowed.
+    - WATCH rows are probationary: enabled/Exec=ON is not enough.  WATCH can pass
+      only through _setup_watch_policy_strict_quality_allows().
+    - Unknown combos are allowed so a fresh system can still discover edge.
+    """
+    try:
+        if not bool(globals().get('SETUP_COMBO_POLICY_LIVE_ENFORCE', True)):
             return True
-        if not _setup_combo_policy_valid_for_enforcement(pol):
+        info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
+        if not bool(info.get('found')):
             return True
-        status = str(pol.get('status') or 'WATCH').upper().strip()
-        enabled = int(pol.get('enabled') or 0) == 1
+        status = str(info.get('status') or 'WATCH').upper().strip()
+        enabled = int(info.get('enabled') or 0) == 1
         if status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled:
             return False
-        if status == 'WATCH' and bool(globals().get('SETUP_COMBO_POLICY_BLOCK_WATCH', False)):
-            return False
-        return True
+        if status == 'KEEP':
+            return True
+        if status == 'WATCH':
+            ok, why, meta = _setup_watch_policy_strict_quality_allows(setup_or_row, session_name=str(info.get('session') or session_name or ''), user_id=int(user_id or 0))
+            if not ok:
+                try:
+                    db_log_setup_pipeline_event(
+                        int(user_id or 0),
+                        stage='watch_combo_quality_gate',
+                        status='skip',
+                        session=str(info.get('session') or session_name or ''),
+                        mode='quality_gate',
+                        setup_id=str(_autotrade_setup_attr(setup_or_row, 'setup_id', '') or _autotrade_setup_attr(setup_or_row, 'id', '') or ''),
+                        symbol=str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or ''),
+                        side=str(_autotrade_setup_attr(setup_or_row, 'side', '') or ''),
+                        details={'reason': str(why), 'policy_status': status, 'combo': str(info.get('combo') or ''), **dict(meta or {})},
+                    )
+                except Exception:
+                    pass
+            return bool(ok)
+        # Any future non-KEEP positive status remains conservative unless explicitly allowed.
+        if status in {'ALLOW', 'ON', 'ACTIVE'}:
+            return True
+        return False
     except Exception:
-        return True
+        # Conservative default: do not let a policy-evaluation bug open a WATCH/DISABLE lane.
+        return False
+
 
 
 
@@ -42388,7 +42651,7 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         f"Policy update time: <b>{html.escape(str(last_pol.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(last_pol.get('kind') or '-'))}</b> | Next scheduled review: <b>{html.escape(str(next_review_txt))}</b>",
         f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | NOHIT: <b>{nh}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b>",
         f"Matrix recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b>",
-        f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | Block WATCH=<b>{'ON' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OFF'}</b>",
+        f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | WATCH gate=<b>{'STRICT' if SETUP_COMBO_WATCH_STRICT_QUALITY_GATE else ('BLOCK' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OPEN')}</b>",
         html.escape(_setup_edge_guard_snapshot_text(int(uid))),
         f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> (temporary severe-disable only).",
         "Manual <code>/setup_matrix</code> rows are advisory. <b>Adv</b> is what this selected window recommends; <b>Live</b> is the currently enforced scheduled/interim/daily-safety state used by executable queue + emails + AutoTrade + optimizer bridge.",
@@ -50637,6 +50900,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             flip_blocked = 0
             diversify_blocked = Counter()
             owner_manual_same_symbol_blocked = 0
+            combo_policy_blocked = 0
 
             for s in picks:
                 if len(chosen_list) >= int(EMAIL_SETUPS_N):
@@ -50658,6 +50922,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     continue
                 _seen_setup_keys.add(_k)
                 sess_name = str(sess["name"])
+
+                try:
+                    if not _setup_combo_policy_allows_setup(s, sess_name, user_id=int(uid)):
+                        combo_policy_blocked += 1
+                        continue
+                except Exception:
+                    combo_policy_blocked += 1
+                    continue
 
                 if symbol_flip_guard_active(uid, sym, side, sess_name):
                     flip_blocked += 1
@@ -50696,6 +50968,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     reasons.append(f"diversified_blocked={dict(diversify_blocked.most_common(3))}")
                 if owner_manual_same_symbol_blocked:
                     reasons.append(f"owner_manual_same_symbol_blocked={owner_manual_same_symbol_blocked}")
+                if combo_policy_blocked:
+                    reasons.append(f"combo_policy_quality_gate_blocked={combo_policy_blocked}")
                 reasons.append("all_candidates_blocked")
 
                 _LAST_EMAIL_DECISION[uid] = {
