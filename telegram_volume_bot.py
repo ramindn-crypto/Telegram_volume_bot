@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver30: AutoTrade debug daily risk used now reconciles open risk minus realised net profit/loss; report Dyn column infers a score when only dynamic risk% is stored.
 # - Ver29: AutoTrade report now avoids fake legacy risk/TP values, makes Reason/LossReason analytically useful, and aligns overall top-loss reasons with the detailed journal.
 # - Ver28: AutoTrade report now persists/displays real dynamic Risk%, Risk$ and TP$; adds CloseReason + LossReason taxonomy; /autotrade_report_overall uses the same classifier and top loss reason.
 # - 15May_ver12: Enforced strict TP/SL-only lifecycle: no automatic mid-trade market closes/reductions for risk correction, exit-attach lag, or opposite F8 signals; report now shows TP/SL/OPEN exit type.
@@ -44359,6 +44360,45 @@ def _autotrade_report_exit_reason(row: dict, result: str | None = None) -> str:
     except Exception:
         return 'OTHER_CLOSE'
 
+def _autotrade_report_infer_dynamic_score(row: dict) -> float:
+    """Infer the dynamic-risk score for reporting when the stored score is missing.
+
+    Some live rows persisted only the executed Risk%/Risk$ but not the dynamic score.
+    For analysis, infer the score from the configured base risk and risk multiplier
+    instead of showing a blank Dyn column.  This is a reporting-only estimate.
+    """
+    try:
+        row = dict(row or {})
+        stored = float(row.get('dynamic_risk_score') or row.get('dyn_score') or 0.0)
+        if stored > 0:
+            return float(stored)
+    except Exception:
+        pass
+    try:
+        mult = float(row.get('risk_multiplier') or 0.0)
+    except Exception:
+        mult = 0.0
+    if mult <= 0:
+        try:
+            base_pct = float(row.get('configured_risk_pct') or _autotrade_risk_per_trade_pct() or 0.0)
+            risk_pct = float(row.get('risk_pct') or row.get('allowed_risk_pct') or row.get('risk_actual_pct') or row.get('filled_risk_pct') or 0.0)
+            if base_pct > 0 and risk_pct > 0:
+                mult = float(risk_pct) / float(base_pct)
+        except Exception:
+            mult = 0.0
+    if mult <= 0:
+        return 0.0
+    try:
+        min_mult, max_mult, low_score, base_score, high_score = _autotrade_dynamic_risk_bounds()
+        mult = max(float(min_mult), min(float(max_mult), float(mult)))
+        if mult <= 1.0:
+            denom = max(1e-9, 1.0 - float(min_mult))
+            return float(low_score) + ((float(mult) - float(min_mult)) / denom) * (float(base_score) - float(low_score))
+        denom = max(1e-9, float(max_mult) - 1.0)
+        return float(base_score) + ((float(mult) - 1.0) / denom) * (float(high_score) - float(base_score))
+    except Exception:
+        return 0.0
+
 def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
     """Add reporting risk/TP amounts without inventing fake legacy values.
 
@@ -44464,6 +44504,21 @@ def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
             out['tp'] = float(tp)
         if risk_usd > 0 and tp_usd > 0:
             out['rr_tp'] = float(tp_usd / risk_usd)
+
+        # Reporting-only repair: if the executed dynamic risk % is present but
+        # the score was not persisted, infer the score/multiplier from config so
+        # /autotrade_report remains analyzable instead of showing Dyn='-'.
+        try:
+            if float(out.get('risk_multiplier') or 0.0) <= 0 and float(out.get('risk_pct') or 0.0) > 0:
+                _base_pct = float(out.get('configured_risk_pct') or _autotrade_risk_per_trade_pct() or 0.0)
+                if _base_pct > 0:
+                    out['risk_multiplier'] = float(out.get('risk_pct') or 0.0) / _base_pct
+            if float(out.get('dynamic_risk_score') or 0.0) <= 0:
+                _dyn = _autotrade_report_infer_dynamic_score(out)
+                if _dyn > 0:
+                    out['dynamic_risk_score'] = float(_dyn)
+        except Exception:
+            pass
     except Exception:
         pass
     return out
@@ -44731,7 +44786,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v29_real_risk_reason:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v30_real_risk_reason_dyn:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -44971,6 +45026,8 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         def _dyn_cell(r: dict) -> str:
             try:
                 v = float(r.get('dynamic_risk_score') or 0.0)
+                if v <= 0:
+                    v = float(_autotrade_report_infer_dynamic_score(r) or 0.0)
                 return f'{v:.0f}' if v > 0 else '-'
             except Exception:
                 return '-'
@@ -45518,11 +45575,21 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     _debug_open_risk_display = float(snap.get('current_total_open_risk', 0.0) or 0.0)
     _debug_realised_display = float(snap.get('pnl_today') or 0.0)
-    _debug_risk_credit_display = float(snap.get('risk_reset_credit') or 0.0)
-    _debug_daily_used_raw = _autotrade_daily_used_from_open_and_realized(_debug_open_risk_display, _debug_realised_display)
+    _debug_risk_credit_display = max(0.0, float(snap.get('risk_reset_credit') or 0.0))
+    # Ver30: single sign-safe formula. Positive realised PnL reduces daily
+    # risk pressure; realised losses increase it. This prevents the confusing
+    # case where Realised net is positive but Daily risk used rises by that
+    # same amount.
+    _debug_daily_used_raw = max(0.0, float(_debug_open_risk_display) - float(_debug_realised_display))
     _debug_daily_used_display = max(0.0, float(_debug_daily_used_raw) - float(_debug_risk_credit_display))
     _debug_cap_display = float(snap.get('cap') or 0.0)
     _debug_remaining_display = float('inf') if _debug_cap_display <= 0 else max(0.0, _debug_cap_display - _debug_daily_used_display)
+    try:
+        snap['used_today'] = float(_debug_daily_used_display)
+        snap['used_today_raw'] = float(_debug_daily_used_raw)
+        snap['remaining_today'] = float(_debug_remaining_display)
+    except Exception:
+        pass
 
     lines = [
         '🧪 AutoTrade Debug',
@@ -45539,7 +45606,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Risk split (AT): current-day ${float(snap.get('current_day_open_risk', 0.0)):.2f} | carried ${float(snap.get('carried_open_risk', 0.0)):.2f}",
         (f"Ignored unmatched live positions (AT): {int(snap.get('external_open_positions', 0) or 0)} | Risk ${float(snap.get('external_open_risk', 0.0)):.2f}" if int(snap.get('external_open_positions', 0) or 0) > 0 else None),
         f"Realised net today (AT): ${_debug_realised_display:+.2f}",
-        f"Daily risk used (AT) (open risk + realised losses - realised profits): ${_debug_daily_used_display:.2f}",
+        f"Daily risk used (AT) (open risk - realised net): ${_debug_daily_used_display:.2f}",
         ('Daily risk remaining (AT): ∞' if not math.isfinite(float(_debug_remaining_display)) else f"Daily risk remaining (AT): ${float(_debug_remaining_display):.2f}"),
         SEP,
         'Email → executable lane',
