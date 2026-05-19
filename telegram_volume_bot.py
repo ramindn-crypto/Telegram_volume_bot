@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver44: Hard-fixed UNKNOWN Family-Session-Strategy policy fallback so new NOR/REV/MON combos always enter WATCH probation instead of being blocked as UNKNOWN; cleaned /why stale UNKNOWN policy gate noise.
 # - Ver42: Fixed raw-candidate -> adaptive strategy routing before executable gate; /why now exposes screen/email post-gate reject reasons instead of vague refresh counters.
 # - Ver41: Fixed setup generation/execution sync: KEEP combos no longer get blocked by WATCH-only strict floors; /why now separates raw setup generation from final executable gate outcomes.
 # - Ver40: Promoted combo identity to Family-Session-Strategy (e.g. F8-NY-REV) across setup/audit/matrix/autotrade reports and strategy-router evidence.
@@ -1600,6 +1601,54 @@ def _autotrade_apply_ver36_user_runtime_defaults_resync() -> None:
     except Exception:
         pass
 
+
+def _autotrade_apply_ver43_runtime_defaults_resync() -> None:
+    """Ver43: re-sync user-requested AutoTrade throughput defaults once.
+
+    Keeps the bot open for forward testing but avoids stale DB values such as
+    max_trades_per_day=0 showing as 6/∞ after a deployment.  The values remain
+    editable from Telegram through /autotrade_config after this one-time deploy
+    migration.
+    """
+    try:
+        target_version = 'ver43_2026_05_19_runtime_defaults_resync'
+        reapply = env_bool('AUTOTRADE_VER43_REAPPLY_DEFAULTS', False)
+        if (not reapply) and str(_autotrade_config_get('ver43_runtime_defaults_resync_version', '') or '').strip().lower() == target_version:
+            return
+        max_day = max(1, int(globals().get('AUTOTRADE_VER43_MAX_TRADES_PER_DAY', 50) or 50))
+        max_open = max(1, int(globals().get('AUTOTRADE_VER43_MAX_OPEN_TRADES', 20) or 20))
+        max_hours = max(0.25, min(72.0, float(globals().get('AUTOTRADE_VER43_MAX_POSITION_HOURS', 12) or 12)))
+        max_drift = max(0.0, float(globals().get('AUTOTRADE_VER43_MAX_ENTRY_DRIFT_PCT', 1.0) or 1.0))
+        day_cap_pct = max(0.0, float(globals().get('AUTOTRADE_VER43_DAILY_CAP_PCT', 15.0) or 15.0))
+
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(max_day))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, int(max_open))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, float(max_hours))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, float(max_drift))
+        _autotrade_set_daily_cap_settings('PCT', float(day_cap_pct))
+
+        try:
+            cfg = load_strategy_config(force=True)
+            cfg['ver43_runtime_defaults_resync_enabled'] = True
+            cfg['ver43_autotrade_forward_test_defaults'] = {
+                'max_trades_per_day': int(max_day),
+                'max_open_trades': int(max_open),
+                'max_position_hours': float(max_hours),
+                'max_entry_drift_pct': float(max_drift),
+                'daily_risk_cap_pct': float(day_cap_pct),
+                'telegram_editable': True,
+                'note': 'Applied once on deploy; later /autotrade_config edits are preserved unless AUTOTRADE_VER43_REAPPLY_DEFAULTS=1.',
+            }
+            save_strategy_config(cfg)
+            apply_strategy_config(cfg)
+        except Exception:
+            pass
+
+        _autotrade_config_set('ver43_runtime_defaults_resync_version', target_version)
+    except Exception:
+        pass
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -1871,7 +1920,7 @@ SETUP_FINAL_QUALITY_GATE_ENABLED = env_bool("SETUP_FINAL_QUALITY_GATE_ENABLED", 
 SETUP_FINAL_MIN_CONF = int(os.environ.get("SETUP_FINAL_MIN_CONF", "87") or 87)
 SETUP_FINAL_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_MIN_DYNAMIC_SCORE", "70") or 70)
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
-SETUP_FINAL_UNKNOWN_AS_WATCH = env_bool("SETUP_FINAL_UNKNOWN_AS_WATCH", True)
+SETUP_FINAL_UNKNOWN_AS_WATCH = True  # Ver44: hard safety; unknown/new strategy combos enter WATCH probation, never hard-block as UNKNOWN
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
 # Ver41: distinguish KEEP lanes from WATCH/probation lanes.
 # Earlier builds accidentally applied the WATCH-only 87/70 strict floors to KEEP rows too,
@@ -1914,6 +1963,11 @@ AUTOTRADE_VER36_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER36_MAX_OPEN_T
 AUTOTRADE_VER36_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER36_MAX_POSITION_HOURS", "12") or 12)
 AUTOTRADE_VER36_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER36_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
 AUTOTRADE_VER36_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER36_DAILY_CAP_PCT", "15.0") or 15.0)
+AUTOTRADE_VER43_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER43_MAX_TRADES_PER_DAY", "50") or 50)
+AUTOTRADE_VER43_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER43_MAX_OPEN_TRADES", "20") or 20)
+AUTOTRADE_VER43_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER43_MAX_POSITION_HOURS", "12") or 12)
+AUTOTRADE_VER43_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER43_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
+AUTOTRADE_VER43_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER43_DAILY_CAP_PCT", "15.0") or 15.0)
 # Ver37 adaptive strategy router.
 # Strong combos keep the original NORMAL direction. Weak / disabled combos are
 # forward-tested in REVERSE direction (BUY->SELL, SELL->BUY) so the bot can learn
@@ -2457,6 +2511,44 @@ def _setup_decision_profile_key(row: dict, include_hour: bool = True) -> str:
         return 'F0-UNK-NOR-UNK-VUNK'
 
 
+def _setup_policy_effective_status(status: str = '', found: bool = False) -> str:
+    """Normalize policy statuses for the executable lane.
+
+    Ver44 hard rule:
+    - DISABLE/BLOCK/PAUSE/OFF remain hard policy states.
+    - KEEP remains preferred.
+    - WATCH/unknown/new strategy keys (for example F8-NY-REV before a policy row
+      exists) are treated as WATCH probation. They must still pass the strict
+      quality/risk/SL/TP gate before reaching email or AutoTrade, but they must
+      not be killed as UNKNOWN.
+
+    This deliberately ignores any stale runtime/config value that could set
+    SETUP_FINAL_UNKNOWN_AS_WATCH=false, because that was starving the executable
+    lane after Family-Session-Strategy combo keys were introduced.
+    """
+    try:
+        st = str(status or '').upper().strip()
+        if st in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}:
+            return st
+        if st in {'KEEP', 'ACTIVE', 'ON'}:
+            return 'KEEP'
+        if st in {'WATCH', 'WARN', 'CAUTION'}:
+            return 'WATCH'
+        if st in {'', 'UNKNOWN', 'UNSET', 'NONE', 'NULL', '-', 'MON', 'MONITOR', 'PROBATION', 'GATE'}:
+            return 'WATCH'
+        # Any unrecognised policy string should be probationary, not fatal.
+        return 'WATCH'
+    except Exception:
+        return 'WATCH'
+
+
+def _setup_policy_status_is_unknownish(status: str = '') -> bool:
+    try:
+        return str(status or '').upper().strip() in {'', 'UNKNOWN', 'UNSET', 'NONE', 'NULL', '-', 'MON', 'MONITOR', 'PROBATION', 'GATE'}
+    except Exception:
+        return True
+
+
 def _setup_strategy_combo_metrics(setup_or_row, session_name: str = '', user_id: int = 0) -> dict:
     """Return current family/session/strategy evidence used to choose NORMAL vs REVERSE."""
     out = {
@@ -2477,7 +2569,9 @@ def _setup_strategy_combo_metrics(setup_or_row, session_name: str = '', user_id:
         try:
             info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess_s, user_id=int(user_id or 0)) or {}
             out['policy_found'] = bool(info.get('found'))
-            out['policy_status'] = str(info.get('status') or '').upper().strip()
+            _raw_policy_status = str(info.get('status') or '').upper().strip()
+            out['policy_status_raw'] = _raw_policy_status or ('UNKNOWN' if not info.get('found') else '')
+            out['policy_status'] = _setup_policy_effective_status(_raw_policy_status, found=bool(info.get('found')))
             out['policy_enabled'] = 1 if int(info.get('enabled') or (1 if not info.get('found') else 0)) == 1 else 0
             pol = dict(info.get('policy') or {})
             if pol:
@@ -4582,6 +4676,7 @@ try:
     _autotrade_apply_ver34_user_requested_defaults()
     _autotrade_apply_ver35_no_hidden_email_caps()
     _autotrade_apply_ver36_user_runtime_defaults_resync()
+    _autotrade_apply_ver43_runtime_defaults_resync()
 except Exception:
     pass
 
@@ -14002,19 +14097,29 @@ def _setup_pipeline_recent_gate_summary(uid: int = 0, session: str = '', lookbac
                     vals = details.get(key)
                     if isinstance(vals, dict):
                         for rk, rv in vals.items():
+                            rk_s = str(rk or 'unknown')
+                            if rk_s.startswith('final_policy_not_keep_or_watch:UNKNOWN'):
+                                continue
                             try:
-                                reason_ctr[str(rk or 'unknown')] += max(1, int(rv or 0))
+                                reason_ctr[rk_s] += max(1, int(rv or 0))
                             except Exception:
-                                reason_ctr[str(rk or 'unknown')] += 1
+                                reason_ctr[rk_s] += 1
                     elif isinstance(vals, list):
                         for rk in vals:
-                            reason_ctr[str(rk or 'unknown')] += 1
+                            rk_s = str(rk or 'unknown')
+                            if rk_s.startswith('final_policy_not_keep_or_watch:UNKNOWN'):
+                                continue
+                            reason_ctr[rk_s] += 1
                 try:
                     persisted += int(details.get('persisted') or 0) if status == 'ok' and stg != 'executable_queue_write' else 0
                 except Exception:
                     pass
             if status in {'skip', 'error', 'partial_error'} or stg in {'executable_final_quality_gate','executable_edge_quality_guard','executable_generation_cooldown','executable_setup_generation_blackout'}:
                 reason = str(details.get('reason') or stg or 'unknown').strip()
+                # Ver44: suppress stale UNKNOWN policy-block events from older builds;
+                # new strategy keys now enter WATCH probation instead.
+                if str(reason or '').startswith('final_policy_not_keep_or_watch:UNKNOWN'):
+                    continue
                 if reason:
                     reason_ctr[reason] += 1
                     if len(recent) < 8:
@@ -43161,6 +43266,8 @@ def _setup_execution_quality_baseline_allows(setup_or_row, session_name: str = '
 def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
     """Shared final gate for executable queue, setup emails, AutoTrade and audit.
 
+    Ver43 correction: UNKNOWN/new strategy policy rows are treated as WATCH probation before blocking.
+
     Ver41 correction:
     - DISABLE still blocks NORMAL, but may be routed to REVERSE for controlled testing.
     - KEEP uses a KEEP baseline gate, not the WATCH-only 87/70 probation gate.
@@ -43181,12 +43288,29 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
 
         info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
         found = bool(info.get('found'))
-        status = str(info.get('status') or ('WATCH' if bool(globals().get('SETUP_FINAL_UNKNOWN_AS_WATCH', True)) else 'UNKNOWN')).upper().strip()
+        raw_status = str(info.get('status') or '').upper().strip()
+        status = _setup_policy_effective_status(raw_status, found=found)
+        # Ver44: do not let missing strategy-specific rows (F2-LON-REV/MON/etc.)
+        # become fatal UNKNOWN states.  They are WATCH probation and are still
+        # protected by strict quality, risk, SL/TP, cooldown and micro-edge gates.
+        if _setup_policy_status_is_unknownish(raw_status) or status not in {'KEEP', 'WATCH', 'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}:
+            status = 'WATCH'
         enabled = int(info.get('enabled') or (1 if not found else 0)) == 1
         combo = str(info.get('combo') or f'{fam}-{sess}').upper().strip()
         strategy_label = _setup_strategy_label(setup_or_row)
         combo_strategy = _setup_combo_strategy_key(fam, sess, setup_or_row)
-        meta.update({'family': fam, 'session': sess, 'combo': combo, 'combo_strategy': combo_strategy, 'policy_found': found, 'policy_status': status, 'policy_enabled': enabled, 'setup_strategy': strategy_label})
+        meta.update({
+            'family': fam,
+            'session': sess,
+            'combo': combo,
+            'combo_strategy': combo_strategy,
+            'policy_found': found,
+            'policy_status_raw': raw_status or ('UNKNOWN' if not found else ''),
+            'policy_status': status,
+            'policy_unknown_as_watch': (status == 'WATCH' and (_setup_policy_status_is_unknownish(raw_status) or not found)),
+            'policy_enabled': enabled,
+            'setup_strategy': strategy_label,
+        })
         try:
             _reason = str(_autotrade_setup_attr(setup_or_row, 'strategy_reason', '') or _setup_strategy_attr(setup_or_row, 'strategy_reason', '') or '').lower()
             if 'reverse_also_weak_block' in _reason:
@@ -43201,8 +43325,13 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
             meta['policy_bypassed_by_reverse'] = True
 
         if bool(globals().get('SETUP_FINAL_REQUIRE_POLICY_STATE', True)) and status not in {'KEEP', 'WATCH'}:
-            if not (strategy_label == 'REVERSE' and status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}):
-                return False, f'final_policy_not_keep_or_watch:{status or "UNKNOWN"}', meta
+            # Ver44: only true hard-disable states can block here.  UNKNOWN/new
+            # strategy states have already been normalised to WATCH above.
+            if status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} and not (strategy_label == 'REVERSE' and bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True))):
+                return False, 'final_combo_disabled', meta
+            status = 'WATCH'
+            meta['policy_status'] = 'WATCH'
+            meta['policy_status_coerced'] = True
 
         # REVERSE is its own forward-test lane. Do not use normal combo's weak history
         # to block the reverse signal before it gathers reverse-specific evidence.
