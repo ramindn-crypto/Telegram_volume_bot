@@ -1,4 +1,8 @@
+# yver56: Clean-start policy unlock; all family/session/strategy policy combos enabled for fresh forward testing.
+# Keeps non-negotiable safety: valid SL/TP, exchange leverage, liquidation guard, equity/risk sizing, and duplicate-owner guards.
+# - Ver56: policy table is clean-start/unlocked by default: no legacy DISABLE/OFF rows, no daily/interim policy disables, no policy-view auto-safety, and no micro-edge policy blocks while collecting fresh NORMAL/REVERSE evidence.
 # CHANGE SUMMARY
+# - Ver54 yver54: forward-test keep-all mode for NORMAL/REVERSE comparison: disables automatic flat/max-hold/carryover closes by default, extends setup entry life for test observation, and lets scheduled AutoTrade continue placing multiple eligible queued setups per tick while retaining SL/TP, risk caps, duplicate guards and exchange safety checks.
 # - Ver53 yver53: fixes post-unblock execution gaps: removes MON from combo identity (NOR/REV only), routes weak combos to REV earlier, lets AutoTrade execute already queued/emailed setups during setup-generation blackout, retries Bybit leverage at exchange max, and continues candidate attempts after leverage/setup-specific skips.
 # - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
@@ -556,6 +560,18 @@ AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 
 AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
 SETUP_GENERATION_BLACKOUT_ENABLED = env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True)
 SETUP_GENERATION_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
+# Ver54 forward-test mode: keep NORMAL and REVERSE setups/trades observable.
+# Default ON for this build because the current test goal is to compare NOR vs REV
+# without the bot closing positions for ASIA handover, max-hold, or carryover cleanup.
+# SL/TP attachment, risk caps, duplicate guards, drift checks and exchange safety checks remain active.
+AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN = env_bool('AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN', True)
+AUTOTRADE_KEEP_ALL_TEST_DISABLE_TIME_EXITS = env_bool('AUTOTRADE_KEEP_ALL_TEST_DISABLE_TIME_EXITS', True)
+AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN = int(os.environ.get('AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN', '1440') or 1440)
+AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS = float(os.environ.get('AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS', '24') or 24)
+# yver55: forward-test mode should not stop after N candidates. 0 means unlimited/all eligible.
+AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE = env_bool('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', True)
+AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS = env_bool('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)
+AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK = int(os.environ.get('AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK', '0') or 0)
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
 SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
 
@@ -752,6 +768,14 @@ def _autotrade_runtime_mode() -> str:
 
 
 def _autotrade_runtime_max_open_trades() -> int:
+    # yver55 forward-test mode: no artificial open-position count cap.
+    # Keep real safety elsewhere: SL/TP, liquidation guard, exchange filters,
+    # equity/risk sizing and duplicate-owner checks. Returning 0 means unlimited.
+    try:
+        if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)):
+            return 0
+    except Exception:
+        pass
     try:
         val = int(float(_autotrade_config_get(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, AUTOTRADE_MAX_OPEN_TRADES) or AUTOTRADE_MAX_OPEN_TRADES))
     except Exception:
@@ -767,12 +791,20 @@ def _autotrade_runtime_max_open_trades() -> int:
 def _autotrade_runtime_max_trades_per_day() -> int:
     """AutoTrade-only daily trade count cap.
 
+    yver55: In keep-all forward-test mode, return 0 to mean no artificial
+    daily count cap. Risk sizing/caps and exchange safety still remain active.
+
     Ver47: the requested production default is 50/day. Older DB snapshots can
     still contain 0 from the previous "unlimited" era, which makes
     /autotrade_debug show 6/∞ and weakens the WR-first learning loop. Treat a
     stored 0/blank as the configured default unless the operator explicitly sets
     AUTOTRADE_ALLOW_UNLIMITED_MAX_TRADES_PER_DAY=1 in the environment.
     """
+    try:
+        if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)):
+            return 0
+    except Exception:
+        pass
     try:
         raw = _autotrade_config_get(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, None)
         if raw is None or str(raw).strip() == '':
@@ -936,7 +968,36 @@ def _autotrade_bool_cfg(key: str, env_name: str, default: bool) -> bool:
         return bool(default)
 
 
+def _autotrade_keep_all_test_mode() -> bool:
+    try:
+        return bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN', False))
+    except Exception:
+        return False
+
+
+def _autotrade_keep_all_test_disables_time_exits() -> bool:
+    try:
+        return bool(_autotrade_keep_all_test_mode() and globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_TIME_EXITS', True))
+    except Exception:
+        return False
+
+
+def _autotrade_candidate_lookback_hours(default_hours: float = 12.0) -> float:
+    try:
+        base = float(default_hours or 12.0)
+    except Exception:
+        base = 12.0
+    if _autotrade_keep_all_test_mode():
+        try:
+            return max(base, float(globals().get('AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS', 24.0) or 24.0))
+        except Exception:
+            return max(base, 24.0)
+    return base
+
+
 def _autotrade_flat_before_asia_enabled() -> bool:
+    if _autotrade_keep_all_test_disables_time_exits():
+        return False
     return _autotrade_bool_cfg(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
 
 
@@ -957,6 +1018,8 @@ def _autotrade_flat_before_asia_minute() -> int:
 
 
 def _autotrade_max_position_hours_enabled() -> bool:
+    if _autotrade_keep_all_test_disables_time_exits():
+        return False
     return _autotrade_bool_cfg(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)
 
 
@@ -1004,6 +1067,12 @@ def _split_blackout_windows(value) -> tuple:
 
 
 def _autotrade_entry_blackout_enabled() -> bool:
+    # yver55: no artificial entry blackout during keep-all forward testing.
+    try:
+        if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)):
+            return False
+    except Exception:
+        pass
     return _autotrade_bool_cfg(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
 
 
@@ -1016,6 +1085,12 @@ def _autotrade_entry_blackout_windows() -> str:
 
 
 def _setup_generation_blackout_enabled() -> bool:
+    # yver55: no artificial setup-generation blackout during keep-all forward testing.
+    try:
+        if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)):
+            return False
+    except Exception:
+        pass
     try:
         raw = _autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0)
         return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
@@ -1891,6 +1966,12 @@ AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MA
 # The review table is always persisted. Live blocking is deliberately limited to
 # statistically weak/losing combinations only; WATCH rows remain allowed by default.
 SETUP_COMBO_REVIEW_ENABLED = env_bool("SETUP_COMBO_REVIEW_ENABLED", True)
+# Ver56 clean-start policy unlock. Default ON because the live DB contains old
+# DISABLE/OFF daily-safety/interim rows from previous experiments. In this mode,
+# /setup_matrix policy starts like a clean bot: every Family-Session-Strategy combo
+# is visible as enabled WATCH/GATE (or KEEP from fresh stats only), while old policy
+# rows remain ignored. Non-negotiable exchange/risk protections still apply.
+SETUP_POLICY_CLEAN_START_ALL_ENABLED = env_bool("SETUP_POLICY_CLEAN_START_ALL_ENABLED", True)
 # Ver08: policy promotion/demotion is fixed weekly, not manual/daily.
 # /setup_matrix 24 and /setup_matrix 168 are reports. The live policy is updated only
 # by the scheduled weekly review, default Sunday 23:00 Australia/Melbourne.
@@ -2172,6 +2253,24 @@ SETUP_EDGE_GUARD_STRICT_MIN_CONF = 78
 SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 15000000.0
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = False
 
+# Ver56: clean-start policy unlock for fresh NORMAL/REVERSE forward testing.
+# This removes only policy/learning blocks that come from old DB evidence or old
+# interim rules. It does NOT bypass SL/TP validity, liquidation guard, exchange max
+# leverage, position/order duplicate protection, or risk sizing.
+if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+    SETUP_COMBO_INTERIM_DISABLE_ENABLED = False
+    SETUP_COMBO_DAILY_SAFETY_ENABLED = False
+    SETUP_COMBO_INTRADAY_SAFETY_ENABLED = False
+    SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED = False
+    SETUP_COMBO_POLICY_CATCHUP_ENABLED = False
+    SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED = False
+    # Keep the policy screen and executable lane clean from old micro-edge blocks.
+    # Fresh setup/audit data still appears in reports; it simply cannot disable combos.
+    SETUP_EDGE_MICRO_GUARD_ENABLED = False
+    SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST = tuple()
+    SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST = tuple()
+    SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple()
+
 # Ver51 FINAL_PIPELINE_LOCKED: forward-test starvation guard.
 # Keep liquidity at 15M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
 # floors freeze the executable queue at zero during live sessions.  The daily/weekly
@@ -2254,7 +2353,8 @@ FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = VER52_MIN_DYNAMIC_SCORE
 VER53_NOR_REV_ONLY_STRATEGY_IDENTITY = True
 SETUP_ADAPTIVE_WEAK_MIN_DECIDED = 1
 SETUP_ADAPTIVE_STRONG_MIN_DECIDED = max(2, int(globals().get('SETUP_ADAPTIVE_STRONG_MIN_DECIDED', 2) or 2))
-AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH = int(os.environ.get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', '5') or 5)
+# yver55: 0 means unlimited/all eligible setups in the just-sent email batch.
+AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH = int(os.environ.get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', '0') or 0)
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
@@ -4932,7 +5032,11 @@ BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
 BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
 BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
 BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
-AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "45") or 45)
+try:
+    _autotrade_entry_window_default_min = str(int(globals().get('AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN', 1440) or 1440)) if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN', False)) else '45'
+except Exception:
+    _autotrade_entry_window_default_min = '45'
+AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", _autotrade_entry_window_default_min) or _autotrade_entry_window_default_min)
 
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
@@ -6967,6 +7071,9 @@ def _autotrade_close_carried_live_positions_after_reset(uid: int, reason: str = 
     """
     out = {'ok': True, 'reason': str(reason or 'post_asia_reset_carryover_guard'), 'closed': [], 'skipped': [], 'errors': []}
     try:
+        if _autotrade_keep_all_test_disables_time_exits():
+            out['skipped'].append({'reason': 'ver54_keep_all_test_mode_no_carryover_flat'})
+            return out
         uid_i = int(uid or 0)
         if uid_i <= 0:
             out['ok'] = False
@@ -7047,6 +7154,9 @@ def _autotrade_close_owned_live_positions(uid: int, reason: str = 'scheduled_fla
     """
     out = {'ok': True, 'reason': str(reason or 'scheduled_flat'), 'closed': [], 'skipped': [], 'errors': []}
     try:
+        if _autotrade_keep_all_test_disables_time_exits() and 'manual_autotrade_flat_now' not in str(reason or ''):
+            out['skipped'].append({'reason': 'ver54_keep_all_test_mode_no_scheduled_flat'})
+            return out
         uid_i = int(uid or 0)
         live_positions = list(_bybit_get_open_positions_linear() or [])
         journal_open = list(_autotrade_db_open_trades(uid_i) or [])
@@ -7264,6 +7374,9 @@ def _autotrade_close_stale_owned_live_positions(uid: int, max_age_hours: float |
     hours = float(max_age_hours if max_age_hours is not None else _autotrade_max_position_hours())
     out = {'ok': True, 'reason': str(reason or 'max_position_age'), 'max_age_hours': hours, 'closed': [], 'skipped': [], 'errors': []}
     try:
+        if _autotrade_keep_all_test_disables_time_exits():
+            out['skipped'].append({'reason': 'ver54_keep_all_test_mode_no_max_hold_close'})
+            return out
         uid_i = int(uid or 0)
         if uid_i <= 0:
             out['ok'] = False
@@ -10176,6 +10289,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
     """
     try:
         from types import SimpleNamespace
+        lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
         cutoff = time.time() - float(lookback_hours) * 3600.0
         req_session_u = str(session_label or '').upper().strip()
 
@@ -10218,8 +10332,14 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     continue
                 now_ts = float(time.time())
                 canonical_ts = float(getattr(obj, 'created_ts', 0.0) or 0.0)
+                if canonical_ts <= 0 and _autotrade_keep_all_test_mode():
+                    canonical_ts = now_ts
+                    try:
+                        setattr(obj, 'created_ts', now_ts)
+                    except Exception:
+                        pass
                 expiry_grace_sec = float(max(300, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 300))
-                if canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec:
+                if (canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec) and not _autotrade_keep_all_test_mode():
                     try:
                         _admin_setup_lifecycle_merge(int(uid), str(getattr(obj, 'setup_id', '') or ''), session=src_session_u or req_session_u, symbol=str(getattr(obj, 'symbol', '') or ''), side=str(getattr(obj, 'side', '') or ''), state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
                     except Exception:
@@ -10249,8 +10369,14 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                         continue
                     now_ts = float(time.time())
                     canonical_ts = float(getattr(obj, 'created_ts', 0.0) or getattr(obj, 'email_logged_ts', 0.0) or 0.0)
+                    if canonical_ts <= 0 and _autotrade_keep_all_test_mode():
+                        canonical_ts = now_ts
+                        try:
+                            setattr(obj, 'created_ts', now_ts)
+                        except Exception:
+                            pass
                     expiry_grace_sec = float(max(300, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 300))
-                    if canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec:
+                    if (canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec) and not _autotrade_keep_all_test_mode():
                         continue
                     exec_ok, exec_why = _autotrade_db_signal_structurally_valid(obj, session_name=req_session_u or src_session_u or session_label)
                     if not exec_ok:
@@ -10304,6 +10430,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
 
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
+    lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
     cache_key = f"autotrade_db_setups:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
@@ -10958,11 +11085,17 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'source_session': str(getattr(s, 'source_session', '') or ''),
         })
         if datetime.now(timezone.utc) > _deadline_dt:
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
-            except Exception:
-                pass
-            return (False, 'setup_expired')
+            if _autotrade_keep_all_test_mode():
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'entry_deadline_bypassed_by_keep_all_test_mode': True})
+                except Exception:
+                    pass
+            else:
+                try:
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
+                except Exception:
+                    pass
+                return (False, 'setup_expired')
     except Exception:
         pass
 
@@ -42554,6 +42687,8 @@ def _setup_combo_review_first_delay_sec() -> int:
 
 def _setup_combo_daily_safety_schedule_text() -> str:
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return 'OFF — clean-start all-enabled policy'
         return f"Daily {int(SETUP_COMBO_DAILY_SAFETY_HOUR):02d}:{int(SETUP_COMBO_DAILY_SAFETY_MINUTE):02d} {str(SETUP_COMBO_POLICY_REVIEW_TZ)}"
     except Exception:
         return 'Daily 10:00 Australia/Melbourne'
@@ -42699,6 +42834,8 @@ def _setup_combo_seed_interim_disable_policy() -> None:
     the same interim policy is already active in the persistent DB.
     """
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return
         if not bool(globals().get('SETUP_COMBO_INTERIM_DISABLE_ENABLED', True)):
             return
         combos = [str(x or '').upper().strip() for x in (globals().get('SETUP_COMBO_INTERIM_DISABLE_LIST', ()) or ()) if str(x or '').strip()]
@@ -43039,6 +43176,9 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
     """
     out = {'ok': False, 'disabled': [], 'rows': 0, 'run_id': '', 'expires_ts': 0.0}
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            out.update({'ok': True, 'reason': 'clean_start_all_enabled_policy', 'disabled': [], 'rows': 0})
+            return out
         if not bool(globals().get('SETUP_COMBO_DAILY_SAFETY_ENABLED', True)):
             out['reason'] = 'daily_safety_disabled'
             return out
@@ -43101,6 +43241,9 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
 def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
     info = {'updated_ts': 0.0, 'text': '-', 'kind': '-', 'scheduled_text': '-', 'expires_text': '-', 'rows': 0, 'scheduled_rows': 0}
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            info.update({'text': 'clean start / all enabled', 'kind': 'policy unlock', 'kind_raw': 'clean_start', 'scheduled_text': '-', 'expires_text': '-', 'rows': 0, 'scheduled_rows': 0, 'enforceable_rows': 0})
+            return info
         _setup_combo_policy_migrate()
         ids = []
         try:
@@ -43145,6 +43288,8 @@ def _setup_combo_policy_valid_for_enforcement(pol: dict | None) -> bool:
     if it is not renewed by the next weekly review.
     """
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return False
         if not pol:
             return False
         kind = str(pol.get('policy_kind') or 'manual').lower().strip()
@@ -43201,6 +43346,10 @@ def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', u
         sess = str(sess or '-').upper().strip()
         out.update({'family': fam, 'session': sess, 'combo': f'{fam}-{sess}'})
         if sess in {'', '-', 'NONE'} or fam in {'', '-', 'F0'}:
+            return out
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            # Clean policy mode: no legacy DISABLE/OFF rows. Unknown combos stay enabled WATCH probation.
+            out.update({'found': False, 'policy': None, 'status': 'WATCH', 'enabled': 1})
             return out
         rows = _setup_combo_policy_cache_rows(force=False)
         uid = int(user_id or 0)
@@ -44145,6 +44294,8 @@ def _setup_edge_guard_setup_key(setup_or_row, session_name: str = '') -> tuple[s
 def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
     """Return (allowed, reason) for granular side/symbol edge filtering."""
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return True, 'clean_start_all_enabled_policy'
         if not bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)):
             return True, 'edge_micro_guard_disabled'
         fam, sess, side, sym, hour = _setup_edge_guard_setup_key(setup_or_row, session_name=session_name)
@@ -44242,6 +44393,8 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
 
 def _setup_edge_guard_snapshot_text(uid: int = 0) -> str:
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return 'Micro edge guard: OFF (clean-start all-enabled policy) | Block side=- | Side review=- | Block symbol=- | Symbol review=- | Weak-hour watch=-'
         data = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
         cs = sorted(list((data or {}).get('combo_side_block') or {}))
         sy = sorted(list((data or {}).get('symbol_block') or {}))
@@ -44271,6 +44424,8 @@ def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
     """
     out = {}
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return {}
         rows = _setup_combo_policy_cache_rows(force=True)
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
         ids = []
@@ -44558,7 +44713,7 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
     out_rows.sort(key=lambda x: (int(x.get('enabled_next') or 0), float(x.get('score') or 0.0), float(x.get('win_rate') or 0.0), int(x.get('decided') or 0)), reverse=True)
     run_id = 'SCM-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
     policy_window_ok = int(hours or 0) >= int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)
-    policy_update_ok = bool(persist and allow_policy_update and policy_window_ok)
+    policy_update_ok = bool(persist and allow_policy_update and policy_window_ok) and not bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True))
     policy_updated = False
     if persist and out_rows:
         try:
@@ -44914,6 +45069,8 @@ def _setup_combo_policy_view_maybe_auto_safety(uid: int) -> dict:
     """
     global _SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_LAST_TS
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return {'ok': True, 'reason': 'clean_start_all_enabled_policy'}
         if not bool(globals().get('SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED', True)):
             return {'ok': False, 'reason': 'disabled'}
         now_ts = float(time.time())
@@ -44952,7 +45109,10 @@ def _setup_combo_policy_text(uid: int) -> str:
                 "SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session",
                 (int(owner_uid),)
             ).fetchall() or []]
-        if not rows:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            # Do not display or overlay old policy rows; clean-start mode starts all combos enabled.
+            rows = []
+        if not rows and not bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
             # After /admin_reset_test_data the historical policy table is intentionally
             # cleared. Re-seed configured safety overrides so live policy visibility is
             # not lost during a clean forward test.
@@ -45046,6 +45206,8 @@ def _setup_combo_policy_text(uid: int) -> str:
             guard_data = _setup_edge_guard_build(int(owner_uid), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
             side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_side_block') or {}).keys())
         except Exception:
+            side_blocks = set()
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
             side_blocks = set()
 
         rows_by_combo = {}
@@ -45157,6 +45319,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
+            + ("Policy clean-start unlock: <b>ON</b> | Existing DISABLE/OFF rows are ignored; all combos are enabled for fresh forward testing.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
             f"{guard_txt}\n{note}\n"
             f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, the micro edge guard, the final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes strategy, so F8-NY-NOR and F8-NY-REV are reviewed separately in reports.\n"
             f"<pre>{html.escape(table)}</pre>"
@@ -45222,6 +45385,8 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setup_combo_review_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return
         if not SETUP_COMBO_REVIEW_ENABLED:
             return
         uid = int(AUTOTRADE_OWNER_UID or 0)
@@ -45258,6 +45423,8 @@ async def setup_combo_review_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def setup_combo_daily_safety_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return
         if not SETUP_COMBO_DAILY_SAFETY_ENABLED:
             return
         uid = int(AUTOTRADE_OWNER_UID or 0)
@@ -45294,6 +45461,8 @@ async def setup_combo_daily_safety_job(context: ContextTypes.DEFAULT_TYPE):
 async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
     """One-shot startup catch-up for missed weekly/daily setup-combo policy reviews."""
     try:
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return
         if not bool(globals().get('SETUP_COMBO_POLICY_CATCHUP_ENABLED', True)):
             return
         uid = int(AUTOTRADE_OWNER_UID or 0)
@@ -47919,6 +48088,8 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         HDR,
         f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
         f"Trading day: {snap.get('today_window_label')}",
+        (f"Keep-all test: ON | Auto flat/max-hold/carryover closes: OFF | Entry window: {int(AUTOTRADE_ENTRY_WINDOW_MIN)}m" if _autotrade_keep_all_test_mode() else None),
+        (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry/setup blackout: OFF" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
         SEP,
         f"EquityAT: ${equity:.2f}",
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
@@ -55025,6 +55196,8 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             ok = False
             reason = 'no_tradable_setup'
             attempted = 0
+            placed_count = 0
+            max_tick_places = max(0, int(globals().get('AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK', 0) or 0))  # 0 = unlimited/all eligible
             for cand in db_setups:
                 if _job_budget_exhausted():
                     reason = f'autotrade_job_budget_exhausted>{int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40)}s'
@@ -55058,21 +55231,29 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
                 if ok:
-                    break
+                    placed_count += 1
+                    if max_tick_places > 0 and placed_count >= max_tick_places:
+                        break
+                    # Ver54: keep opening eligible queued setups in this tick so the
+                    # NORMAL/REVERSE forward test can observe all positions until TP/SL.
+                    continue
                 if not _autotrade_should_try_next_after_skip(reason):
                     break
 
+            final_ok = placed_count > 0
+            final_reason = (f'placed_{placed_count}_from_queue' if final_ok else reason)
             _LAST_AUTOTRADE_DECISION[uid] = {
-                "status": "PLACED" if ok else "SKIP",
+                "status": "PLACED" if final_ok else "SKIP",
                 "when": now_utc.isoformat(timespec="seconds"),
-                "reason": "" if ok else reason,
+                "reason": final_reason,
                 "attempted": attempted,
+                "placed": placed_count,
                 "session": sess,
                 "mode": AUTOTRADE_MODE,
                 "attempted_candidates": attempt_summaries,
                 "latest_candidate": attempt_summaries[0] if attempt_summaries else {},
             }
-            _hb_touch('autotrade', ok=True, details=f"status={'PLACED' if ok else 'SKIP'} reason={'' if ok else reason}")
+            _hb_touch('autotrade', ok=True, details=f"status={'PLACED' if final_ok else 'SKIP'} reason={final_reason} placed={placed_count}")
 
     except Exception as e:
         try:
@@ -55201,8 +55382,11 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             attempts_meta = []
             ok = False
             reason = 'no_setups_after_email'
-            max_batch_places = max(1, int(globals().get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', 5) or 5))
-            for cand in list(db_setups or [])[:max_batch_places]:
+            max_batch_places = max(0, int(globals().get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', 0) or 0))  # 0 = unlimited/all eligible
+            _email_batch_candidates = list(db_setups or [])
+            if max_batch_places > 0:
+                _email_batch_candidates = _email_batch_candidates[:max_batch_places]
+            for cand in _email_batch_candidates:
                 attempted += 1
                 try:
                     attempts_meta.append({
@@ -55235,7 +55419,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                     pass
                 if ok:
                     placed_count += 1
-                    if placed_count >= max_batch_places:
+                    if max_batch_places > 0 and placed_count >= max_batch_places:
                         break
                     # Continue through the just-emailed batch while normal risk/open-trade
                     # caps still allow it, so AutoTrade does not fall behind emails.
