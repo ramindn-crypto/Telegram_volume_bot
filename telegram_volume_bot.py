@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver28: AutoTrade report now persists/displays real dynamic Risk%, Risk$ and TP$; adds CloseReason + LossReason taxonomy; /autotrade_report_overall uses the same classifier and top loss reason.
 # - 15May_ver12: Enforced strict TP/SL-only lifecycle: no automatic mid-trade market closes/reductions for risk correction, exit-attach lag, or opposite F8 signals; report now shows TP/SL/OPEN exit type.
 # - 15May_ver11: Controlled safe-leverage downgrade: setups needing practical lower leverage (e.g. 7x vs configured 10x) can open safely; very low required leverage remains blocked.
 # - 15May_ver10: Clean forward-test mode after dataset reset: removed default static symbol micro-blocks so symbols are active again; symbol blocks now only appear from new rolling evidence during the fresh test.
@@ -295,6 +296,17 @@ def _autotrade_migrate_tables():
             add_col("regime_primary", "regime_primary TEXT NOT NULL DEFAULT ''")
             add_col("allocator_plan_id", "allocator_plan_id TEXT NOT NULL DEFAULT ''")
             add_col("param_set_id", "param_set_id TEXT NOT NULL DEFAULT ''")
+            # Ver28 reporting fields: persist the real dynamic risk used at entry.
+            # These values are used by /autotrade_report and /autotrade_report_overall
+            # so the report does not fall back to a generic/base risk percentage.
+            add_col("risk_usd", "risk_usd REAL NOT NULL DEFAULT 0")
+            add_col("risk_pct", "risk_pct REAL NOT NULL DEFAULT 0")
+            add_col("tp_usd", "tp_usd REAL NOT NULL DEFAULT 0")
+            add_col("risk_multiplier", "risk_multiplier REAL NOT NULL DEFAULT 0")
+            add_col("dynamic_risk_score", "dynamic_risk_score REAL NOT NULL DEFAULT 0")
+            add_col("configured_risk_pct", "configured_risk_pct REAL NOT NULL DEFAULT 0")
+            add_col("allowed_risk_pct", "allowed_risk_pct REAL NOT NULL DEFAULT 0")
+            add_col("rr_tp", "rr_tp REAL NOT NULL DEFAULT 0")
 
             # Backfill trade_id for legacy rows (uses rowid).
             try:
@@ -7371,6 +7383,7 @@ def _autotrade_reconstruct_provisional_closes(uid: int, days: int = 7) -> list[d
                     'opened_ts': base_ts,
                     'closed_ts': float(best.get('ts') or 0.0),
                     'pnl': pnl,
+                    'qty': abs(float(best.get('qty') or 0.0)),
                     'outcome': 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN'),
                     'provisional': True,
                     'note': 'provisional_exchange_match_from_setup_history',
@@ -7451,6 +7464,7 @@ def _autotrade_exchange_close_fallback_rows(uid: int, days: int = 7) -> list[dic
                 'opened_ts': 0.0,
                 'closed_ts': ts,
                 'pnl': float(pnl),
+                'qty': float(_bybit_closed_pnl_event_qty(ev) or 0.0),
                 'outcome': 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'BREAKEVEN'),
                 'exchange_only': True,
                 'note': 'exchange_only_fallback_close',
@@ -8037,7 +8051,7 @@ def _autotrade_trade_insert_cols(cur, payload: dict, preferred_order: list[str])
                 live_payload[name] = str(live_payload.get('trade_id') or f"AT-{int(time.time())}-{uuid.uuid4().hex[:8].upper()}")
             elif name_l in {'tp1', 'take_profit', 'target', 'target_price'}:
                 live_payload[name] = float(tp_val or 0.0)
-            elif name_l in {'tp2', 'tp3', 'pnl', 'pnl_usdt', 'qty', 'entry', 'sl', 'tp', 'conf', 'quality_score', 'atr_pct'} or any(t in col_type for t in ('INT', 'REAL', 'NUM', 'FLOAT', 'DOUBLE')):
+            elif name_l in {'tp2', 'tp3', 'pnl', 'pnl_usdt', 'qty', 'entry', 'sl', 'tp', 'conf', 'quality_score', 'atr_pct', 'risk_usd', 'risk_pct', 'tp_usd', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp'} or any(t in col_type for t in ('INT', 'REAL', 'NUM', 'FLOAT', 'DOUBLE')):
                 live_payload[name] = 0.0
             else:
                 live_payload[name] = ''
@@ -8084,6 +8098,14 @@ def _autotrade_db_insert_open_trade_row(uid: int, trade_row: dict) -> str:
         'regime_primary': str((trade_row or {}).get('regime_primary') or ''),
         'allocator_plan_id': str((trade_row or {}).get('allocator_plan_id') or ''),
         'param_set_id': str((trade_row or {}).get('param_set_id') or ''),
+        'risk_usd': float((trade_row or {}).get('risk_usd') or (trade_row or {}).get('risk_usdt') or 0.0),
+        'risk_pct': float((trade_row or {}).get('risk_pct') or 0.0),
+        'tp_usd': float((trade_row or {}).get('tp_usd') or (trade_row or {}).get('tp_usdt') or 0.0),
+        'risk_multiplier': float((trade_row or {}).get('risk_multiplier') or 0.0),
+        'dynamic_risk_score': float((trade_row or {}).get('dynamic_risk_score') or 0.0),
+        'configured_risk_pct': float((trade_row or {}).get('configured_risk_pct') or 0.0),
+        'allowed_risk_pct': float((trade_row or {}).get('allowed_risk_pct') or 0.0),
+        'rr_tp': float((trade_row or {}).get('rr_tp') or 0.0),
     }
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -8091,7 +8113,8 @@ def _autotrade_db_insert_open_trade_row(uid: int, trade_row: dict) -> str:
             preferred_order = [
                 'trade_id','uid','opened_ts','created_ts','updated_ts','day_utc','session','setup_id','symbol','side',
                 'entry','sl','tp','tp1','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine',
-                'status','closed_ts','pnl_usdt','pnl','outcome','note','family_id','regime_primary','allocator_plan_id','param_set_id'
+                'status','closed_ts','pnl_usdt','pnl','outcome','note','family_id','regime_primary','allocator_plan_id','param_set_id',
+                'risk_usd','risk_pct','tp_usd','risk_multiplier','dynamic_risk_score','configured_risk_pct','allowed_risk_pct','rr_tp'
             ]
             insert_cols, values = _autotrade_trade_insert_cols(cur, payload, preferred_order)
             placeholders = ','.join(['?'] * len(insert_cols))
@@ -8767,7 +8790,7 @@ def _autotrade_has_live_open_order(symbol: str, side: str | None = None) -> bool
     return False
 
 
-def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float, lifecycle_state: str = 'executed_open', lifecycle_reason: str = '') -> str:
+def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float, lifecycle_state: str = 'executed_open', lifecycle_reason: str = '', report_meta: dict | None = None) -> str:
     """Persist a bot-opened trade into SQLite using the live DB schema.
 
     Older Render DBs can contain extra NOT NULL columns (created_ts/updated_ts).
@@ -8783,6 +8806,7 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
     setup_id = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '')
     symbol = str(getattr(s, 'symbol', '') or '').upper()
     side = str(getattr(s, 'side', '') or '').upper()
+    report_meta = dict(report_meta or {})
 
     payload = {
         'trade_id': trade_id,
@@ -8816,6 +8840,14 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
         'regime_primary': str(getattr(s, 'regime_primary', '') or ''),
         'allocator_plan_id': str(getattr(s, 'allocator_plan_id', '') or ''),
         'param_set_id': str(getattr(s, 'param_set_id', '') or ''),
+        'risk_usd': float(report_meta.get('risk_usd') or getattr(s, 'risk_usd', 0.0) or 0.0),
+        'risk_pct': float(report_meta.get('risk_pct') or getattr(s, 'risk_pct', 0.0) or 0.0),
+        'tp_usd': float(report_meta.get('tp_usd') or getattr(s, 'tp_usd', 0.0) or 0.0),
+        'risk_multiplier': float(report_meta.get('risk_multiplier') or getattr(s, 'risk_multiplier', 0.0) or 0.0),
+        'dynamic_risk_score': float(report_meta.get('dynamic_risk_score') or getattr(s, 'dynamic_risk_score', 0.0) or 0.0),
+        'configured_risk_pct': float(report_meta.get('configured_risk_pct') or getattr(s, 'configured_risk_pct', 0.0) or 0.0),
+        'allowed_risk_pct': float(report_meta.get('allowed_risk_pct') or getattr(s, 'allowed_risk_pct', 0.0) or 0.0),
+        'rr_tp': float(report_meta.get('rr_tp') or getattr(s, 'rr_tp', 0.0) or 0.0),
     }
 
     try:
@@ -8824,7 +8856,8 @@ def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float
             preferred_order = [
                 'trade_id','uid','opened_ts','created_ts','updated_ts','day_utc','session','setup_id','symbol','side',
                 'entry','sl','tp','tp1','alt_target_a','alt_target_b','qty','conf','quality_score','atr_pct','engine',
-                'status','closed_ts','pnl_usdt','pnl','outcome','note','family_id','regime_primary','allocator_plan_id','param_set_id'
+                'status','closed_ts','pnl_usdt','pnl','outcome','note','family_id','regime_primary','allocator_plan_id','param_set_id',
+                'risk_usd','risk_pct','tp_usd','risk_multiplier','dynamic_risk_score','configured_risk_pct','allowed_risk_pct','rr_tp'
             ]
             insert_cols, values = _autotrade_trade_insert_cols(c, payload, preferred_order)
             placeholders = ','.join(['?'] * len(insert_cols))
@@ -10277,7 +10310,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     try:
         if str(_autotrade_runtime_mode()).lower() != 'live':
             s_paper = _autotrade_clone_setup_for_execution(s, entry=float(price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
-            trade_id = _autotrade_db_add_trade(uid, session_label, s_paper, float(qty), lifecycle_state='executed_open', lifecycle_reason='paper_opened')
+            try:
+                _paper_risk_usd = _autotrade_true_risk_usd(float(getattr(s_paper, 'entry', 0.0) or 0.0), float(getattr(s_paper, 'sl', 0.0) or 0.0), float(qty or 0.0), float(contract_size or 1.0))
+                _paper_tp_usd = abs(float(getattr(s_paper, 'tp', 0.0) or 0.0) - float(getattr(s_paper, 'entry', 0.0) or 0.0)) * abs(float(qty or 0.0)) * float(contract_size or 1.0)
+                _paper_meta = {'risk_usd': _paper_risk_usd, 'risk_pct': _risk_pct_from_amount(float(equity), _paper_risk_usd), 'tp_usd': _paper_tp_usd, 'risk_multiplier': float(risk_mult or 0.0), 'dynamic_risk_score': float((_LAST_AUTOTRADE_DETAIL.get(int(uid)) or {}).get('dynamic_risk_score') or 0.0), 'configured_risk_pct': float(configured_risk_pct or 0.0), 'allowed_risk_pct': float(allowed_risk_pct or 0.0)}
+            except Exception:
+                _paper_meta = {}
+            trade_id = _autotrade_db_add_trade(uid, session_label, s_paper, float(qty), lifecycle_state='executed_open', lifecycle_reason='paper_opened', report_meta=_paper_meta)
             _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
             try:
                 _LAST_AUTOTRADE_DETAIL[int(uid)].update({'trade_id': str(trade_id), 'mode': 'paper'})
@@ -10539,8 +10578,36 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                     return (False, 'live_liq_unsafe_closed')
 
 
-        s_live = _autotrade_clone_setup_for_execution(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0)
-        trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened_pending_exit_attach')
+        # Ver28: persist authoritative dynamic-risk/reporting metrics at entry.
+        # Do this before journalling so /autotrade_report does not have to guess from
+        # the base risk config or current equity after the fact.
+        try:
+            _report_entry = float(filled_entry or price_ref or 0.0)
+            _report_sl = float(sl_for_order or 0.0)
+            _report_tp = float(live_final_tp or 0.0)
+            _report_qty = float(qty_for_db or 0.0)
+            _report_cs = float(contract_size or 1.0)
+            _report_risk_usd = _autotrade_true_risk_usd(_report_entry, _report_sl, _report_qty, _report_cs)
+            _report_tp_usd = abs(_report_tp - _report_entry) * abs(_report_qty) * abs(_report_cs) if _report_entry > 0 and _report_tp > 0 and _report_qty > 0 else 0.0
+            _report_risk_pct = _risk_pct_from_amount(float(equity), float(_report_risk_usd))
+            _report_rr = (_report_tp_usd / _report_risk_usd) if _report_risk_usd > 0 and _report_tp_usd > 0 else 0.0
+        except Exception:
+            _report_risk_usd = float(allowed_risk_usd or 0.0)
+            _report_risk_pct = float(allowed_risk_pct or 0.0)
+            _report_tp_usd = 0.0
+            _report_rr = 0.0
+        _report_meta = {
+            'risk_usd': float(_report_risk_usd or 0.0),
+            'risk_pct': float(_report_risk_pct or 0.0),
+            'tp_usd': float(_report_tp_usd or 0.0),
+            'risk_multiplier': float(risk_mult or 0.0),
+            'dynamic_risk_score': float((_LAST_AUTOTRADE_DETAIL.get(int(uid)) or {}).get('dynamic_risk_score') or 0.0),
+            'configured_risk_pct': float(configured_risk_pct or 0.0),
+            'allowed_risk_pct': float(allowed_risk_pct or 0.0),
+            'rr_tp': float(_report_rr or 0.0),
+        }
+        s_live = _autotrade_clone_setup_for_execution(s, entry=float(filled_entry or price_ref), sl=float(sl_for_order), tp=float(live_final_tp or 0.0), alt_target_a=0.0, alt_target_b=0.0, **_report_meta)
+        trade_id = _autotrade_db_add_trade(uid, session_label, s_live, qty_for_db, lifecycle_state='executed_open', lifecycle_reason='live_opened_pending_exit_attach', report_meta=_report_meta)
         _autotrade_exec_mark(reserved_keys, 'PLACED', trade_id)
         try:
             _admin_setup_lifecycle_merge(
@@ -40136,7 +40203,7 @@ def _setup_audit_merge_trade_setup_row(trade_row: dict | None) -> dict:
         merged = dict(setup_row)
         # Keep real trade fields where they are more authoritative for report display.
         for k, v in row.items():
-            if k in {'trade_id', 'uid', 'opened_ts', 'closed_ts', 'pnl_usdt', 'pnl', 'status', 'qty', 'note', 'outcome'}:
+            if k in {'trade_id', 'uid', 'opened_ts', 'closed_ts', 'pnl_usdt', 'pnl', 'status', 'qty', 'note', 'outcome', 'risk_usd', 'risk_usdt', 'risk_pct', 'tp_usd', 'tp_usdt', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'result_path', 'result_label', 'close_reason', 'source_note'}:
                 merged[k] = v
             elif not str(merged.get(k) or '').strip():
                 merged[k] = v
@@ -44127,11 +44194,131 @@ def _autotrade_report_is_before_asia_close(row: dict) -> bool:
         return False
 
 
+AUTOTRADE_REPORT_LOSS_REASON_CHOICES = (
+    'SL_HIT',                 # stop price/order was hit or PnL is close to expected risk
+    'CLOSED_BEFORE_ASIA_LOSS', # 09:45/09:55 flat closed the position at a loss
+    'MAX_HOLD_LOSS',          # max-hold rule closed the position at a loss
+    'WEAK_COMBO',             # family+session currently has negative/disabled edge evidence
+    'WEAK_SYMBOL',            # symbol has recent blocklist/poor-edge evidence
+    'WEAK_HOUR',              # entry hour is in weak-hour watch/blackout evidence
+    'TIGHT_SL',               # stop distance was too small for crypto noise/volatility
+    'BAD_ENTRY',              # entry drifted/adverse or candle structure was weak
+    'COUNTER_TREND',          # setup side fought the 24h/4h/1h direction
+    'LOW_CONFIDENCE',         # confidence was below the stronger live threshold
+    'LOW_VOLUME',             # volume was above floor but still thin for AutoTrade quality
+    'LOSS_CLOSE',             # exchange closed at loss but exact failure mode is unknown
+)
+
+
+def _autotrade_report_loss_reason(row: dict) -> str:
+    """Best-effort analytical loss reason for continuous improvement.
+
+    This is not fake exchange data: direct SL/time/max-hold evidence wins.  The
+    remaining labels are deterministic inferences from the stored setup features
+    and current policy/micro-guard state, so the weekly/daily optimizer can group
+    losses by practical causes instead of a useless generic LOSS_CLOSE.
+    """
+    try:
+        row = dict(row or {})
+        note = str(row.get('note') or row.get('close_reason') or row.get('source_note') or row.get('result_label') or '').upper()
+        if _autotrade_report_is_before_asia_close(row):
+            return 'CLOSED_BEFORE_ASIA_LOSS'
+        if 'MAX_POSITION' in note or 'MAX_HOLD' in note or 'MAX-HOLD' in note:
+            return 'MAX_HOLD_LOSS'
+        if _autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL'):
+            return 'SL_HIT'
+
+        sym = str(row.get('symbol') or '').upper().replace('USDT', '')
+        side = str(row.get('side') or '').upper().strip()
+        fam = _setup_audit_family_display(row, compact=True)
+        sess = str(row.get('session') or row.get('open_session') or '').upper().strip()
+        combo = f"{fam}-{sess}" if fam and sess else ''
+
+        # Current enforced/guard evidence.
+        try:
+            disabled = set(_setup_combo_disabled_set(int(row.get('uid') or AUTOTRADE_OWNER_UID or 0)) or set())
+            if combo and combo in disabled:
+                return 'WEAK_COMBO'
+        except Exception:
+            pass
+        try:
+            pol = _setup_combo_policy_cache_rows(force=False) or {}
+            for (_uid, pfam, pses), pr in pol.items():
+                if pfam == str(fam).upper() and pses == str(sess).upper():
+                    if int(pr.get('enabled') or 0) <= 0 or str(pr.get('status') or '').upper() == 'DISABLE':
+                        return 'WEAK_COMBO'
+                    if float(pr.get('last_score') or 0.0) < -20 or float(pr.get('last_win_rate') or 0.0) < 35:
+                        return 'WEAK_COMBO'
+        except Exception:
+            pass
+        try:
+            guard = _setup_edge_guard_build(int(row.get('uid') or AUTOTRADE_OWNER_UID or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+            bad_symbols = set((guard or {}).get('symbol_block') or {})
+            if sym and (sym in bad_symbols or f'{sym}USDT' in bad_symbols):
+                return 'WEAK_SYMBOL'
+            opened_ts = float(row.get('opened_ts') or row.get('ts') or 0.0)
+            if opened_ts > 0:
+                hh = datetime.fromtimestamp(opened_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%H:00')
+                weak_hours = set((guard or {}).get('hour_watch') or {})
+                if hh in weak_hours:
+                    return 'WEAK_HOUR'
+        except Exception:
+            pass
+
+        entry = float(row.get('entry') or 0.0)
+        sl = float(row.get('sl') or 0.0)
+        if entry > 0 and sl > 0:
+            sl_pct = abs(entry - sl) / max(abs(entry), 1e-12) * 100.0
+            # Below ~1.2% is often noise-level for small/mid-cap crypto.  For bigger caps,
+            # the same label still points to stop placement rather than signal direction.
+            if sl_pct < 1.20:
+                return 'TIGHT_SL'
+            if sl_pct > 0:
+                try:
+                    atr_pct = float(row.get('atr_pct') or 0.0)
+                    if atr_pct > 0 and sl_pct < max(0.65 * atr_pct, 0.8):
+                        return 'TIGHT_SL'
+                except Exception:
+                    pass
+
+        try:
+            drift = float(row.get('entry_drift_adverse_pct') or row.get('entry_delta_pct') or 0.0)
+            if drift >= 0.35:
+                return 'BAD_ENTRY'
+        except Exception:
+            pass
+
+        # Direction conflict using available move features.
+        try:
+            moves = [float(row.get('ch24') or 0.0), float(row.get('ch4') or 0.0), float(row.get('ch1') or 0.0)]
+            if side == 'BUY' and sum(1 for x in moves if x < -1.0) >= 2:
+                return 'COUNTER_TREND'
+            if side == 'SELL' and sum(1 for x in moves if x > 1.0) >= 2:
+                return 'COUNTER_TREND'
+        except Exception:
+            pass
+
+        try:
+            if int(float(row.get('conf') or row.get('confidence') or 0.0)) < 83:
+                return 'LOW_CONFIDENCE'
+        except Exception:
+            pass
+        try:
+            volm = float(row.get('fut_vol_usd') or row.get('volume_usd') or 0.0) / 1e6
+            if 0 < volm < 25:
+                return 'LOW_VOLUME'
+        except Exception:
+            pass
+        return 'LOSS_CLOSE'
+    except Exception:
+        return 'LOSS_CLOSE'
+
+
 def _autotrade_report_exit_reason(row: dict, result: str | None = None) -> str:
     """Short user-facing close reason used by /autotrade_report.
 
     Result is the trading outcome (TP/SL/FLAT/OPEN). Reason explains how it closed
-    (target, stop, pre-ASIA flat, max hold, profit close, loss close, etc.).
+    (TP hit, SL hit, pre-ASIA flat, max hold, or inferred loss cause).
     """
     try:
         row = dict(row or {})
@@ -44141,17 +44328,21 @@ def _autotrade_report_exit_reason(row: dict, result: str | None = None) -> str:
         note_raw = str(row.get('note') or row.get('close_reason') or row.get('source_note') or row.get('result_label') or '').strip()
         note = note_raw.upper()
         if _autotrade_report_is_before_asia_close(row):
+            if res == 'TP':
+                return 'CLOSED_BEFORE_ASIA_WIN'
+            if res == 'SL':
+                return 'CLOSED_BEFORE_ASIA_LOSS'
             return 'CLOSED_BEFORE_ASIA'
         if 'MAX_POSITION' in note or 'MAX_HOLD' in note or 'MAX-HOLD' in note:
+            if res == 'TP':
+                return 'MAX_HOLD_WIN'
+            if res == 'SL':
+                return 'MAX_HOLD_LOSS'
             return 'MAX_HOLD'
         if res == 'TP':
-            if _autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP'):
-                return 'TP_TARGET'
-            return 'PROFIT_CLOSE'
+            return 'TP_HIT'
         if res == 'SL':
-            if _autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL'):
-                return 'SL_STOP'
-            return 'LOSS_CLOSE'
+            return _autotrade_report_loss_reason(row)
         if res == 'FLAT':
             return 'FLAT_CLOSE'
         if note_raw:
@@ -44160,31 +44351,98 @@ def _autotrade_report_exit_reason(row: dict, result: str | None = None) -> str:
     except Exception:
         return 'OTHER_CLOSE'
 
-
 def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
-    """Add risk_usd/risk_pct/tp_usd estimates where possible for reporting."""
+    """Add authoritative risk_usd/risk_pct/tp_usd estimates where possible.
+
+    Priority:
+    1) stored execution metadata persisted by ver28 (risk_usd/risk_pct/tp_usd),
+    2) actual setup geometry × executed/closed qty,
+    3) lifecycle risk_usdt,
+    4) last-resort percentage-to-dollar conversion.
+
+    This prevents /autotrade_report from displaying the base config risk (for example
+    1.50%) for every row when dynamic risk actually sized each trade differently.
+    """
     out = dict(row or {})
     try:
-        risk_usd = 0.0
-        for k in ('risk_usd', 'risk_usdt', 'risk', 'risk_est', 'estimated_risk_usd', 'target_risk_usd'):
+        eq = float(equity or 0.0)
+
+        def _num(*keys, absval: bool = False) -> float:
+            best = 0.0
+            for k in keys:
+                try:
+                    v = float(out.get(k) or 0.0)
+                    if absval:
+                        v = abs(v)
+                    if v > best:
+                        best = v
+                except Exception:
+                    pass
+            return float(best or 0.0)
+
+        risk_usd = _num('risk_usd', 'risk_usdt', 'risk', 'risk_est', 'estimated_risk_usd', 'target_risk_usd', 'filled_risk_usd', 'risk_actual_usd', absval=True)
+        tp_usd = _num('tp_usd', 'tp_usdt', 'target_tp_usd', 'expected_tp_usd', absval=True)
+
+        entry = float(out.get('entry') or 0.0)
+        sl = float(out.get('sl') or 0.0)
+        side = str(out.get('side') or '').upper().strip()
+        tp = float(_resolve_single_tp(entry, sl, out.get('tp'), out.get('alt_target_a'), out.get('alt_target_b'), side) or 0.0)
+        qty = abs(float(out.get('qty') or out.get('filled_qty') or out.get('closed_qty') or 0.0))
+        try:
+            cs = float(out.get('contract_size') or out.get('contractSize') or 0.0)
+            if cs <= 0:
+                cs = float((_bybit_get_instr_filters(str(out.get('symbol') or '')) or {}).get('contractSize') or 1.0)
+        except Exception:
+            cs = 1.0
+        cs = abs(float(cs or 1.0))
+
+        if entry > 0 and sl > 0 and qty > 0:
+            geom_risk = abs(entry - sl) * qty * cs
+            if geom_risk > 0:
+                # Geometry from actual qty is the most reliable dollar risk for old rows.
+                risk_usd = geom_risk
+        if entry > 0 and tp > 0 and qty > 0:
+            geom_tp = abs(tp - entry) * qty * cs
+            if geom_tp > 0:
+                tp_usd = geom_tp
+        elif tp_usd <= 0 and risk_usd > 0:
+            rr = 0.0
             try:
-                risk_usd = max(risk_usd, abs(float(out.get(k) or 0.0)))
+                rr = abs(tp - entry) / max(abs(entry - sl), 1e-12) if entry > 0 and sl > 0 and tp > 0 else float(out.get('rr_tp') or out.get('rr_tp_target') or 0.0)
+            except Exception:
+                rr = 0.0
+            if rr > 0:
+                tp_usd = risk_usd * rr
+
+        # Last resort: if lifecycle only has a risk percentage, show a dollar estimate
+        # rather than a blank. Do not let this override real geometry/stored risk.
+        raw_risk_pct = 0.0
+        for k in ('risk_pct', 'filled_risk_pct', 'risk_actual_pct', 'allowed_risk_pct'):
+            try:
+                raw_risk_pct = max(raw_risk_pct, float(out.get(k) or 0.0))
             except Exception:
                 pass
-        targets = _autotrade_report_expected_pnl_targets(out) or {}
-        if risk_usd <= 0:
-            risk_usd = abs(float(targets.get('SL') or 0.0))
+        if risk_usd <= 0 and eq > 0 and raw_risk_pct > 0:
+            risk_usd = eq * (raw_risk_pct / 100.0)
+        risk_pct = float(out.get('risk_pct') or 0.0)
+        if risk_usd > 0 and eq > 0:
+            risk_pct = (risk_usd / eq) * 100.0
+        elif risk_pct <= 0:
+            risk_pct = raw_risk_pct
+
         out['risk_usd'] = float(risk_usd or 0.0)
-        eq = float(equity or 0.0)
-        out['risk_pct'] = (risk_usd / eq * 100.0) if eq > 0 and risk_usd > 0 else float(out.get('risk_pct') or 0.0)
-        tp_usd = abs(float(targets.get('TP') or 0.0))
-        out['tp_usd'] = tp_usd
+        out['risk_pct'] = float(risk_pct or 0.0)
+        out['tp_usd'] = float(tp_usd or 0.0)
+        if tp > 0:
+            out['tp'] = float(tp)
+        if risk_usd > 0 and tp_usd > 0:
+            out['rr_tp'] = float(tp_usd / risk_usd)
     except Exception:
         pass
     return out
 
 def _autotrade_report_expected_pnl_targets(row: dict) -> dict:
-    """Expected TP/SL PnL from the setup geometry."""
+    """Expected TP/SL PnL from actual stored execution risk and setup geometry."""
     row = dict(row or {})
     try:
         entry = float(row.get('entry') or 0.0)
@@ -44192,23 +44450,33 @@ def _autotrade_report_expected_pnl_targets(row: dict) -> dict:
         side = str(row.get('side') or '').upper().strip()
         tp = float(_resolve_single_tp(entry, sl, row.get('tp'), row.get('alt_target_a'), row.get('alt_target_b'), side) or 0.0)
         qty = abs(float(row.get('qty') or row.get('filled_qty') or row.get('closed_qty') or 0.0))
+        try:
+            cs = float(row.get('contract_size') or row.get('contractSize') or 0.0)
+            if cs <= 0:
+                cs = float((_bybit_get_instr_filters(str(row.get('symbol') or '')) or {}).get('contractSize') or 1.0)
+        except Exception:
+            cs = 1.0
         risk_usd = 0.0
-        for key in ('risk_usd', 'risk_usdt', 'risk', 'estimated_risk_usd', 'target_risk_usd'):
+        for key in ('risk_usd', 'risk_usdt', 'risk', 'estimated_risk_usd', 'target_risk_usd', 'filled_risk_usd', 'risk_actual_usd'):
             try:
-                v = float(row.get(key) or 0.0)
+                v = abs(float(row.get(key) or 0.0))
                 if v > risk_usd:
                     risk_usd = v
             except Exception:
                 pass
         if entry > 0 and sl > 0 and qty > 0:
-            risk_usd = max(risk_usd, abs(entry - sl) * qty)
+            risk_usd = max(risk_usd, abs(entry - sl) * qty * abs(float(cs or 1.0)))
         tp_usd = 0.0
-        if entry > 0 and sl > 0 and tp > 0:
+        for key in ('tp_usd', 'tp_usdt', 'target_tp_usd', 'expected_tp_usd'):
+            try:
+                tp_usd = max(tp_usd, abs(float(row.get(key) or 0.0)))
+            except Exception:
+                pass
+        if entry > 0 and tp > 0 and qty > 0:
+            tp_usd = max(tp_usd, abs(tp - entry) * qty * abs(float(cs or 1.0)))
+        elif tp_usd <= 0 and entry > 0 and sl > 0 and tp > 0 and risk_usd > 0:
             rr = abs(tp - entry) / max(abs(entry - sl), 1e-12)
-            if risk_usd > 0:
-                tp_usd = risk_usd * rr
-            elif qty > 0:
-                tp_usd = abs(tp - entry) * qty
+            tp_usd = risk_usd * rr
         return {'TP': float(abs(tp_usd or 0.0)), 'SL': -float(abs(risk_usd or 0.0))}
     except Exception:
         return {'TP': 0.0, 'SL': 0.0}
@@ -44386,6 +44654,14 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
             else:
                 matched['pnl'] = float(matched.get('pnl') or 0.0) + float(pnl)
                 matched['pnl_usdt'] = float(matched.get('pnl') or 0.0)
+                # Preserve the best available execution/reporting metadata for the merged position.
+                for _mk in ('risk_usd', 'risk_pct', 'tp_usd', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'entry', 'sl', 'tp', 'qty', 'conf', 'fut_vol_usd', 'ch24', 'ch4', 'ch1'):
+                    try:
+                        if float(matched.get(_mk) or 0.0) <= 0 and float(r.get(_mk) or 0.0) > 0:
+                            matched[_mk] = r.get(_mk)
+                    except Exception:
+                        if not str(matched.get(_mk) or '').strip() and str(r.get(_mk) or '').strip():
+                            matched[_mk] = r.get(_mk)
                 matched['parts'] = int(matched.get('parts') or 1) + int(r.get('parts') or 1)
                 matched['first_ts'] = min(float(matched.get('first_ts') or ts), float(ts or 0.0))
                 matched['last_ts'] = max(float(matched.get('last_ts') or ts), float(ts or 0.0))
@@ -44428,7 +44704,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v27_comprehensive:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v28_risk_reason:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -44518,6 +44794,15 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'setup_id': str(row.get('setup_id') or ''),
             'trade_id': str(row.get('trade_id') or ''),
             'opened_ts': float(row.get('opened_ts') or ts or 0.0),
+            'entry': float(row.get('entry') or 0.0),
+            'sl': float(row.get('sl') or 0.0),
+            'tp': float(row.get('tp') or 0.0),
+            'qty': float(row.get('qty') or 0.0),
+            'conf': int(float(row.get('conf') or row.get('confidence') or 0.0)),
+            'fut_vol_usd': float(row.get('fut_vol_usd') or 0.0),
+            'ch24': float(row.get('ch24') or 0.0),
+            'ch4': float(row.get('ch4') or 0.0),
+            'ch1': float(row.get('ch1') or 0.0),
             'pnl': pnl,
             'parts': 1,
             'risk_usd': float(row.get('risk_usd') or 0.0),
@@ -44556,6 +44841,15 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'close_reason': str(row.get('close_reason') or r.get('close_reason') or ''),
             'note': str(row.get('note') or r.get('note') or ''),
             'source_note': str(row.get('source_note') or r.get('source_note') or ''),
+            'entry': float(row.get('entry') or r.get('entry') or 0.0),
+            'sl': float(row.get('sl') or r.get('sl') or 0.0),
+            'tp': float(row.get('tp') or r.get('tp') or 0.0),
+            'qty': float(row.get('qty') or r.get('qty') or 0.0),
+            'conf': int(float(row.get('conf') or r.get('conf') or row.get('confidence') or 0.0)),
+            'fut_vol_usd': float(row.get('fut_vol_usd') or r.get('fut_vol_usd') or 0.0),
+            'ch24': float(row.get('ch24') or r.get('ch24') or 0.0),
+            'ch4': float(row.get('ch4') or r.get('ch4') or 0.0),
+            'ch1': float(row.get('ch1') or r.get('ch1') or 0.0),
             'pnl': pnl,
             'pnl_usdt': pnl,
             'parts': 1,
@@ -44577,7 +44871,8 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
         f"Trades: <b>{len(journal_rows)}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
-        "Result: TP=profitable/target close, SL=losing/stop close, FLAT=near-zero. Reason shows TP_TARGET, SL_STOP, CLOSED_BEFORE_ASIA, MAX_HOLD, PROFIT_CLOSE, or LOSS_CLOSE.",
+        "Result: TP=win/profitable close, SL=loss, FLAT=near-zero. Reason separates TP_HIT, SL_HIT, CLOSED_BEFORE_ASIA_WIN/LOSS, MAX_HOLD, and inferred loss causes.",
+        "LossReason choices: SL_HIT, CLOSED_BEFORE_ASIA_LOSS, MAX_HOLD_LOSS, WEAK_COMBO, WEAK_SYMBOL, WEAK_HOUR, TIGHT_SL, BAD_ENTRY, COUNTER_TREND, LOW_CONFIDENCE, LOW_VOLUME, LOSS_CLOSE.",
     ]
     if external_positions:
         lines.append(f"Ignored unmatched manual/external live positions: <b>{len(external_positions)}</b>")
@@ -44601,6 +44896,13 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 return str(r.get('exit_reason') or _autotrade_report_exit_reason(r, _result_display(r)) or '-')
             except Exception:
                 return '-'
+        def _loss_reason_display(r: dict) -> str:
+            try:
+                if str(_result_display(r)).upper() == 'SL':
+                    return _autotrade_report_loss_reason(r)
+                return '-'
+            except Exception:
+                return '-'
         table_rows = []
         for r in display:
             open_ts = float(r.get('opened_ts') or r.get('ts') or 0.0)
@@ -44620,12 +44922,13 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 int(r.get('parts') or 1),
                 f"{float(r.get('pnl') or 0.0):+.2f}",
                 _reason_display(r),
+                _loss_reason_display(r),
             ])
         table = tabulate(
             table_rows,
-            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Fam', 'SesO', 'SesC', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason'],
+            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Fam', 'SesO', 'SesC', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason', 'LossReason'],
             tablefmt='plain',
-            colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'left'),
+            colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'left', 'left'),
         )
         raw_count = int(len(bot_positions or [])) + int(len(closed_rows or []))
         lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> merged position rows. Raw fragments: <b>{raw_count}</b>. Time: <b>Melbourne</b>.")
@@ -45380,7 +45683,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v27_result_reason:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v28_reason_matrix:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -45456,13 +45759,25 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
             'closed_ts': ts,
             'result_path': str(row.get('result_path') or r.get('result_path') or ''),
             'result_label': str(row.get('result_label') or r.get('result_label') or ''),
+            'close_reason': str(row.get('close_reason') or r.get('close_reason') or ''),
+            'note': str(row.get('note') or r.get('note') or ''),
+            'source_note': str(row.get('source_note') or r.get('source_note') or ''),
+            'entry': float(row.get('entry') or r.get('entry') or 0.0),
+            'sl': float(row.get('sl') or r.get('sl') or 0.0),
+            'tp': float(row.get('tp') or r.get('tp') or 0.0),
+            'qty': float(row.get('qty') or r.get('qty') or 0.0),
+            'conf': int(float(row.get('conf') or r.get('conf') or row.get('confidence') or 0.0)),
+            'fut_vol_usd': float(row.get('fut_vol_usd') or r.get('fut_vol_usd') or 0.0),
+            'ch24': float(row.get('ch24') or r.get('ch24') or 0.0),
+            'ch4': float(row.get('ch4') or r.get('ch4') or 0.0),
+            'ch1': float(row.get('ch1') or r.get('ch1') or 0.0),
             'pnl': pnl,
             'pnl_usdt': pnl,
             'parts': 1,
         })
 
     merged = _autotrade_merge_position_report_rows(rows)
-    buckets = defaultdict(lambda: {'trades': 0, 'tp': 0, 'sl': 0, 'open': 0, 'other': 0, 'pnl': 0.0, 'parts': 0})
+    buckets = defaultdict(lambda: {'trades': 0, 'tp': 0, 'sl': 0, 'open': 0, 'other': 0, 'pnl': 0.0, 'parts': 0, 'loss_reasons': defaultdict(int)})
     for r in merged:
         fam = str(r.get('family') or 'F0').upper().strip() or 'F0'
         sess = str(r.get('session') or _autotrade_report_row_session(r) or 'UNK').upper().strip() or 'UNK'
@@ -45479,6 +45794,10 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
                 b['tp'] += 1
             elif kind == 'SL':
                 b['sl'] += 1
+                try:
+                    b['loss_reasons'][_autotrade_report_loss_reason(r)] += 1
+                except Exception:
+                    b['loss_reasons']['LOSS_CLOSE'] += 1
             else:
                 b['other'] += 1
 
@@ -45500,7 +45819,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         HDR,
         f'Window: last {lookback_h}h (Melbourne)' + (f' | Now: {now_txt}' if now_txt else ''),
         f'Position rows: {total_trades} | Raw fragments merged: {raw_fragments} | TP: {total_tp} | SL: {total_sl} | Other: {total_other} | Open: {total_open} | WR: {wr:.1f}% | PnL: {total_pnl:+.2f} USDT',
-        'TP/SL counts are realised outcomes: positive closes count as TP/win, negative closes count as SL/loss. Time exits such as the 09:45/09:55 pre-ASIA flat are tracked in the detailed report Reason column.',
+        'TP/SL counts are realised outcomes and use the same classifier as /autotrade_report. Other should only be near-zero/unknown rows; time exits and inferred loss reasons are tracked in the detailed report.',
     ]
     if external_positions:
         lines.append(f'Ignored unmatched manual/external live positions: {len(external_positions)}')
@@ -45515,6 +45834,11 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     for (fam, sess), v in sorted(buckets.items(), key=lambda kv: (float(kv[1].get('pnl') or 0.0), int(kv[1].get('tp') or 0), -int(kv[1].get('sl') or 0)), reverse=True):
         d = int(v.get('tp') or 0) + int(v.get('sl') or 0)
         wr_i = (int(v.get('tp') or 0) / d * 100.0) if d > 0 else 0.0
+        try:
+            loss_reasons = dict(v.get('loss_reasons') or {})
+            top_loss = max(loss_reasons.items(), key=lambda kv: kv[1])[0] if loss_reasons else '-'
+        except Exception:
+            top_loss = '-'
         table_rows.append([
             fam,
             sess,
@@ -45525,12 +45849,13 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
             int(v.get('open') or 0),
             f'{wr_i:.1f}%',
             f"{float(v.get('pnl') or 0.0):+.2f}",
+            top_loss,
         ])
     table = tabulate(
         table_rows,
-        headers=['Fam', 'Ses', 'Trades', 'TP', 'SL', 'Other', 'Open', 'WR', 'PnL'],
+        headers=['Fam', 'Ses', 'Trades', 'TP', 'SL', 'Other', 'Open', 'WR', 'PnL', 'TopLossReason'],
         tablefmt='plain',
-        colalign=('center', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
+        colalign=('center', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'),
     )
     out = '\n'.join(lines) + '\n<pre>' + html.escape(table) + '</pre>'
     try:
