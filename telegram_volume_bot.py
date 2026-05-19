@@ -521,10 +521,10 @@ AUTOTRADE_VER07_TARGET_RISK_PCT = float(os.environ.get('AUTOTRADE_VER07_TARGET_R
 AUTOTRADE_VER07_MIN_RISK_MULT = float(os.environ.get('AUTOTRADE_VER07_MIN_RISK_MULT', '0.75') or 0.75)
 AUTOTRADE_VER07_MAX_RISK_MULT = float(os.environ.get('AUTOTRADE_VER07_MAX_RISK_MULT', '1.25') or 1.25)
 AUTOTRADE_VER07_OPEN_RISK_CAP_PCT = float(os.environ.get('AUTOTRADE_VER07_OPEN_RISK_CAP_PCT', '6.0') or 6.0)
-AUTOTRADE_VER07_DAILY_RISK_CAP_PCT = float(os.environ.get('AUTOTRADE_VER07_DAILY_RISK_CAP_PCT', '6.0') or 6.0)
-AUTOTRADE_VER07_MAX_OPEN_TRADES = int(os.environ.get('AUTOTRADE_VER07_MAX_OPEN_TRADES', '5') or 5)
-AUTOTRADE_VER07_MAX_TRADES_PER_DAY = int(os.environ.get('AUTOTRADE_VER07_MAX_TRADES_PER_DAY', '8') or 8)
-AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT = float(os.environ.get('AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT', '0.80') or 0.80)
+AUTOTRADE_VER07_DAILY_RISK_CAP_PCT = float(os.environ.get('AUTOTRADE_VER07_DAILY_RISK_CAP_PCT', '15.0') or 15.0)
+AUTOTRADE_VER07_MAX_OPEN_TRADES = int(os.environ.get('AUTOTRADE_VER07_MAX_OPEN_TRADES', '20') or 20)
+AUTOTRADE_VER07_MAX_TRADES_PER_DAY = int(os.environ.get('AUTOTRADE_VER07_MAX_TRADES_PER_DAY', '50') or 50)
+AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT = float(os.environ.get('AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT', '1.00') or 1.00)
 
 AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
 AUTOTRADE_FLAT_BEFORE_ASIA_HOUR = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9)
@@ -537,7 +537,7 @@ AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_
 AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_GRACE_HOURS = float(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_GRACE_HOURS', '18') or 18)
 AUTOTRADE_FLAT_FALLBACK_UNMATCHED_AS_OWNED = env_bool('AUTOTRADE_FLAT_FALLBACK_UNMATCHED_AS_OWNED', True)
 AUTOTRADE_MAX_POSITION_HOURS_ENABLED = env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)
-AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8)
+AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '12') or 12)
 AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', '600') or 600)
 AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
 AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
@@ -703,7 +703,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY: 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0,
         SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
         AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True) else 0,
-        AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8),
+        AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '12') or 12),
     }
     for k, v in defaults.items():
         try:
@@ -937,9 +937,9 @@ def _autotrade_max_position_hours_enabled() -> bool:
 
 def _autotrade_max_position_hours() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8')) or 8.0)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '12')) or 12.0)
     except Exception:
-        val = 8.0
+        val = 12.0
     return max(0.25, min(72.0, float(val)))
 
 
@@ -1372,9 +1372,8 @@ def _autotrade_apply_ver33_wr_first_caps() -> None:
     """Ver33 WR-first runtime caps and display sync.
 
     Ver32 correctly added a strict quality gate, but live runtime config could still
-    show stale values such as max_open=20, max_trades/day=0, max_hold=18h and
-    entry_drift=1.5%.  That makes the system look unsynchronised and can allow too
-    many live attempts if caps are reset manually.  Ver33 clamps only trading risk
+    show stale values that were outside the chosen runtime defaults. Ver34 keeps
+    higher throughput defaults for forward testing while still preserving quality gates.  Ver33 clamps only trading risk
     and throughput controls; it does not remove users, emails, sessions, timezone,
     API credentials, or reporting tables.
     """
@@ -1450,6 +1449,62 @@ def _autotrade_apply_ver33_wr_first_caps() -> None:
             pass
 
         _autotrade_config_set('ver33_wr_first_caps_policy_version', target_version)
+    except Exception:
+        pass
+
+
+
+def _autotrade_apply_ver34_user_requested_defaults() -> None:
+    """Ver34 user-requested AutoTrade runtime defaults.
+
+    The bot is still in forward-test/learning mode. Keep the strict setup quality
+    gates from ver32/ver33, but do not throttle AutoTrade throughput too heavily.
+    These values are applied once on deploy so stale ver33 runtime caps are lifted,
+    then the admin can change them any time from Telegram using /autotrade_config.
+
+    Defaults requested:
+    - AUTOTRADE_MAX_TRADES_PER_DAY = 50
+    - AUTOTRADE_MAX_OPEN_TRADES = 20
+    - AUTOTRADE_MAX_POSITION_HOURS = 12h
+    - AUTOTRADE_MAX_ENTRY_DRIFT_PCT = 1.00%
+    - AUTOTRADE_DAILY_RISK_CAP_PCT = 15%
+    """
+    try:
+        target_version = 'ver34_2026_05_19_user_runtime_defaults'
+        if str(_autotrade_config_get('ver34_user_runtime_defaults_version', '') or '').strip().lower() == target_version:
+            return
+
+        max_day = max(1, int(globals().get('AUTOTRADE_VER34_MAX_TRADES_PER_DAY', 50) or 50))
+        max_open = max(1, int(globals().get('AUTOTRADE_VER34_MAX_OPEN_TRADES', 20) or 20))
+        max_hours = max(0.5, float(globals().get('AUTOTRADE_VER34_MAX_POSITION_HOURS', 12) or 12))
+        max_drift = max(0.05, float(globals().get('AUTOTRADE_VER34_MAX_ENTRY_DRIFT_PCT', 1.00) or 1.00))
+        day_cap_pct = max(0.5, float(globals().get('AUTOTRADE_VER34_DAILY_CAP_PCT', 15.0) or 15.0))
+
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(max_day))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, int(max_open))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, float(max_hours))
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, float(max_drift))
+        _autotrade_set_daily_cap_settings('PCT', float(day_cap_pct))
+
+        # Keep the email/setup quality objective; only restore throughput defaults.
+        try:
+            cfg = load_strategy_config(force=True)
+            cfg['ver34_user_runtime_defaults_enabled'] = True
+            cfg['ver34_autotrade_forward_test_defaults'] = {
+                'max_trades_per_day': int(max_day),
+                'max_open_trades': int(max_open),
+                'max_position_hours': float(max_hours),
+                'max_entry_drift_pct': float(max_drift),
+                'daily_risk_cap_pct': float(day_cap_pct),
+                'telegram_editable': True,
+            }
+            save_strategy_config(cfg)
+            apply_strategy_config(cfg)
+        except Exception:
+            pass
+
+        _autotrade_config_set('ver34_user_runtime_defaults_version', target_version)
     except Exception:
         pass
 
@@ -1727,16 +1782,22 @@ SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", 
 SETUP_FINAL_UNKNOWN_AS_WATCH = env_bool("SETUP_FINAL_UNKNOWN_AS_WATCH", True)
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
 SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE = env_bool("SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE", True)
-AUTOTRADE_VER32_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER32_MAX_TRADES_PER_DAY", "5") or 5)
+AUTOTRADE_VER32_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER32_MAX_TRADES_PER_DAY", "50") or 50)
 EMAIL_VER32_HARD_MAX_PER_DAY = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_DAY", "5") or 5)
 EMAIL_VER32_HARD_MAX_PER_SESSION = int(os.environ.get("EMAIL_VER32_HARD_MAX_PER_SESSION", "3") or 3)
 # Ver33 WR-first operating caps. These are runtime caps, not API/email/session deletion.
-# They keep live AutoTrade aligned with the 3-5 trades/day quality target.
-AUTOTRADE_VER33_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER33_MAX_TRADES_PER_DAY", "5") or 5)
-AUTOTRADE_VER33_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER33_MAX_OPEN_TRADES", "4") or 4)
-AUTOTRADE_VER33_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER33_MAX_POSITION_HOURS", "8") or 8)
-AUTOTRADE_VER33_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER33_MAX_ENTRY_DRIFT_PCT", "0.80") or 0.80)
-AUTOTRADE_VER33_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER33_DAILY_CAP_PCT", "6.0") or 6.0)
+# Ver34 keeps these open by default for forward testing while the quality gates improve WR.
+AUTOTRADE_VER33_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER33_MAX_TRADES_PER_DAY", "50") or 50)
+AUTOTRADE_VER33_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER33_MAX_OPEN_TRADES", "20") or 20)
+AUTOTRADE_VER33_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER33_MAX_POSITION_HOURS", "12") or 12)
+AUTOTRADE_VER33_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER33_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
+AUTOTRADE_VER33_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER33_DAILY_CAP_PCT", "15.0") or 15.0)
+# Ver34 user-requested AutoTrade forward-test defaults. These remain editable via /autotrade_config.
+AUTOTRADE_VER34_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER34_MAX_TRADES_PER_DAY", "50") or 50)
+AUTOTRADE_VER34_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER34_MAX_OPEN_TRADES", "20") or 20)
+AUTOTRADE_VER34_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER34_MAX_POSITION_HOURS", "12") or 12)
+AUTOTRADE_VER34_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER34_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
+AUTOTRADE_VER34_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER34_DAILY_CAP_PCT", "15.0") or 15.0)
 SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "8") or 8)
 SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "4") or 4)
 SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
@@ -3889,12 +3950,12 @@ except Exception:
 # Risk controls
 AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "1") or 1)
 AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "3") or 3)
-AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "3") or 3)
+AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "15") or 15)
 # Open-trade count cap for commercial/live safety.
-AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "1") or 1)
+AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "20") or 20)
 # AutoTrade-only daily trade count cap. 0 = unlimited.
 # This is deliberately independent from /limits maxtrades, which remains manual-only.
-AUTOTRADE_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_MAX_TRADES_PER_DAY", "8") or 8)
+AUTOTRADE_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_MAX_TRADES_PER_DAY", "50") or 50)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
 EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
@@ -3931,6 +3992,7 @@ try:
     _autotrade_apply_ver17_time_risk_policy_defaults()
     _autotrade_apply_ver32_quality_defaults()
     _autotrade_apply_ver33_wr_first_caps()
+    _autotrade_apply_ver34_user_requested_defaults()
 except Exception:
     pass
 
@@ -3956,7 +4018,7 @@ AUTOTRADE_BE_AFTER_TP_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AFT
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
-AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "0.80") or 0.80)
+AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
 # Estimated liquidation must sit this many percent-of-entry beyond the SL.
 # This protects isolated futures positions where a wide SL with high leverage would
 # otherwise liquidate before the stop can execute.
@@ -37569,16 +37631,16 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-10:45",
             "• /autotrade_config SETUP_GENERATION_BLACKOUT_ENABLED true",
             "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS_ENABLED true",
-            "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 8",
+            "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 12",
             "• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true",
             "• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK true",
             "• Strict TP/SL lifecycle is ON, with owner-approved time exits: scheduled ASIA flat and max-hold guardian.",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
-            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
             "• /autotrade_config AUTOTRADE_MODE live",
-            "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 3",
-            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 20   (0 = unlimited)",
-            "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 0.8",
+            "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
+            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (0 = unlimited)",
+            "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
             "• /autotrade_config AUTOTRADE_ISOLATED true",
