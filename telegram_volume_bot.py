@@ -1,4 +1,5 @@
 # CHANGE SUMMARY
+# - Ver42: Fixed raw-candidate -> adaptive strategy routing before executable gate; /why now exposes screen/email post-gate reject reasons instead of vague refresh counters.
 # - Ver41: Fixed setup generation/execution sync: KEEP combos no longer get blocked by WATCH-only strict floors; /why now separates raw setup generation from final executable gate outcomes.
 # - Ver40: Promoted combo identity to Family-Session-Strategy (e.g. F8-NY-REV) across setup/audit/matrix/autotrade reports and strategy-router evidence.
 # - Ver38: Synced NORMAL/REVERSE strategy into AutoTrade reports, repaired report risk metadata recovery, and hardened setup-audit OPEN resolution/wording.
@@ -2658,6 +2659,33 @@ def _setup_adaptive_strategy_route_setup(setup, session_name: str = '', user_id:
         return setup
     except Exception:
         return setup
+
+
+def _setup_route_candidate_for_executable_lane(setup, session_name: str = '', user_id: int = 0):
+    """Route a raw generated candidate into its executable strategy before gating.
+
+    Ver42 fix: raw generated setups must be passed through the adaptive NORMAL/REVERSE
+    router before `is_executable_setup_eligible()` is called.  Earlier builds checked
+    the raw NORMAL setup first, so weak NORMAL combos were rejected before they could
+    be converted into their intended REVERSE test lane.
+    """
+    try:
+        routed = _setup_adaptive_strategy_route_setup(setup, session_name=session_name, user_id=int(user_id or 0))
+    except Exception:
+        routed = setup
+    try:
+        sess = str(session_name or '').upper().strip()
+        if sess:
+            _setup_strategy_set_attr(routed, 'source_session', sess)
+            # Keep an explicit session marker for downstream report joins; do not
+            # overwrite if a setup already carries a specific source session.
+            if not _setup_strategy_attr(routed, 'session', ''):
+                _setup_strategy_set_attr(routed, 'session', sess)
+        if not float(_setup_strategy_attr(routed, 'created_ts', 0.0) or 0.0):
+            _setup_strategy_set_attr(routed, 'created_ts', float(time.time()))
+    except Exception:
+        pass
+    return routed
 
 
 def _setup_strategy_for_combo_metrics(setups: int = 0, decided: int = 0, tp: int = 0, sl: int = 0, wr: float = 0.0, avg_r: float = 0.0, status: str = 'WATCH', enabled: int = 1) -> str:
@@ -10003,11 +10031,13 @@ def _autotrade_refresh_owner_executable_pool(uid: int, session_label: str, lookb
     reject_counts = Counter()
     for s in (raw_pool or []):
         try:
-            ok, why = is_executable_setup_eligible(s, session_name=sess)
+            s_eff = _setup_route_candidate_for_executable_lane(s, sess, owner_uid)
+            ok, why = is_executable_setup_eligible(s_eff, session_name=sess)
         except Exception:
+            s_eff = s
             ok, why = False, 'autotrade_exec_gate_exception'
         if ok:
-            executable_ready.append(s)
+            executable_ready.append(s_eff)
         else:
             reject_counts[str(why)] += 1
 
@@ -10513,6 +10543,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, 'no_setups')
 
     s = setups[0]
+    try:
+        s = _setup_route_candidate_for_executable_lane(s, session_label, int(uid))
+    except Exception:
+        pass
     side = str(getattr(s, 'side', '') or '').upper()
     intended_entry = float(getattr(s, 'entry', 0.0) or 0.0)
     intended_sl = float(getattr(s, 'sl', 0.0) or 0.0)
@@ -13959,6 +13993,26 @@ def _setup_pipeline_recent_gate_summary(uid: int = 0, session: str = '', lookbac
                 details = {}
             if stg == 'executable_queue_write' and status == 'ok':
                 persisted += int(details.get('persisted') or 0)
+            # Summarise both explicit per-candidate skip rows and aggregate
+            # screen/email executable-pool reasons.  Ver41 only showed vague
+            # refresh/counter events when no candidate reached the queue, which made
+            # a healthy scan look broken in /why.
+            if stg in {'screen_executable_pool', 'email_executable_pool', 'autotrade_exec_refresh'}:
+                for key in ('top_exec_rejects', 'top_reasons'):
+                    vals = details.get(key)
+                    if isinstance(vals, dict):
+                        for rk, rv in vals.items():
+                            try:
+                                reason_ctr[str(rk or 'unknown')] += max(1, int(rv or 0))
+                            except Exception:
+                                reason_ctr[str(rk or 'unknown')] += 1
+                    elif isinstance(vals, list):
+                        for rk in vals:
+                            reason_ctr[str(rk or 'unknown')] += 1
+                try:
+                    persisted += int(details.get('persisted') or 0) if status == 'ok' and stg != 'executable_queue_write' else 0
+                except Exception:
+                    pass
             if status in {'skip', 'error', 'partial_error'} or stg in {'executable_final_quality_gate','executable_edge_quality_guard','executable_generation_cooldown','executable_setup_generation_blackout'}:
                 reason = str(details.get('reason') or stg or 'unknown').strip()
                 if reason:
@@ -49424,11 +49478,13 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         _exec_rejects = Counter()
         for _s in _raw_pool_setups:
             try:
-                _ok_exec, _why_exec = is_executable_setup_eligible(_s, session_name=session)
+                _s_eff = _setup_route_candidate_for_executable_lane(_s, session, int(uid))
+                _ok_exec, _why_exec = is_executable_setup_eligible(_s_eff, session_name=session)
             except Exception:
+                _s_eff = _s
                 _ok_exec, _why_exec = False, 'screen_exec_gate_exception'
             if _ok_exec:
-                _exec_ready.append(_s)
+                _exec_ready.append(_s_eff)
             else:
                 _exec_rejects[str(_why_exec)] += 1
         if _exec_ready:
@@ -49739,6 +49795,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             # Only setups that are valid for the background email/autotrade lane
             # may be emailed and queued here.
             try:
+                s = _setup_route_candidate_for_executable_lane(s, target_session, int(uid))
                 _exec_ok, _exec_why = is_executable_setup_eligible(s, session_name=target_session)
             except Exception:
                 _exec_ok, _exec_why = False, 'screen_sync_exec_gate_exception'
@@ -52168,9 +52225,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             skip_reasons_counter = Counter()
             eligible: List[Setup] = []
             for s in (setups_all or []):
-                ok, why = is_executable_setup_eligible(s, session_name=sess_name)
+                try:
+                    s_eff = _setup_route_candidate_for_executable_lane(s, sess_name, int(uid))
+                    ok, why = is_executable_setup_eligible(s_eff, session_name=sess_name)
+                except Exception:
+                    s_eff = s
+                    ok, why = False, 'email_exec_gate_exception'
                 if ok:
-                    eligible.append(s)
+                    eligible.append(s_eff)
                 else:
                     skip_reasons_counter[str(why)] += 1
 
@@ -52204,7 +52266,16 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     recent_candidates = []
                 if recent_candidates:
-                    eligible = [s for s in (recent_candidates or []) if s is not None and is_executable_setup_eligible(s, session_name=sess_name)[0]]
+                    eligible = []
+                    for _cand in (recent_candidates or []):
+                        if _cand is None:
+                            continue
+                        try:
+                            _cand_eff = _setup_route_candidate_for_executable_lane(_cand, sess_name, int(uid))
+                            if is_executable_setup_eligible(_cand_eff, session_name=sess_name)[0]:
+                                eligible.append(_cand_eff)
+                        except Exception:
+                            continue
                     try:
                         db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_fallback', status='ok' if eligible else 'empty', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'source': f'recent_candidates_{int(MAX_STALE_SCAN_SEC)}s'})
                     except Exception:
@@ -52218,10 +52289,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     recovery_now = []
                     for _s in list(setups_all or []):
                         try:
-                            setattr(_s, 'recovery_fallback', True)
-                            ok_now, _why_now = is_executable_setup_eligible(_s, session_name=sess_name)
+                            _s_eff = _setup_route_candidate_for_executable_lane(_s, sess_name, int(uid))
+                            setattr(_s_eff, 'recovery_fallback', True)
+                            ok_now, _why_now = is_executable_setup_eligible(_s_eff, session_name=sess_name)
                             if ok_now:
-                                recovery_now.append(_s)
+                                recovery_now.append(_s_eff)
                         except Exception:
                             continue
                     if recovery_now:
@@ -54361,9 +54433,10 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 db_setups = []
                 for _s in list(chosen_list or []):
                     try:
-                        ok_s, _why_s = is_executable_setup_eligible(_s, session_name=sess)
+                        _s_eff = _setup_route_candidate_for_executable_lane(_s, sess, owner_uid)
+                        ok_s, _why_s = is_executable_setup_eligible(_s_eff, session_name=sess)
                         if ok_s:
-                            db_setups.append(_s)
+                            db_setups.append(_s_eff)
                     except Exception:
                         continue
             attempted = 0
