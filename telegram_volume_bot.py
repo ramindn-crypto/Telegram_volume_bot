@@ -1,4 +1,5 @@
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
+# - yver65: fixes remaining report/policy wording and display sanity: /setup_matrix deep now labels exact disabled lanes vs micro-edge tightened lanes, and /autotrade_report prevents impossible Open > Close timestamps while refreshing report caches.
 # Keeps non-negotiable safety: valid SL/TP, exchange leverage, liquidation guard, equity/risk sizing, and duplicate-owner guards.
 # - Ver58: restores user-control for /autotrade_config time-exit toggles, keeps scheduled ASIA flat ON at 09:55 Melbourne by default, persists catch-up/report/safety booleans, and stops keep-all mode from forcing displayed config values to false.
 # - yver62: fixes NOR/REV learning state machine so weak NORMAL lanes are not also tightening the paired REVERSE lane; micro-edge blocks are now exact Family-Session-Strategy-Side keys and REV is evaluated only on REV evidence.
@@ -45503,8 +45504,8 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
         except Exception:
             start_txt = end_txt = '-'
 
-        # Show exact live lane blocks first.  Coarse policy rows are still reported as
-        # coarse context only; they must not be confused with the lane recommendation.
+        # Show exact disabled policy lanes separately from micro-edge tightened lanes.
+        # This avoids confusing an exact lane disable with an old coarse family/session row.
         guard_lane_blocks = []
         try:
             gd = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
@@ -45536,8 +45537,8 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
             HDR,
             f"Window: <b>{hours}h</b> | Rows evaluated: <b>{evaluated}</b> | Start: <b>{html.escape(start_txt)}</b> | End: <b>{html.escape(end_txt)}</b>",
             f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | TP=<b>{tp_n}</b> SL=<b>{sl_n}</b> OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
-            f"Live tightened/blocked lanes now: <b>{html.escape(', '.join(guard_lane_blocks[:12]) if guard_lane_blocks else '-')}</b>",
-            f"Coarse policy rows now: <b>{html.escape(', '.join(coarse_disabled[:12]) if coarse_disabled else '-')}</b> | WATCH rows: <b>{len(watch_now)}</b>",
+            f"Exact disabled policy lanes now: <b>{html.escape(', '.join(coarse_disabled[:12]) if coarse_disabled else '-')}</b> | WATCH rows: <b>{len(watch_now)}</b>",
+            f"Micro-edge tightened lanes now: <b>{html.escape(', '.join(guard_lane_blocks[:12]) if guard_lane_blocks else '-')}</b>",
             html.escape(_setup_edge_guard_snapshot_text(uid)),
             f"Data recommendation from this window (exact lanes): DISABLE/TIGHTEN=<b>{html.escape(', '.join(rec_disable) if rec_disable else '-')}</b> | WATCH/TIGHTEN=<b>{html.escape(', '.join(rec_tighten) if rec_tighten else '-')}</b>",
             "Action rule: weak NOR-BUY/SELL evidence only tightens that exact NOR side; REV remains available until REV itself has decided evidence. If REV also fails, that exact REV side is then tightened/disabled.",
@@ -45814,7 +45815,13 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         except Exception:
             coarse_disabled = []
-        active_disabled_txt = ', '.join(exact_disabled or coarse_disabled) if (exact_disabled or coarse_disabled) else '-'
+        # Show the union of exact daily-safety disabled lanes and micro-edge tightened lanes.
+        # Do not collapse exact F1-ASIA-NOR-SELL back to legacy/coarse F1-ASIA.
+        try:
+            _active_lanes = sorted(set([x for x in (coarse_disabled or []) if str(x or '').strip()]) | set([x for x in (exact_disabled or []) if str(x or '').strip()]))
+        except Exception:
+            _active_lanes = list(exact_disabled or coarse_disabled or [])
+        active_disabled_txt = ', '.join(_active_lanes) if _active_lanes else '-'
         text = (
             f"🛡️ <b>Setup Combo Daily Safety</b>\n{HDR}\n"
             f"Status: <b>{'OK' if (res or {}).get('ok') else 'SKIP/ERROR'}</b> | Run: <b>{html.escape(str((res or {}).get('run_id') or '-'))}</b>\n"
@@ -47748,7 +47755,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v61_reason_only_amounts:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v65_display_sanity:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -47815,6 +47822,34 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             return datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M')
         except Exception:
             return '-'
+
+    def _report_display_open_close_ts(r: dict) -> tuple[float, float]:
+        """Return sane Melbourne display timestamps for /autotrade_report.
+
+        Exchange-only/merged close fragments can occasionally inherit setup/open
+        metadata newer than the realised close record.  Never display an impossible
+        Open time later than Close time; fall back to the earliest reliable fragment
+        timestamp for that merged row.
+        """
+        try:
+            state = str((r or {}).get('state') or '').upper().strip()
+            open_ts = float((r or {}).get('opened_ts') or (r or {}).get('first_ts') or (r or {}).get('ts') or 0.0)
+            close_ts = 0.0
+            if state != 'OPEN':
+                close_ts = float((r or {}).get('closed_ts') or (r or {}).get('last_ts') or (r or {}).get('ts') or 0.0)
+                if close_ts > 0 and (open_ts <= 0 or open_ts > close_ts):
+                    candidates = []
+                    for k in ('first_ts', 'ts', 'created_ts', 'updated_ts', 'opened_ts'):
+                        try:
+                            v = float((r or {}).get(k) or 0.0)
+                            if v > 0 and v <= close_ts:
+                                candidates.append(v)
+                        except Exception:
+                            pass
+                    open_ts = min(candidates) if candidates else close_ts
+            return float(open_ts or 0.0), float(close_ts or 0.0)
+        except Exception:
+            return 0.0, 0.0
 
     for p, tr in (bot_positions or []):
         row = _setup_audit_merge_trade_setup_row(tr)
@@ -47991,8 +48026,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 return '-'
         table_rows = []
         for r in display:
-            open_ts = float(r.get('opened_ts') or r.get('ts') or 0.0)
-            close_ts = float(r.get('closed_ts') or r.get('last_ts') or 0.0) if str(r.get('state') or '').upper() != 'OPEN' else 0.0
+            open_ts, close_ts = _report_display_open_close_ts(r)
             table_rows.append([
                 _ts_txt(open_ts),
                 _ts_txt(close_ts) if close_ts > 0 else '-',
@@ -48134,7 +48168,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
 
-    cache_key = f"autotrade_report_text_cmd:v61_reason_only:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text_cmd:v65_display_sanity:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
@@ -48783,7 +48817,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v61_reason_names_matrix:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v65_policy_labels_matrix:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
