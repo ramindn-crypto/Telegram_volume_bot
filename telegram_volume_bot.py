@@ -42906,6 +42906,8 @@ def _setup_combo_policy_migrate() -> None:
                 user_id INTEGER NOT NULL DEFAULT 0,
                 family TEXT NOT NULL,
                 session TEXT NOT NULL,
+                strategy TEXT NOT NULL DEFAULT 'ALL',
+                side TEXT NOT NULL DEFAULT 'BOTH',
                 status TEXT NOT NULL DEFAULT 'WATCH',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 last_score REAL NOT NULL DEFAULT 0,
@@ -42920,7 +42922,7 @@ def _setup_combo_policy_migrate() -> None:
                 scheduled_for_ts REAL NOT NULL DEFAULT 0,
                 expires_ts REAL NOT NULL DEFAULT 0,
                 policy_tz TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY(user_id, family, session)
+                PRIMARY KEY(user_id, family, session, strategy, side)
             )""")
             try:
                 cols = [r[1] for r in cur.execute("PRAGMA table_info(setup_combo_policy)").fetchall()]
@@ -42928,10 +42930,66 @@ def _setup_combo_policy_migrate() -> None:
                     if name not in cols:
                         cur.execute(f"ALTER TABLE setup_combo_policy ADD COLUMN {ddl}")
                         cols.append(name)
+                _add_policy_col('strategy', "strategy TEXT NOT NULL DEFAULT 'ALL'")
+                _add_policy_col('side', "side TEXT NOT NULL DEFAULT 'BOTH'")
                 _add_policy_col('policy_kind', "policy_kind TEXT NOT NULL DEFAULT 'manual'")
                 _add_policy_col('scheduled_for_ts', "scheduled_for_ts REAL NOT NULL DEFAULT 0")
                 _add_policy_col('expires_ts', "expires_ts REAL NOT NULL DEFAULT 0")
                 _add_policy_col('policy_tz', "policy_tz TEXT NOT NULL DEFAULT ''")
+                # yver64: migrate coarse family/session policy PK to exact lane PK.
+                # Legacy coarse scheduled/interim/emergency rows are kept as ALL/BOTH;
+                # legacy coarse daily_safety rows are dropped so one bad NOR side cannot
+                # disable all NOR/REV BUY/SELL lanes.
+                try:
+                    pinfo = cur.execute("PRAGMA table_info(setup_combo_policy)").fetchall()
+                    pk_cols = [rr[1] for rr in sorted([rr for rr in pinfo if int(rr[5] or 0) > 0], key=lambda rr: int(rr[5] or 0))]
+                    if pk_cols != ['user_id', 'family', 'session', 'strategy', 'side']:
+                        legacy_name = 'setup_combo_policy_legacy_' + str(int(time.time()))
+                        cur.execute(f"ALTER TABLE setup_combo_policy RENAME TO {legacy_name}")
+                        cur.execute("""CREATE TABLE setup_combo_policy (
+                            user_id INTEGER NOT NULL DEFAULT 0,
+                            family TEXT NOT NULL,
+                            session TEXT NOT NULL,
+                            strategy TEXT NOT NULL DEFAULT 'ALL',
+                            side TEXT NOT NULL DEFAULT 'BOTH',
+                            status TEXT NOT NULL DEFAULT 'WATCH',
+                            enabled INTEGER NOT NULL DEFAULT 1,
+                            last_score REAL NOT NULL DEFAULT 0,
+                            last_win_rate REAL NOT NULL DEFAULT 0,
+                            last_avg_r REAL NOT NULL DEFAULT 0,
+                            last_setups INTEGER NOT NULL DEFAULT 0,
+                            last_decided INTEGER NOT NULL DEFAULT 0,
+                            last_run_id TEXT NOT NULL DEFAULT '',
+                            updated_ts REAL NOT NULL DEFAULT 0,
+                            notes TEXT NOT NULL DEFAULT '',
+                            policy_kind TEXT NOT NULL DEFAULT 'manual',
+                            scheduled_for_ts REAL NOT NULL DEFAULT 0,
+                            expires_ts REAL NOT NULL DEFAULT 0,
+                            policy_tz TEXT NOT NULL DEFAULT '',
+                            PRIMARY KEY(user_id, family, session, strategy, side)
+                        )""")
+                        legacy_cols = [rr[1] for rr in cur.execute(f"PRAGMA table_info({legacy_name})").fetchall()]
+                        for old_row in cur.execute(f"SELECT * FROM {legacy_name}").fetchall() or []:
+                            dd = dict(zip(legacy_cols, old_row))
+                            pkind = str(dd.get('policy_kind') or 'manual').lower().strip()
+                            strat = str(dd.get('strategy') or 'ALL').upper().strip() or 'ALL'
+                            side = str(dd.get('side') or 'BOTH').upper().strip() or 'BOTH'
+                            if strat in {'', '-', 'NONE', 'BOTH', '*'}:
+                                strat = 'ALL'
+                            if side not in {'BUY', 'SELL'}:
+                                side = 'BOTH'
+                            if pkind == 'daily_safety' and (strat == 'ALL' or side == 'BOTH'):
+                                continue
+                            cur.execute("""INSERT OR REPLACE INTO setup_combo_policy
+                                (user_id,family,session,strategy,side,status,enabled,last_score,last_win_rate,last_avg_r,last_setups,last_decided,last_run_id,updated_ts,notes,policy_kind,scheduled_for_ts,expires_ts,policy_tz)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (int(dd.get('user_id') or 0), str(dd.get('family') or '').upper().strip(), str(dd.get('session') or '').upper().strip(), strat, side,
+                                 str(dd.get('status') or 'WATCH').upper().strip(), int(dd.get('enabled') if dd.get('enabled') is not None else 1),
+                                 float(dd.get('last_score') or 0), float(dd.get('last_win_rate') or 0), float(dd.get('last_avg_r') or 0),
+                                 int(dd.get('last_setups') or 0), int(dd.get('last_decided') or 0), str(dd.get('last_run_id') or ''), float(dd.get('updated_ts') or 0),
+                                 str(dd.get('notes') or '')[:500], pkind or 'manual', float(dd.get('scheduled_for_ts') or 0), float(dd.get('expires_ts') or 0), str(dd.get('policy_tz') or '')))
+                except Exception:
+                    pass
             except Exception:
                 pass
             cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_combo_scores_user_ts ON setup_combo_scores(user_id, evaluated_ts)")
@@ -42955,7 +43013,18 @@ def _setup_combo_policy_cache_rows(force: bool = False) -> dict:
             cur = conn.cursor()
             for r in cur.execute("SELECT * FROM setup_combo_policy").fetchall() or []:
                 d = dict(r)
-                key = (int(d.get('user_id') or 0), str(d.get('family') or '').upper().strip(), str(d.get('session') or '').upper().strip())
+                fam = str(d.get('family') or '').upper().strip()
+                sess = str(d.get('session') or '').upper().strip()
+                strat = str(d.get('strategy') or 'ALL').upper().strip() or 'ALL'
+                side = str(d.get('side') or 'BOTH').upper().strip() or 'BOTH'
+                if strat in {'', '-', 'NONE', 'BOTH', '*'}:
+                    strat = 'ALL'
+                elif strat not in {'NOR', 'REV', 'ALL'}:
+                    strat = _setup_strategy_suffix(value=strat)
+                if side not in {'BUY', 'SELL'}:
+                    side = 'BOTH'
+                d['strategy'] = strat; d['side'] = side
+                key = (int(d.get('user_id') or 0), fam, sess, strat, side)
                 rows[key] = d
         _SETUP_COMBO_POLICY_CACHE['ts'] = now
         _SETUP_COMBO_POLICY_CACHE['rows'] = dict(rows)
@@ -43531,13 +43600,18 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
                 for r, reason in disabled:
                     fam = str(r.get('family') or '').upper().strip()
                     sess = str(r.get('session') or '').upper().strip()
+                    strat = _setup_strategy_suffix(value=str(r.get('strategy') or 'NOR'))
+                    side = _setup_side_suffix(value=str(r.get('side') or 'BOTH'))
+                    if side not in {'BUY', 'SELL'}:
+                        continue
                     if not fam or not sess:
                         continue
+                    lane_combo = _setup_combo_strategy_side_key(fam, sess, strat, side)
                     for pol_uid in list(dict.fromkeys([int(uid), 0])):
                         cur.execute("""INSERT OR REPLACE INTO setup_combo_policy
-                            (user_id, family, session, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (int(pol_uid), fam, sess, 'DISABLE', 0, float(r.get('score') or 0.0), float(r.get('win_rate') or 0.0), float(r.get('avg_r') or 0.0), int(r.get('setups') or 0), int(r.get('decided') or 0), run_id, now_ts, str(reason)[:500], 'daily_safety', now_ts, expires_ts, policy_tz))
+                            (user_id, family, session, strategy, side, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (int(pol_uid), fam, sess, strat, side, 'DISABLE', 0, float(r.get('score') or 0.0), float(r.get('win_rate') or 0.0), float(r.get('avg_r') or 0.0), int(r.get('setups') or 0), int(r.get('decided') or 0), run_id, now_ts, (lane_combo + ' | ' + str(reason))[:500], 'daily_safety', now_ts, expires_ts, policy_tz))
                 conn.commit()
             _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
         bridge_report = {}
@@ -43547,7 +43621,7 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
                 bridge_report = _setup_combo_apply_adaptive_parameter_bridge(int(uid), bridge_rows, 'daily_safety', int(hours), str(run_id))
         except Exception:
             bridge_report = {}
-        out.update({'ok': True, 'disabled': [str((r or {}).get('combo') or '') for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'bridge_report': bridge_report, 'reason': 'ok'})
+        out.update({'ok': True, 'disabled': [_setup_combo_strategy_side_key(str((r or {}).get('family') or ''), str((r or {}).get('session') or ''), str((r or {}).get('strategy') or 'NOR'), str((r or {}).get('side') or '')) for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'bridge_report': bridge_report, 'reason': 'ok'})
         try:
             logger.info('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
         except Exception:
@@ -43660,17 +43734,25 @@ def _setup_combo_family_session_from_obj(setup_or_row, session_name: str = '') -
 
 
 def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> dict:
-    """Return the active family/session policy row for this setup, if any.
+    """Return the active policy row for this exact setup lane.
 
-    Used by executable queue, email, AutoTrade, /setup_matrix policy view and report
-    consumers so all lanes use the same enforceable policy state.
+    yver64: policy enforcement is lane-aware. Daily/intraday safety may only block
+    the exact Family-Session-Strategy-Side lane that produced weak decided evidence.
+    Coarse ALL/BOTH rows remain available for scheduled/interim high-level controls.
     """
-    out = {'found': False, 'policy': None, 'family': 'F0', 'session': str(session_name or '').upper().strip() or '-', 'status': 'UNKNOWN', 'enabled': 1, 'combo': ''}
+    out = {'found': False, 'policy': None, 'family': 'F0', 'session': str(session_name or '').upper().strip() or '-', 'strategy': 'NOR', 'side': 'BOTH', 'status': 'UNKNOWN', 'enabled': 1, 'combo': ''}
     try:
         fam, sess = _setup_combo_family_session_from_obj(setup_or_row, session_name=session_name)
         fam = str(fam or 'F0').upper().strip()
         sess = str(sess or '-').upper().strip()
-        out.update({'family': fam, 'session': sess, 'combo': f'{fam}-{sess}'})
+        strat = _setup_strategy_suffix(setup_or_row)
+        side = _setup_side_suffix(setup_or_row)
+        if side not in {'BUY', 'SELL'}:
+            side = _setup_side_suffix(value=str(_autotrade_setup_attr(setup_or_row, 'side', '') or ''))
+        if side not in {'BUY', 'SELL'}:
+            side = 'BOTH'
+        full_combo = _setup_combo_strategy_side_key(fam, sess, strat, side) if side in {'BUY','SELL'} else _setup_combo_strategy_key(fam, sess, strat)
+        out.update({'family': fam, 'session': sess, 'strategy': strat, 'side': side, 'combo': full_combo})
         if sess in {'', '-', 'NONE'} or fam in {'', '-', 'F0'}:
             return out
         rows = _setup_combo_policy_cache_rows(force=False)
@@ -43682,20 +43764,29 @@ def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', u
         if owner_uid > 0 and owner_uid not in candidates:
             candidates.append(owner_uid)
         candidates.append(0)
+        lane_keys = []
+        if side in {'BUY', 'SELL'}:
+            lane_keys.append((strat, side))
+        lane_keys.append((strat, 'BOTH'))
+        lane_keys.append(('ALL', side if side in {'BUY','SELL'} else 'BOTH'))
+        lane_keys.append(('ALL', 'BOTH'))
         for cu in candidates:
-            pol = rows.get((int(cu), fam, sess))
-            if pol:
-                if not _setup_combo_policy_valid_for_enforcement(pol):
+            for k_strat, k_side in lane_keys:
+                pol = rows.get((int(cu), fam, sess, k_strat, k_side))
+                if not pol or not _setup_combo_policy_valid_for_enforcement(pol):
+                    continue
+                kind = str(pol.get('policy_kind') or '').lower().strip()
+                if kind == 'daily_safety' and not (k_strat in {'NOR','REV'} and k_side in {'BUY','SELL'}):
                     continue
                 status = str(pol.get('status') or 'WATCH').upper().strip()
-                enabled = 1 if int(pol.get('enabled') or 0) == 1 else 0
-                out.update({'found': True, 'policy': dict(pol or {}), 'status': status, 'enabled': enabled})
+                enabled = 1 if int(pol.get('enabled') if pol.get('enabled') is not None else 1) == 1 else 0
+                out.update({'found': True, 'policy': dict(pol or {}), 'status': status, 'enabled': enabled,
+                            'strategy': k_strat if k_strat != 'ALL' else strat, 'side': k_side if k_side != 'BOTH' else side})
                 return out
         return out
     except Exception as exc:
         out.update({'found': False, 'error': f'{type(exc).__name__}: {exc}'})
         return out
-
 
 def _setup_quality_gate_set_attr(setup_or_row, name: str, value) -> None:
     try:
@@ -44758,12 +44849,11 @@ def _setup_edge_guard_snapshot_text(uid: int = 0) -> str:
 
 
 def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
-    """Return the current enforceable policy rows by combo.
+    """Return current enforceable policy rows keyed by combo/lane.
 
-    This is the single policy state used by /setup_matrix display, live executable
-    blocking, and the Setup Matrix -> optimizer bridge. Manual matrix rows remain
-    advisory; this lookup only returns scheduled/interim/daily-safety/emergency rows
-    that have not expired.
+    yver64: exact Family-Session-Strategy-Side keys are used whenever available.
+    Coarse daily_safety rows are ignored, preventing one weak NOR side from switching
+    off paired NOR/REV BUY/SELL lanes.
     """
     out = {}
     try:
@@ -44775,14 +44865,28 @@ def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
         if owner_uid > 0 and owner_uid not in ids:
             ids.append(owner_uid)
         ids.append(0)
-        for (_uid, fam, sess), pol in rows.items():
+        for key, pol in rows.items():
             try:
+                if len(key) == 5:
+                    _uid, fam, sess, strat, side = key
+                else:
+                    _uid, fam, sess = key[:3]
+                    strat, side = 'ALL', 'BOTH'
                 if int(_uid) not in ids:
                     continue
                 if not _setup_combo_policy_valid_for_enforcement(pol):
                     continue
-                combo = f"{str(fam).upper().strip()}-{str(sess).upper().strip()}"
-                # Prefer owner/user policy over global when both exist.
+                kind = str((pol or {}).get('policy_kind') or '').lower().strip()
+                strat = str(strat or 'ALL').upper().strip() or 'ALL'
+                side = str(side or 'BOTH').upper().strip() or 'BOTH'
+                if kind == 'daily_safety' and not (strat in {'NOR','REV'} and side in {'BUY','SELL'}):
+                    continue
+                if strat in {'NOR','REV'} and side in {'BUY','SELL'}:
+                    combo = _setup_combo_strategy_side_key(str(fam), str(sess), strat, side)
+                elif strat in {'NOR','REV'}:
+                    combo = _setup_combo_strategy_key(str(fam), str(sess), strat)
+                else:
+                    combo = f"{str(fam).upper().strip()}-{str(sess).upper().strip()}"
                 old = out.get(combo)
                 if old is None or (int(_uid or 0) != 0 and int(old.get('user_id') or 0) == 0):
                     out[combo] = dict(pol or {})
@@ -44791,7 +44895,6 @@ def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
         return out
     except Exception:
         return {}
-
 
 def _setup_combo_enrich_rows_with_active_policy(uid: int, rows: list[dict]) -> list[dict]:
     """Overlay active policy state onto advisory matrix rows.
@@ -44855,7 +44958,11 @@ def _setup_combo_policy_rows_for_bridge(uid: int, matrix_rows: list[dict] | None
         min_dec = max(1, int(globals().get('SETUP_COMBO_BRIDGE_MIN_DECIDED', 4) or 4))
         for combo, pol in sorted(policy_by_combo.items()):
             try:
-                fam, sess = combo.split('-', 1)
+                fam = str(pol.get('family') or '').upper().strip()
+                sess = str(pol.get('session') or '').upper().strip()
+                parts_combo = str(combo or '').split('-')
+                strat = str(pol.get('strategy') or '').upper().strip() or (_setup_strategy_suffix(value=parts_combo[2]) if len(parts_combo) >= 3 else 'ALL')
+                side = str(pol.get('side') or '').upper().strip() or (parts_combo[3] if len(parts_combo) >= 4 else 'BOTH')
                 base = dict(by_combo.get(combo) or {})
                 status = str(pol.get('status') or base.get('action') or 'WATCH').upper().strip()
                 enabled = int(pol.get('enabled') or 0) == 1
@@ -44878,7 +44985,7 @@ def _setup_combo_policy_rows_for_bridge(uid: int, matrix_rows: list[dict] | None
                     score = min(score, -80.0)
                     setups = max(setups, decided)
                 row = {
-                    'family': fam, 'session': sess, 'combo': combo, 'setups': setups,
+                    'family': fam, 'session': sess, 'strategy': strat, 'side': side, 'combo': combo, 'setups': setups,
                     'decided': decided, 'tp': tp, 'sl': sl, 'nohit': int(base.get('nohit') or 0),
                     'open': int(base.get('open') or 0), 'win_rate': wr, 'avg_r': avg_r,
                     'avg_conf': float(base.get('avg_conf') or 0.0), 'avg_quality': float(base.get('avg_quality') or 0.0),
@@ -45106,26 +45213,23 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
                          win_rate, avg_r, avg_conf, avg_quality, avg_volume_m, score, action, enabled_next, notes)
                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", row_tuple)
                 if policy_update_ok:
-                    # setup_combo_policy is intentionally still family/session coarse.
-                    # When multiple strategy rows exist, choose the most conservative
-                    # live action for that family/session so weak lanes cannot be hidden.
-                    action_rank = {'DISABLE': 0, 'WATCH': 1, 'KEEP': 2}
-                    by_fs = {}
-                    for d in policy_rows:
-                        fs = (d['family'], d['session'])
-                        old = by_fs.get(fs)
-                        if old is None or action_rank.get(str(d.get('action') or 'WATCH').upper(), 1) < action_rank.get(str(old.get('action') or 'WATCH').upper(), 1):
-                            by_fs[fs] = d
+                    # yver64: scheduled live policy is exact lane policy.
                     kind_s = 'scheduled' if str(policy_kind or '').lower().strip() == 'scheduled' else 'manual'
                     scheduled_for_ts = float(now_ts) if kind_s == 'scheduled' else 0.0
                     expires_ts = float(now_ts) + max(1.0, float(SETUP_COMBO_POLICY_EXPIRY_HOURS or 168.0)) * 3600.0 if kind_s == 'scheduled' else 0.0
                     policy_tz = str(SETUP_COMBO_POLICY_REVIEW_TZ or 'Australia/Melbourne')
-                    for d in by_fs.values():
+                    for d in list(out_rows or []):
+                        fam_d = str(d.get('family') or '').upper().strip()
+                        sess_d = str(d.get('session') or '').upper().strip()
+                        strat_d = _setup_strategy_suffix(value=str(d.get('strategy') or 'NOR'))
+                        side_d = _setup_side_suffix(value=str(d.get('side') or 'BOTH'))
+                        if side_d not in {'BUY', 'SELL'}:
+                            continue
                         for pol_uid in list(dict.fromkeys([int(uid), 0])):
                             cur.execute("""INSERT OR REPLACE INTO setup_combo_policy
-                                (user_id, family, session, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
-                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                (int(pol_uid), d['family'], d['session'], str(d['action']), int(d['enabled_next']), float(d['score']), float(d['win_rate']), float(d['avg_r']), int(d['setups']), int(d['decided']), run_id, now_ts, str(d['notes'])[:500], kind_s, scheduled_for_ts, expires_ts, policy_tz))
+                                (user_id, family, session, strategy, side, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (int(pol_uid), fam_d, sess_d, strat_d, side_d, str(d.get('action') or 'WATCH'), int(d.get('enabled_next') or 1), float(d.get('score') or 0), float(d.get('win_rate') or 0), float(d.get('avg_r') or 0), int(d.get('setups') or 0), int(d.get('decided') or 0), run_id, now_ts, str(d.get('notes') or '')[:500], kind_s, scheduled_for_ts, expires_ts, policy_tz))
                     policy_updated = True
                 conn.commit()
             _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
@@ -45486,7 +45590,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             rows = [dict(r) for r in cur.execute(
-                "SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session",
+                "SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session, strategy, side",
                 (int(owner_uid),)
             ).fetchall() or []]
         if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
@@ -45570,10 +45674,21 @@ def _setup_combo_policy_text(uid: int) -> str:
         rows_by_combo = {}
         for r in rows:
             try:
-                combo = f"{str(r.get('family') or '').upper().strip()}-{str(r.get('session') or '').upper().strip()}"
+                fam_r = str(r.get('family') or '').upper().strip()
+                sess_r = str(r.get('session') or '').upper().strip()
+                strat_r = str(r.get('strategy') or 'ALL').upper().strip() or 'ALL'
+                side_r = str(r.get('side') or 'BOTH').upper().strip() or 'BOTH'
+                if side_r not in {'BUY','SELL'}:
+                    side_r = 'BOTH'
+                if strat_r in {'NOR','REV'} and side_r in {'BUY','SELL'}:
+                    combo = _setup_combo_strategy_side_key(fam_r, sess_r, strat_r, side_r)
+                elif strat_r in {'NOR','REV'}:
+                    combo = _setup_combo_strategy_key(fam_r, sess_r, strat_r)
+                else:
+                    combo = f"{fam_r}-{sess_r}"
                 if combo and combo != '-':
-                    old = rows_by_combo.get(combo)
-                    if old is None or (int(r.get('user_id') or 0) != 0 and int(old.get('user_id') or 0) == 0):
+                    old_r = rows_by_combo.get(combo)
+                    if old_r is None or (int(r.get('user_id') or 0) != 0 and int(old_r.get('user_id') or 0) == 0):
                         rows_by_combo[combo] = dict(r)
             except Exception:
                 continue
@@ -45583,8 +45698,8 @@ def _setup_combo_policy_text(uid: int) -> str:
         for fam, sess, strat, side, full_combo in _setup_combo_full_universe(families, sessions):
             base_combo = f'{fam}-{sess}'
             strat_combo = _setup_combo_strategy_key(fam, sess, strat)
-            pol = dict(policy_by_combo.get(strat_combo) or policy_by_combo.get(base_combo) or {})
-            raw_pol = dict(rows_by_combo.get(base_combo) or {})
+            pol = dict(policy_by_combo.get(full_combo) or policy_by_combo.get(strat_combo) or policy_by_combo.get(base_combo) or {})
+            raw_pol = dict(rows_by_combo.get(full_combo) or rows_by_combo.get(strat_combo) or rows_by_combo.get(base_combo) or {})
             score = dict(latest_scores.get(full_combo) or latest_scores.get(strat_combo) or latest_scores.get(base_combo) or {})
 
             full_disabled = False
@@ -45622,7 +45737,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             kind_txt = _setup_combo_policy_kind_label(kind_src, short=True) if kind_src and kind_src != '-' else '-'
             if not pol and raw_pol and float(raw_pol.get('expires_ts') or 0.0) > 0:
                 kind_txt = 'expired'
-            table_rows.append([full_combo, exec_state, live_state, 'YES' if side_block else '-', set_v, dec_v, f'{wr_v:.1f}%', f'{avg_v:+.2f}', adv, kind_txt])
+            table_rows.append([full_combo, exec_state, live_state, set_v, dec_v, f'{wr_v:.1f}%', f'{avg_v:+.2f}', adv, kind_txt])
 
         order_rank = {'OFF': 0, 'PART': 1, 'GATE': 2, 'KEEP': 3, 'ON': 4}
         def _row_key(row):
@@ -45638,14 +45753,14 @@ def _setup_combo_policy_text(uid: int) -> str:
             side_n = 0 if side == 'BUY' else 1
             return (order_rank.get(str(row[1]), 9), fam_n, sess_n, strat_n, side_n, combo)
         table_rows = sorted(table_rows, key=_row_key)
-        table = tabulate(table_rows, headers=['Combo','Exec','Live','SideBlock','Set','Dec','WR','AvgR','Adv','Kind'], tablefmt='plain')
+        table = tabulate(table_rows, headers=['Combo','ExecNow','LiveState','Set','Dec','WR','AvgR','Reco','Kind'], tablefmt='plain')
 
         info = _setup_combo_latest_policy_update_info(int(owner_uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL), <b>KEEP</b>=preferred executable lane, <b>GATE</b>=WATCH/probation and not executable unless the final quality gate passes, <b>PART</b>=this exact strategy-side lane is tightened/blocked by its own micro-edge evidence, <b>OFF</b>=disabled by the coarse family/session policy."
+            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL). <b>ExecNow</b> is the actual executable state now. <b>LiveState</b> is the enforced policy state. <b>Reco</b> is this window's recommendation only. <b>PART</b>=this exact lane is tightened by its own evidence. <b>OFF</b>=this exact lane is disabled by scheduled/daily safety policy."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
@@ -45695,7 +45810,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             active_policy = _setup_combo_enforceable_policy_lookup(int(AUTOTRADE_OWNER_UID or uid))
             coarse_disabled = sorted([
                 k for k, v in (active_policy or {}).items()
-                if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') or 0) == 0
+                if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') if (v or {}).get('enabled') is not None else 1) == 0
             ])
         except Exception:
             coarse_disabled = []
@@ -47058,12 +47173,30 @@ def _autotrade_report_loss_reason(row: dict) -> str:
             pass
         try:
             pol = _setup_combo_policy_cache_rows(force=False) or {}
-            for (_uid, pfam, pses), pr in pol.items():
-                if pfam == str(fam).upper() and pses == str(sess).upper():
-                    if int(pr.get('enabled') or 0) <= 0 or str(pr.get('status') or '').upper() == 'DISABLE':
-                        return 'WEAK_COMBO'
-                    if float(pr.get('last_score') or 0.0) < -20 or float(pr.get('last_win_rate') or 0.0) < 35:
-                        return 'WEAK_COMBO'
+            strat_row = _setup_strategy_suffix(row)
+            side_row = _setup_side_suffix(value=side)
+            for key_pol, pr in pol.items():
+                try:
+                    if len(key_pol) == 5:
+                        _uid, pfam, pses, pstrat, pside = key_pol
+                    else:
+                        _uid, pfam, pses = key_pol[:3]
+                        pstrat, pside = 'ALL', 'BOTH'
+                    if pfam == str(fam).upper() and pses == str(sess).upper():
+                        # Exact-lane policy gets priority; coarse policy is still useful
+                        # for scheduled high-level context, but coarse daily safety is ignored.
+                        pkind = str((pr or {}).get('policy_kind') or '').lower().strip()
+                        exact_or_coarse = (pstrat in {'ALL', strat_row}) and (pside in {'BOTH', side_row})
+                        if not exact_or_coarse:
+                            continue
+                        if pkind == 'daily_safety' and not (pstrat in {'NOR','REV'} and pside in {'BUY','SELL'}):
+                            continue
+                        if int(pr.get('enabled') if pr.get('enabled') is not None else 1) <= 0 or str(pr.get('status') or '').upper() == 'DISABLE':
+                            return 'WEAK_COMBO'
+                        if float(pr.get('last_score') or 0.0) < -20 or float(pr.get('last_win_rate') or 0.0) < 35:
+                            return 'WEAK_COMBO'
+                except Exception:
+                    continue
         except Exception:
             pass
         try:
