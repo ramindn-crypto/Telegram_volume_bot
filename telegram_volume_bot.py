@@ -1,10 +1,13 @@
-# yver57: Runtime sync lock: policy safety ON after clean reset, blackout config respected, and AutoTrade consumes emailed setups only.
+# yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
 # Keeps non-negotiable safety: valid SL/TP, exchange leverage, liquidation guard, equity/risk sizing, and duplicate-owner guards.
+# - Ver58: restores user-control for /autotrade_config time-exit toggles, keeps scheduled ASIA flat ON at 09:55 Melbourne by default, persists catch-up/report/safety booleans, and stops keep-all mode from forcing displayed config values to false.
+# - yver59: promotes reporting and policy visibility to full Family-Session-Strategy-Side keys (NOR/REV + BUY/SELL), expands setup matrix scoring persistence, and aligns setup audit + AutoTrade matrices with the new combo identity.
 # - Ver57: keeps clean-start legacy rows ignored but re-enables fresh daily/intraday safety, policy-view auto-safety, micro-edge learning, respects runtime blackout config even in keep-all mode, and prevents AutoTrade/email divergence by requiring emailed setups for entries.
 # - Ver56: policy table clean-start/unlocked by default for fresh forward testing.
 # CHANGE SUMMARY
 # - Ver54 yver54: forward-test keep-all mode for NORMAL/REVERSE comparison: disables automatic flat/max-hold/carryover closes by default, extends setup entry life for test observation, and lets scheduled AutoTrade continue placing multiple eligible queued setups per tick while retaining SL/TP, risk caps, duplicate guards and exchange safety checks.
 # - Ver53 yver53: fixes post-unblock execution gaps: removes MON from combo identity (NOR/REV only), routes weak combos to REV earlier, lets AutoTrade execute already queued/emailed setups during setup-generation blackout, retries Bybit leverage at exchange max, and continues candidate attempts after leverage/setup-specific skips.
+# - yver60: major sync patch: runtime AutoTrade on/off commands, /dailycap mirrors AutoTrade cap for owner/admin, all cooldown sessions fixed at 3h, and full Family-Session-NOR/REV-BUY/SELL universe is seeded in setup matrix/audit reports.
 # - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
 # - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
@@ -26,8 +29,8 @@
 # - 15May_ver11: Controlled safe-leverage downgrade: setups needing practical lower leverage (e.g. 7x vs configured 10x) can open safely; very low required leverage remains blocked.
 # - 15May_ver10: Clean forward-test mode after dataset reset: removed default static symbol micro-blocks so symbols are active again; symbol blocks now only appear from new rolling evidence during the fresh test.
 # - 15May_ver09: /setup_matrix policy now shows the full configured combo universe with ON/PART/OFF status after clean test-data reset.
-# - 17May_ver15: Hardened 09:45 Melbourne flat with catch-up guardian, synthetic owner fallback, and forced max-hold default back to 8h.
-# - 16May_ver14: Re-enabled explicit time-based AutoTrade exits: scheduled 09:45 Melbourne flat + max 8h hold guardian.
+# - 17May_ver15: Hardened 09:55 Melbourne flat with catch-up guardian, synthetic owner fallback, and forced max-hold default back to 8h.
+# - 16May_ver14: Re-enabled explicit time-based AutoTrade exits: scheduled 09:55 Melbourne flat + max 8h hold guardian.
 # - 15May_ver07: Crisis hardening after poor 24h live results: safer dynamic risk range (±25%), stricter setup micro-guard, daily AutoTrade caps, pre-ASIA flatten job, and admin data-reset command.
 # - 14May_ver06: Added strict live risk/leverage guard: no silent leverage downgrade to 1x, post-attach exchange-risk verification, and guardian emergency reduction for oversized live positions.
 # - 14May_ver03: Added dynamic AutoTrade risk scoring/sizing: base risk from /autotrade_config scales 0.50x–1.50x by setup score (family/session/side/symbol/hour/regime/RR/volume/confidence), with daily/open caps still enforced.
@@ -44,7 +47,7 @@
 # - Ver14: made interim setup-combo policy seeding idempotent/quiet and downgraded manual-position conflict logs from WARNING to INFO.
 # - Ver27: improved AutoTrade reporting with comprehensive open/close/risk/reason table and profit/loss sane TP/SL classification.
 # - Ver17: added deep setup analytics, separated advisory vs live policy in /setup_matrix, added missed policy catch-up, and fixed /autotrade_report_overall open/closed fallback counts.
-# - 18May_ver18: clear setup/email/AutoTrade cooldown gates at the 09:45 Melbourne flat reset; include exchange-only closed PnL in reports as OTHER unless TP/SL is verified.
+# - 18May_ver18: clear setup/email/AutoTrade cooldown gates at the 09:55 Melbourne flat reset; include exchange-only closed PnL in reports as OTHER unless TP/SL is verified.
 # - Ver16b: strict verified TP/SL reporting; no raw exchange-only fallback rows in AutoTrade report by default; stop inferring TP/SL from PnL sign alone.
 # - 07May_v01: throttled autonomous screen sync, added DB-backed family/session edge matrix, and safety-clamped AutoTrade defaults.
 # - 07May_v04: setup generation/email duplicate cooldown reduced to 3 hours.
@@ -477,6 +480,7 @@ AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY = 'open_risk_cap_pct'
 AUTOTRADE_CFG_LEVERAGE_KEY = 'leverage'
 AUTOTRADE_CFG_ISOLATED_KEY = 'isolated'
 AUTOTRADE_CFG_MODE_KEY = 'mode'
+AUTOTRADE_CFG_ENTRY_ENABLED_KEY = 'entry_enabled'  # yver60: runtime AutoTrade new-entry ON/OFF switch
 AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
 AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY = 'max_trades_per_day'  # AutoTrade-only daily count cap; independent from /limits maxtrades
 AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY = 'max_entry_drift_pct'
@@ -510,6 +514,12 @@ AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY = 'safe_leverage_downgrade_min'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY = 'flat_before_asia_enabled'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY = 'flat_before_asia_hour'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY = 'flat_before_asia_minute'
+AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY = 'flat_before_asia_catchup_enabled'
+AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY = 'strict_tpsl_only'
+AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY = 'market_reduce_on_risk_breach'
+AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY = 'market_close_on_exit_attach_fail'
+AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY = 'report_require_verified_tpsl'
+AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY = 'report_include_exchange_only_fallback'
 # Ver20: admin-controlled Melbourne blackout windows. AutoTrade entry blackout
 # controls live Bybit entries; setup-generation blackout controls executable/email
 # setup creation for all users. Both are stored in autotrade_config so the admin
@@ -528,8 +538,9 @@ AUTOTRADE_CFG_VER14_TIME_EXIT_POLICY_VERSION_KEY = 'ver14_time_exit_policy_versi
 AUTOTRADE_CFG_VER15_TIME_EXIT_POLICY_VERSION_KEY = 'ver15_time_exit_policy_version'
 # Ver17: conservative risk accounting + enforce 8h max-hold after persisted configs from older builds.
 AUTOTRADE_CFG_VER17_TIME_RISK_POLICY_VERSION_KEY = 'ver17_time_risk_policy_version'
+AUTOTRADE_CFG_VER58_TIME_EXIT_RUNTIME_VERSION_KEY = 'ver58_time_exit_runtime_config_version'
 # Ver18: timestamp marker used to ignore setup/email/autotrade cooldown history
-# before the daily 09:45 Melbourne flat reset. This preserves reports while
+# before the daily 09:55 Melbourne flat reset. This preserves reports while
 # making the 10:00 ASIA session start fresh.
 AUTOTRADE_CFG_COOLDOWN_RESET_TS_KEY = 'cooldown_reset_after_ts'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY = 'flat_before_asia_last_local_date'
@@ -549,16 +560,16 @@ AUTOTRADE_VER07_MAX_ENTRY_DRIFT_PCT = float(os.environ.get('AUTOTRADE_VER07_MAX_
 
 AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
 AUTOTRADE_FLAT_BEFORE_ASIA_HOUR = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9)
-AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45)
+AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55') or 55)
 AUTOTRADE_FLAT_CLOSE_ALL_LIVE = env_bool('AUTOTRADE_FLAT_CLOSE_ALL_LIVE', False)
 # Ver15: scheduled daily jobs can be missed after Render restarts/sleep.
-# A repeating catch-up guardian re-runs the 09:45 Melbourne flat once per local day.
+# A repeating catch-up guardian re-runs the 09:55 Melbourne flat once per local day.
 AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED = env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)
 AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_INTERVAL_SEC', '300') or 300)
 AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_GRACE_HOURS = float(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_GRACE_HOURS', '18') or 18)
 AUTOTRADE_FLAT_FALLBACK_UNMATCHED_AS_OWNED = env_bool('AUTOTRADE_FLAT_FALLBACK_UNMATCHED_AS_OWNED', True)
 AUTOTRADE_MAX_POSITION_HOURS_ENABLED = env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)
-AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '12') or 12)
+AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18)
 AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', '600') or 600)
 AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
 AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
@@ -569,7 +580,7 @@ SETUP_GENERATION_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get(
 # without the bot closing positions for ASIA handover, max-hold, or carryover cleanup.
 # SL/TP attachment, risk caps, duplicate guards, drift checks and exchange safety checks remain active.
 AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN = env_bool('AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN', True)
-AUTOTRADE_KEEP_ALL_TEST_DISABLE_TIME_EXITS = env_bool('AUTOTRADE_KEEP_ALL_TEST_DISABLE_TIME_EXITS', True)
+AUTOTRADE_KEEP_ALL_TEST_DISABLE_TIME_EXITS = env_bool('AUTOTRADE_KEEP_ALL_TEST_DISABLE_TIME_EXITS', False)
 AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN = int(os.environ.get('AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN', '1440') or 1440)
 AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS = float(os.environ.get('AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS', '24') or 24)
 # yver55: forward-test mode should not stop after N candidates. 0 means unlimited/all eligible.
@@ -577,7 +588,7 @@ AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE = env_bool('AUTOTRADE_KEEP_ALL_TEST_UNLIM
 AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS = env_bool('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)
 AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK = int(os.environ.get('AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK', '0') or 0)
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
-SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 45)
+SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 55)
 
 # Setup audit defaults: report actionable/executable setups, not every raw scanner candidate.
 # This prevents /setup_audit and /setup_audit_overall from being inflated by repeated
@@ -661,7 +672,7 @@ def _autotrade_cooldown_reset_ts() -> float:
 def _autotrade_clear_execution_cooldowns(uid: int, reason: str = 'asia_fresh_start') -> dict:
     """Clear email/setup/autotrade cooldown gates without deleting report history.
 
-    Used after the 09:45 Melbourne flat so the 10:00 ASIA session starts with no
+    Used after the 09:55 Melbourne flat so the 10:00 ASIA session starts with no
     position and no stale cooldowns. It preserves reports by storing a reset marker
     and making cooldown checks ignore older executable/generated/autotrade rows.
     """
@@ -715,6 +726,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_LEVERAGE_KEY: int(AUTOTRADE_LEVERAGE),
         AUTOTRADE_CFG_ISOLATED_KEY: 1 if bool(AUTOTRADE_ISOLATED) else 0,
         AUTOTRADE_CFG_MODE_KEY: str(AUTOTRADE_MODE or 'paper').strip().lower(),
+        AUTOTRADE_CFG_ENTRY_ENABLED_KEY: 1 if env_bool('AUTOTRADE_ENTRY_ENABLED', True) else 0,
         AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(_autotrade_runtime_max_open_trades()),
         AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: int(_autotrade_runtime_max_trades_per_day()),
         AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT),
@@ -730,14 +742,20 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY: float(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '4') or 4),
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY: 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True) else 0,
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9),
-        AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45),
+        AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55') or 55),
+        AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True) else 0,
         AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY: 1 if env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True) else 0,
         AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY: str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
         SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY: 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0,
         SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
-        AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True) else 0,
-        AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '12') or 12),
+        AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0,
+        AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18),
         AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True) else 0,
+        AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY: 1 if env_bool('AUTOTRADE_STRICT_TPSL_ONLY', True) else 0,
+        AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY: 1 if env_bool('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False) else 0,
+        AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY: 1 if env_bool('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False) else 0,
+        AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY: 1 if env_bool('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True) else 0,
+        AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY: 1 if env_bool('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True) else 0,
     }
     for k, v in defaults.items():
         try:
@@ -770,6 +788,18 @@ def _autotrade_runtime_mode() -> str:
     except Exception:
         mode = str(AUTOTRADE_MODE or 'paper').strip().lower()
     return mode if mode in {'paper', 'live'} else str(AUTOTRADE_MODE or 'paper').strip().lower()
+
+
+def _autotrade_entry_enabled() -> bool:
+    """Runtime switch for opening NEW AutoTrade entries.
+
+    This intentionally does not disable reports, TP/SL guardian, or manual flat/fix
+    commands, so turning entries OFF does not leave existing positions unmanaged.
+    """
+    try:
+        return bool(_autotrade_bool_cfg(AUTOTRADE_CFG_ENTRY_ENABLED_KEY, 'AUTOTRADE_ENTRY_ENABLED', True))
+    except Exception:
+        return True
 
 
 def _autotrade_runtime_max_open_trades() -> int:
@@ -1001,9 +1031,13 @@ def _autotrade_candidate_lookback_hours(default_hours: float = 12.0) -> float:
 
 
 def _autotrade_flat_before_asia_enabled() -> bool:
-    if _autotrade_keep_all_test_disables_time_exits():
-        return False
+    # yver58: /autotrade_config is the authority. Keep-all forward testing must not
+    # force this OFF; the daily 09:55 Melbourne flat is the clean session reset.
     return _autotrade_bool_cfg(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
+
+
+def _autotrade_flat_before_asia_catchup_enabled() -> bool:
+    return _autotrade_bool_cfg(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY, 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)
 
 
 def _autotrade_flat_before_asia_hour() -> int:
@@ -1016,23 +1050,23 @@ def _autotrade_flat_before_asia_hour() -> int:
 
 def _autotrade_flat_before_asia_minute() -> int:
     try:
-        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45')) or 45))
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55')) or 55))
     except Exception:
-        val = 45
+        val = 55
     return max(0, min(59, int(val)))
 
 
 def _autotrade_max_position_hours_enabled() -> bool:
-    if _autotrade_keep_all_test_disables_time_exits():
-        return False
-    return _autotrade_bool_cfg(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)
+    # yver58: fully runtime-configurable. Default is OFF for the current forward
+    # test, but /autotrade_config can turn it ON at any time.
+    return _autotrade_bool_cfg(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False)
 
 
 def _autotrade_max_position_hours() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '12')) or 12.0)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18')) or 18.0)
     except Exception:
-        val = 12.0
+        val = 18.0
     return max(0.25, min(72.0, float(val)))
 
 
@@ -1131,6 +1165,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_DAILY_RISK_CAP_PCT': float(daily_val or 0.0),
         'AUTOTRADE_DAILY_RISK_CAP_MODE': str(mode_txt or 'PCT').upper(),
         'AUTOTRADE_MODE': str(_autotrade_runtime_mode()).lower(),
+        'AUTOTRADE_ENTRY_ENABLED': bool(_autotrade_entry_enabled()),
         'AUTOTRADE_MAX_OPEN_TRADES': int(_autotrade_runtime_max_open_trades()),
         'AUTOTRADE_MAX_TRADES_PER_DAY': int(_autotrade_runtime_max_trades_per_day()),
         'AUTOTRADE_MAX_ENTRY_DRIFT_PCT': float(_autotrade_runtime_max_entry_drift_pct()),
@@ -1145,20 +1180,23 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE': bool(_autotrade_allow_leverage_downgrade()),
         'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN': int(_autotrade_safe_leverage_downgrade_min()),
         'AUTOTRADE_EMERGENCY_RISK_MAX_MULT': float(_autotrade_emergency_risk_max_mult()),
-        'AUTOTRADE_STRICT_TPSL_ONLY': bool(globals().get('AUTOTRADE_STRICT_TPSL_ONLY', True)),
-        'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH': bool(globals().get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)),
-        'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL': bool(globals().get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)),
+        'AUTOTRADE_STRICT_TPSL_ONLY': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True)),
+        'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY, 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)),
+        'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY, 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)),
         'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED': bool(_autotrade_flat_before_asia_enabled()),
         'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR': int(_autotrade_flat_before_asia_hour()),
         'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE': int(_autotrade_flat_before_asia_minute()),
+        'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP': bool(_autotrade_flat_before_asia_catchup_enabled()),
+        'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED': bool(_autotrade_flat_before_asia_catchup_enabled()),
+        'BLACKOUT_ENABLED': bool(_autotrade_entry_blackout_enabled() and _setup_generation_blackout_enabled()),
         'AUTOTRADE_ENTRY_BLACKOUT_ENABLED': bool(_autotrade_entry_blackout_enabled()),
         'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS': str(_autotrade_entry_blackout_windows()),
         'SETUP_GENERATION_BLACKOUT_ENABLED': bool(_setup_generation_blackout_enabled()),
         'SETUP_GENERATION_BLACKOUT_WINDOWS': str(_setup_generation_blackout_windows()),
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED': bool(_autotrade_max_position_hours_enabled()),
         'AUTOTRADE_MAX_POSITION_HOURS': float(_autotrade_max_position_hours()),
-        'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL': bool(globals().get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)),
-        'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK': bool(globals().get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)),
+        'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY, 'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)),
+        'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY, 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)),
         'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)),
@@ -1324,7 +1362,7 @@ def _autotrade_apply_ver11_leverage_policy_defaults() -> None:
 
 
 def _autotrade_apply_ver19_entry_execution_policy_defaults() -> None:
-    """Ver19: allow the ASIA session to restart after the 09:45 flat and reduce false AutoTrade skips.
+    """Ver19: allow the ASIA session to restart after the 09:55 flat and reduce false AutoTrade skips.
 
     Changes:
     - Shrinks the default entry blackout from 09:00-11:00 to 09:00-10:05 Melbourne.
@@ -1355,7 +1393,7 @@ def _autotrade_apply_ver20_blackout_policy_defaults() -> None:
     """Ver20: admin-configurable Melbourne blackout for both setup generation and AutoTrade.
 
     Default is 10:00-10:45 Melbourne. This prevents fresh setup emails and AutoTrade
-    entries in the first noisy ASIA-reset window while still letting the 09:45 flat
+    entries in the first noisy ASIA-reset window while still letting the 09:55 flat
     finish and cooldowns clear. Values are persisted so the admin can adjust them with
     /autotrade_config without redeploying.
     """
@@ -1407,8 +1445,32 @@ def _autotrade_apply_ver57_blackout_config_sync() -> None:
         pass
 
 
+def _autotrade_apply_ver58_time_exit_runtime_defaults() -> None:
+    """yver58 runtime authority defaults.
+
+    Current forward-test rule: let NORMAL/REVERSE setups trade, but still perform the
+    owner-approved daily ASIA handover flat at 09:55 Melbourne. Keep-all mode must not
+    override /autotrade_config values. Max-position-hours remains OFF by default so
+    positions are not closed at arbitrary ages unless the admin enables it.
+    """
+    try:
+        target_version = 'yver58_2026_05_20'
+        if str(_autotrade_config_get(AUTOTRADE_CFG_VER58_TIME_EXIT_RUNTIME_VERSION_KEY, '') or '').strip().lower() == target_version:
+            return
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9))
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55') or 55))
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY, 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True) else 0)
+        # Do not force arbitrary max-age closure in this forward test. The admin can
+        # enable it later with /autotrade_config AUTOTRADE_MAX_POSITION_HOURS_ENABLED true.
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0)
+        _autotrade_config_set(AUTOTRADE_CFG_VER58_TIME_EXIT_RUNTIME_VERSION_KEY, target_version)
+    except Exception:
+        pass
+
+
 def _autotrade_apply_ver15_time_exit_policy_defaults() -> None:
-    """Ver15: make the 09:45 flat reliable after deployment/reset.
+    """Ver15: make the 09:55 flat reliable after deployment/reset.
 
     This intentionally corrects stale user/runtime values from earlier versions where
     max-hold could remain at 18h and the daily flat could be enabled in config but missed
@@ -1421,8 +1483,9 @@ def _autotrade_apply_ver15_time_exit_policy_defaults() -> None:
             return
         _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 1)
         _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9))
-        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45))
-        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55') or 55))
+        # yver58: max-hold is admin-controlled; do not force-enable it during migrations.
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0)
         try:
             cur_hours = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, '8') or 8)
         except Exception:
@@ -1441,7 +1504,7 @@ def _autotrade_apply_ver17_time_risk_policy_defaults() -> None:
     Older persisted runtime configs could keep AUTOTRADE_MAX_POSITION_HOURS at 18 even
     after the code default moved back to 8. This migration is intentionally versioned
     after ver16 so it runs once on the deployed DB and re-aligns the live bot with the
-    intended policy: 09:45 Melbourne flat ON, 8h max hold ON.
+    intended policy: 09:55 Melbourne flat ON, 8h max hold ON.
     """
     try:
         target_version = 'ver17_2026_05_17'
@@ -1449,10 +1512,10 @@ def _autotrade_apply_ver17_time_risk_policy_defaults() -> None:
             return
         _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 1)
         _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9))
-        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '45') or 45))
-        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1)
-        # Force 8h for this tuning cycle. The admin can still change it later with /autotrade_config.
-        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '8') or 8))
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55') or 55))
+        # yver58: max-hold remains admin-controlled and defaults OFF for the current forward test.
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0)
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY, float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18))
         _autotrade_config_set(AUTOTRADE_CFG_VER17_TIME_RISK_POLICY_VERSION_KEY, target_version)
     except Exception:
         pass
@@ -1994,7 +2057,7 @@ _AUTONOMOUS_SCREEN_SYNC_LOCK = asyncio.Lock()
 # Keep the autonomous lane hot, but make the schedule longer than the hard runtime budget.
 AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC", "120") or 120)
 AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC", "180") or 180)
-AUTONOMOUS_SCREEN_SYNC_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_FIRST_SEC", "45") or 45)
+AUTONOMOUS_SCREEN_SYNC_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_FIRST_SEC", "45") or 55)
 AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_USERS", "1") or 1)
 
 # 07May_v01: DB-backed family/session edge governance.
@@ -2032,7 +2095,7 @@ SETUP_COMBO_DAILY_SAFETY_HOUR = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_HOU
 SETUP_COMBO_DAILY_SAFETY_MINUTE = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MINUTE", "0") or 0)
 SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS", "24") or 24)
 SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED", "8") or 8)
-SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WR_MAX", "45") or 45)
+SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WR_MAX", "45") or 55)
 SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "0.05") or 0.05)
 SETUP_COMBO_DAILY_SAFETY_SCORE_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SCORE_MAX", "0") or 0)
 SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_SL_TP_MULT", "1.25") or 1.25)
@@ -2188,7 +2251,7 @@ SETUP_ADAPTIVE_STRONG_AVG_R = float(os.environ.get("SETUP_ADAPTIVE_STRONG_AVG_R"
 SETUP_ADAPTIVE_REVERSE_WR_MAX = float(os.environ.get("SETUP_ADAPTIVE_REVERSE_WR_MAX", "50") or 50)
 SETUP_ADAPTIVE_REVERSE_AVG_R_MAX = float(os.environ.get("SETUP_ADAPTIVE_REVERSE_AVG_R_MAX", "0.05") or 0.05)
 SETUP_ADAPTIVE_TIGHTEN_REVERSE_MIN_DECIDED = int(os.environ.get("SETUP_ADAPTIVE_TIGHTEN_REVERSE_MIN_DECIDED", "4") or 4)
-SETUP_ADAPTIVE_TIGHTEN_REVERSE_WR_MAX = float(os.environ.get("SETUP_ADAPTIVE_TIGHTEN_REVERSE_WR_MAX", "45") or 45)
+SETUP_ADAPTIVE_TIGHTEN_REVERSE_WR_MAX = float(os.environ.get("SETUP_ADAPTIVE_TIGHTEN_REVERSE_WR_MAX", "45") or 55)
 try:
     _v = _autotrade_config_get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', None)
     if _v is not None:
@@ -2201,7 +2264,7 @@ except Exception:
 SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "8") or 8)
 SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "4") or 4)
 SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
-SETUP_COMBO_POLICY_DISABLE_WR = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_WR", "45") or 45)
+SETUP_COMBO_POLICY_DISABLE_WR = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_WR", "45") or 55)
 SETUP_COMBO_POLICY_KEEP_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_AVG_R", "0.05") or 0.05)
 SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "0.00") or 0.00)
 
@@ -2856,6 +2919,78 @@ def _setup_combo_strategy_key_for_row(row: dict, session_name: str = '') -> str:
         return 'F0-UNK-NOR'
 
 
+
+def _setup_side_suffix(setup_or_row=None, value: str | None = None) -> str:
+    """Compact side suffix for reporting keys: BUY / SELL / BOTH.
+
+    yver59: the analytical identity is Family-Session-Strategy-Side so the bot can
+    compare NOR-BUY, NOR-SELL, REV-BUY and REV-SELL separately while the older
+    family/session policy table remains a coarse safety layer.
+    """
+    try:
+        raw = value if value is not None else _setup_strategy_attr(setup_or_row, 'side', '')
+        side = str(raw or '').upper().strip()
+        if side in {'LONG', 'BULL', 'BULLISH'}:
+            side = 'BUY'
+        elif side in {'SHORT', 'BEAR', 'BEARISH'}:
+            side = 'SELL'
+        if side in {'BUY', 'SELL'}:
+            return side
+        if side in {'BOTH', 'ALL', '*'}:
+            return 'BOTH'
+    except Exception:
+        pass
+    return 'BOTH'
+
+
+def _setup_combo_strategy_side_key(family: str = '', session: str = '', strategy=None, side=None) -> str:
+    """Canonical granular learning key: Family-Session-Strategy-Side.
+
+    Example: F3-ASIA-NOR-BUY or F8-NY-REV-SELL.
+    """
+    try:
+        base = _setup_combo_strategy_key(family, session, strategy)
+        s = _setup_side_suffix(value=side) if isinstance(side, str) else _setup_side_suffix(side)
+        if s == 'BOTH':
+            return base
+        return f'{base}-{s}'
+    except Exception:
+        return 'F0-UNK-NOR-BOTH'
+
+
+def _setup_combo_strategy_side_key_for_row(row: dict, session_name: str = '') -> str:
+    try:
+        fam = _setup_audit_family_code(row) if isinstance(row, dict) else _setup_family_id_to_code(str(getattr(row, 'family_id', '') or getattr(row, 'family', '') or 'F0'))
+        sess = str(session_name or (row or {}).get('session') or (row or {}).get('source_session') or '-').upper().strip() if isinstance(row, dict) else str(session_name or getattr(row, 'session', '') or '-').upper().strip()
+        side = str((row or {}).get('side') or '').upper().strip() if isinstance(row, dict) else str(getattr(row, 'side', '') or '').upper().strip()
+        return _setup_combo_strategy_side_key(fam, sess, row, side)
+    except Exception:
+        return 'F0-UNK-NOR-BOTH'
+
+
+def _setup_combo_full_universe(families=None, sessions=None) -> list[tuple[str, str, str, str, str]]:
+    """Return the full configured Family-Session-Strategy-Side universe for policy views."""
+    try:
+        fams = [str(f or '').upper().strip() for f in (families or []) if str(f or '').strip()]
+        sesses = [str(s or '').upper().strip() for s in (sessions or []) if str(s or '').strip()]
+        if not fams:
+            fams = [f'F{i}' for i in range(1, 9)]
+        if not sesses:
+            sesses = ['ASIA', 'LON', 'NY']
+        fams = sorted(set(fams), key=lambda x: (int(x[1:]) if re.fullmatch(r'F\d+', x) else 99, x))
+        order = ['ASIA', 'LON', 'NY']
+        sesses = sorted(set(sesses), key=lambda x: (order.index(x) if x in order else 99, x))
+        out = []
+        for fam in fams:
+            for sess in sesses:
+                for strat in ('NOR', 'REV'):
+                    for side in ('BUY', 'SELL'):
+                        out.append((fam, sess, strat, side, _setup_combo_strategy_side_key(fam, sess, strat, side)))
+        return out
+    except Exception:
+        return []
+
+
 def _setup_volume_bucket_from_usd(vol_usd: float) -> str:
     try:
         v = float(vol_usd or 0.0)
@@ -2934,7 +3069,7 @@ def _setup_policy_status_is_unknownish(status: str = '') -> bool:
 def _setup_strategy_combo_metrics(setup_or_row, session_name: str = '', user_id: int = 0) -> dict:
     """Return current family/session/strategy evidence used to choose NORMAL vs REVERSE."""
     out = {
-        'combo': '', 'combo_strategy': '', 'family': '', 'session': '', 'strategy': _setup_strategy_short_label(setup_or_row),
+        'combo': '', 'combo_strategy': '', 'combo_strategy_side': '', 'family': '', 'session': '', 'strategy': _setup_strategy_short_label(setup_or_row), 'side': _setup_side_suffix(setup_or_row),
         'decided': 0, 'tp': 0, 'sl': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': 0.0,
         'policy_status': '', 'policy_enabled': 1, 'policy_found': False,
         'strategy_decided': 0, 'strategy_wr': 0.0, 'strategy_avg_r': 0.0, 'strategy_score': 0.0,
@@ -2946,8 +3081,10 @@ def _setup_strategy_combo_metrics(setup_or_row, session_name: str = '', user_id:
         sess_s = str(sess or '-').upper().strip()
         strat_s = _setup_strategy_short_label(setup_or_row)
         combo = f"{fam_s}-{sess_s}"
+        side_s = _setup_side_suffix(setup_or_row)
         combo_strategy = _setup_combo_strategy_key(fam_s, sess_s, strat_s)
-        out.update({'family': fam_s, 'session': sess_s, 'combo': combo, 'combo_strategy': combo_strategy, 'strategy': strat_s})
+        combo_strategy_side = _setup_combo_strategy_side_key(fam_s, sess_s, strat_s, side_s)
+        out.update({'family': fam_s, 'session': sess_s, 'combo': combo, 'combo_strategy': combo_strategy, 'combo_strategy_side': combo_strategy_side, 'strategy': strat_s, 'side': side_s})
         try:
             info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess_s, user_id=int(user_id or 0)) or {}
             out['policy_found'] = bool(info.get('found'))
@@ -2967,7 +3104,8 @@ def _setup_strategy_combo_metrics(setup_or_row, session_name: str = '', user_id:
             data = _setup_edge_guard_build(int(user_id or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False) or {}
             cm_legacy = dict((data.get('combo_metrics') or {}).get(combo) or {})
             cm_strategy = dict((data.get('combo_strategy_metrics') or {}).get(combo_strategy) or {})
-            cm = cm_strategy or cm_legacy
+            cm_strategy_side = dict((data.get('combo_strategy_side_metrics') or {}).get(combo_strategy_side) or {})
+            cm = cm_strategy_side or cm_strategy or cm_legacy
             if cm:
                 out['decided'] = int(cm.get('decided') or out['decided'])
                 out['tp'] = int(cm.get('tp') or out.get('tp') or 0)
@@ -2975,7 +3113,12 @@ def _setup_strategy_combo_metrics(setup_or_row, session_name: str = '', user_id:
                 out['wr'] = float(cm.get('wr') or out['wr'])
                 out['avg_r'] = float(cm.get('avg_r') or out['avg_r'])
                 out['score'] = float(cm.get('score') or out['score'])
-            if cm_strategy:
+            if cm_strategy_side:
+                out['strategy_decided'] = int(cm_strategy_side.get('decided') or 0)
+                out['strategy_wr'] = float(cm_strategy_side.get('wr') or 0.0)
+                out['strategy_avg_r'] = float(cm_strategy_side.get('avg_r') or 0.0)
+                out['strategy_score'] = float(cm_strategy_side.get('score') or 0.0)
+            elif cm_strategy:
                 out['strategy_decided'] = int(cm_strategy.get('decided') or 0)
                 out['strategy_wr'] = float(cm_strategy.get('wr') or 0.0)
                 out['strategy_avg_r'] = float(cm_strategy.get('avg_r') or 0.0)
@@ -2987,11 +3130,16 @@ def _setup_strategy_combo_metrics(setup_or_row, session_name: str = '', user_id:
     return out
 
 
-def _setup_strategy_metrics_for_key(family: str, session: str, strategy: str, user_id: int = 0) -> dict:
-    """Fetch evidence for a specific Family-Session-Strategy key from the audit edge cache."""
+def _setup_strategy_metrics_for_key(family: str, session: str, strategy: str, user_id: int = 0, side: str = '') -> dict:
+    """Fetch evidence for a Family-Session-Strategy-Side key, falling back to strategy level."""
     try:
         combo_strategy = _setup_combo_strategy_key(family, session, strategy)
+        combo_strategy_side = _setup_combo_strategy_side_key(family, session, strategy, side) if str(side or '').strip() else ''
         data = _setup_edge_guard_build(int(user_id or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False) or {}
+        if combo_strategy_side:
+            m = dict((data.get('combo_strategy_side_metrics') or {}).get(combo_strategy_side) or {})
+            if m:
+                return m
         return dict((data.get('combo_strategy_metrics') or {}).get(combo_strategy) or {})
     except Exception:
         return {}
@@ -3019,14 +3167,15 @@ def _setup_strategy_decision_for_setup(setup_or_row, session_name: str = '', use
         reverse_avg = float(globals().get('SETUP_ADAPTIVE_REVERSE_AVG_R_MAX', 0.05) or 0.05)
         fam = str(meta.get('family') or 'F0')
         sess = str(meta.get('session') or '-')
-        rev_m = _setup_strategy_metrics_for_key(fam, sess, 'REV', user_id=int(user_id or 0))
+        rev_side = 'SELL' if str(meta.get('side') or '').upper().strip() == 'BUY' else ('BUY' if str(meta.get('side') or '').upper().strip() == 'SELL' else '')
+        rev_m = _setup_strategy_metrics_for_key(fam, sess, 'REV', user_id=int(user_id or 0), side=rev_side)
         rev_dec = int(rev_m.get('decided') or 0)
         rev_wr = float(rev_m.get('wr') or 0.0)
         rev_avg = float(rev_m.get('avg_r') or 0.0)
         rev_sl = int(rev_m.get('sl') or 0)
         rev_tp = int(rev_m.get('tp') or 0)
         meta.update({'reverse_decided': rev_dec, 'reverse_wr': rev_wr, 'reverse_avg_r': rev_avg, 'reverse_tp': rev_tp, 'reverse_sl': rev_sl})
-        rev_bad_enough = rev_dec >= int(globals().get('SETUP_ADAPTIVE_TIGHTEN_REVERSE_MIN_DECIDED', 4) or 4) and (rev_wr <= float(globals().get('SETUP_ADAPTIVE_TIGHTEN_REVERSE_WR_MAX', 45) or 45) or rev_avg <= 0.0 or rev_sl > rev_tp)
+        rev_bad_enough = rev_dec >= int(globals().get('SETUP_ADAPTIVE_TIGHTEN_REVERSE_MIN_DECIDED', 4) or 4) and (rev_wr <= float(globals().get('SETUP_ADAPTIVE_TIGHTEN_REVERSE_WR_MAX', 45) or 55) or rev_avg <= 0.0 or rev_sl > rev_tp)
 
         if decided >= strong_min and wr >= strong_wr and avg_r >= strong_avg and tp >= sl:
             return 'NORMAL', f"strong_combo_keep_normal:{meta.get('combo_strategy','-')}:WR{wr:.1f}:AvgR{avg_r:+.2f}:n{decided}", meta
@@ -4899,9 +5048,11 @@ WARN_RISK_PCT_PER_TRADE = 2.0
 # Ver02 note: cooldowns now suppress executable setup generation and setup emails.
 # You can still control additional spam via email_gap_min + daily/session caps.
 SESSION_SYMBOL_COOLDOWN_HOURS = {
-    "NY": 1,     # more active
-    "LON": 2,    # balanced
-    "ASIA": 3,   # a bit stricter
+    # yver60: one fixed production cooldown across all sessions so setup/email
+    # generation, /cooldowns, and AutoTrade duplicate protection are synced.
+    "NY": 3,
+    "LON": 3,
+    "ASIA": 3,
 }
 
 # Fallback if session unknown
@@ -5054,6 +5205,7 @@ try:
     _autotrade_apply_ver57_blackout_config_sync()
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
+    _autotrade_apply_ver58_time_exit_runtime_defaults()
     _autotrade_apply_ver32_quality_defaults()
     _autotrade_apply_ver33_wr_first_caps()
     _autotrade_apply_ver34_user_requested_defaults()
@@ -5770,13 +5922,16 @@ def _autotrade_find_live_position(symbol: str, side: str | None = None) -> dict 
         return None
     return None
 def _autotrade_ready() -> bool:
+    # Infrastructure readiness. New-entry ON/OFF is checked separately by
+    # _autotrade_entry_enabled() so guardian/report/flat controls still work.
     if not AUTOTRADE_ENABLED:
         return False
     if AUTOTRADE_OWNER_UID <= 0:
         return False
-    if AUTOTRADE_MODE not in ("paper", "live"):
+    mode = str(_autotrade_runtime_mode()).lower()
+    if mode not in ("paper", "live"):
         return False
-    if AUTOTRADE_MODE == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
+    if mode == "live" and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
         return False
     return True
 
@@ -7135,16 +7290,13 @@ def _autotrade_close_carried_live_positions_after_reset(uid: int, reason: str = 
 
     When AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED is ON, the design rule is: after the
     10:00 Melbourne trading-day reset there should be no carried AutoTrade risk.
-    The exact 09:45 flat job can be missed or can skip positions whose journal row
+    The exact 09:55 flat job can be missed or can skip positions whose journal row
     was reset/recreated, so this guard uses the same live-position classification
     as /open_trades and closes any bot-owned position whose resolved open time is
     before the current 10:00→10:00 Melbourne trading day start.
     """
     out = {'ok': True, 'reason': str(reason or 'post_asia_reset_carryover_guard'), 'closed': [], 'skipped': [], 'errors': []}
     try:
-        if _autotrade_keep_all_test_disables_time_exits():
-            out['skipped'].append({'reason': 'ver54_keep_all_test_mode_no_carryover_flat'})
-            return out
         uid_i = int(uid or 0)
         if uid_i <= 0:
             out['ok'] = False
@@ -7221,13 +7373,10 @@ def _autotrade_close_owned_live_positions(uid: int, reason: str = 'scheduled_fla
     - Uses the same owner classification as /open_trades and /autotrade_debug, including
       synthetic fallback for live Bybit positions when the journal was reset/cleared.
     - Optional max_opened_before_ts is used by the catch-up flat so positions opened after
-      the 09:45 cutoff are not closed by a late catch-up run.
+      the 09:55 cutoff are not closed by a late catch-up run.
     """
     out = {'ok': True, 'reason': str(reason or 'scheduled_flat'), 'closed': [], 'skipped': [], 'errors': []}
     try:
-        if _autotrade_keep_all_test_disables_time_exits() and 'manual_autotrade_flat_now' not in str(reason or ''):
-            out['skipped'].append({'reason': 'ver54_keep_all_test_mode_no_scheduled_flat'})
-            return out
         uid_i = int(uid or 0)
         live_positions = list(_bybit_get_open_positions_linear() or [])
         journal_open = list(_autotrade_db_open_trades(uid_i) or [])
@@ -7350,11 +7499,11 @@ def _autotrade_flat_before_asia_local_cutoff(now_dt: datetime | None = None) -> 
 
 
 def _autotrade_flat_before_asia_catchup_due(now_dt: datetime | None = None) -> tuple[bool, datetime, str, str]:
-    """Return whether the missed 09:45 Melbourne flat should be caught up now."""
+    """Return whether the missed 09:55 Melbourne flat should be caught up now."""
     try:
         if not bool(_autotrade_flat_before_asia_enabled()):
             return False, datetime.now(MEL_TZ), '', 'disabled'
-        if not bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)):
+        if not bool(_autotrade_flat_before_asia_catchup_enabled()):
             return False, datetime.now(MEL_TZ), '', 'catchup_disabled'
         now = now_dt or datetime.now(MEL_TZ)
         cutoff, date_s = _autotrade_flat_before_asia_local_cutoff(now)
@@ -7375,10 +7524,10 @@ def _autotrade_flat_before_asia_catchup_due(now_dt: datetime | None = None) -> t
 
 
 async def autotrade_flat_before_asia_catchup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Repeating safety net for missed 09:45 Melbourne scheduled flat.
+    """Repeating safety net for missed 09:55 Melbourne scheduled flat.
 
     Render restarts/sleeps or job-queue misfires can miss an exact run_daily event. This
-    guardian checks repeatedly after 09:45 and runs the flat once per Melbourne date. It
+    guardian checks repeatedly after 09:55 and runs the flat once per Melbourne date. It
     only closes positions opened before the configured cutoff, so a late catch-up does not
     close legitimate new ASIA trades opened after the blackout window.
     """
@@ -7389,7 +7538,7 @@ async def autotrade_flat_before_asia_catchup_job(context: ContextTypes.DEFAULT_T
         if uid <= 0:
             return
         # Ver25: also enforce the zero-carryover rule after the Melbourne 10:00 reset.
-        # This runs even when the normal 09:45 flat was marked complete, because a
+        # This runs even when the normal 09:55 flat was marked complete, because a
         # position can survive due to journal reset/linkage issues or Render timing.
         try:
             carry_res = await to_thread_autotrade(_autotrade_close_carried_live_positions_after_reset, uid, 'catchup_zero_carryover_after_10_melbourne', timeout=60)
@@ -7423,7 +7572,7 @@ async def autotrade_flat_before_asia_catchup_job(context: ContextTypes.DEFAULT_T
         closed = list((res or {}).get('closed') or [])
         skipped = list((res or {}).get('skipped') or [])
         try:
-            msg = '🧹 AutoTrade 09:45 flat catch-up\n' + f"Date: {date_s} | Cutoff: {cutoff.strftime('%H:%M')} Melbourne\nClosed positions: {len(closed)}"
+            msg = '🧹 AutoTrade 09:55 flat catch-up\n' + f"Date: {date_s} | Cutoff: {cutoff.strftime('%H:%M')} Melbourne\nClosed positions: {len(closed)}"
             if cd_reset:
                 msg += f"\nCooldown reset: cleared {int((cd_reset or {}).get('deleted_emailed_symbols') or 0)} email/setup cooldown rows"
             if skipped:
@@ -7445,8 +7594,8 @@ def _autotrade_close_stale_owned_live_positions(uid: int, max_age_hours: float |
     hours = float(max_age_hours if max_age_hours is not None else _autotrade_max_position_hours())
     out = {'ok': True, 'reason': str(reason or 'max_position_age'), 'max_age_hours': hours, 'closed': [], 'skipped': [], 'errors': []}
     try:
-        if _autotrade_keep_all_test_disables_time_exits():
-            out['skipped'].append({'reason': 'ver54_keep_all_test_mode_no_max_hold_close'})
+        if not bool(_autotrade_max_position_hours_enabled()):
+            out['skipped'].append({'reason': 'max_position_hours_disabled'})
             return out
         uid_i = int(uid or 0)
         if uid_i <= 0:
@@ -7576,6 +7725,14 @@ async def autotrade_flat_now_cmd(update: Update, context: ContextTypes.DEFAULT_T
 AUTOTRADE_STRICT_TPSL_ONLY = env_bool('AUTOTRADE_STRICT_TPSL_ONLY', True)
 AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = env_bool('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)
 AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = env_bool('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)
+try:
+    AUTOTRADE_STRICT_TPSL_ONLY = bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True))
+    AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = bool(_autotrade_bool_cfg(AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY, 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False))
+    AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = bool(_autotrade_bool_cfg(AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY, 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False))
+    AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = bool(_autotrade_bool_cfg(AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY, 'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True))
+    AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK = bool(_autotrade_bool_cfg(AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY, 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True))
+except Exception:
+    pass
 AUTOTRADE_PREFILL_RISK_BUFFER_MULT = float(os.environ.get('AUTOTRADE_PREFILL_RISK_BUFFER_MULT', '0.92') or 0.92)
 AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED = env_bool('AUTOTRADE_F8_CLOSE_OPPOSITE_ENABLED', False)
 AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE = env_bool('AUTOTRADE_F8_CLOSE_EXTERNAL_OPPOSITE', False)
@@ -14507,7 +14664,7 @@ def _setup_pipeline_recent_gate_summary(uid: int = 0, session: str = '', lookbac
     """
     out = {'rows': 0, 'persisted': 0, 'top_reasons': {}, 'recent': []}
     try:
-        cutoff = float(time.time()) - max(60.0, float(lookback_min or 45) * 60.0)
+        cutoff = float(time.time()) - max(60.0, float(lookback_min or 55) * 60.0)
         ids = []
         try:
             if int(uid or 0) > 0:
@@ -15888,7 +16045,7 @@ def get_user(user_id: int) -> dict:
     con.close()
     return dict(row)
 
-FAST_USER_CACHE_TTL_SEC = int(os.getenv("FAST_USER_CACHE_TTL_SEC", "45") or 45)
+FAST_USER_CACHE_TTL_SEC = int(os.getenv("FAST_USER_CACHE_TTL_SEC", "45") or 55)
 
 def _user_cache_key(user_id: int) -> str:
     return f"user_row:{int(user_id)}"
@@ -22121,7 +22278,7 @@ def _latest_recent_delivery_ts(user_id: int, session_name: str = '', max_age_min
     if uid <= 0:
         return 0.0
     req_session_u = str(session_name or '').upper().strip()
-    cutoff = float(time.time()) - float(max(2, int(max_age_min or 45))) * 60.0
+    cutoff = float(time.time()) - float(max(2, int(max_age_min or 55))) * 60.0
     latest = 0.0
     try:
         _recent_emailed_cache_prune(uid)
@@ -23660,7 +23817,7 @@ _OHLCV_COLD_FETCH_COUNT = 0
 _OHLCV_COLD_FETCH_LAST_TS = 0.0
 BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_POSITIONS_CACHE_TTL_SEC", "6") or 6)
 BYBIT_OPEN_ORDERS_CACHE_TTL_SEC = int(os.getenv("BYBIT_OPEN_ORDERS_CACHE_TTL_SEC", "6") or 6)
-SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 45)
+SCREEN_DIRECTIONAL_CACHE_TTL_SEC = int(os.getenv("SCREEN_DIRECTIONAL_CACHE_TTL_SEC", "45") or 55)
 
 
 
@@ -32371,7 +32528,7 @@ async def market_adaptive_status_cmd(update: Update, context: ContextTypes.DEFAU
     base = (rep.get('baseline') or {}).get('overall') or {}
     final = (rep.get('final') or {}).get('overall') or {}
     actions = list(rep.get('actions') or [])
-    first_delay = int(float((cfg or {}).get('market_adaptive_first_delay_sec', 45) or 45))
+    first_delay = int(float((cfg or {}).get('market_adaptive_first_delay_sec', 45) or 55))
     lines = [
         '📈 Market-Adaptive Optimization Status',
         HDR,
@@ -34733,7 +34890,7 @@ def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tupl
         fingerprint = f"{len(best_fut or {})}"
     cache_key = f"screen_directional_lists:{fingerprint}"
     try:
-        if cache_valid(cache_key, int(SCREEN_DIRECTIONAL_CACHE_TTL_SEC or 45)):
+        if cache_valid(cache_key, int(SCREEN_DIRECTIONAL_CACHE_TTL_SEC or 55)):
             cached = cache_get(cache_key)
             if isinstance(cached, dict):
                 return list(cached.get('up') or []), list(cached.get('dn') or [])
@@ -37303,7 +37460,7 @@ KNOWN_COMMANDS = sorted(set([
     "health", "health_sys",
 
     # AutoTrade (admin)
-    "open_trades", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_fix_exits", "autotrade_debug_reset", "autotrade_report_overall", "autoytrade_report_overall", "autotrade_report_matrix", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
+    "open_trades", "autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_fix_exits", "autotrade_debug_reset", "autotrade_report_overall", "autoytrade_report_overall", "autotrade_report_matrix", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
@@ -37845,12 +38002,14 @@ ADMIN_HELP_DESCRIPTIONS = {
     "lessons_learned": "Cached latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
-    "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; shows Symbol, Side, Family-Session-Strategy combo, Conf, Result",
+    "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; shows Symbol, Side, Family-Session-Strategy-Side combo, Conf, Result",
     "setup_quality": "Alias of /setup_audit",
-    "setup_audit_overall": "Overall Family-Session-Strategy summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR",
+    "setup_audit_overall": "Overall Family-Session-Strategy-Side summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR",
     "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
     "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
     "setup_deep_analysis": "Deep setup analytics: family/session, symbol, side, Melbourne hour/day, regime buckets. Usage: /setup_deep_analysis 168",
+    "autotrade_on": "Enable NEW AutoTrade entries; existing TP/SL guardian and reports remain active",
+    "autotrade_off": "Pause NEW AutoTrade entries without disabling reports/guardian/flat commands",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
     "autotrade_debug_reset": "Clear AutoTrade debug state",
     "autotrade_last": "Show last autotrade attempt details",
@@ -37858,7 +38017,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_flat_now": "Manually close AutoTrade-owned live positions now",
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
     "autotrade_report_overall": "AutoTrade overall performance summary",
-    "autoytrade_report_overall": "Family/session/strategy AutoTrade matrix: /autotrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
+    "autoytrade_report_overall": "Family/session/strategy/side AutoTrade matrix: /autotrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
     "autotrade_report_matrix": "Alias of /autotrade_report_overall for the family/session AutoTrade matrix",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "trade_lifecycle": "Exchange-backed per-trade lifecycle analytics with TP/SL path classification",
@@ -37903,7 +38062,7 @@ ADMIN_HELP_GROUPS = [
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
     ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_test_data", "admin_reset_signal_reports", "reset", "restore"]),
 ]
@@ -38848,22 +39007,50 @@ async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    user = get_user(uid)
+    """Set daily risk cap.
 
-    # This is TOTAL DAILY risk cap (sum of open risks for today's trades).
+    yver60: for the owner/admin, /dailycap also updates the AutoTrade daily cap,
+    because the live operator expects /dailycap pct X to control the active bot cap.
+    /dailycapAT remains as an explicit AutoTrade-only alias.
+    """
+    uid = int(update.effective_user.id)
+    user = get_user(uid) or {}
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    admin_or_owner = bool(is_admin_user(uid) or int(uid) == int(owner))
+
+    def _at_cap_snapshot():
+        try:
+            at_user = _autotrade_user_settings(owner)
+            eq = float(_effective_equity_for_risk(at_user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
+            mode_at, val_at = _autotrade_daily_cap_settings()
+            cap_at = float(_autotrade_daily_cap_usd(owner, eq) or 0.0)
+            return str(mode_at or 'PCT').upper(), float(val_at or 0.0), float(cap_at or 0.0), float(eq or 0.0)
+        except Exception:
+            return 'PCT', 0.0, 0.0, 0.0
+
     if len(context.args) != 2:
-        cap = daily_cap_usd(user)
+        cap = float(daily_cap_usd(user) or 0.0)
         mode = str(user.get("daily_cap_mode", DEFAULT_DAILY_CAP_MODE)).upper()
         val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
-        await update.message.reply_text(
-            f"Daily risk cap (TOTAL per day): {mode} {val:.2f} (≈ ${cap:.2f} per day)\n"
-            f"Per-trade risk is separate: /riskmode\n\n"
-            "Set examples:\n"
-            "• /dailycap pct 5\n"
-            "• /dailycap pct 100\n"
-            "• /dailycap usd 60"
-        )
+        if admin_or_owner:
+            mode_at, val_at, cap_at, eq_at = _at_cap_snapshot()
+            await update.message.reply_text(
+                f"Daily risk cap (manual): {mode} {val:.2f} (≈ ${cap:.2f} per day)\n"
+                f"Daily risk cap (AutoTrade): {mode_at} {val_at:.2f}{'%' if mode_at == 'PCT' else ''} (≈ ${cap_at:.2f} per day, EquityAT≈${eq_at:.2f})\n\n"
+                "Set examples:\n"
+                "• /dailycap pct 5   (updates manual + AutoTrade for owner/admin)\n"
+                "• /dailycapAT pct 5 (AutoTrade-only)\n"
+                "• /dailycap usd 60"
+            )
+        else:
+            await update.message.reply_text(
+                f"Daily risk cap (TOTAL per day): {mode} {val:.2f} (≈ ${cap:.2f} per day)\n"
+                f"Per-trade risk is separate: /riskmode\n\n"
+                "Set examples:\n"
+                "• /dailycap pct 5\n"
+                "• /dailycap pct 100\n"
+                "• /dailycap usd 60"
+            )
         return
 
     mode = context.args[0].strip().upper()
@@ -38884,9 +39071,25 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     update_user(uid, daily_cap_mode=mode, daily_cap_value=val)
-    user = get_user(uid)
+    user = get_user(uid) or {}
+    manual_cap = float(daily_cap_usd(user) or 0.0)
+
+    at_line = ""
+    if admin_or_owner:
+        try:
+            _autotrade_set_daily_cap_settings(mode, val)
+            for key0 in (f'accounting_snapshot_fast:{int(owner)}', f'autotrade_day_metrics_fast:{int(owner)}'):
+                try:
+                    cache_delete(key0)
+                except Exception:
+                    pass
+            mode_at, val_at, cap_at, eq_at = _at_cap_snapshot()
+            at_line = f"\nAutoTrade cap synced: {mode_at} {val_at:.2f}{'%' if mode_at == 'PCT' else ''} (≈ ${cap_at:.2f} per day, EquityAT≈${eq_at:.2f})"
+        except Exception as e:
+            at_line = f"\n⚠️ AutoTrade cap sync failed: {type(e).__name__}: {e}"
+
     await update.message.reply_text(
-        f"✅ Daily risk cap updated: {mode} {float(val):.2f} (≈ ${daily_cap_usd(user):.2f} per day)"
+        f"✅ Daily risk cap updated: {mode} {float(val):.2f} (manual ≈ ${manual_cap:.2f} per day){at_line}"
     )
 
 
@@ -38976,19 +39179,20 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = {'true' if bool(summary.get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)) else 'false'}",
             f"AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = {'true' if bool(summary.get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)) else 'false'}",
             f"AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = {'true' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)) else 'false'}",
-            f"AUTOTRADE_FLAT_BEFORE_ASIA_TIME = {int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9)):02d}:{int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 45)):02d} Melbourne",
-            f"AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP = {'true' if bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_FLAT_BEFORE_ASIA_TIME = {int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9)):02d}:{int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 55)):02d} Melbourne",
+            f"AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP = {'true' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP', True)) else 'false'}",
             f"AUTOTRADE_ENTRY_BLACKOUT_ENABLED = {'true' if bool(summary.get('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = {str(summary.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '-')} Melbourne",
             f"SETUP_GENERATION_BLACKOUT_ENABLED = {'true' if bool(summary.get('SETUP_GENERATION_BLACKOUT_ENABLED', True)) else 'false'}",
             f"SETUP_GENERATION_BLACKOUT_WINDOWS = {str(summary.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '-')} Melbourne",
-            f"AUTOTRADE_MAX_POSITION_HOURS_ENABLED = {'true' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_MAX_POSITION_HOURS = {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 8.0)):.2f}",
+            f"AUTOTRADE_MAX_POSITION_HOURS_ENABLED = {'true' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False)) else 'false'}",
+            f"AUTOTRADE_MAX_POSITION_HOURS = {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 18.0)):.2f}",
             f"AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = {'true' if bool(summary.get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)) else 'false'}",
             f"AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK = {'true' if bool(summary.get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)) else 'false'}",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
+            f"AUTOTRADE_ENTRY_ENABLED = {'true' if bool(summary.get('AUTOTRADE_ENTRY_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
             f"AUTOTRADE_MAX_TRADES_PER_DAY = {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0))} (default 50; env can allow 0=unlimited)",
             f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
@@ -39008,7 +39212,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_HOUR 9",
-            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE 45",
+            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE 55",
+            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP true",
             "• /autotrade_config BLACKOUT_WINDOWS 10:00-10:45   (sets both setup + autotrade blackout)",
             "• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS 10:00-10:45",
             "• /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-10:45",
@@ -39017,10 +39222,13 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 12",
             "• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true",
             "• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK true",
-            "• Strict TP/SL lifecycle is ON, with owner-approved time exits: scheduled ASIA flat and max-hold guardian.",
+            "• Strict TP/SL lifecycle is ON. Scheduled ASIA flat is ON by default; max-hold is optional and controlled by AUTOTRADE_MAX_POSITION_HOURS_ENABLED.",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
             "• /autotrade_config AUTOTRADE_MODE live",
+            "• /autotrade_on   (enable new AutoTrade entries)",
+            "• /autotrade_off  (pause new AutoTrade entries; reports/guardian remain active)",
+            "• /autotrade_config AUTOTRADE_ENTRY_ENABLED true",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (default; env can allow 0=unlimited)",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0",
@@ -39044,16 +39252,17 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     value_raw = " ".join(context.args[1:]).strip()
     if key not in {
         'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT',
-        'AUTOTRADE_MODE', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED',
+        'AUTOTRADE_MODE', 'AUTOTRADE_ENTRY_ENABLED', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED',
         'AUTOTRADE_DYNAMIC_RISK_ENABLED', 'AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 'AUTOTRADE_DYNAMIC_RISK_MAX_MULT',
         'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE',
         'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', 'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT',
-        'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE',
+        'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP', 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED',
         'BLACKOUT_ENABLED', 'BLACKOUT_WINDOWS',
         'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS',
         'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS',
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS',
         'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY',
+        'AUTOTRADE_STRICT_TPSL_ONLY', 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL',
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED'
     }:
@@ -39100,6 +39309,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE':
             val = max(0, min(59, int(float(value_raw))))
             _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY, val)
+        elif key in {'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP', 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED'}:
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY, 1 if val else 0)
         elif key == 'BLACKOUT_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1 if val else 0)
@@ -39144,6 +39356,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             if val not in {'paper', 'live'}:
                 raise ValueError('mode must be paper or live')
             _autotrade_config_set(AUTOTRADE_CFG_MODE_KEY, val)
+        elif key == 'AUTOTRADE_ENTRY_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_ENABLED_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_MAX_OPEN_TRADES':
             # 0 = unlimited in keep-all forward-test mode; risk caps and exchange safety still apply.
             val = max(0, int(float(value_raw)))
@@ -39165,12 +39380,26 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_ISOLATED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_ISOLATED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_STRICT_TPSL_ONLY':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['AUTOTRADE_STRICT_TPSL_ONLY'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY, 1 if val else 0)
         elif key == 'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED'] = bool(val)
@@ -39187,6 +39416,34 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 
     summary = _autotrade_runtime_summary_dict()
     await update.message.reply_text(f"✅ Updated {key}. Current value: {summary.get(key)}")
+
+
+async def autotrade_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner/admin: enable NEW AutoTrade entries without changing reports/guardian."""
+    uid = int(update.effective_user.id)
+    if int(uid) != int(AUTOTRADE_OWNER_UID or 0) and not is_admin_user(uid):
+        await update.message.reply_text("⛔ Owner/admin only.")
+        return
+    _autotrade_config_set(AUTOTRADE_CFG_ENTRY_ENABLED_KEY, 1)
+    try:
+        cache_delete(f'autotrade_day_metrics_fast:{int(AUTOTRADE_OWNER_UID or uid)}')
+    except Exception:
+        pass
+    await update.message.reply_text("✅ AutoTrade entries: ON. New emailed/executable setups can be opened by AutoTrade.")
+
+
+async def autotrade_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner/admin: pause NEW AutoTrade entries without disabling reports/guardian."""
+    uid = int(update.effective_user.id)
+    if int(uid) != int(AUTOTRADE_OWNER_UID or 0) and not is_admin_user(uid):
+        await update.message.reply_text("⛔ Owner/admin only.")
+        return
+    _autotrade_config_set(AUTOTRADE_CFG_ENTRY_ENABLED_KEY, 0)
+    try:
+        cache_delete(f'autotrade_day_metrics_fast:{int(AUTOTRADE_OWNER_UID or uid)}')
+    except Exception:
+        pass
+    await update.message.reply_text("⏸️ AutoTrade entries: OFF. Existing positions, TP/SL guardian, reports and manual flat/fix commands remain available.")
 
 
 async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -42591,7 +42848,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
             volm = float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0) / 1e6
         except Exception:
             volm = 0.0
-        combo_key = _setup_combo_strategy_key(family_code, sess_row, r)
+        combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
         table_rows.append([ttxt, sym, side, combo_key, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n + nohit_n
@@ -42643,6 +42900,8 @@ def _setup_combo_policy_migrate() -> None:
                 horizon_hours INTEGER NOT NULL,
                 family TEXT NOT NULL,
                 session TEXT NOT NULL,
+                strategy TEXT NOT NULL DEFAULT 'NOR',
+                side TEXT NOT NULL DEFAULT 'BOTH',
                 combo TEXT NOT NULL,
                 setups INTEGER NOT NULL DEFAULT 0,
                 decided INTEGER NOT NULL DEFAULT 0,
@@ -42659,8 +42918,62 @@ def _setup_combo_policy_migrate() -> None:
                 action TEXT NOT NULL DEFAULT 'WATCH',
                 enabled_next INTEGER NOT NULL DEFAULT 1,
                 notes TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY(run_id, user_id, family, session)
+                PRIMARY KEY(run_id, user_id, combo)
             )""")
+            # yver59: old DBs used PRIMARY KEY(run_id,user_id,family,session), which
+            # silently overwrote NOR/REV rows and would also overwrite BUY/SELL rows.
+            # Rebuild once to make `combo` the persistence key.
+            try:
+                info = cur.execute("PRAGMA table_info(setup_combo_scores)").fetchall()
+                cols = [r[1] for r in info]
+                pk_cols = [r[1] for r in sorted([r for r in info if int(r[5] or 0) > 0], key=lambda x: int(x[5]))]
+                needs_rebuild = ('strategy' not in cols) or ('side' not in cols) or ('combo' not in pk_cols)
+                if needs_rebuild:
+                    legacy = 'setup_combo_scores_legacy_v59'
+                    cur.execute("DROP TABLE IF EXISTS setup_combo_scores_legacy_v59")
+                    cur.execute("ALTER TABLE setup_combo_scores RENAME TO setup_combo_scores_legacy_v59")
+                    cur.execute("""CREATE TABLE setup_combo_scores (
+                        run_id TEXT NOT NULL,
+                        user_id INTEGER NOT NULL DEFAULT 0,
+                        evaluated_ts REAL NOT NULL,
+                        window_hours INTEGER NOT NULL,
+                        horizon_hours INTEGER NOT NULL,
+                        family TEXT NOT NULL,
+                        session TEXT NOT NULL,
+                        strategy TEXT NOT NULL DEFAULT 'NOR',
+                        side TEXT NOT NULL DEFAULT 'BOTH',
+                        combo TEXT NOT NULL,
+                        setups INTEGER NOT NULL DEFAULT 0,
+                        decided INTEGER NOT NULL DEFAULT 0,
+                        tp INTEGER NOT NULL DEFAULT 0,
+                        sl INTEGER NOT NULL DEFAULT 0,
+                        nohit INTEGER NOT NULL DEFAULT 0,
+                        open INTEGER NOT NULL DEFAULT 0,
+                        win_rate REAL NOT NULL DEFAULT 0,
+                        avg_r REAL NOT NULL DEFAULT 0,
+                        avg_conf REAL NOT NULL DEFAULT 0,
+                        avg_quality REAL NOT NULL DEFAULT 0,
+                        avg_volume_m REAL NOT NULL DEFAULT 0,
+                        score REAL NOT NULL DEFAULT 0,
+                        action TEXT NOT NULL DEFAULT 'WATCH',
+                        enabled_next INTEGER NOT NULL DEFAULT 1,
+                        notes TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY(run_id, user_id, combo)
+                    )""")
+                    legacy_cols = [r[1] for r in cur.execute(f"PRAGMA table_info({legacy})").fetchall()]
+                    def _expr(col, default):
+                        return col if col in legacy_cols else default
+                    # Old rows are copied as family-session-strategy aggregate rows. New
+                    # runs will create the full side-specific rows.
+                    strategy_expr = _expr('strategy', "'NOR'")
+                    side_expr = _expr('side', "'BOTH'")
+                    combo_expr = "COALESCE(NULLIF(combo,''), family || '-' || session || '-' || " + strategy_expr + ")" if 'combo' in legacy_cols else "family || '-' || session || '-' || " + strategy_expr
+                    cur.execute(f"""INSERT OR IGNORE INTO setup_combo_scores
+                        (run_id,user_id,evaluated_ts,window_hours,horizon_hours,family,session,strategy,side,combo,setups,decided,tp,sl,nohit,open,win_rate,avg_r,avg_conf,avg_quality,avg_volume_m,score,action,enabled_next,notes)
+                        SELECT run_id,user_id,evaluated_ts,window_hours,horizon_hours,family,session,{strategy_expr},{side_expr},{combo_expr},setups,decided,tp,sl,nohit,open,win_rate,avg_r,avg_conf,avg_quality,avg_volume_m,score,action,enabled_next,notes
+                        FROM {legacy}""")
+            except Exception:
+                pass
             cur.execute("""CREATE TABLE IF NOT EXISTS setup_combo_policy (
                 user_id INTEGER NOT NULL DEFAULT 0,
                 family TEXT NOT NULL,
@@ -42694,6 +43007,8 @@ def _setup_combo_policy_migrate() -> None:
             except Exception:
                 pass
             cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_combo_scores_user_ts ON setup_combo_scores(user_id, evaluated_ts)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_combo_scores_combo ON setup_combo_scores(combo)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_combo_scores_family_session_strategy_side ON setup_combo_scores(family, session, strategy, side)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_combo_policy_user_enabled ON setup_combo_policy(user_id, enabled, status)")
             conn.commit()
     except Exception:
@@ -44247,6 +44562,7 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
         by_combo_side: dict[str, dict] = {}
         by_combo: dict[str, dict] = {}
         by_combo_strategy: dict[str, dict] = {}
+        by_combo_strategy_side: dict[str, dict] = {}
         by_family: dict[str, dict] = {}
         by_session: dict[str, dict] = {}
         by_side: dict[str, dict] = {}
@@ -44269,6 +44585,8 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
                 combo_side = f'{fam}-{sess}-{side}'
                 combo = f'{fam}-{sess}'
                 combo_strategy = _setup_combo_strategy_key(fam, sess, strat)
+                combo_strategy_side = _setup_combo_strategy_side_key(fam, sess, strat, side)
+                _setup_edge_guard_add(by_combo_strategy_side, combo_strategy_side, result, r_mult)
                 _setup_edge_guard_add(by_combo_side, combo_side, result, r_mult)
                 _setup_edge_guard_add(by_combo, combo, result, r_mult)
                 _setup_edge_guard_add(by_combo_strategy, combo_strategy, result, r_mult)
@@ -44337,6 +44655,7 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
             'combo_side_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo_side.items()},
             'combo_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo.items()},
             'combo_strategy_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo_strategy.items()},
+            'combo_strategy_side_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo_strategy_side.items()},
             'family_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_family.items()},
             'session_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_session.items()},
             'side_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_side.items()},
@@ -44709,6 +45028,13 @@ def _setup_combo_adjust_action_for_side_split(st: dict, side_stats: dict, family
         return action, int(enabled_next), notes, float(score), '-'
 
 def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False, policy_kind: str = 'manual') -> dict:
+    """Build the setup edge matrix.
+
+    yver59: scoring rows are Family-Session-Strategy-Side, e.g. F1-ASIA-NOR-BUY.
+    The older family/session policy table remains the coarse scheduled safety layer;
+    side-specific learning is enforced through the micro-edge guard and final quality
+    gate, and is now visible in all matrix/audit/autotrade reports.
+    """
     _setup_combo_policy_migrate()
     hours = max(1, min(8760, int(hours or 168)))
     result_horizon = _setup_audit_result_horizon_hours()
@@ -44716,50 +45042,67 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
     audit_tf = str(os.environ.get('SETUP_COMBO_MATRIX_TIMEFRAME', os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m'))) or '15m').strip().lower() or '15m'
     candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf) if rows else {}
     actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
-    stats: dict[tuple[str, str, str], dict] = {}
-    side_stats: dict[tuple[str, str, str], dict] = {}
+
+    def _new_bucket(fam: str, sess: str, strat: str = 'NOR', side: str = 'BOTH') -> dict:
+        return {'family': fam, 'session': sess, 'strategy': strat, 'side': side, 'setups': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'r_sum': 0.0, 'conf_sum': 0.0, 'quality_sum': 0.0, 'vol_sum': 0.0}
+
+    side_stats: dict[tuple[str, str, str, str], dict] = {}
+    aggregate_stats: dict[tuple[str, str, str], dict] = {}
+    split_stats: dict[tuple[str, str, str], dict] = {}
+
+    # yver60: seed the complete 8 families × 3 sessions × NOR/REV × BUY/SELL
+    # universe before adding evidence. This makes /setup_matrix and /setup_matrix
+    # policy traceable from day zero instead of showing only combos that have fired.
+    try:
+        for fam_u, sess_u, strat_u, side_u, _combo_u in _setup_combo_full_universe():
+            side_stats.setdefault((fam_u, sess_u, strat_u, side_u), _new_bucket(fam_u, sess_u, strat_u, side_u))
+    except Exception:
+        pass
+
     for r in rows:
         try:
             fam = _setup_audit_family_code(r)
             sess = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
             strat = _setup_strategy_suffix(r)
+            side = _setup_side_suffix(value=str(r.get('side') or ''))
+            if side not in {'BUY', 'SELL'}:
+                side = 'BOTH'
             sid = str(r.get('setup_id') or '').strip()
             actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
             ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
             result = _setup_audit_result_label(ev.get('result'))
-            key = (fam, sess, strat)
-            st = stats.setdefault(key, {'family': fam, 'session': sess, 'strategy': strat, 'setups': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'r_sum': 0.0, 'conf_sum': 0.0, 'quality_sum': 0.0, 'vol_sum': 0.0})
-            st['setups'] += 1
-            st['conf_sum'] += float(r.get('conf') or 0.0)
-            st['quality_sum'] += float(r.get('quality_score') or 0.0)
-            st['vol_sum'] += float(r.get('fut_vol_usd') or 0.0) / 1e6
-            side = str(r.get('side') or '').upper().strip() or '-'
-            st_side = side_stats.setdefault((fam, sess, side), {'setups': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'r_sum': 0.0})
-            st_side['setups'] += 1
-            if result == 'TP':
-                st_side['tp'] += 1
-                st_side['r_sum'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
-            elif result == 'SL':
-                st_side['sl'] += 1
-                st_side['r_sum'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
-            elif result == 'NOHIT':
-                st_side['nohit'] += 1
-            else:
-                st_side['open'] += 1
-            if result == 'TP':
-                st['tp'] += 1
-                st['r_sum'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
-            elif result == 'SL':
-                st['sl'] += 1
-                st['r_sum'] += float(_setup_audit_net_r_for_result(r, result) or 0.0)
-            elif result == 'NOHIT':
-                st['nohit'] += 1
-            else:
-                st['open'] += 1
+            r_mult = float(_setup_audit_net_r_for_result(r, result) or 0.0) if result in {'TP', 'SL'} else 0.0
+            conf = float(r.get('conf') or 0.0)
+            quality = float(r.get('quality_score') or 0.0)
+            vol_m = float(r.get('fut_vol_usd') or 0.0) / 1e6
+            for key, bucket in (
+                ((fam, sess, strat, side), side_stats.setdefault((fam, sess, strat, side), _new_bucket(fam, sess, strat, side))),
+                ((fam, sess, strat), aggregate_stats.setdefault((fam, sess, strat), _new_bucket(fam, sess, strat, 'BOTH'))),
+                ((fam, sess, side), split_stats.setdefault((fam, sess, side), {'setups': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'r_sum': 0.0})),
+            ):
+                bucket['setups'] += 1
+                if 'conf_sum' in bucket:
+                    bucket['conf_sum'] += conf
+                    bucket['quality_sum'] += quality
+                    bucket['vol_sum'] += vol_m
+                if result == 'TP':
+                    bucket['tp'] += 1
+                    bucket['r_sum'] += r_mult
+                elif result == 'SL':
+                    bucket['sl'] += 1
+                    bucket['r_sum'] += r_mult
+                elif result == 'NOHIT':
+                    bucket['nohit'] += 1
+                else:
+                    bucket['open'] += 1
         except Exception:
             continue
-    out_rows = []
-    for (_fam, _sess, _strat), st in stats.items():
+
+    def _finalise_bucket(st: dict, *, side_specific: bool = True) -> dict:
+        _fam = str(st.get('family') or 'F0').upper().strip() or 'F0'
+        _sess = str(st.get('session') or '-').upper().strip() or '-'
+        _strat = _setup_strategy_suffix(value=str(st.get('strategy') or 'NOR'))
+        _side = _setup_side_suffix(value=str(st.get('side') or 'BOTH'))
         total = int(st.get('setups') or 0)
         decided = int(st.get('tp') or 0) + int(st.get('sl') or 0) + int(st.get('nohit') or 0)
         tp = int(st.get('tp') or 0)
@@ -44773,17 +45116,26 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
         avg_vol_m = float(st.get('vol_sum') or 0.0) / max(1, total)
         tmp = {'setups': total, 'decided': decided, 'tp': tp, 'sl': sl, 'nohit': nohit, 'open': op, 'wr': wr, 'avg_r': avg_r}
         action, enabled_next, notes, score = _setup_combo_action_for_stats(tmp, hours)
-        action, enabled_next, notes, score, guard_txt = _setup_combo_adjust_action_for_side_split(st, side_stats, _fam, _sess, action, enabled_next, notes, score)
-        strategy_rec = str(_strat or _setup_strategy_for_combo_metrics(total, decided, tp, sl, wr, avg_r, action, enabled_next)).upper().strip()
-        out_rows.append({
-            'family': _fam, 'session': _sess, 'strategy': strategy_rec, 'combo': _setup_combo_strategy_key(_fam, _sess, strategy_rec), 'setups': total, 'decided': decided,
-            'tp': tp, 'sl': sl, 'nohit': nohit, 'open': op, 'win_rate': wr, 'avg_r': avg_r,
-            'avg_conf': avg_conf, 'avg_quality': avg_quality, 'avg_volume_m': avg_vol_m,
-            'score': score, 'action': action, 'enabled_next': int(enabled_next), 'notes': notes,
-            'guard': guard_txt,
-            'strategy': strategy_rec,
-        })
+        guard_txt = '-'
+        if not side_specific:
+            try:
+                action, enabled_next, notes, score, guard_txt = _setup_combo_adjust_action_for_side_split(st, split_stats, _fam, _sess, action, enabled_next, notes, score)
+            except Exception:
+                guard_txt = '-'
+        combo_key = _setup_combo_strategy_side_key(_fam, _sess, _strat, _side) if side_specific else _setup_combo_strategy_key(_fam, _sess, _strat)
+        return {
+            'family': _fam, 'session': _sess, 'strategy': _strat, 'side': _side, 'combo': combo_key,
+            'setups': total, 'decided': decided, 'tp': tp, 'sl': sl, 'nohit': nohit, 'open': op,
+            'win_rate': wr, 'avg_r': avg_r, 'avg_conf': avg_conf, 'avg_quality': avg_quality, 'avg_volume_m': avg_vol_m,
+            'score': score, 'action': action, 'enabled_next': int(enabled_next), 'notes': notes, 'guard': guard_txt,
+        }
+
+    out_rows = [_finalise_bucket(st, side_specific=True) for st in side_stats.values()]
+    # Coarse aggregate rows are used only for the older scheduled policy table and bridge.
+    policy_rows = [_finalise_bucket(st, side_specific=False) for st in aggregate_stats.values()]
     out_rows.sort(key=lambda x: (int(x.get('enabled_next') or 0), float(x.get('score') or 0.0), float(x.get('win_rate') or 0.0), int(x.get('decided') or 0)), reverse=True)
+    policy_rows.sort(key=lambda x: (int(x.get('enabled_next') or 0), float(x.get('score') or 0.0), float(x.get('win_rate') or 0.0), int(x.get('decided') or 0)), reverse=True)
+
     run_id = 'SCM-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
     policy_window_ok = int(hours or 0) >= int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)
     policy_update_ok = bool(persist and allow_policy_update and policy_window_ok)
@@ -44795,31 +45147,38 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
                 cur = conn.cursor()
                 for d in out_rows:
                     row_tuple = (
-                        run_id, int(uid), now_ts, int(hours), int(result_horizon), d['family'], d['session'], d['combo'],
+                        run_id, int(uid), now_ts, int(hours), int(result_horizon), d['family'], d['session'], d.get('strategy') or 'NOR', d.get('side') or 'BOTH', d['combo'],
                         int(d['setups']), int(d['decided']), int(d['tp']), int(d['sl']), int(d['nohit']), int(d['open']),
                         float(d['win_rate']), float(d['avg_r']), float(d['avg_conf']), float(d['avg_quality']), float(d['avg_volume_m']),
                         float(d['score']), str(d['action']), int(d['enabled_next']), str(d['notes'])[:500],
                     )
                     cur.execute("""INSERT OR REPLACE INTO setup_combo_scores
-                        (run_id, user_id, evaluated_ts, window_hours, horizon_hours, family, session, combo, setups, decided, tp, sl, nohit, open,
+                        (run_id, user_id, evaluated_ts, window_hours, horizon_hours, family, session, strategy, side, combo, setups, decided, tp, sl, nohit, open,
                          win_rate, avg_r, avg_conf, avg_quality, avg_volume_m, score, action, enabled_next, notes)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", row_tuple)
-                    # Save both owner-scoped and global policy only from a weekly-or-longer window.
-                    # Short windows such as /setup_matrix 24 are diagnostics and must not
-                    # promote/demote live combinations.
-                    if policy_update_ok:
-                        kind_s = 'scheduled' if str(policy_kind or '').lower().strip() == 'scheduled' else 'manual'
-                        scheduled_for_ts = float(now_ts) if kind_s == 'scheduled' else 0.0
-                        expires_ts = float(now_ts) + max(1.0, float(SETUP_COMBO_POLICY_EXPIRY_HOURS or 168.0)) * 3600.0 if kind_s == 'scheduled' else 0.0
-                        policy_tz = str(SETUP_COMBO_POLICY_REVIEW_TZ or 'Australia/Melbourne')
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", row_tuple)
+                if policy_update_ok:
+                    # setup_combo_policy is intentionally still family/session coarse.
+                    # When multiple strategy rows exist, choose the most conservative
+                    # live action for that family/session so weak lanes cannot be hidden.
+                    action_rank = {'DISABLE': 0, 'WATCH': 1, 'KEEP': 2}
+                    by_fs = {}
+                    for d in policy_rows:
+                        fs = (d['family'], d['session'])
+                        old = by_fs.get(fs)
+                        if old is None or action_rank.get(str(d.get('action') or 'WATCH').upper(), 1) < action_rank.get(str(old.get('action') or 'WATCH').upper(), 1):
+                            by_fs[fs] = d
+                    kind_s = 'scheduled' if str(policy_kind or '').lower().strip() == 'scheduled' else 'manual'
+                    scheduled_for_ts = float(now_ts) if kind_s == 'scheduled' else 0.0
+                    expires_ts = float(now_ts) + max(1.0, float(SETUP_COMBO_POLICY_EXPIRY_HOURS or 168.0)) * 3600.0 if kind_s == 'scheduled' else 0.0
+                    policy_tz = str(SETUP_COMBO_POLICY_REVIEW_TZ or 'Australia/Melbourne')
+                    for d in by_fs.values():
                         for pol_uid in list(dict.fromkeys([int(uid), 0])):
                             cur.execute("""INSERT OR REPLACE INTO setup_combo_policy
                                 (user_id, family, session, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
                                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                 (int(pol_uid), d['family'], d['session'], str(d['action']), int(d['enabled_next']), float(d['score']), float(d['win_rate']), float(d['avg_r']), int(d['setups']), int(d['decided']), run_id, now_ts, str(d['notes'])[:500], kind_s, scheduled_for_ts, expires_ts, policy_tz))
-                conn.commit()
-                if policy_update_ok:
                     policy_updated = True
+                conn.commit()
             _SETUP_COMBO_POLICY_CACHE['ts'] = 0.0
         except Exception as exc:
             try:
@@ -44829,15 +45188,14 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
     bridge_report = {}
     try:
         if bool(globals().get('SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED', True)):
+            bridge_input = list(policy_rows or out_rows)
             if bool(policy_updated):
-                bridge_report = _setup_combo_apply_adaptive_parameter_bridge(int(uid), list(out_rows), str(policy_kind or 'scheduled'), int(hours), str(run_id))
+                bridge_report = _setup_combo_apply_adaptive_parameter_bridge(int(uid), bridge_input, str(policy_kind or 'scheduled'), int(hours), str(run_id))
             else:
-                # Manual /setup_matrix must not update policy, but it must still show/sync
-                # the active policy into optimizer/adaptive runtime config and /optimize_report.
-                bridge_report = _setup_combo_sync_active_policy_bridge(int(uid), list(out_rows), str(run_id), int(hours), 'matrix_view')
+                bridge_report = _setup_combo_sync_active_policy_bridge(int(uid), bridge_input, str(run_id), int(hours), 'matrix_view')
     except Exception:
         bridge_report = {}
-    return {'run_id': run_id, 'rows': out_rows, 'source_rows': len(rows), 'window_hours': hours, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_updated': bool(policy_updated), 'policy_update_allowed': bool(allow_policy_update), 'policy_kind': str(policy_kind or 'manual'), 'bridge_report': bridge_report, 'last_policy': _setup_combo_latest_policy_update_info(int(uid))}
+    return {'run_id': run_id, 'rows': out_rows, 'policy_rows': policy_rows, 'source_rows': len(rows), 'window_hours': hours, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_updated': bool(policy_updated), 'policy_update_allowed': bool(allow_policy_update), 'policy_kind': str(policy_kind or 'manual'), 'bridge_report': bridge_report, 'last_policy': _setup_combo_latest_policy_update_info(int(uid))}
 
 
 def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False) -> str:
@@ -44888,7 +45246,7 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | WATCH gate=<b>{'STRICT' if SETUP_COMBO_WATCH_STRICT_QUALITY_GATE else ('BLOCK' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OPEN')}</b>",
         html.escape(_setup_edge_guard_snapshot_text(int(uid))),
         f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> (temporary severe-disable only).",
-        "Manual <code>/setup_matrix</code> rows are advisory. <b>Combo</b> is Family-Session-Strategy (NOR/REV); <b>Adv</b> is what this selected window recommends; <b>Live</b> is the currently enforced scheduled/interim/daily-safety state used by executable queue + emails + AutoTrade + optimizer bridge.",
+        "Manual <code>/setup_matrix</code> rows are advisory. <b>Combo</b> is Family-Session-Strategy-Side (NOR/REV + BUY/SELL); <b>Adv</b> is what this selected window recommends; <b>Live</b> is the currently enforced scheduled/interim/daily-safety state used by executable queue + emails + AutoTrade + optimizer bridge.",
     ]
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -45155,24 +45513,12 @@ def _setup_combo_policy_view_maybe_auto_safety(uid: int) -> dict:
 
 
 def _setup_combo_policy_text(uid: int) -> str:
-    """Human policy view.
-
-    Ver09: after /admin_reset_test_data the saved policy table can contain only the
-    disabled safety rows, which made /setup_matrix policy look like there were no
-    active combinations.  This view now shows the full configured family/session
-    universe and overlays:
-      - full combo policy (ON/OFF)
-      - side-level micro guard (BUY/SELL/PARTIAL)
-      - latest advisory stats when available
-    """
     try:
-        _setup_combo_policy_migrate()
         owner_uid = int(uid or 0)
         if owner_uid <= 0:
             owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
-        # Ver23: reconcile stale WATCH policy with fresh profit-first safety evidence
-        # before rendering the policy view. Cooldown-limited and temporary-only.
         _setup_combo_policy_view_maybe_auto_safety(int(owner_uid))
+        _setup_combo_policy_migrate()
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
@@ -45181,27 +45527,8 @@ def _setup_combo_policy_text(uid: int) -> str:
                 (int(owner_uid),)
             ).fetchall() or []]
         if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            # Ignore only legacy policy rows from before the clean-start marker;
-            # fresh daily/intraday safety rows remain visible and enforceable.
             rows = [r for r in rows if not _setup_policy_row_is_clean_start_legacy(r)]
-        if not rows and not bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            # After /admin_reset_test_data the historical policy table is intentionally
-            # cleared. Re-seed configured safety overrides so live policy visibility is
-            # not lost during a clean forward test.
-            try:
-                _setup_combo_seed_interim_disable_policy()
-                with sqlite3.connect(DB_PATH) as conn2:
-                    conn2.row_factory = sqlite3.Row
-                    cur2 = conn2.cursor()
-                    rows = [dict(r) for r in cur2.execute(
-                        "SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session",
-                        (int(owner_uid),)
-                    ).fetchall() or []]
-            except Exception:
-                rows = []
 
-        # Latest advisory matrix rows are optional. They provide live stats but are not
-        # required to know which combos are currently active/disabled.
         latest_scores = {}
         try:
             with sqlite3.connect(DB_PATH) as conn3:
@@ -45216,20 +45543,19 @@ def _setup_combo_policy_text(uid: int) -> str:
                 if latest and latest['run_id']:
                     for sr in cur3.execute("SELECT * FROM setup_combo_scores WHERE run_id=?", (latest['run_id'],)).fetchall() or []:
                         d = dict(sr)
-                        combo = str(d.get('combo') or f"{d.get('family','')}-{d.get('session','')}").upper().strip()
+                        combo = str(d.get('combo') or f"{d.get('family','')}-{d.get('session','')}-{d.get('strategy','NOR')}-{d.get('side','BOTH')}").upper().strip()
                         base_combo = f"{str(d.get('family','')).upper().strip()}-{str(d.get('session','')).upper().strip()}"
+                        strat_combo = _setup_combo_strategy_key(str(d.get('family','')).upper().strip(), str(d.get('session','')).upper().strip(), str(d.get('strategy') or 'NOR'))
                         if combo:
                             latest_scores[combo] = d
+                        if strat_combo:
+                            latest_scores.setdefault(strat_combo, d)
                         if base_combo and base_combo != '-':
                             latest_scores.setdefault(base_combo, d)
         except Exception:
             latest_scores = {}
 
-        # Active policy rows by combo, respecting expiry and owner/global precedence.
         policy_by_combo = _setup_combo_enforceable_policy_lookup(int(owner_uid))
-
-        # Build the configured universe. Include F1-F8 by default so the admin can see
-        # what is active even when there is no fresh setup data after a reset.
         families = set()
         sessions = set()
         try:
@@ -45262,29 +45588,26 @@ def _setup_combo_policy_text(uid: int) -> str:
             pass
         if not sessions:
             sessions.update(['ASIA', 'LON', 'NY'])
-        # Preferred display order.
         sess_order = ['ASIA', 'LON', 'NY']
         for c in list(policy_by_combo.keys()) + list(latest_scores.keys()):
             try:
                 parts = str(c or '').upper().split('-')
                 if len(parts) >= 2:
-                    families.add(parts[0])
-                    sessions.add(parts[1])
+                    families.add(parts[0]); sessions.add(parts[1])
             except Exception:
                 pass
 
-        # Side-level micro guard overlay.
         try:
             guard_data = _setup_edge_guard_build(int(owner_uid), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
             side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_side_block') or {}).keys())
         except Exception:
             side_blocks = set()
+
         rows_by_combo = {}
         for r in rows:
             try:
                 combo = f"{str(r.get('family') or '').upper().strip()}-{str(r.get('session') or '').upper().strip()}"
                 if combo and combo != '-':
-                    # Prefer owner row over global row.
                     old = rows_by_combo.get(combo)
                     if old is None or (int(r.get('user_id') or 0) != 0 and int(old.get('user_id') or 0) == 0):
                         rows_by_combo[combo] = dict(r)
@@ -45293,85 +45616,60 @@ def _setup_combo_policy_text(uid: int) -> str:
 
         table_rows = []
         active_count = partial_count = disabled_count = 0
-        for fam in sorted(families, key=lambda x: (int(x[1:]) if re.fullmatch(r'F\d+', x) else 99, x)):
-            for sess in sorted(sessions, key=lambda x: (sess_order.index(x) if x in sess_order else 99, x)):
-                combo = f'{fam}-{sess}'
-                pol = dict(policy_by_combo.get(combo) or {})
-                raw_pol = dict(rows_by_combo.get(combo) or {})
-                score = dict(latest_scores.get(combo) or {})
+        for fam, sess, strat, side, full_combo in _setup_combo_full_universe(families, sessions):
+            base_combo = f'{fam}-{sess}'
+            strat_combo = _setup_combo_strategy_key(fam, sess, strat)
+            pol = dict(policy_by_combo.get(strat_combo) or policy_by_combo.get(base_combo) or {})
+            raw_pol = dict(rows_by_combo.get(base_combo) or {})
+            score = dict(latest_scores.get(full_combo) or latest_scores.get(strat_combo) or latest_scores.get(base_combo) or {})
 
+            full_disabled = False
+            if pol:
+                st = str(pol.get('status') or '').upper().strip()
+                full_disabled = st in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or int(pol.get('enabled') or 0) == 0
+            elif raw_pol:
                 full_disabled = False
-                if pol:
-                    st = str(pol.get('status') or '').upper().strip()
-                    full_disabled = st in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or int(pol.get('enabled') or 0) == 0
-                elif raw_pol:
-                    # Non-enforceable/expired rows are shown as historical only; they do
-                    # not disable execution.
-                    full_disabled = False
 
-                buy_block = f'{combo}-BUY' in side_blocks
-                sell_block = f'{combo}-SELL' in side_blocks
-                if full_disabled or (buy_block and sell_block):
-                    exec_state = 'OFF'
-                    live_state = 'DISABLE'
-                    disabled_count += 1
-                elif buy_block or sell_block:
-                    exec_state = 'PART'
-                    live_state = 'TIGHTEN'
-                    partial_count += 1
+            side_block = (f'{strat_combo}-{side}' in side_blocks) or (f'{base_combo}-{side}' in side_blocks)
+            if full_disabled:
+                exec_state = 'OFF'; live_state = 'DISABLE'; disabled_count += 1
+            elif side_block:
+                exec_state = 'PART'; live_state = 'TIGHTEN'; partial_count += 1
+            else:
+                pol_status = str((pol or raw_pol or {}).get('status') or '').upper().strip()
+                adv_status = str(score.get('action') or '').upper().strip()
+                if pol_status == 'KEEP' or (not pol and adv_status == 'KEEP'):
+                    exec_state = 'KEEP'; live_state = 'KEEP' if pol_status == 'KEEP' else 'WATCH'
+                elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
+                    exec_state = 'GATE'; live_state = 'WATCH'
                 else:
-                    # Ver33 display sync: WATCH is not automatically executable.
-                    # With the strict gate enabled, it is a probation lane and only
-                    # passes when the per-setup final quality gate succeeds.
-                    pol_status = str((pol or raw_pol or {}).get('status') or '').upper().strip()
-                    adv_status = str(score.get('action') or '').upper().strip()
-                    if pol_status == 'KEEP' or (not pol and adv_status == 'KEEP'):
-                        exec_state = 'KEEP'
-                        live_state = 'KEEP' if pol_status == 'KEEP' else 'WATCH'
-                    elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
-                        exec_state = 'GATE'
-                        live_state = 'WATCH'
-                    else:
-                        exec_state = 'ON'
-                        live_state = 'WATCH'
-                    active_count += 1
+                    exec_state = 'ON'; live_state = 'WATCH'
+                active_count += 1
 
-                if buy_block and sell_block:
-                    side_txt = 'BUY/SELL'
-                elif buy_block:
-                    side_txt = 'BUY'
-                elif sell_block:
-                    side_txt = 'SELL'
-                else:
-                    side_txt = '-'
+            set_v = int(score.get('setups') if score.get('setups') is not None else (pol.get('last_setups') or raw_pol.get('last_setups') or 0))
+            dec_v = int(score.get('decided') if score.get('decided') is not None else (pol.get('last_decided') or raw_pol.get('last_decided') or 0))
+            wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
+            avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
+            adv = str(score.get('action') or '-').upper().strip() or '-'
+            kind_src = pol.get('policy_kind') or raw_pol.get('policy_kind') or '-'
+            kind_txt = _setup_combo_policy_kind_label(kind_src, short=True) if kind_src and kind_src != '-' else '-'
+            if not pol and raw_pol and float(raw_pol.get('expires_ts') or 0.0) > 0:
+                kind_txt = 'expired'
+            table_rows.append([full_combo, exec_state, live_state, 'YES' if side_block else '-', set_v, dec_v, f'{wr_v:.1f}%', f'{avg_v:+.2f}', adv, kind_txt])
 
-                set_v = int(score.get('setups') if score.get('setups') is not None else (pol.get('last_setups') or raw_pol.get('last_setups') or 0))
-                dec_v = int(score.get('decided') if score.get('decided') is not None else (pol.get('last_decided') or raw_pol.get('last_decided') or 0))
-                wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
-                avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
-                adv = str(score.get('action') or '-').upper().strip() or '-'
-                kind_src = pol.get('policy_kind') or raw_pol.get('policy_kind') or '-'
-                kind_txt = _setup_combo_policy_kind_label(kind_src, short=True) if kind_src and kind_src != '-' else '-'
-                if not pol and raw_pol and float(raw_pol.get('expires_ts') or 0.0) > 0:
-                    kind_txt = 'expired'
-                strat_txt = _setup_strategy_for_combo_metrics(set_v, dec_v, int(score.get('tp') or 0), int(score.get('sl') or 0), wr_v, avg_v, live_state, 0 if exec_state == 'OFF' else 1)
-                combo_display = _setup_combo_strategy_key(fam, sess, strat_txt)
-                table_rows.append([
-                    combo_display, exec_state, live_state, side_txt,
-                    set_v, dec_v, f'{wr_v:.1f}%', f'{avg_v:+.2f}', adv, kind_txt,
-                ])
-
-        # Show disabled/tightened rows first, then active rows by family/session. This makes
-        # the safety state obvious while still showing every currently available combo.
         order_rank = {'OFF': 0, 'PART': 1, 'GATE': 2, 'KEEP': 3, 'ON': 4}
         def _row_key(row):
             combo = str(row[0])
             parts = combo.split('-')
             fam = parts[0] if parts else combo
             sess = parts[1] if len(parts) > 1 else ''
+            strat = parts[2] if len(parts) > 2 else 'NOR'
+            side = parts[3] if len(parts) > 3 else 'BUY'
             fam_n = int(fam[1:]) if re.fullmatch(r'F\d+', fam) else 99
             sess_n = sess_order.index(sess) if sess in sess_order else 99
-            return (order_rank.get(str(row[1]), 9), fam_n, sess_n, combo)
+            strat_n = 0 if strat == 'NOR' else 1
+            side_n = 0 if side == 'BUY' else 1
+            return (order_rank.get(str(row[1]), 9), fam_n, sess_n, strat_n, side_n, combo)
         table_rows = sorted(table_rows, key=_row_key)
         table = tabulate(table_rows, headers=['Combo','Exec','Live','SideBlock','Set','Dec','WR','AvgR','Adv','Kind'], tablefmt='plain')
 
@@ -45380,7 +45678,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy (e.g. F8-NY-REV), <b>KEEP</b>=preferred executable combo, <b>GATE</b>=WATCH/probation and not executable unless Conf≥{int(globals().get('SETUP_FINAL_MIN_CONF', 87) or 87)}/Dyn≥{float(globals().get('SETUP_FINAL_MIN_DYNAMIC_SCORE', 70) or 70):.0f} OR Conf≥{int(globals().get('SETUP_FINAL_ADAPTIVE_MIN_CONF', 85) or 85)}/Dyn≥{float(globals().get('SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE', 80) or 80):.0f} OR scout Conf≥{int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)}/Dyn≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 84) or 84):.0f}/RR≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.4) or 1.4):.1f}/Vol≥{float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 15000000) or 15000000)/1_000_000:.0f}M, no weak combo/symbol/hour and valid Risk/SL/TP, <b>PART</b>=one side blocked, <b>OFF</b>=fully disabled."
+            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL), <b>KEEP</b>=preferred executable lane, <b>GATE</b>=WATCH/probation and not executable unless the final quality gate passes, <b>PART</b>=this side is tightened/blocked by micro-edge evidence, <b>OFF</b>=disabled by the coarse family/session policy."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
@@ -45390,7 +45688,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
             f"{guard_txt}\n{note}\n"
-            f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, the micro edge guard, the final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes strategy, so F8-NY-NOR and F8-NY-REV are reviewed separately in reports.\n"
+            f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, the micro edge guard, the final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity now includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately in reports.\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -45661,17 +45959,22 @@ def _setup_audit_overall_text(uid: int) -> str:
     """Overall family-level setup audit summary across all stored setup rows."""
     rows = _setup_audit_load_rows(int(uid), hours=None, limit=0, dedup=True)
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
-    if not rows:
-        return f"📊 <b>Setup Audit Overall</b>\n{HDR}\nNo unique setup rows found above ${min_vol_m:.0f}M volume."
-
+    # yver60: keep reporting the full Family-Session-NOR/REV-BUY/SELL universe
+    # even when no setup has fired yet; zeros are useful for clean forward tests.
     result_horizon = _setup_audit_result_horizon_hours()
     audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
     # Overall is the command where stale OPEN counts were most wrong. Force grouped
     # historical candles by symbol so old setups are checked against their real
     # post-setup path instead of the current ticker only.
     candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
-    fam_stats: dict[tuple[str, str], dict] = {}
+    fam_stats: dict[tuple[str, str, str, str], dict] = {}
     fam_codes_seen: set[str] = set()
+    try:
+        for fam_u, sess_u, strat_u, side_u, _combo_u in _setup_combo_full_universe():
+            fam_codes_seen.add(fam_u)
+            fam_stats.setdefault((fam_u, sess_u, strat_u, side_u), {'family': fam_u, 'session': sess_u, 'strategy': strat_u, 'side': side_u, 'total': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0})
+    except Exception:
+        pass
     for r in rows:
         fam = _setup_audit_family_code(r)
         fam_codes_seen.add(fam)
@@ -45680,7 +45983,8 @@ def _setup_audit_overall_text(uid: int) -> str:
         ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=0.0)
         result = _setup_audit_result_label(ev.get('result'))
         strat = _setup_strategy_short_label(r)
-        item = fam_stats.setdefault((fam, sess_row, strat), {'family': fam, 'session': sess_row, 'strategy': strat, 'total': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0})
+        side_row = _setup_side_suffix(value=str(r.get('side') or ''))
+        item = fam_stats.setdefault((fam, sess_row, strat, side_row), {'family': fam, 'session': sess_row, 'strategy': strat, 'side': side_row, 'total': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0})
         item['total'] += 1
         item['tp'] += 1 if result == 'TP' else 0
         item['sl'] += 1 if result == 'SL' else 0
@@ -45689,10 +45993,11 @@ def _setup_audit_overall_text(uid: int) -> str:
 
     table_rows = []
     total_setups = total_tp = total_sl = total_nohit = total_open = 0
-    for (_fam_key, _sess_key, _strat_key), st in sorted(fam_stats.items(), key=lambda kv: (int(kv[1].get('total') or 0), str(kv[1].get('family') or ''), str(kv[1].get('session') or ''), str(kv[1].get('strategy') or '')), reverse=True):
+    for (_fam_key, _sess_key, _strat_key, _side_key), st in sorted(fam_stats.items(), key=lambda kv: (int(str(kv[1].get('family') or 'F99')[1:]) if re.fullmatch(r'F\d+', str(kv[1].get('family') or '')) else 99, ['ASIA','LON','NY'].index(str(kv[1].get('session') or '').upper()) if str(kv[1].get('session') or '').upper() in ['ASIA','LON','NY'] else 99, 0 if str(kv[1].get('strategy') or 'NOR').upper() == 'NOR' else 1, 0 if str(kv[1].get('side') or 'BUY').upper() == 'BUY' else 1)):
         fam = str(st.get('family') or _fam_key or '-')
         sess_row = str(st.get('session') or _sess_key or '-')
         strat_row = str(st.get('strategy') or _strat_key or '-')
+        side_row = str(st.get('side') or _side_key or 'BOTH')
         total = int(st.get('total') or 0)
         tp = int(st.get('tp') or 0)
         sl = int(st.get('sl') or 0)
@@ -45705,7 +46010,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         total_sl += sl
         total_nohit += nohit
         total_open += op
-        combo_key = _setup_combo_strategy_key(fam, sess_row, strat_row)
+        combo_key = _setup_combo_strategy_side_key(fam, sess_row, strat_row, side_row)
         table_rows.append([combo_key, total, tp, sl, nohit, op, f"{wr:.1f}%"])
     decided_total = total_tp + total_sl + total_nohit
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
@@ -45728,7 +46033,7 @@ def _setup_audit_overall_text(uid: int) -> str:
     header = [
         "📊 <b>Setup Audit Overall</b>",
         HDR,
-        f"Families: <b>{len(fam_codes_seen or [])}</b> | Family/session/strategy rows: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
+        f"Families: <b>{len(fam_codes_seen or [])}</b> | Family/session/strategy/side rows: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Duration: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
@@ -46721,7 +47026,7 @@ def _autotrade_report_is_before_asia_close(row: dict) -> bool:
         if ts <= 0:
             return False
         dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
-        # The scheduled job is 09:45, but Render/catch-up can close a few minutes later.
+        # The scheduled job is 09:55, but Render/catch-up can close a few minutes later.
         return (dt.hour == 9 and 40 <= dt.minute <= 59) or (dt.hour == 10 and 0 <= dt.minute <= 5)
     except Exception:
         return False
@@ -46729,7 +47034,7 @@ def _autotrade_report_is_before_asia_close(row: dict) -> bool:
 
 AUTOTRADE_REPORT_LOSS_REASON_CHOICES = (
     'SL_HIT',                 # stop price/order was hit or PnL is close to expected risk
-    'CLOSED_BEFORE_ASIA_LOSS', # 09:45/09:55 flat closed the position at a loss
+    'CLOSED_BEFORE_ASIA_LOSS', # 09:55/09:55 flat closed the position at a loss
     'MAX_HOLD_LOSS',          # max-hold rule closed the position at a loss
     'WEAK_COMBO',             # family+session currently has negative/disabled edge evidence
     'WEAK_SYMBOL',            # symbol has recent blocklist/poor-edge evidence
@@ -47338,7 +47643,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v38_strategy_amounts:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v60_strategy_side_amounts:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -47597,7 +47902,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 _result_display(r),
                 r.get('symbol'),
                 r.get('side'),
-                _setup_combo_strategy_key(str(r.get('family') or 'F0'), str(r.get('session') or '-'), r),
+                _setup_combo_strategy_side_key(str(r.get('family') or 'F0'), str(r.get('session') or '-'), r, str(r.get('side') or '')),
                 _autotrade_report_close_session(r),
                 int(float(r.get('conf') or 0.0)) if float(r.get('conf') or 0.0) > 0 else '-',
                 _dyn_cell(r),
@@ -48004,7 +48309,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     ready = _autotrade_ready()
     sess_allowed = (sess != 'NONE') and _autotrade_allowed_session(sess)
     # Ver25: /autotrade_debug also self-heals any carried AutoTrade position
-    # that survived past the 10:00 Melbourne reset despite the 09:45 flat rule.
+    # that survived past the 10:00 Melbourne reset despite the 09:55 flat rule.
     # After this, carried risk should normally be zero whenever flat-before-ASIA is ON.
     try:
         if bool(_autotrade_flat_before_asia_enabled()) and str(_autotrade_runtime_mode()).lower() == 'live':
@@ -48058,6 +48363,8 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         reasons.append('AUTOTRADE_OWNER_UID missing/0')
     if str(_autotrade_runtime_mode()).lower() == 'live' and (not BYBIT_API_KEY or not BYBIT_API_SECRET):
         reasons.append('missing BYBIT_API_KEY/SECRET')
+    if not _autotrade_entry_enabled():
+        reasons.append('autotrade_entries_off')
 
     session_cap_txt = '∞' if int(email_gate.get('session_cap', 0) or 0) <= 0 else str(int(email_gate.get('session_cap', 0) or 0))
     day_cap_txt = '∞' if int(email_gate.get('day_cap', 0) or 0) <= 0 else str(int(email_gate.get('day_cap', 0) or 0))
@@ -48149,9 +48456,9 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines = [
         '🧪 AutoTrade Debug',
         HDR,
-        f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
+        f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Entries: {'ON' if _autotrade_entry_enabled() else 'OFF'} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
         f"Trading day: {snap.get('today_window_label')}",
-        (f"Keep-all test: ON | Auto flat/max-hold/carryover closes: OFF | Entry window: {int(AUTOTRADE_ENTRY_WINDOW_MIN)}m" if _autotrade_keep_all_test_mode() else None),
+        (f"Keep-all test: ON | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(AUTOTRADE_ENTRY_WINDOW_MIN)}m" if _autotrade_keep_all_test_mode() else None),
         (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry blackout: {'ON' if _autotrade_entry_blackout_enabled() else 'OFF'} | Setup blackout: {'ON' if _setup_generation_blackout_enabled() else 'OFF'}" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
         SEP,
         f"EquityAT: ${equity:.2f}",
@@ -48380,7 +48687,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v38_strategy_matrix:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v60_strategy_side_matrix:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -48483,7 +48790,8 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         fam = str(r.get('family') or 'F0').upper().strip() or 'F0'
         sess = str(r.get('session') or _autotrade_report_row_session(r) or 'UNK').upper().strip() or 'UNK'
         strat = _setup_strategy_short_label(r)
-        key = (fam, sess, strat)
+        side = _setup_side_suffix(value=str(r.get('side') or ''))
+        key = (fam, sess, strat, side)
         b = buckets[key]
         b['trades'] += 1
         b['parts'] += int(r.get('parts') or 1)
@@ -48533,7 +48841,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         return out
 
     table_rows = []
-    for (fam, sess, strat), v in sorted(buckets.items(), key=lambda kv: (float(kv[1].get('pnl') or 0.0), int(kv[1].get('tp') or 0), -int(kv[1].get('sl') or 0)), reverse=True):
+    for (fam, sess, strat, side), v in sorted(buckets.items(), key=lambda kv: (float(kv[1].get('pnl') or 0.0), int(kv[1].get('tp') or 0), -int(kv[1].get('sl') or 0)), reverse=True):
         d = int(v.get('tp') or 0) + int(v.get('sl') or 0)
         wr_i = (int(v.get('tp') or 0) / d * 100.0) if d > 0 else 0.0
         try:
@@ -48542,7 +48850,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         except Exception:
             top_loss = '-'
         table_rows.append([
-            _setup_combo_strategy_key(fam, sess, strat),
+            _setup_combo_strategy_side_key(fam, sess, strat, side),
             int(v.get('trades') or 0),
             int(v.get('tp') or 0),
             int(v.get('sl') or 0),
@@ -52108,7 +52416,7 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
-EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 45))
+EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
@@ -52247,7 +52555,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
         def _job_budget_exhausted() -> bool:
             try:
-                return (time.time() - job_started_ts) >= float(ALERT_JOB_MAX_RUNTIME_SEC or 45)
+                return (time.time() - job_started_ts) >= float(ALERT_JOB_MAX_RUNTIME_SEC or 55)
             except Exception:
                 return False
 
@@ -52255,7 +52563,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             try:
                 if not users_notify:
                     return False
-                max_runtime = max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 45))
+                max_runtime = max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 55))
                 reserve_pct = max(0.05, min(0.90, float(ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT or 0.45)))
                 share_pct = max(0.10, min(0.95, float(ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT or 0.55)))
                 allowed = min(max_runtime * share_pct, max_runtime * max(0.05, 1.0 - reserve_pct))
@@ -52265,7 +52573,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
         def _bigmove_deferred_budget_exhausted() -> bool:
             try:
-                max_runtime = max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 45))
+                max_runtime = max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 55))
                 grace = max(0.0, float(ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC or 0))
                 return (time.time() - job_started_ts) >= (max_runtime + grace)
             except Exception:
@@ -54009,6 +54317,8 @@ async def _post_init(app: Application):
             BotCommand("equity", "Set your equity"),
             BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
             BotCommand("dailycap", "Set your total daily risk cap"),
+                BotCommand("autotrade_on", "Enable AutoTrade entries"),
+                BotCommand("autotrade_off", "Pause AutoTrade entries"),
             BotCommand("dayrisk_reset", "Admin: reset today risk usage"),
             BotCommand("size", "Position size calculator"),
 
@@ -54758,7 +55068,7 @@ async def admin_reset_test_data_cmd(update: Update, context: ContextTypes.DEFAUL
             f"Deleted/cleared tables: {len(deleted)}\n"
             "Configs preserved: users, autotrade_config, strategy_config, email/session/tz/billing.\n"
             "Configured safety policy/micro-guard was re-seeded for the clean forward test.\n"
-            "Live Bybit positions were not closed by reset. Use /open_trades, /autotrade_flat_now, or wait for the scheduled 09:45 Melbourne flat/max-hold job."
+            "Live Bybit positions were not closed by reset. Use /open_trades, /autotrade_flat_now, or wait for the scheduled 09:55 Melbourne flat/max-hold job."
         )
     except Exception as exc:
         await update.message.reply_text(f"❌ admin_reset_test_data failed: {type(exc).__name__}: {exc}")
@@ -55115,6 +55425,21 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             return
         if not _autotrade_ready():
             return
+        if not _autotrade_entry_enabled():
+            try:
+                uid0 = int(AUTOTRADE_OWNER_UID or 0)
+                if uid0:
+                    _LAST_AUTOTRADE_DECISION[uid0] = {
+                        "status": "SKIP",
+                        "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "reason": "autotrade_entries_off",
+                        "session": str(scan_session_name_utc(datetime.now(timezone.utc)) or "NONE"),
+                        "mode": str(_autotrade_runtime_mode()).lower(),
+                    }
+            except Exception:
+                pass
+            _hb_touch('autotrade', ok=True, details='entries_off')
+            return
 
         uid = int(AUTOTRADE_OWNER_UID)
         try:
@@ -55355,6 +55680,16 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 'reason': 'autotrade_not_ready_or_disabled',
                 'session': sess,
                 'mode': str(_autotrade_runtime_mode()).lower(),
+            }
+            return
+        if not _autotrade_entry_enabled():
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP',
+                'when': now_utc.isoformat(timespec='seconds'),
+                'reason': 'autotrade_entries_off',
+                'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(),
+                'trigger': 'email_sent_immediate',
             }
             return
         # The email itself is already an authorized bot action.  Always route the
@@ -55878,6 +56213,8 @@ def main():
     app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_fix_exits", autotrade_fix_exits_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_flat_now", autotrade_flat_now_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_on", autotrade_on_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_off", autotrade_off_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
     app.add_handler(CommandHandler("autoytrade_report_overall", autoytrade_report_overall_cmd, block=False))
@@ -55951,7 +56288,7 @@ def main():
         app.job_queue.run_repeating(
             autonomous_screen_sync_job,
             interval=auto_screen_interval_sec,
-            first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 45), auto_screen_interval_sec // 2)),
+            first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
             name="autonomous_screen_sync_job",
             job_kwargs={
                 "max_instances": 1,
@@ -56035,7 +56372,7 @@ def main():
                 except Exception:
                     pass
 
-        if bool(_autotrade_flat_before_asia_enabled()) and bool(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)):
+        if bool(_autotrade_flat_before_asia_enabled()) and bool(_autotrade_flat_before_asia_catchup_enabled()):
             try:
                 app.job_queue.run_repeating(
                     autotrade_flat_before_asia_catchup_job,
@@ -56151,7 +56488,7 @@ def main():
                 app.job_queue.run_repeating(
                     market_adaptive_daily_job,
                     interval=max(21600, int(float((_market_cfg or {}).get("market_adaptive_interval_hours", 24.0) or 24.0) * 3600)),
-                    first=max(900, int(float((_market_cfg or {}).get("market_adaptive_first_delay_sec", 45) or 45))),
+                    first=max(900, int(float((_market_cfg or {}).get("market_adaptive_first_delay_sec", 45) or 55))),
                     name="market_adaptive_daily_job",
                     job_kwargs={
                         "max_instances": 1,
