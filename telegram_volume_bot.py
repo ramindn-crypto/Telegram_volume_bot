@@ -1,6 +1,7 @@
-# yver56: Clean-start policy unlock; all family/session/strategy policy combos enabled for fresh forward testing.
+# yver57: Runtime sync lock: policy safety ON after clean reset, blackout config respected, and AutoTrade consumes emailed setups only.
 # Keeps non-negotiable safety: valid SL/TP, exchange leverage, liquidation guard, equity/risk sizing, and duplicate-owner guards.
-# - Ver56: policy table is clean-start/unlocked by default: no legacy DISABLE/OFF rows, no daily/interim policy disables, no policy-view auto-safety, and no micro-edge policy blocks while collecting fresh NORMAL/REVERSE evidence.
+# - Ver57: keeps clean-start legacy rows ignored but re-enables fresh daily/intraday safety, policy-view auto-safety, micro-edge learning, respects runtime blackout config even in keep-all mode, and prevents AutoTrade/email divergence by requiring emailed setups for entries.
+# - Ver56: policy table clean-start/unlocked by default for fresh forward testing.
 # CHANGE SUMMARY
 # - Ver54 yver54: forward-test keep-all mode for NORMAL/REVERSE comparison: disables automatic flat/max-hold/carryover closes by default, extends setup entry life for test observation, and lets scheduled AutoTrade continue placing multiple eligible queued setups per tick while retaining SL/TP, risk caps, duplicate guards and exchange safety checks.
 # - Ver53 yver53: fixes post-unblock execution gaps: removes MON from combo identity (NOR/REV only), routes weak combos to REV earlier, lets AutoTrade execute already queued/emailed setups during setup-generation blackout, retries Bybit leverage at exchange max, and continues candidate attempts after leverage/setup-specific skips.
@@ -518,6 +519,9 @@ AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY = 'entry_blackout_windows'
 SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY = 'setup_generation_blackout_enabled'
 SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY = 'setup_generation_blackout_windows'
 AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY = 'ver20_blackout_policy_version'
+AUTOTRADE_CFG_VER57_BLACKOUT_SYNC_VERSION_KEY = 'ver57_blackout_sync_version'
+AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY = 'require_setup_email_for_entry'
+SETUP_POLICY_CLEAN_START_MARKER_TS_KEY = 'setup_policy_clean_start_marker_ts'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY = 'max_position_hours_enabled'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY = 'max_position_hours'
 AUTOTRADE_CFG_VER14_TIME_EXIT_POLICY_VERSION_KEY = 'ver14_time_exit_policy_version'
@@ -733,6 +737,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
         AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '12') or 12),
+        AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True) else 0,
     }
     for k, v in defaults.items():
         try:
@@ -1067,12 +1072,7 @@ def _split_blackout_windows(value) -> tuple:
 
 
 def _autotrade_entry_blackout_enabled() -> bool:
-    # yver55: no artificial entry blackout during keep-all forward testing.
-    try:
-        if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)):
-            return False
-    except Exception:
-        pass
+    # Ver57: keep-all removes count caps/time exits, but user-configured blackout is a real gate.
     return _autotrade_bool_cfg(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
 
 
@@ -1085,12 +1085,7 @@ def _autotrade_entry_blackout_windows() -> str:
 
 
 def _setup_generation_blackout_enabled() -> bool:
-    # yver55: no artificial setup-generation blackout during keep-all forward testing.
-    try:
-        if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)):
-            return False
-    except Exception:
-        pass
+    # Ver57: keep-all removes count caps/time exits, but user-configured setup blackout is a real gate.
     try:
         raw = _autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0)
         return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
@@ -1104,6 +1099,13 @@ def _setup_generation_blackout_windows() -> str:
     except Exception:
         raw = os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45')
     return _normalise_melbourne_blackout_windows(raw, default='10:00-10:45')
+
+
+def _autotrade_require_setup_email_for_entry() -> bool:
+    try:
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
+    except Exception:
+        return bool(globals().get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True))
 
 def _autotrade_hard_risk_cap_usd(equity: float, multiplier: float | None = None) -> float:
     '''Hard per-position risk cap from base risk and dynamic max multiplier.'''
@@ -1160,6 +1162,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)),
         'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)),
+        'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY': _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True),
     }
 
 
@@ -1368,6 +1371,38 @@ def _autotrade_apply_ver20_blackout_policy_defaults() -> None:
         _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
         _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, setup_w)
         _autotrade_config_set(AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY, target_version)
+    except Exception:
+        pass
+
+
+
+def _autotrade_apply_ver57_blackout_config_sync() -> None:
+    """Ver57: respect blackout windows again after keep-all testing.
+
+    yver56 displayed/stored blackout ENABLED flags as false while windows were still
+    configured. This one-time sync turns the gates back ON when a real window exists,
+    so /autotrade_config BLACKOUT_WINDOWS immediately protects both setup emails and
+    live entries without requiring a redeploy or a second command.
+    """
+    try:
+        target_version = 'ver57_2026_05_20_blackout_sync'
+        if str(_autotrade_config_get(AUTOTRADE_CFG_VER57_BLACKOUT_SYNC_VERSION_KEY, '') or '').strip().lower() == target_version:
+            return
+        try:
+            entry_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45')), '10:00-10:45')
+            if entry_w:
+                _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+                _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, entry_w)
+        except Exception:
+            pass
+        try:
+            setup_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45')), '10:00-10:45')
+            if setup_w:
+                _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+                _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, setup_w)
+        except Exception:
+            pass
+        _autotrade_config_set(AUTOTRADE_CFG_VER57_BLACKOUT_SYNC_VERSION_KEY, target_version)
     except Exception:
         pass
 
@@ -1966,7 +2001,7 @@ AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MA
 # The review table is always persisted. Live blocking is deliberately limited to
 # statistically weak/losing combinations only; WATCH rows remain allowed by default.
 SETUP_COMBO_REVIEW_ENABLED = env_bool("SETUP_COMBO_REVIEW_ENABLED", True)
-# Ver56 clean-start policy unlock. Default ON because the live DB contains old
+# Ver57 clean-start legacy policy filter. Default ON because the live DB may contain old
 # DISABLE/OFF daily-safety/interim rows from previous experiments. In this mode,
 # /setup_matrix policy starts like a clean bot: every Family-Session-Strategy combo
 # is visible as enabled WATCH/GATE (or KEEP from fresh stats only), while old policy
@@ -2253,23 +2288,55 @@ SETUP_EDGE_GUARD_STRICT_MIN_CONF = 78
 SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 15000000.0
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = False
 
-# Ver56: clean-start policy unlock for fresh NORMAL/REVERSE forward testing.
-# This removes only policy/learning blocks that come from old DB evidence or old
-# interim rules. It does NOT bypass SL/TP validity, liquidation guard, exchange max
-# leverage, position/order duplicate protection, or risk sizing.
+# Ver57: clean-start legacy ignore + fresh safety ON.
+# Clean-start now means: ignore any old DISABLE/OFF rows from before this reset marker,
+# but keep fresh daily/intraday safety, policy-view auto-safety, micro-edge learning,
+# and the NORMAL/REVERSE router running from the new forward-test data.
+# It does NOT bypass SL/TP validity, liquidation guard, exchange max leverage,
+# duplicate protection, risk sizing, or user-configured blackout windows.
 if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-    SETUP_COMBO_INTERIM_DISABLE_ENABLED = False
-    SETUP_COMBO_DAILY_SAFETY_ENABLED = False
-    SETUP_COMBO_INTRADAY_SAFETY_ENABLED = False
-    SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED = False
-    SETUP_COMBO_POLICY_CATCHUP_ENABLED = False
-    SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED = False
-    # Keep the policy screen and executable lane clean from old micro-edge blocks.
-    # Fresh setup/audit data still appears in reports; it simply cannot disable combos.
-    SETUP_EDGE_MICRO_GUARD_ENABLED = False
+    SETUP_COMBO_INTERIM_DISABLE_ENABLED = False  # legacy hard-coded override stays off
+    SETUP_COMBO_DAILY_SAFETY_ENABLED = True
+    SETUP_COMBO_INTRADAY_SAFETY_ENABLED = True
+    SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED = True
+    SETUP_COMBO_POLICY_CATCHUP_ENABLED = True
+    SETUP_COMBO_ADAPTIVE_BRIDGE_ENABLED = True
+    SETUP_EDGE_MICRO_GUARD_ENABLED = True
+    # Static legacy blocklists stay off; rolling evidence from the fresh DB can still act.
     SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST = tuple()
     SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST = tuple()
     SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple()
+
+
+def _setup_policy_clean_start_marker_ts() -> float:
+    """Persistent cut-off timestamp for yver57 clean-start policy rows.
+
+    Rows older than this marker are treated as legacy and ignored. Fresh daily/intraday
+    safety rows written after deploy remain visible and enforceable.
+    """
+    try:
+        if not bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return 0.0
+        raw = _autotrade_config_get(SETUP_POLICY_CLEAN_START_MARKER_TS_KEY, None)
+        if raw is not None and str(raw).strip() != '':
+            return float(raw)
+        marker = float(time.time())
+        _autotrade_config_set(SETUP_POLICY_CLEAN_START_MARKER_TS_KEY, marker)
+        return marker
+    except Exception:
+        return 0.0
+
+
+def _setup_policy_row_is_clean_start_legacy(pol: dict | None) -> bool:
+    try:
+        if not bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            return False
+        marker = float(_setup_policy_clean_start_marker_ts() or 0.0)
+        if marker <= 0:
+            return False
+        return float((pol or {}).get('updated_ts') or 0.0) < marker
+    except Exception:
+        return False
 
 # Ver51 FINAL_PIPELINE_LOCKED: forward-test starvation guard.
 # Keep liquidity at 15M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
@@ -2355,6 +2422,9 @@ SETUP_ADAPTIVE_WEAK_MIN_DECIDED = 1
 SETUP_ADAPTIVE_STRONG_MIN_DECIDED = max(2, int(globals().get('SETUP_ADAPTIVE_STRONG_MIN_DECIDED', 2) or 2))
 # yver55: 0 means unlimited/all eligible setups in the just-sent email batch.
 AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH = int(os.environ.get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', '0') or 0)
+# Ver57: AutoTrade must not open from a hidden executable row before the setup email is sent.
+# The scheduled job can still catch up emailed rows, but email is the authorising/sync point.
+AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
@@ -4981,6 +5051,7 @@ try:
     _autotrade_apply_ver11_leverage_policy_defaults()
     _autotrade_apply_ver19_entry_execution_policy_defaults()
     _autotrade_apply_ver20_blackout_policy_defaults()
+    _autotrade_apply_ver57_blackout_config_sync()
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
     _autotrade_apply_ver32_quality_defaults()
@@ -10296,6 +10367,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
+        require_email_entry = bool(_autotrade_require_setup_email_for_entry())
         cur.execute(
             """
             SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts
@@ -10308,10 +10380,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
               AND x.executable_ts >= ?
               AND (? = '' OR UPPER(COALESCE(x.session, '')) = ?)
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+              AND (? = 0 OR COALESCE(e.emailed_ts, 0) > 0 OR LOWER(COALESCE(x.source_kind, '')) IN ('emailed_setups','setup_email','email_autotrade_immediate'))
             ORDER BY x.executable_ts DESC, x.setup_id DESC
             LIMIT ?
             """,
-            (int(uid), float(cutoff), req_session_u, req_session_u, int(max(limit * 4, limit))),
+            (int(uid), float(cutoff), req_session_u, req_session_u, 1 if require_email_entry else 0, int(max(limit * 4, limit))),
         )
         rows = [dict(r) for r in (cur.fetchall() or [])]
         con.close()
@@ -38919,6 +38992,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
             f"AUTOTRADE_MAX_TRADES_PER_DAY = {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0))} (default 50; env can allow 0=unlimited)",
             f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
+            f"AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)) else 'false'}",
             f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
             f"SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED = {'true' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'false'}",
@@ -38950,6 +39024,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (default; env can allow 0=unlimited)",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0",
+            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY true",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
             "• /autotrade_config AUTOTRADE_ISOLATED true",
@@ -38978,6 +39053,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS',
         'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS',
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS',
+        'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY',
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED'
     }:
@@ -39032,18 +39108,25 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = _normalise_melbourne_blackout_windows(value_raw, default='10:00-10:45')
             _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, val)
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, val)
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1 if val else 0)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_ENTRY_BLACKOUT_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS':
             val = _normalise_melbourne_blackout_windows(value_raw, default='10:00-10:45')
             _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, val)
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1 if val else 0)
         elif key == 'SETUP_GENERATION_BLACKOUT_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if val else 0)
         elif key == 'SETUP_GENERATION_BLACKOUT_WINDOWS':
             val = _normalise_melbourne_blackout_windows(value_raw, default='10:00-10:45')
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, val)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_MAX_POSITION_HOURS_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1 if val else 0)
@@ -39062,7 +39145,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
                 raise ValueError('mode must be paper or live')
             _autotrade_config_set(AUTOTRADE_CFG_MODE_KEY, val)
         elif key == 'AUTOTRADE_MAX_OPEN_TRADES':
-            val = max(1, int(float(value_raw)))
+            # 0 = unlimited in keep-all forward-test mode; risk caps and exchange safety still apply.
+            val = max(0, int(float(value_raw)))
+            if val > 500:
+                raise ValueError('max AutoTrade open trades must be 0..500 (0 = unlimited)')
             _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, val)
         elif key == 'AUTOTRADE_MAX_TRADES_PER_DAY':
             # 0 = unlimited. This is AutoTrade-only and intentionally not capped by /limits.
@@ -42687,8 +42773,6 @@ def _setup_combo_review_first_delay_sec() -> int:
 
 def _setup_combo_daily_safety_schedule_text() -> str:
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            return 'OFF — clean-start all-enabled policy'
         return f"Daily {int(SETUP_COMBO_DAILY_SAFETY_HOUR):02d}:{int(SETUP_COMBO_DAILY_SAFETY_MINUTE):02d} {str(SETUP_COMBO_POLICY_REVIEW_TZ)}"
     except Exception:
         return 'Daily 10:00 Australia/Melbourne'
@@ -43176,9 +43260,6 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
     """
     out = {'ok': False, 'disabled': [], 'rows': 0, 'run_id': '', 'expires_ts': 0.0}
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            out.update({'ok': True, 'reason': 'clean_start_all_enabled_policy', 'disabled': [], 'rows': 0})
-            return out
         if not bool(globals().get('SETUP_COMBO_DAILY_SAFETY_ENABLED', True)):
             out['reason'] = 'daily_safety_disabled'
             return out
@@ -43241,9 +43322,6 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
 def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
     info = {'updated_ts': 0.0, 'text': '-', 'kind': '-', 'scheduled_text': '-', 'expires_text': '-', 'rows': 0, 'scheduled_rows': 0}
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            info.update({'text': 'clean start / all enabled', 'kind': 'policy unlock', 'kind_raw': 'clean_start', 'scheduled_text': '-', 'expires_text': '-', 'rows': 0, 'scheduled_rows': 0, 'enforceable_rows': 0})
-            return info
         _setup_combo_policy_migrate()
         ids = []
         try:
@@ -43257,6 +43335,11 @@ def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
             cur = conn.cursor()
             qmarks = ','.join(['?'] * len(ids))
             rows = [dict(r) for r in cur.execute(f"SELECT * FROM setup_combo_policy WHERE user_id IN ({qmarks})", tuple(ids)).fetchall() or []]
+        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+            rows = [r for r in rows if not _setup_policy_row_is_clean_start_legacy(r)]
+            if not rows:
+                info.update({'text': 'clean start / all enabled', 'kind': 'policy unlock', 'kind_raw': 'clean_start', 'scheduled_text': '-', 'expires_text': '-', 'rows': 0, 'scheduled_rows': 0, 'enforceable_rows': 0})
+                return info
         if not rows:
             return info
         latest = max(rows, key=lambda r: float(r.get('updated_ts') or 0.0))
@@ -43288,9 +43371,9 @@ def _setup_combo_policy_valid_for_enforcement(pol: dict | None) -> bool:
     if it is not renewed by the next weekly review.
     """
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            return False
         if not pol:
+            return False
+        if _setup_policy_row_is_clean_start_legacy(pol):
             return False
         kind = str(pol.get('policy_kind') or 'manual').lower().strip()
         if kind not in {'scheduled', 'interim', 'emergency', 'daily_safety'}:
@@ -43346,10 +43429,6 @@ def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', u
         sess = str(sess or '-').upper().strip()
         out.update({'family': fam, 'session': sess, 'combo': f'{fam}-{sess}'})
         if sess in {'', '-', 'NONE'} or fam in {'', '-', 'F0'}:
-            return out
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            # Clean policy mode: no legacy DISABLE/OFF rows. Unknown combos stay enabled WATCH probation.
-            out.update({'found': False, 'policy': None, 'status': 'WATCH', 'enabled': 1})
             return out
         rows = _setup_combo_policy_cache_rows(force=False)
         uid = int(user_id or 0)
@@ -44294,8 +44373,6 @@ def _setup_edge_guard_setup_key(setup_or_row, session_name: str = '') -> tuple[s
 def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
     """Return (allowed, reason) for granular side/symbol edge filtering."""
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            return True, 'clean_start_all_enabled_policy'
         if not bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)):
             return True, 'edge_micro_guard_disabled'
         fam, sess, side, sym, hour = _setup_edge_guard_setup_key(setup_or_row, session_name=session_name)
@@ -44393,8 +44470,6 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
 
 def _setup_edge_guard_snapshot_text(uid: int = 0) -> str:
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            return 'Micro edge guard: OFF (clean-start all-enabled policy) | Block side=- | Side review=- | Block symbol=- | Symbol review=- | Weak-hour watch=-'
         data = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
         cs = sorted(list((data or {}).get('combo_side_block') or {}))
         sy = sorted(list((data or {}).get('symbol_block') or {}))
@@ -44424,8 +44499,6 @@ def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
     """
     out = {}
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            return {}
         rows = _setup_combo_policy_cache_rows(force=True)
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
         ids = []
@@ -44713,7 +44786,7 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
     out_rows.sort(key=lambda x: (int(x.get('enabled_next') or 0), float(x.get('score') or 0.0), float(x.get('win_rate') or 0.0), int(x.get('decided') or 0)), reverse=True)
     run_id = 'SCM-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
     policy_window_ok = int(hours or 0) >= int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)
-    policy_update_ok = bool(persist and allow_policy_update and policy_window_ok) and not bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True))
+    policy_update_ok = bool(persist and allow_policy_update and policy_window_ok)
     policy_updated = False
     if persist and out_rows:
         try:
@@ -45069,8 +45142,6 @@ def _setup_combo_policy_view_maybe_auto_safety(uid: int) -> dict:
     """
     global _SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_LAST_TS
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            return {'ok': True, 'reason': 'clean_start_all_enabled_policy'}
         if not bool(globals().get('SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED', True)):
             return {'ok': False, 'reason': 'disabled'}
         now_ts = float(time.time())
@@ -45110,8 +45181,9 @@ def _setup_combo_policy_text(uid: int) -> str:
                 (int(owner_uid),)
             ).fetchall() or []]
         if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            # Do not display or overlay old policy rows; clean-start mode starts all combos enabled.
-            rows = []
+            # Ignore only legacy policy rows from before the clean-start marker;
+            # fresh daily/intraday safety rows remain visible and enforceable.
+            rows = [r for r in rows if not _setup_policy_row_is_clean_start_legacy(r)]
         if not rows and not bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
             # After /admin_reset_test_data the historical policy table is intentionally
             # cleared. Re-seed configured safety overrides so live policy visibility is
@@ -45207,9 +45279,6 @@ def _setup_combo_policy_text(uid: int) -> str:
             side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_side_block') or {}).keys())
         except Exception:
             side_blocks = set()
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            side_blocks = set()
-
         rows_by_combo = {}
         for r in rows:
             try:
@@ -45319,7 +45388,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
-            + ("Policy clean-start unlock: <b>ON</b> | Existing DISABLE/OFF rows are ignored; all combos are enabled for fresh forward testing.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
+            + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
             f"{guard_txt}\n{note}\n"
             f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, the micro edge guard, the final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes strategy, so F8-NY-NOR and F8-NY-REV are reviewed separately in reports.\n"
             f"<pre>{html.escape(table)}</pre>"
@@ -45385,8 +45454,6 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setup_combo_review_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            return
         if not SETUP_COMBO_REVIEW_ENABLED:
             return
         uid = int(AUTOTRADE_OWNER_UID or 0)
@@ -45423,8 +45490,6 @@ async def setup_combo_review_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def setup_combo_daily_safety_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            return
         if not SETUP_COMBO_DAILY_SAFETY_ENABLED:
             return
         uid = int(AUTOTRADE_OWNER_UID or 0)
@@ -45461,8 +45526,6 @@ async def setup_combo_daily_safety_job(context: ContextTypes.DEFAULT_TYPE):
 async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
     """One-shot startup catch-up for missed weekly/daily setup-combo policy reviews."""
     try:
-        if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
-            return
         if not bool(globals().get('SETUP_COMBO_POLICY_CATCHUP_ENABLED', True)):
             return
         uid = int(AUTOTRADE_OWNER_UID or 0)
@@ -48089,7 +48152,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
         f"Trading day: {snap.get('today_window_label')}",
         (f"Keep-all test: ON | Auto flat/max-hold/carryover closes: OFF | Entry window: {int(AUTOTRADE_ENTRY_WINDOW_MIN)}m" if _autotrade_keep_all_test_mode() else None),
-        (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry/setup blackout: OFF" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
+        (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry blackout: {'ON' if _autotrade_entry_blackout_enabled() else 'OFF'} | Setup blackout: {'ON' if _setup_generation_blackout_enabled() else 'OFF'}" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
         SEP,
         f"EquityAT: ${equity:.2f}",
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
@@ -55362,21 +55425,18 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                     db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email_persist', status='error', session=sess, mode='autotrade', details={'error': f'{type(e).__name__}: {e}'})
                 except Exception:
                     pass
-            try:
-                db_setups = await to_thread_autotrade(_autotrade_select_db_setups_cached, owner_uid, sess, 12, 5, 1, True, timeout=6)
-            except Exception:
-                db_setups = []
-            if not db_setups:
-                # Last fallback: use the just-emailed setup objects if structurally executable.
-                db_setups = []
-                for _s in list(chosen_list or []):
-                    try:
-                        _s_eff = _setup_route_candidate_for_executable_lane(_s, sess, owner_uid)
-                        ok_s, _why_s = is_executable_setup_eligible(_s_eff, session_name=sess)
-                        if ok_s:
-                            db_setups.append(_s_eff)
-                    except Exception:
-                        continue
+            # Ver57: email_sent_immediate must execute only the exact just-emailed batch.
+            # Do not pull the latest generic executable queue here; otherwise AutoTrade can
+            # open rows that were not in the email, then the emailed rows show as duplicates.
+            db_setups = []
+            for _s in list(chosen_list or []):
+                try:
+                    _s_eff = _setup_route_candidate_for_executable_lane(_s, sess, owner_uid)
+                    ok_s, _why_s = is_executable_setup_eligible(_s_eff, session_name=sess)
+                    if ok_s:
+                        db_setups.append(_s_eff)
+                except Exception:
+                    continue
             attempted = 0
             placed_count = 0
             attempts_meta = []
