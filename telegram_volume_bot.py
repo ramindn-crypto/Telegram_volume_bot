@@ -7,7 +7,7 @@
 # CHANGE SUMMARY
 # - Ver54 yver54: forward-test keep-all mode for NORMAL/REVERSE comparison: disables automatic flat/max-hold/carryover closes by default, extends setup entry life for test observation, and lets scheduled AutoTrade continue placing multiple eligible queued setups per tick while retaining SL/TP, risk caps, duplicate guards and exchange safety checks.
 # - Ver53 yver53: fixes post-unblock execution gaps: removes MON from combo identity (NOR/REV only), routes weak combos to REV earlier, lets AutoTrade execute already queued/emailed setups during setup-generation blackout, retries Bybit leverage at exchange max, and continues candidate attempts after leverage/setup-specific skips.
-# - yver60: major sync patch: runtime AutoTrade on/off commands, /dailycap mirrors AutoTrade cap for owner/admin, all cooldown sessions fixed at 3h, and full Family-Session-NOR/REV-BUY/SELL universe is seeded in setup matrix/audit reports.
+# - yver61: AutoTrade risk caps are controlled only by /autotrade_config; /dailycap is manual-only; AutoTrade reports use one clear Reason column with pre-ASIA closes renamed.
 # - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
 # - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
@@ -38049,15 +38049,14 @@ ADMIN_HELP_DESCRIPTIONS = {
     "goal_set": "Set goal targets: setups/day low-high, WR target, optional AvgR target",
     "goal_abort": "Abort a running goal-profile optimizer cycle safely after the current evaluation step",
     "trade_id_reset": "Reset your own Trade ID numbering",
-    "dailycap": "Set daily risk cap, including /dailycap pct 100 for full-account daily cap",
-    "dailycapAT": "Set AutoTrade daily risk cap separately from manual /dailycap",
+    "dailycap": "Set MANUAL daily risk cap only. AutoTrade caps use /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT and AUTOTRADE_DAILY_RISK_CAP_PCT",
     "autotrade_config": "Show/set AutoTrade runtime config: base risk, dynamic risk, caps, mode, max open, max trades/day, leverage, isolated, AutoTrade entry blackout, and global setup-generation blackout.",
     "dayrisk_reset": "Reset today’s used-risk baseline for the active day. Use /dayrisk_reset, /dayrisk_reset show, or /dayrisk_reset clear",
 }
 
 ADMIN_HELP_GROUPS = [
     ("👤 USERS & ACCESS", ["admin_user", "admin_users", "admin_grant", "admin_revoke", "admin_payments", "payment_approve", "myplan", "billing", "trade_id_reset"]),
-    ("⚖️ RISK / DAY RESET", ["dailycap", "dailycapAT", "dayrisk_reset"]),
+    ("⚖️ RISK / DAY RESET", ["dailycap", "dayrisk_reset"]),
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
@@ -39007,50 +39006,30 @@ async def riskmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set daily risk cap.
+    """Set MANUAL daily risk cap only.
 
-    yver60: for the owner/admin, /dailycap also updates the AutoTrade daily cap,
-    because the live operator expects /dailycap pct X to control the active bot cap.
-    /dailycapAT remains as an explicit AutoTrade-only alias.
+    yver61: /dailycap is intentionally decoupled from AutoTrade. AutoTrade daily/open
+    risk caps are controlled only through /autotrade_config so manual and bot risk
+    accounting cannot silently overwrite each other.
     """
     uid = int(update.effective_user.id)
     user = get_user(uid) or {}
-    owner = int(AUTOTRADE_OWNER_UID or uid)
-    admin_or_owner = bool(is_admin_user(uid) or int(uid) == int(owner))
-
-    def _at_cap_snapshot():
-        try:
-            at_user = _autotrade_user_settings(owner)
-            eq = float(_effective_equity_for_risk(at_user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
-            mode_at, val_at = _autotrade_daily_cap_settings()
-            cap_at = float(_autotrade_daily_cap_usd(owner, eq) or 0.0)
-            return str(mode_at or 'PCT').upper(), float(val_at or 0.0), float(cap_at or 0.0), float(eq or 0.0)
-        except Exception:
-            return 'PCT', 0.0, 0.0, 0.0
 
     if len(context.args) != 2:
         cap = float(daily_cap_usd(user) or 0.0)
         mode = str(user.get("daily_cap_mode", DEFAULT_DAILY_CAP_MODE)).upper()
         val = float(user.get("daily_cap_value", DEFAULT_DAILY_CAP_VALUE) or DEFAULT_DAILY_CAP_VALUE)
-        if admin_or_owner:
-            mode_at, val_at, cap_at, eq_at = _at_cap_snapshot()
-            await update.message.reply_text(
-                f"Daily risk cap (manual): {mode} {val:.2f} (≈ ${cap:.2f} per day)\n"
-                f"Daily risk cap (AutoTrade): {mode_at} {val_at:.2f}{'%' if mode_at == 'PCT' else ''} (≈ ${cap_at:.2f} per day, EquityAT≈${eq_at:.2f})\n\n"
-                "Set examples:\n"
-                "• /dailycap pct 5   (updates manual + AutoTrade for owner/admin)\n"
-                "• /dailycapAT pct 5 (AutoTrade-only)\n"
-                "• /dailycap usd 60"
-            )
-        else:
-            await update.message.reply_text(
-                f"Daily risk cap (TOTAL per day): {mode} {val:.2f} (≈ ${cap:.2f} per day)\n"
-                f"Per-trade risk is separate: /riskmode\n\n"
-                "Set examples:\n"
-                "• /dailycap pct 5\n"
-                "• /dailycap pct 100\n"
-                "• /dailycap usd 60"
-            )
+        await update.message.reply_text(
+            f"Daily risk cap (manual only): {mode} {val:.2f}{'%' if mode == 'PCT' else ''} (≈ ${cap:.2f} per day)\n"
+            f"Per-trade manual risk is separate: /riskmode\n\n"
+            "AutoTrade risk caps are separate and are NOT changed by /dailycap:\n"
+            "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 15\n"
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10\n\n"
+            "Set manual examples:\n"
+            "• /dailycap pct 5\n"
+            "• /dailycap pct 100\n"
+            "• /dailycap usd 60"
+        )
         return
 
     mode = context.args[0].strip().upper()
@@ -39073,84 +39052,26 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_user(uid, daily_cap_mode=mode, daily_cap_value=val)
     user = get_user(uid) or {}
     manual_cap = float(daily_cap_usd(user) or 0.0)
-
-    at_line = ""
-    if admin_or_owner:
-        try:
-            _autotrade_set_daily_cap_settings(mode, val)
-            for key0 in (f'accounting_snapshot_fast:{int(owner)}', f'autotrade_day_metrics_fast:{int(owner)}'):
-                try:
-                    cache_delete(key0)
-                except Exception:
-                    pass
-            mode_at, val_at, cap_at, eq_at = _at_cap_snapshot()
-            at_line = f"\nAutoTrade cap synced: {mode_at} {val_at:.2f}{'%' if mode_at == 'PCT' else ''} (≈ ${cap_at:.2f} per day, EquityAT≈${eq_at:.2f})"
-        except Exception as e:
-            at_line = f"\n⚠️ AutoTrade cap sync failed: {type(e).__name__}: {e}"
-
     await update.message.reply_text(
-        f"✅ Daily risk cap updated: {mode} {float(val):.2f} (manual ≈ ${manual_cap:.2f} per day){at_line}"
+        f"✅ Manual daily risk cap updated: {mode} {float(val):.2f}{'%' if mode == 'PCT' else ''} (≈ ${manual_cap:.2f} per day)\n"
+        "AutoTrade caps unchanged. Use:\n"
+        "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT X\n"
+        "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT X"
     )
 
 
 async def dailycapAT_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only AutoTrade daily risk cap, separate from manual /dailycap."""
+    """Deprecated alias kept only to prevent confusion; AutoTrade caps live in /autotrade_config."""
     uid = int(update.effective_user.id)
     if not is_admin_user(uid):
         await update.message.reply_text("⛔ Admin only.")
         return
-
-    owner = int(AUTOTRADE_OWNER_UID or uid)
-    user = _autotrade_user_settings(owner)
-    eq = _effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
-    mode_now, val_now = _autotrade_daily_cap_settings()
-    cap_now = float(_autotrade_daily_cap_usd(owner, float(eq or 0.0)) or 0.0)
-
-    if len(context.args) != 2:
-        mode_txt = str(mode_now or 'PCT').upper()
-        suffix = '%' if mode_txt == 'PCT' else ''
-        await update.message.reply_text(
-            f"AutoTrade daily risk cap: {mode_txt} {float(val_now or 0.0):.2f}{suffix} (≈ ${cap_now:.2f} per day)\n"
-            "Manual trading daily cap is separate: /dailycap\n\n"
-            "Set examples:\n"
-            "• /dailycapAT pct 5\n"
-            "• /dailycapAT pct 100\n"
-            "• /dailycapAT usd 60"
-        )
-        return
-
-    mode = str(context.args[0] or '').strip().upper()
-    try:
-        val = float(context.args[1])
-    except Exception:
-        await update.message.reply_text("Usage: /dailycapAT pct 5  OR  /dailycapAT usd 60")
-        return
-
-    if mode not in {"PCT", "USD"}:
-        await update.message.reply_text("Mode must be pct or usd")
-        return
-    if mode == "PCT" and not (0.0 <= val <= 100):
-        await update.message.reply_text("pct/day should be between 0 and 100")
-        return
-    if mode == "USD" and val < 0:
-        await update.message.reply_text("usd/day must be >= 0")
-        return
-
-    _autotrade_set_daily_cap_settings(mode, val)
-    mode_txt, val_txt = _autotrade_daily_cap_settings()
-    cap_txt = float(_autotrade_daily_cap_usd(owner, float(eq or 0.0)) or 0.0)
-    suffix = '%' if mode_txt == 'PCT' else ''
-    try:
-        cache_delete(f'accounting_snapshot_fast:{int(owner)}')
-    except Exception:
-        pass
-    try:
-        cache_delete(f'autotrade_day_metrics_fast:{int(owner)}')
-    except Exception:
-        pass
     await update.message.reply_text(
-        f"✅ AutoTrade daily risk cap updated: {mode_txt} {float(val_txt or 0.0):.2f}{suffix} (≈ ${cap_txt:.2f} per day)\n"
-        "Manual trading /dailycap remains separate."
+        "⚠️ /dailycapAT is deprecated in yver61.\n\n"
+        "AutoTrade risk caps are controlled only through /autotrade_config:\n"
+        "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT X\n"
+        "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT X\n\n"
+        "Manual /dailycap remains manual-only."
     )
 
 
@@ -39239,7 +39160,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED true",
             "• /autotrade_config SETUP_ADAPTIVE_REVERSE_FOR_DISABLED true",
             "",
-            "Note: daily cap mode stays under /dailycapAT pct|usd <value>.",
+            "Note: AutoTrade risk caps are controlled here only; /dailycap is manual-only.",
         ]
         await send_long_message(update, "\n".join(lines), parse_mode=None)
         return
@@ -47034,7 +46955,7 @@ def _autotrade_report_is_before_asia_close(row: dict) -> bool:
 
 AUTOTRADE_REPORT_LOSS_REASON_CHOICES = (
     'SL_HIT',                 # stop price/order was hit or PnL is close to expected risk
-    'CLOSED_BEFORE_ASIA_LOSS', # 09:55/09:55 flat closed the position at a loss
+    'CLOSE_BEFORE_ASIA_SESSION', # 09:55 daily flat closed before the ASIA trading day
     'MAX_HOLD_LOSS',          # max-hold rule closed the position at a loss
     'WEAK_COMBO',             # family+session currently has negative/disabled edge evidence
     'WEAK_SYMBOL',            # symbol has recent blocklist/poor-edge evidence
@@ -47060,7 +46981,7 @@ def _autotrade_report_loss_reason(row: dict) -> str:
         row = dict(row or {})
         note = str(row.get('note') or row.get('close_reason') or row.get('source_note') or row.get('result_label') or '').upper()
         if _autotrade_report_is_before_asia_close(row):
-            return 'CLOSED_BEFORE_ASIA_LOSS'
+            return 'CLOSE_BEFORE_ASIA_SESSION'
         if 'MAX_POSITION' in note or 'MAX_HOLD' in note or 'MAX-HOLD' in note:
             return 'MAX_HOLD_LOSS'
 
@@ -47188,10 +47109,10 @@ def _autotrade_report_exit_reason(row: dict, result: str | None = None) -> str:
         note = note_raw.upper()
         if _autotrade_report_is_before_asia_close(row):
             if res == 'TP':
-                return 'CLOSED_BEFORE_ASIA_WIN'
+                return 'CLOSE_BEFORE_ASIA_SESSION'
             if res == 'SL':
-                return 'CLOSED_BEFORE_ASIA_LOSS'
-            return 'CLOSED_BEFORE_ASIA'
+                return 'CLOSE_BEFORE_ASIA_SESSION'
+            return 'CLOSE_BEFORE_ASIA_SESSION'
         if 'MAX_POSITION' in note or 'MAX_HOLD' in note or 'MAX-HOLD' in note:
             if res == 'TP':
                 return 'MAX_HOLD_WIN'
@@ -47493,7 +47414,7 @@ def _autotrade_report_closed_kind(row: dict) -> str:
     Ver27: TP/SL reporting is profit/loss sane. Direct TP/SL proof still wins,
     but exchange-only/in-between closes are not left as OTHER when the realised
     PnL clearly says profit or loss. The reason column separately explains
-    CLOSED_BEFORE_ASIA, MAX_HOLD, PROFIT_CLOSE, LOSS_CLOSE, etc.
+    CLOSE_BEFORE_ASIA_SESSION, MAX_HOLD, PROFIT_CLOSE, LOSS_CLOSE, etc.
     """
     try:
         row = dict(row or {})
@@ -47643,7 +47564,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v60_strategy_side_amounts:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v61_reason_only_amounts:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -47828,8 +47749,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
         f"Trades: <b>{len(journal_rows)}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
-        "Result: TP=win/profitable close, SL=loss, FLAT=near-zero. Reason separates TP_HIT, SL_HIT, CLOSED_BEFORE_ASIA_WIN/LOSS, MAX_HOLD, and inferred loss causes.",
-        "LossReason choices: SL_HIT, CLOSED_BEFORE_ASIA_LOSS, MAX_HOLD_LOSS, WEAK_COMBO, WEAK_SYMBOL, WEAK_HOUR, TIGHT_SL, BAD_ENTRY, COUNTER_TREND, LOW_CONFIDENCE, LOW_VOLUME, MISSING_SETUP_DATA, LOSS_CLOSE.",
+        "Result: TP=win/profitable close, SL=loss, FLAT=near-zero. Reason shows TP_HIT, SL_HIT, CLOSE_BEFORE_ASIA_SESSION, MAX_HOLD, PROFIT_CLOSE, or the best inferred close cause.",
     ]
     if external_positions:
         lines.append(f"Ignored unmatched manual/external live positions: <b>{len(external_positions)}</b>")
@@ -47856,13 +47776,6 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 if str(res).upper() == 'SL':
                     return _autotrade_report_loss_reason(r)
                 return str(r.get('exit_reason') or _autotrade_report_exit_reason(r, res) or '-')
-            except Exception:
-                return '-'
-        def _loss_reason_display(r: dict) -> str:
-            try:
-                if str(_result_display(r)).upper() == 'SL':
-                    return _autotrade_report_loss_reason(r)
-                return '-'
             except Exception:
                 return '-'
         def _real_money_cell(r: dict, key: str) -> str:
@@ -47912,13 +47825,12 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 int(r.get('parts') or 1),
                 f"{float(r.get('pnl') or 0.0):+.2f}",
                 _reason_display(r),
-                _loss_reason_display(r),
             ])
         table = tabulate(
             table_rows,
-            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Combo', 'SesC', 'Conf', 'Dyn', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason', 'LossReason'],
+            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Combo', 'SesC', 'Conf', 'Dyn', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason'],
             tablefmt='plain',
-            colalign=('left', 'left', 'center', 'left', 'center', 'left', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left', 'left'),
+            colalign=('left', 'left', 'center', 'left', 'center', 'left', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'),
         )
         raw_count = int(len(bot_positions or [])) + int(len(closed_rows or []))
         lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> merged position rows. Raw fragments: <b>{raw_count}</b>. Time: <b>Melbourne</b>.")
@@ -48038,7 +47950,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
 
-    cache_key = f"autotrade_report_text:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text_cmd:v61_reason_only:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
@@ -48687,7 +48599,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v60_strategy_side_matrix:{owner_uid}:{lookback_h}"
+    cache_key = f"autoytrade_report_overall:v61_reason_names_matrix:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -54316,7 +54228,7 @@ async def _post_init(app: Application):
 
             BotCommand("equity", "Set your equity"),
             BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
-            BotCommand("dailycap", "Set your total daily risk cap"),
+            BotCommand("dailycap", "Set manual daily risk cap"),
                 BotCommand("autotrade_on", "Enable AutoTrade entries"),
                 BotCommand("autotrade_off", "Pause AutoTrade entries"),
             BotCommand("dayrisk_reset", "Admin: reset today risk usage"),
