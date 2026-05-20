@@ -2,6 +2,7 @@
 # Keeps non-negotiable safety: valid SL/TP, exchange leverage, liquidation guard, equity/risk sizing, and duplicate-owner guards.
 # - Ver58: restores user-control for /autotrade_config time-exit toggles, keeps scheduled ASIA flat ON at 09:55 Melbourne by default, persists catch-up/report/safety booleans, and stops keep-all mode from forcing displayed config values to false.
 # - yver62: fixes NOR/REV learning state machine so weak NORMAL lanes are not also tightening the paired REVERSE lane; micro-edge blocks are now exact Family-Session-Strategy-Side keys and REV is evaluated only on REV evidence.
+# - yver63: cleans /setup_matrix deep output, promotes deep analysis recommendations/tables to exact Family-Session-Strategy-Side lanes, and shows lane-level disabled/tightened state instead of coarse legacy combo labels.
 # - yver59: promotes reporting and policy visibility to full Family-Session-Strategy-Side keys (NOR/REV + BUY/SELL), expands setup matrix scoring persistence, and aligns setup audit + AutoTrade matrices with the new combo identity.
 # - Ver57: keeps clean-start legacy rows ignored but re-enables fresh daily/intraday safety, policy-view auto-safety, micro-edge learning, respects runtime blackout config even in keep-all mode, and prevents AutoTrade/email divergence by requiring emailed setups for entries.
 # - Ver56: policy table clean-start/unlocked by default for fresh forward testing.
@@ -45309,10 +45310,11 @@ def _setup_edge_stats_table(stats: dict, title: str, *, sort_mode: str = 'score'
 
 
 def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
-    """Deep setup analytics: family/session + symbol + day/hour + market regime.
+    """Deep setup analytics with the same canonical lane key used everywhere else.
 
-    This is intentionally read-only. It does not change live policy; /setup_matrix safety
-    or the scheduled daily/weekly policy jobs do that.
+    yver63: keep this command compact and decision-useful.  The primary unit is now
+    Family-Session-Strategy-Side (example: F1-ASIA-NOR-SELL).  Coarse family/session
+    summaries are shown only as context so NOR/REV and BUY/SELL lanes are not mixed.
     """
     try:
         uid = int(uid or 0)
@@ -45326,6 +45328,8 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
         candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
         actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(uid, start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
 
+        # Canonical buckets.  by_lane is the authoritative learning/reporting view.
+        by_lane = {}
         by_combo = {}
         by_family = {}
         by_session = {}
@@ -45334,7 +45338,6 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
         by_hour = {}
         by_day = {}
         by_regime = {}
-        by_combo_side = {}
         first_ts = 0.0
         last_ts = 0.0
         evaluated = 0
@@ -45352,7 +45355,9 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
                 sym = str(r.get('symbol') or '').upper().strip()
                 if sym.endswith('USDT'):
                     sym = sym[:-4]
-                side = str(r.get('side') or '').upper().strip() or '-'
+                side = _setup_side_suffix(value=str(r.get('side') or '').upper().strip())
+                if side == 'BOTH':
+                    side = str(r.get('side') or '').upper().strip() or '-'
                 actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
                 ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=uid, candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
                 result = _setup_audit_result_label(ev.get('result'))
@@ -45369,12 +45374,13 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
                 vol_m = float(r.get('fut_vol_usd') or 0.0) / 1e6
                 strat = _setup_strategy_suffix(r)
                 combo = _setup_combo_strategy_key(fam, sess, strat)
+                lane = _setup_combo_strategy_side_key(fam, sess, strat, side)
+                _setup_edge_stats_add(by_lane, lane, result, r_mult, conf, vol_m)
                 _setup_edge_stats_add(by_combo, combo, result, r_mult, conf, vol_m)
                 _setup_edge_stats_add(by_family, fam, result, r_mult, conf, vol_m)
                 _setup_edge_stats_add(by_session, sess, result, r_mult, conf, vol_m)
                 _setup_edge_stats_add(by_symbol, sym, result, r_mult, conf, vol_m)
                 _setup_edge_stats_add(by_side, side, result, r_mult, conf, vol_m)
-                _setup_edge_stats_add(by_combo_side, f'{combo}-{side}', result, r_mult, conf, vol_m)
                 regime = _setup_edge_extract_regime(r)
                 _setup_edge_stats_add(by_regime, regime, result, r_mult, conf, vol_m)
                 if ts > 0:
@@ -45392,14 +45398,23 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
             end_txt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M') if last_ts else '-'
         except Exception:
             start_txt = end_txt = '-'
+
+        # Show exact live lane blocks first.  Coarse policy rows are still reported as
+        # coarse context only; they must not be confused with the lane recommendation.
+        guard_lane_blocks = []
+        try:
+            gd = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+            guard_lane_blocks = sorted([str(x or '').upper().strip() for x in ((gd or {}).get('combo_strategy_side_block') or (gd or {}).get('combo_side_block') or {}).keys() if str(x or '').strip()])
+        except Exception:
+            guard_lane_blocks = []
         policy_by_combo = _setup_combo_enforceable_policy_lookup(uid)
-        disabled_now = sorted([k for k, v in policy_by_combo.items() if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') or 0) == 0])
+        coarse_disabled = sorted([k for k, v in policy_by_combo.items() if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') or 0) == 0])
         watch_now = sorted([k for k, v in policy_by_combo.items() if str((v or {}).get('status') or '').upper() == 'WATCH' and int((v or {}).get('enabled') or 0) == 1])
+
         min_dec_weekly = int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY if hours >= 72 else SETUP_COMBO_POLICY_MIN_DECIDED_DAILY)
-        # Recommendations are data-derived from the selected window, separate from live policy.
         rec_disable = []
         rec_tighten = []
-        for combo, b in by_combo.items():
+        for lane, b in by_lane.items():
             tp = int(b.get('tp') or 0); sl = int(b.get('sl') or 0); nh = int(b.get('nohit') or 0)
             dec = tp + sl + nh
             if dec < max(1, min_dec_weekly):
@@ -45407,29 +45422,29 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
             wr_i = tp / max(1, dec) * 100.0
             avg_r_i = float(b.get('r_sum') or 0.0) / max(1, dec)
             if wr_i < float(SETUP_COMBO_POLICY_DISABLE_WR) or avg_r_i <= float(SETUP_COMBO_POLICY_DISABLE_AVG_R) or (sl >= tp + 2 and dec >= min_dec_weekly):
-                rec_disable.append(combo)
+                rec_disable.append(lane)
             elif wr_i < 50.0 or avg_r_i < 0.0:
-                rec_tighten.append(combo)
+                rec_tighten.append(lane)
+
+        # Keep Telegram output below the split threshold so code blocks do not break.
         lines = [
             "🧠 <b>Setup Deep Analysis</b>",
             HDR,
             f"Window: <b>{hours}h</b> | Rows evaluated: <b>{evaluated}</b> | Start: <b>{html.escape(start_txt)}</b> | End: <b>{html.escape(end_txt)}</b>",
             f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | TP=<b>{tp_n}</b> SL=<b>{sl_n}</b> OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
-            f"Live disabled combos now: <b>{html.escape(', '.join(disabled_now) if disabled_now else '-')}</b> | Live WATCH rows: <b>{len(watch_now)}</b>",
+            f"Live tightened/blocked lanes now: <b>{html.escape(', '.join(guard_lane_blocks[:12]) if guard_lane_blocks else '-')}</b>",
+            f"Coarse policy rows now: <b>{html.escape(', '.join(coarse_disabled[:12]) if coarse_disabled else '-')}</b> | WATCH rows: <b>{len(watch_now)}</b>",
             html.escape(_setup_edge_guard_snapshot_text(uid)),
-            f"Data recommendation from this window: DISABLE=<b>{html.escape(', '.join(rec_disable) if rec_disable else '-')}</b> | TIGHTEN/WATCH=<b>{html.escape(', '.join(rec_tighten) if rec_tighten else '-')}</b>",
-            "Note: Day/hour/regime rows need several days of data before they are reliable. Use 168h/720h for real policy decisions; 24h is diagnostic. The strongest table can still be negative; treat it as least-bad unless WR/AvgR and sample size are both good.",
+            f"Data recommendation from this window (exact lanes): DISABLE/TIGHTEN=<b>{html.escape(', '.join(rec_disable) if rec_disable else '-')}</b> | WATCH/TIGHTEN=<b>{html.escape(', '.join(rec_tighten) if rec_tighten else '-')}</b>",
+            "Action rule: weak NOR-BUY/SELL evidence only tightens that exact NOR side; REV remains available until REV itself has decided evidence. If REV also fails, that exact REV side is then tightened/disabled.",
             SEP,
-            _setup_edge_stats_table(by_combo, 'Family + session + strategy — strongest / least-bad', sort_mode='best', min_setups=1, limit=12),
-            _setup_edge_stats_table(by_combo, 'Family + session + strategy — worst', sort_mode='worst', min_setups=1, limit=12),
-            _setup_edge_stats_table(by_symbol, 'Symbols — worst / blocklist candidates', sort_mode='worst', min_setups=1, limit=15),
-            _setup_edge_stats_table(by_combo_side, 'Family + session + side', sort_mode='worst', min_setups=1, limit=15),
-            _setup_edge_stats_table(by_hour, 'Melbourne hour-of-day', sort_mode='worst', min_setups=1, limit=24),
-            _setup_edge_stats_table(by_day, 'Melbourne day-of-week', sort_mode='worst', min_setups=1, limit=7),
-            _setup_edge_stats_table(by_regime, 'Market regime bucket', sort_mode='worst', min_setups=1, limit=12),
-            _setup_edge_stats_table(by_session, 'Session summary', sort_mode='worst', min_setups=1, limit=5),
-            _setup_edge_stats_table(by_family, 'Family summary', sort_mode='worst', min_setups=1, limit=10),
-            _setup_edge_stats_table(by_side, 'Side summary', sort_mode='worst', min_setups=1, limit=5),
+            _setup_edge_stats_table(by_lane, 'Strategy-side lanes — best', sort_mode='best', min_setups=1, limit=8),
+            _setup_edge_stats_table(by_lane, 'Strategy-side lanes — worst', sort_mode='worst', min_setups=1, limit=10),
+            _setup_edge_stats_table(by_combo, 'Family-session-strategy summary', sort_mode='worst', min_setups=1, limit=8),
+            _setup_edge_stats_table(by_symbol, 'Symbols — worst', sort_mode='worst', min_setups=1, limit=8),
+            _setup_edge_stats_table(by_hour, 'Melbourne hours — worst', sort_mode='worst', min_setups=1, limit=8),
+            _setup_edge_stats_table(by_session, 'Session summary', sort_mode='worst', min_setups=1, limit=3),
+            _setup_edge_stats_table(by_side, 'Side summary', sort_mode='worst', min_setups=1, limit=3),
         ]
         return "\n".join(lines)
     except Exception as e:
@@ -45672,19 +45687,24 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disabled = ', '.join(list((res or {}).get('disabled') or [])) or '-'
         expires = _setup_combo_format_policy_ts((res or {}).get('expires_ts'))
         try:
+            guard_data = _setup_edge_guard_build(int(AUTOTRADE_OWNER_UID or uid), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+            exact_disabled = sorted([str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_strategy_side_block') or (guard_data or {}).get('combo_side_block') or {}).keys() if str(x or '').strip()])
+        except Exception:
+            exact_disabled = []
+        try:
             active_policy = _setup_combo_enforceable_policy_lookup(int(AUTOTRADE_OWNER_UID or uid))
-            already_disabled = sorted([
+            coarse_disabled = sorted([
                 k for k, v in (active_policy or {}).items()
                 if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') or 0) == 0
             ])
         except Exception:
-            already_disabled = []
-        active_disabled_txt = ', '.join(already_disabled) if already_disabled else '-'
+            coarse_disabled = []
+        active_disabled_txt = ', '.join(exact_disabled or coarse_disabled) if (exact_disabled or coarse_disabled) else '-'
         text = (
             f"🛡️ <b>Setup Combo Daily Safety</b>\n{HDR}\n"
             f"Status: <b>{'OK' if (res or {}).get('ok') else 'SKIP/ERROR'}</b> | Run: <b>{html.escape(str((res or {}).get('run_id') or '-'))}</b>\n"
             f"Rows reviewed: <b>{int((res or {}).get('rows') or 0)}</b> | Newly disabled by this run: <b>{html.escape(disabled)}</b> | Expires: <b>{html.escape(expires)}</b>\n"
-            f"Currently active disabled combos: <b>{html.escape(active_disabled_txt)}</b>\n"
+            f"Currently active disabled/tightened lanes: <b>{html.escape(active_disabled_txt)}</b>\n"
             f"Reason: <b>{html.escape(str((res or {}).get('reason') or '-'))}</b>"
         )
         await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
