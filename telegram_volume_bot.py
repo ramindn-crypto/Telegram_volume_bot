@@ -1,6 +1,7 @@
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
 # Keeps non-negotiable safety: valid SL/TP, exchange leverage, liquidation guard, equity/risk sizing, and duplicate-owner guards.
 # - Ver58: restores user-control for /autotrade_config time-exit toggles, keeps scheduled ASIA flat ON at 09:55 Melbourne by default, persists catch-up/report/safety booleans, and stops keep-all mode from forcing displayed config values to false.
+# - yver62: fixes NOR/REV learning state machine so weak NORMAL lanes are not also tightening the paired REVERSE lane; micro-edge blocks are now exact Family-Session-Strategy-Side keys and REV is evaluated only on REV evidence.
 # - yver59: promotes reporting and policy visibility to full Family-Session-Strategy-Side keys (NOR/REV + BUY/SELL), expands setup matrix scoring persistence, and aligns setup audit + AutoTrade matrices with the new combo identity.
 # - Ver57: keeps clean-start legacy rows ignored but re-enables fresh daily/intraday safety, policy-view auto-safety, micro-edge learning, respects runtime blackout config even in keep-all mode, and prevents AutoTrade/email divergence by requiring emailed setups for entries.
 # - Ver56: policy table clean-start/unlocked by default for fresh forward testing.
@@ -11001,11 +11002,16 @@ def _autotrade_dynamic_risk_score(uid: int, setup, session_name: str = '', regim
 
         # Live learned edge evidence from the same executable audit lane used by /setup_matrix.
         data = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+        strategy_short = _setup_strategy_suffix(setup)
+        combo_strategy_side = _setup_combo_strategy_side_key(fam, sess, strategy_short, side)
         combo_side = f'{fam}-{sess}-{side}'
         combo = f'{fam}-{sess}'
+        combo_strategy = _setup_combo_strategy_key(fam, sess, strategy_short)
         for metrics_key, key, label, max_abs, min_dec in [
-            ('combo_side_metrics', combo_side, 'combo_side', 22.0, 3),
-            ('combo_metrics', combo, 'combo', 14.0, 3),
+            ('combo_strategy_side_metrics', combo_strategy_side, 'strategy_side', 24.0, 3),
+            ('combo_strategy_metrics', combo_strategy, 'strategy_combo', 16.0, 3),
+            ('combo_side_metrics', combo_side, 'legacy_combo_side', 8.0, 5),
+            ('combo_metrics', combo, 'legacy_combo', 6.0, 5),
             ('side_metrics', side, 'side', 12.0, 8),
             ('family_metrics', fam, 'family', 10.0, 6),
             ('session_metrics', sess, 'session', 8.0, 6),
@@ -11020,9 +11026,9 @@ def _autotrade_dynamic_risk_score(uid: int, setup, session_name: str = '', regim
 
         # Explicit guard hits are strong de-risk signals. They should normally be blocked
         # before AutoTrade, but this keeps sizing safe if a stale setup slips through.
-        if combo_side in dict((data or {}).get('combo_side_block') or {}):
+        if combo_strategy_side in dict((data or {}).get('combo_strategy_side_block') or (data or {}).get('combo_side_block') or {}):
             score -= 30.0
-            components.append(f"guard_combo_side_block={combo_side}:-30")
+            components.append(f"guard_strategy_side_block={combo_strategy_side}:-30")
         if sym and sym in dict((data or {}).get('symbol_block') or {}):
             score -= 25.0
             components.append(f"guard_symbol_block={sym}:-25")
@@ -43847,13 +43853,10 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
             data = _setup_edge_guard_build(int(user_id or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False) or {}
             fam_k, sess_k, side_k, sym_k, hour_k = _setup_edge_guard_setup_key(setup_or_row, session_name=sess)
             combo_k = f'{fam_k}-{sess_k}'
-            combo_side_k = f'{fam_k}-{sess_k}-{side_k}'
+            combo_side_k = _setup_combo_strategy_side_key(fam_k, sess_k, _setup_strategy_suffix(setup_or_row), side_k)
             meta.update({'combo_key': combo_k, 'combo_side_key': combo_side_k, 'symbol_key': sym_k, 'hour_key': hour_k})
-            if combo_side_k in dict(data.get('combo_side_block') or {}):
-                if strategy_label == 'REVERSE':
-                    meta['reverse_bypassed_combo_side_block'] = combo_side_k
-                else:
-                    return False, f'watch_weak_combo_side:{combo_side_k}', meta
+            if combo_side_k in dict(data.get('combo_strategy_side_block') or data.get('combo_side_block') or {}):
+                return False, f'watch_weak_strategy_side:{combo_side_k}', meta
             if sym_k and sym_k in dict(data.get('symbol_block') or {}):
                 if strategy_label == 'REVERSE':
                     meta['reverse_bypassed_symbol_block'] = sym_k
@@ -44464,11 +44467,11 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
     """
     try:
         if not bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)):
-            return {'ok': True, 'enabled': False, 'combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': 'disabled'}
+            return {'ok': True, 'enabled': False, 'combo_side_block': {}, 'combo_strategy_side_block': {}, 'legacy_combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': 'disabled'}
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
         eval_uid = int(uid or owner_uid or 0)
         if eval_uid <= 0:
-            return {'ok': True, 'enabled': True, 'combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': 'no_uid'}
+            return {'ok': True, 'enabled': True, 'combo_side_block': {}, 'combo_strategy_side_block': {}, 'legacy_combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': 'no_uid'}
         hrs = int(hours or globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168)
         now_ts = float(time.time())
         cache = globals().setdefault('_SETUP_EDGE_GUARD_CACHE', {'ts': 0.0, 'uid': 0, 'hours': 0, 'data': {}})
@@ -44531,11 +44534,21 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
         hour_wr_max = float(globals().get('SETUP_EDGE_GUARD_HOUR_WR_MAX', 25) or 25)
         hour_avgr_max = float(globals().get('SETUP_EDGE_GUARD_HOUR_AVGR_MAX', -0.30) or -0.30)
 
-        combo_side_block = {}
+        # yver62: build micro-edge blocks at the exact analytical lane level:
+        # Family-Session-Strategy-Side (e.g. F1-ASIA-NOR-SELL).  The old
+        # Family-Session-Side bucket is kept only as diagnostics so a weak NORMAL
+        # side does not automatically tighten/block its paired REVERSE test lane.
+        legacy_combo_side_block = {}
         for key, b in by_combo_side.items():
             m = _setup_edge_bucket_metrics(b)
             if m['decided'] >= side_min and m['wr'] <= side_wr_max and m['avg_r'] <= side_avgr_max and m['sl'] >= max(m['tp'] + 2, 3):
-                combo_side_block[key] = {**m, 'reason': f"weak combo-side {key}: {m['tp']}TP/{m['sl']}SL, WR {m['wr']:.1f}%, AvgR {m['avg_r']:+.2f}"}
+                legacy_combo_side_block[key] = {**m, 'reason': f"weak legacy combo-side {key}: {m['tp']}TP/{m['sl']}SL, WR {m['wr']:.1f}%, AvgR {m['avg_r']:+.2f}"}
+
+        combo_strategy_side_block = {}
+        for key, b in by_combo_strategy_side.items():
+            m = _setup_edge_bucket_metrics(b)
+            if m['decided'] >= side_min and m['wr'] <= side_wr_max and m['avg_r'] <= side_avgr_max and m['sl'] >= max(m['tp'] + 2, 3):
+                combo_strategy_side_block[key] = {**m, 'reason': f"weak strategy-side lane {key}: {m['tp']}TP/{m['sl']}SL, WR {m['wr']:.1f}%, AvgR {m['avg_r']:+.2f}"}
 
         symbol_block = {}
         for key, b in by_symbol.items():
@@ -44558,7 +44571,14 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
             for key in tuple(globals().get('SETUP_EDGE_GUARD_INTERIM_COMBO_SIDE_LIST', ()) or ()): 
                 k = str(key or '').upper().strip()
                 if k:
-                    combo_side_block.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': f'temporary combo-side block until weekly review {weekly_txt}'})
+                    # yver62: legacy F1-ASIA-SELL overrides apply only to the NORMAL
+                    # lane. Full F1-ASIA-REV-SELL keys remain exact.
+                    parts = k.split('-')
+                    exact_k = k
+                    if len(parts) == 3:
+                        exact_k = f'{parts[0]}-{parts[1]}-NOR-{parts[2]}'
+                    combo_strategy_side_block.setdefault(exact_k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': f'temporary strategy-side block until weekly review {weekly_txt}'})
+                    legacy_combo_side_block.setdefault(k, {'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0, 'score': -80.0, 'reason': f'temporary legacy combo-side diagnostic until weekly review {weekly_txt}'})
             for key in tuple(globals().get('SETUP_EDGE_GUARD_INTERIM_HOUR_LIST', ()) or ()): 
                 k = str(key or '').strip()
                 if k:
@@ -44572,7 +44592,11 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
 
         data = {
             'ok': True, 'enabled': True, 'uid': eval_uid, 'hours': hrs, 'rows': len(rows or []), 'built_ts': now_ts,
-            'combo_side_block': combo_side_block, 'symbol_block': symbol_block, 'hour_watch': hour_watch,
+            # combo_side_block is intentionally strategy-aware from yver62 onward.
+            'combo_side_block': combo_strategy_side_block,
+            'combo_strategy_side_block': combo_strategy_side_block,
+            'legacy_combo_side_block': legacy_combo_side_block,
+            'symbol_block': symbol_block, 'hour_watch': hour_watch,
             'combo_side_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo_side.items()},
             'combo_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo.items()},
             'combo_strategy_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo_strategy.items()},
@@ -44587,7 +44611,7 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
         cache.update({'ts': now_ts, 'uid': eval_uid, 'hours': hrs, 'data': data})
         return data
     except Exception as exc:
-        return {'ok': False, 'enabled': True, 'combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': f'{type(exc).__name__}: {exc}'}
+        return {'ok': False, 'enabled': True, 'combo_side_block': {}, 'combo_strategy_side_block': {}, 'legacy_combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': f'{type(exc).__name__}: {exc}'}
 
 
 def _setup_edge_guard_setup_key(setup_or_row, session_name: str = '') -> tuple[str, str, str, str, str]:
@@ -44617,8 +44641,10 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
             return True, 'edge_micro_guard_disabled'
         fam, sess, side, sym, hour = _setup_edge_guard_setup_key(setup_or_row, session_name=session_name)
         data = _setup_edge_guard_build(int(user_id or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
-        combo_side = f'{fam}-{sess}-{side}'
-        cs = dict((data or {}).get('combo_side_block') or {})
+        strategy_short = _setup_strategy_suffix(setup_or_row)
+        combo_side = _setup_combo_strategy_side_key(fam, sess, strategy_short, side)
+        legacy_combo_side = f'{fam}-{sess}-{side}'
+        cs = dict((data or {}).get('combo_strategy_side_block') or (data or {}).get('combo_side_block') or {})
         sb = dict((data or {}).get('symbol_block') or {})
         hw = dict((data or {}).get('hour_watch') or {})
         strategy_label = _setup_strategy_label(setup_or_row)
@@ -44667,8 +44693,9 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         except Exception:
             pass
         if combo_side in cs:
-            if strategy_label != 'REVERSE':
-                return False, str((cs.get(combo_side) or {}).get('reason') or f'combo-side {combo_side} blocked by edge guard')
+            # yver62: exact lane block. NORMAL weak evidence blocks/tightens only the
+            # matching NOR side. REV lanes are blocked only by their own REV evidence.
+            return False, str((cs.get(combo_side) or {}).get('reason') or f'strategy-side {combo_side} blocked by edge guard')
         if sym and sym in sb:
             if strategy_label != 'REVERSE':
                 return False, str((sb.get(sym) or {}).get('reason') or f'symbol {sym} blocked by edge guard')
@@ -44711,7 +44738,7 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
 def _setup_edge_guard_snapshot_text(uid: int = 0) -> str:
     try:
         data = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
-        cs = sorted(list((data or {}).get('combo_side_block') or {}))
+        cs = sorted(list((data or {}).get('combo_strategy_side_block') or (data or {}).get('combo_side_block') or {}))
         sy = sorted(list((data or {}).get('symbol_block') or {}))
         hw = sorted(list((data or {}).get('hour_watch') or {}))
         side_exp = _setup_combo_format_policy_ts(_setup_edge_guard_interim_until_ts()) if _setup_edge_guard_interim_active() else '-'
@@ -44719,7 +44746,7 @@ def _setup_edge_guard_snapshot_text(uid: int = 0) -> str:
         sym_exp = (_setup_combo_format_policy_ts(_setup_edge_guard_symbol_until_ts()) if (static_sy and _setup_edge_guard_symbol_interim_active()) else 'rolling evidence only')
         return (
             f"Micro edge guard: {'ON' if bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)) else 'OFF'}"
-            f" | Block side={', '.join(cs[:10]) if cs else '-'}"
+            f" | Block lane={', '.join(cs[:10]) if cs else '-'}"
             f" | Side review={side_exp}"
             f" | Block symbol={', '.join(sy[:12]) if sy else '-'}"
             f" | Symbol review={sym_exp}"
@@ -45520,9 +45547,10 @@ def _setup_combo_policy_text(uid: int) -> str:
 
         try:
             guard_data = _setup_edge_guard_build(int(owner_uid), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
-            side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_side_block') or {}).keys())
+            side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_strategy_side_block') or (guard_data or {}).get('combo_side_block') or {}).keys())
+            legacy_side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('legacy_combo_side_block') or {}).keys())
         except Exception:
-            side_blocks = set()
+            side_blocks = set(); legacy_side_blocks = set()
 
         rows_by_combo = {}
         for r in rows:
@@ -45551,7 +45579,10 @@ def _setup_combo_policy_text(uid: int) -> str:
             elif raw_pol:
                 full_disabled = False
 
-            side_block = (f'{strat_combo}-{side}' in side_blocks) or (f'{base_combo}-{side}' in side_blocks)
+            # yver62: exact Family-Session-Strategy-Side only. Legacy
+            # Family-Session-Side diagnostics are mapped to NOR only so a weak NOR
+            # side does not make the paired REV side look blocked before REV has data.
+            side_block = (full_combo in side_blocks) or (strat == 'NOR' and f'{base_combo}-{side}' in legacy_side_blocks)
             if full_disabled:
                 exec_state = 'OFF'; live_state = 'DISABLE'; disabled_count += 1
             elif side_block:
@@ -45599,7 +45630,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL), <b>KEEP</b>=preferred executable lane, <b>GATE</b>=WATCH/probation and not executable unless the final quality gate passes, <b>PART</b>=this side is tightened/blocked by micro-edge evidence, <b>OFF</b>=disabled by the coarse family/session policy."
+            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL), <b>KEEP</b>=preferred executable lane, <b>GATE</b>=WATCH/probation and not executable unless the final quality gate passes, <b>PART</b>=this exact strategy-side lane is tightened/blocked by its own micro-edge evidence, <b>OFF</b>=disabled by the coarse family/session policy."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
