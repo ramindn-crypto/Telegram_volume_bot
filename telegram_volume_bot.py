@@ -45272,20 +45272,45 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
     live_keep_n = sum(1 for r in rows if str(r.get('effective_action') or '').upper() == 'KEEP')
     live_watch_n = sum(1 for r in rows if str(r.get('effective_action') or '').upper() == 'WATCH')
     live_off_n = sum(1 for r in rows if str(r.get('effective_action') or '').upper() == 'DISABLE')
+
+    def _fmt_when_decided(r: dict, key: str, fmt: str, default: str = '-') -> str:
+        try:
+            if int(r.get('decided') or 0) <= 0:
+                return default
+            return fmt.format(float(r.get(key) or 0.0))
+        except Exception:
+            return default
+
+    def _fmt_when_seen(r: dict, key: str, fmt: str, default: str = '-') -> str:
+        try:
+            if int(r.get('setups') or 0) <= 0:
+                return default
+            return fmt.format(float(r.get(key) or 0.0))
+        except Exception:
+            return default
+
     table_rows = []
     for r in rows:
+        # yver67: Score/WR/AvgR are evidence metrics. Do not show fake -60/0.0
+        # for empty or still-open lanes, because that makes untested REV/NOR lanes
+        # look weak before they have decided TP/SL/NOHIT evidence.
         table_rows.append([
             str(r.get('combo') or ''),
             int(r.get('tp') or 0), int(r.get('sl') or 0), int(r.get('open') or 0),
-            f"{float(r.get('win_rate') or 0.0):.1f}%", f"{float(r.get('avg_r') or 0.0):+.2f}",
-            f"{float(r.get('avg_conf') or 0.0):.0f}", f"{float(r.get('avg_volume_m') or 0.0):.0f}",
-            f"{float(r.get('score') or 0.0):+.1f}",
-            str(r.get('guard') or '-'),
+            _fmt_when_decided(r, 'win_rate', '{:.1f}%'),
+            _fmt_when_decided(r, 'avg_r', '{:+.2f}'),
+            _fmt_when_seen(r, 'avg_conf', '{:.0f}'),
+            _fmt_when_seen(r, 'avg_volume_m', '{:.0f}'),
+            _fmt_when_decided(r, 'score', '{:+.1f}'),
             str(r.get('advisory_action') or r.get('action') or 'WATCH'),
             str(r.get('effective_action') or r.get('action') or 'WATCH'),
-            str(r.get('active_policy_kind') or '-'),
         ])
-    table = tabulate(table_rows, headers=['Combo', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'VolM', 'Score', 'Guard', 'Adv', 'Live', 'Kind'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','left','center','center','center'))
+    table = tabulate(
+        table_rows,
+        headers=['Combo', 'TP', 'SL', 'Open', 'WR', 'AvgR', 'Conf', 'VolM', 'Score', 'Reco', 'Policy'],
+        tablefmt='plain',
+        colalign=('left','right','right','right','right','right','right','right','right','center','center')
+    )
     last_pol = dict((res or {}).get('last_policy') or {})
     try:
         next_review_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
@@ -45301,11 +45326,9 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | WATCH gate=<b>{'STRICT' if SETUP_COMBO_WATCH_STRICT_QUALITY_GATE else ('BLOCK' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OPEN')}</b>",
         html.escape(_setup_edge_guard_snapshot_text(int(uid))),
         f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> (temporary severe-disable only).",
-        "Manual <code>/setup_matrix</code> rows are advisory. <b>Combo</b> is Family-Session-Strategy-Side (NOR/REV + BUY/SELL); <b>Adv</b> is what this selected window recommends; <b>Live</b> is the currently enforced scheduled/interim/daily-safety state used by executable queue + emails + AutoTrade + optimizer bridge.",
+        "Manual <code>/setup_matrix</code> rows are advisory. <b>Combo</b> is Family-Session-Strategy-Side (NOR/REV + BUY/SELL); <b>Reco</b> is what this selected window recommends; <b>Policy</b> is the currently enforced state used by executable queue + emails + AutoTrade + optimizer bridge. Score is blank for lanes with no decided evidence yet.",
     ]
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
-
-
 
 def _setup_edge_extract_regime(row: dict) -> str:
     """Best-effort market-regime label for setup analytics.
@@ -45737,11 +45760,11 @@ def _setup_combo_policy_text(uid: int) -> str:
             wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
             avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
             adv = str(score.get('action') or '-').upper().strip() or '-'
-            kind_src = pol.get('policy_kind') or raw_pol.get('policy_kind') or '-'
-            kind_txt = _setup_combo_policy_kind_label(kind_src, short=True) if kind_src and kind_src != '-' else '-'
-            if not pol and raw_pol and float(raw_pol.get('expires_ts') or 0.0) > 0:
-                kind_txt = 'expired'
-            table_rows.append([full_combo, exec_state, live_state, set_v, dec_v, f'{wr_v:.1f}%', f'{avg_v:+.2f}', adv, kind_txt])
+            # yver67: keep policy table focused. Row-level Kind was confusing and
+            # duplicated the header policy-kind summary; no-evidence lanes show '-' metrics.
+            wr_txt = f'{wr_v:.1f}%' if dec_v > 0 else '-'
+            avg_txt = f'{avg_v:+.2f}' if dec_v > 0 else '-'
+            table_rows.append([full_combo, exec_state, live_state, set_v, dec_v, wr_txt, avg_txt, adv])
 
         order_rank = {'OFF': 0, 'PART': 1, 'GATE': 2, 'KEEP': 3, 'ON': 4}
         def _row_key(row):
@@ -45757,14 +45780,14 @@ def _setup_combo_policy_text(uid: int) -> str:
             side_n = 0 if side == 'BUY' else 1
             return (order_rank.get(str(row[1]), 9), fam_n, sess_n, strat_n, side_n, combo)
         table_rows = sorted(table_rows, key=_row_key)
-        table = tabulate(table_rows, headers=['Combo','ExecNow','LiveState','Set','Dec','WR','AvgR','Reco','Kind'], tablefmt='plain')
+        table = tabulate(table_rows, headers=['Combo','ExecNow','Policy','Set','Dec','WR','AvgR','Reco'], tablefmt='plain')
 
         info = _setup_combo_latest_policy_update_info(int(owner_uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL). <b>ExecNow</b> is the actual executable state now. <b>LiveState</b> is the enforced policy state. <b>Reco</b> is this window's recommendation only. <b>PART</b>=this exact lane is tightened by its own evidence. <b>OFF</b>=this exact lane is disabled by scheduled/daily safety policy."
+            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL). <b>ExecNow</b> is the actual executable state now. <b>Policy</b> is the enforced policy state. <b>Reco</b> is this window's recommendation only. <b>PART</b>=this exact lane is tightened by its own evidence. <b>OFF</b>=this exact lane is disabled by scheduled/daily safety policy. No-evidence lanes show '-' metrics."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
