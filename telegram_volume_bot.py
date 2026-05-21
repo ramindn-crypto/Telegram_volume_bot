@@ -1,3 +1,4 @@
+# yver68: adds explicit NOR→REV route visibility in /setup_matrix, /setup_matrix policy and deep analysis, confirming disabled/tightened NOR lanes route future raw candidates to the opposite REV side only after a fresh candidate passes the shared final gate.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
 # - yver65: fixes remaining report/policy wording and display sanity: /setup_matrix deep now labels exact disabled lanes vs micro-edge tightened lanes, and /autotrade_report prevents impossible Open > Close timestamps while refreshing report caches.
 # - yver66: minor deep-analysis sync: the summary table now uses the full Family-Session-Strategy-Side lane key, not the older side-mixed Family-Session-Strategy key.
@@ -2961,6 +2962,89 @@ def _setup_combo_strategy_side_key(family: str = '', session: str = '', strategy
     except Exception:
         return 'F0-UNK-NOR-BOTH'
 
+
+
+
+def _setup_reverse_target_lane_for_combo(combo: str = '') -> str:
+    """Return the exact REV lane that a weak/disabled NOR lane routes into.
+
+    Important direction rule:
+    - NOR-BUY weakness means the original BUY signal is faded as REV-SELL.
+    - NOR-SELL weakness means the original SELL signal is faded as REV-BUY.
+    REV lanes are never auto-marked weak from NOR evidence; they need their own
+    decided REV evidence before being tightened/disabled.
+    """
+    try:
+        c = str(combo or '').upper().strip()
+        parts = [x for x in c.split('-') if x]
+        if len(parts) < 4:
+            return '-'
+        fam, sess, strat, side = parts[0], parts[1], parts[2], parts[3]
+        if strat != 'NOR' or side not in {'BUY', 'SELL'}:
+            return '-'
+        rev_side = 'SELL' if side == 'BUY' else 'BUY'
+        return _setup_combo_strategy_side_key(fam, sess, 'REV', rev_side)
+    except Exception:
+        return '-'
+
+
+def _setup_nor_rev_router_note(uid: int = 0, rows: list[dict] | None = None) -> str:
+    """Compact operator-facing explanation of the active NOR->REV router state."""
+    try:
+        active = []
+        seen = set()
+        # Enforceable policy disables: hard live route candidates.
+        try:
+            policy_by_combo = _setup_combo_enforceable_policy_lookup(int(uid or 0))
+            for combo, pol in sorted((policy_by_combo or {}).items()):
+                c = str(combo or '').upper().strip()
+                tgt = _setup_reverse_target_lane_for_combo(c)
+                if tgt == '-':
+                    continue
+                st = str((pol or {}).get('status') or '').upper().strip()
+                en = int((pol or {}).get('enabled') or 0) == 1
+                if st in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not en:
+                    txt = f'{c}->{tgt} (policy)'
+                    if txt not in seen:
+                        active.append(txt); seen.add(txt)
+        except Exception:
+            pass
+        # Micro-edge tightened lanes: soft/strict quality route candidates.
+        try:
+            gd = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+            for combo in sorted(((gd or {}).get('combo_strategy_side_block') or (gd or {}).get('combo_side_block') or {}).keys()):
+                c = str(combo or '').upper().strip()
+                tgt = _setup_reverse_target_lane_for_combo(c)
+                if tgt == '-':
+                    continue
+                txt = f'{c}->{tgt} (tighten)'
+                if txt not in seen:
+                    active.append(txt); seen.add(txt)
+        except Exception:
+            pass
+        # Advisory rows from the currently selected /setup_matrix window.
+        try:
+            for r in list(rows or []):
+                c = str((r or {}).get('combo') or '').upper().strip()
+                tgt = _setup_reverse_target_lane_for_combo(c)
+                if tgt == '-':
+                    continue
+                act = str((r or {}).get('action') or (r or {}).get('advisory_action') or '').upper().strip()
+                if act in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}:
+                    txt = f'{c}->{tgt} (reco)'
+                    if txt not in seen:
+                        active.append(txt); seen.add(txt)
+        except Exception:
+            pass
+        route_txt = ', '.join(active[:8]) if active else '-'
+        more = f' (+{len(active)-8} more)' if len(active) > 8 else ''
+        return (
+            'NOR→REV router: weak/disabled NOR-BUY routes future raw BUY candidates to REV-SELL; '
+            'weak/disabled NOR-SELL routes future raw SELL candidates to REV-BUY. '
+            f'Active route candidates now: {route_txt}{more}. REV rows appear only after a fresh raw NOR candidate is generated, flipped, and passes the shared final executable gate.'
+        )
+    except Exception:
+        return 'NOR→REV router: unavailable'
 
 def _setup_combo_strategy_side_key_for_row(row: dict, session_name: str = '') -> str:
     try:
@@ -45325,6 +45409,7 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         f"Matrix recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b>",
         f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | WATCH gate=<b>{'STRICT' if SETUP_COMBO_WATCH_STRICT_QUALITY_GATE else ('BLOCK' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OPEN')}</b>",
         html.escape(_setup_edge_guard_snapshot_text(int(uid))),
+        html.escape(_setup_nor_rev_router_note(int(uid), rows)),
         f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> (temporary severe-disable only).",
         "Manual <code>/setup_matrix</code> rows are advisory. <b>Combo</b> is Family-Session-Strategy-Side (NOR/REV + BUY/SELL); <b>Reco</b> is what this selected window recommends; <b>Policy</b> is the currently enforced state used by executable queue + emails + AutoTrade + optimizer bridge. Score is blank for lanes with no decided evidence yet.",
     ]
@@ -45566,6 +45651,7 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
             html.escape(_setup_edge_guard_snapshot_text(uid)),
             f"Data recommendation from this window (exact lanes): DISABLE/TIGHTEN=<b>{html.escape(', '.join(rec_disable) if rec_disable else '-')}</b> | WATCH/TIGHTEN=<b>{html.escape(', '.join(rec_tighten) if rec_tighten else '-')}</b>",
             "Action rule: weak NOR-BUY/SELL evidence only tightens that exact NOR side; REV remains available until REV itself has decided evidence. If REV also fails, that exact REV side is then tightened/disabled.",
+            html.escape(_setup_nor_rev_router_note(uid, [])),
             SEP,
             _setup_edge_stats_table(by_lane, 'Strategy-side lanes — best', sort_mode='best', min_setups=1, limit=8),
             _setup_edge_stats_table(by_lane, 'Strategy-side lanes — worst', sort_mode='worst', min_setups=1, limit=10),
@@ -45796,7 +45882,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
-            f"{guard_txt}\n{note}\n"
+            f"{guard_txt}\n{html.escape(_setup_nor_rev_router_note(int(owner_uid), []))}\n{note}\n"
             f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, the micro edge guard, the final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity now includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately in reports.\n"
             f"<pre>{html.escape(table)}</pre>"
         )
