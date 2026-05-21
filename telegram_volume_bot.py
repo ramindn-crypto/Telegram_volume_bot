@@ -1,5 +1,6 @@
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
 # - yver65: fixes remaining report/policy wording and display sanity: /setup_matrix deep now labels exact disabled lanes vs micro-edge tightened lanes, and /autotrade_report prevents impossible Open > Close timestamps while refreshing report caches.
+# - yver66: minor deep-analysis sync: the summary table now uses the full Family-Session-Strategy-Side lane key, not the older side-mixed Family-Session-Strategy key.
 # Keeps non-negotiable safety: valid SL/TP, exchange leverage, liquidation guard, equity/risk sizing, and duplicate-owner guards.
 # - Ver58: restores user-control for /autotrade_config time-exit toggles, keeps scheduled ASIA flat ON at 09:55 Melbourne by default, persists catch-up/report/safety booleans, and stops keep-all mode from forcing displayed config values to false.
 # - yver62: fixes NOR/REV learning state machine so weak NORMAL lanes are not also tightening the paired REVERSE lane; micro-edge blocks are now exact Family-Session-Strategy-Side keys and REV is evaluated only on REV evidence.
@@ -45417,9 +45418,9 @@ def _setup_edge_stats_table(stats: dict, title: str, *, sort_mode: str = 'score'
 def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
     """Deep setup analytics with the same canonical lane key used everywhere else.
 
-    yver63: keep this command compact and decision-useful.  The primary unit is now
-    Family-Session-Strategy-Side (example: F1-ASIA-NOR-SELL).  Coarse family/session
-    summaries are shown only as context so NOR/REV and BUY/SELL lanes are not mixed.
+    yver66: keep this command compact and decision-useful.  The primary unit is now
+    Family-Session-Strategy-Side (example: F1-ASIA-NOR-SELL).  The main summary also
+    uses the exact lane key so NOR/REV and BUY/SELL are never mixed in decisions.
     """
     try:
         uid = int(uid or 0)
@@ -45545,7 +45546,9 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
             SEP,
             _setup_edge_stats_table(by_lane, 'Strategy-side lanes — best', sort_mode='best', min_setups=1, limit=8),
             _setup_edge_stats_table(by_lane, 'Strategy-side lanes — worst', sort_mode='worst', min_setups=1, limit=10),
-            _setup_edge_stats_table(by_combo, 'Family-session-strategy summary', sort_mode='worst', min_setups=1, limit=8),
+            # yver66: keep this summary on the canonical exact lane key too.
+            # Do not collapse BUY/SELL or NOR/REV back into old Family-Session-Strategy only.
+            _setup_edge_stats_table(by_lane, 'Family-session-strategy-side summary', sort_mode='volume', min_setups=1, limit=12),
             _setup_edge_stats_table(by_symbol, 'Symbols — worst', sort_mode='worst', min_setups=1, limit=8),
             _setup_edge_stats_table(by_hour, 'Melbourne hours — worst', sort_mode='worst', min_setups=1, limit=8),
             _setup_edge_stats_table(by_session, 'Session summary', sort_mode='worst', min_setups=1, limit=3),
