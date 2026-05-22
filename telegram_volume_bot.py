@@ -1,4 +1,4 @@
-# yver68: adds explicit NOR→REV route visibility in /setup_matrix, /setup_matrix policy and deep analysis, confirming disabled/tightened NOR lanes route future raw candidates to the opposite REV side only after a fresh candidate passes the shared final gate.
+# yver70: fixes NOR→REV starvation: disabled/tightened NOR lanes are routed before NORMAL policy blocking/strong-keep shortcuts, and REVERSE geometry now uses a valid forward-test RR target instead of old TP/SL swap.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
 # - yver65: fixes remaining report/policy wording and display sanity: /setup_matrix deep now labels exact disabled lanes vs micro-edge tightened lanes, and /autotrade_report prevents impossible Open > Close timestamps while refreshing report caches.
 # - yver66: minor deep-analysis sync: the summary table now uses the full Family-Session-Strategy-Side lane key, not the older side-mixed Family-Session-Strategy key.
@@ -1207,6 +1207,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)),
         'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)),
+        'SETUP_REVERSE_TARGET_RR': float(globals().get('SETUP_REVERSE_TARGET_RR', 1.20) or 1.20),
         'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY': _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True),
     }
 
@@ -2251,6 +2252,10 @@ AUTOTRADE_VER43_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER43_DAILY_CAP_
 SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED = env_bool("SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED", True)
 SETUP_ADAPTIVE_REVERSE_FOR_DISABLED = env_bool("SETUP_ADAPTIVE_REVERSE_FOR_DISABLED", True)
 SETUP_ADAPTIVE_REVERSE_SUFFIX = str(os.environ.get("SETUP_ADAPTIVE_REVERSE_SUFFIX", "RV") or "RV").strip().upper()
+# yver70: old swap geometry made REVERSE RR = 1 / original RR, so almost every
+# REV candidate failed the shared executable RR gate.  Reverse tests now target
+# the old NORMAL stop and calculate a closer protective stop to keep RR valid.
+SETUP_REVERSE_TARGET_RR = float(os.environ.get("SETUP_REVERSE_TARGET_RR", "1.20") or 1.20)
 SETUP_ADAPTIVE_WEAK_MIN_DECIDED = int(os.environ.get("SETUP_ADAPTIVE_WEAK_MIN_DECIDED", "2") or 2)
 SETUP_ADAPTIVE_STRONG_MIN_DECIDED = int(os.environ.get("SETUP_ADAPTIVE_STRONG_MIN_DECIDED", "2") or 2)
 SETUP_ADAPTIVE_STRONG_WR = float(os.environ.get("SETUP_ADAPTIVE_STRONG_WR", "55") or 55)
@@ -2266,6 +2271,9 @@ try:
     _v = _autotrade_config_get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', None)
     if _v is not None:
         SETUP_ADAPTIVE_REVERSE_FOR_DISABLED = str(_v).strip().lower() in {'1', 'true', 'yes', 'on'}
+    _v = _autotrade_config_get('SETUP_REVERSE_TARGET_RR', None)
+    if _v is not None:
+        SETUP_REVERSE_TARGET_RR = float(_v)
 except Exception:
     pass
 SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "8") or 8)
@@ -3267,14 +3275,16 @@ def _setup_strategy_decision_for_setup(setup_or_row, session_name: str = '', use
         meta.update({'reverse_decided': rev_dec, 'reverse_wr': rev_wr, 'reverse_avg_r': rev_avg, 'reverse_tp': rev_tp, 'reverse_sl': rev_sl})
         rev_bad_enough = rev_dec >= int(globals().get('SETUP_ADAPTIVE_TIGHTEN_REVERSE_MIN_DECIDED', 4) or 4) and (rev_wr <= float(globals().get('SETUP_ADAPTIVE_TIGHTEN_REVERSE_WR_MAX', 45) or 55) or rev_avg <= 0.0 or rev_sl > rev_tp)
 
-        if decided >= strong_min and wr >= strong_wr and avg_r >= strong_avg and tp >= sl:
-            return 'NORMAL', f"strong_combo_keep_normal:{meta.get('combo_strategy','-')}:WR{wr:.1f}:AvgR{avg_r:+.2f}:n{decided}", meta
-
+        # yver70: policy-disabled NORMAL lanes must be routed before the strong-KEEP
+        # shortcut.  Otherwise a disabled but historically decent NOR lane could stay
+        # NORMAL and then be rejected by final_combo_disabled, starving the REV lane.
         needs_reverse = False
         reverse_reason = ''
         if (status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or not enabled) and bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)):
             needs_reverse = True
             reverse_reason = f"disabled_combo_route_reverse:{meta.get('combo','-')}"
+        elif decided >= strong_min and wr >= strong_wr and avg_r >= strong_avg and tp >= sl:
+            return 'NORMAL', f"strong_combo_keep_normal:{meta.get('combo_strategy','-')}:WR{wr:.1f}:AvgR{avg_r:+.2f}:n{decided}", meta
         elif decided >= weak_min and (wr < reverse_wr or avg_r <= reverse_avg or score <= 0.0 or sl > tp):
             needs_reverse = True
             reverse_reason = f"weak_combo_route_reverse:{meta.get('combo','-')}:WR{wr:.1f}:AvgR{avg_r:+.2f}:n{decided}"
@@ -3293,7 +3303,14 @@ def _setup_strategy_decision_for_setup(setup_or_row, session_name: str = '', use
 
 
 def _setup_strategy_reverse_setup(setup, session_name: str = '', user_id: int = 0, reason: str = '', meta: dict | None = None):
-    """Return a reversed copy of a setup: BUY->SELL / SELL->BUY, old SL becomes TP and old TP becomes SL."""
+    """Return a reversed copy of a setup: BUY->SELL / SELL->BUY with valid REV RR.
+
+    yver70: Do NOT simply swap old TP and old SL.  A normal setup with RR 1.55
+    would become a reverse setup with RR 0.65 and would almost always be rejected
+    by the shared executable RR gate.  Instead, the old NORMAL stop becomes the
+    reverse target, and the reverse protective stop is calculated from
+    SETUP_REVERSE_TARGET_RR so the flipped lane can actually forward-test.
+    """
     try:
         side = str(_setup_strategy_attr(setup, 'side', '') or '').upper().strip()
         entry = float(_setup_strategy_attr(setup, 'entry', 0.0) or 0.0)
@@ -3303,9 +3320,37 @@ def _setup_strategy_reverse_setup(setup, session_name: str = '', user_id: int = 
             _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
             _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_not_possible_bad_levels')
             return setup
+        if side == 'BUY' and not (old_sl < entry < old_tp):
+            _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
+            _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_not_possible_bad_normal_buy_geometry')
+            return setup
+        if side == 'SELL' and not (old_tp < entry < old_sl):
+            _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
+            _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_not_possible_bad_normal_sell_geometry')
+            return setup
+
         new_side = 'SELL' if side == 'BUY' else 'BUY'
-        new_sl = old_tp
-        new_tp = old_sl
+        target_rr = float(globals().get('SETUP_REVERSE_TARGET_RR', 1.20) or 1.20)
+        target_rr = float(clamp(target_rr, 1.05, 2.50))
+        # The old normal SL is the first proof point that the normal idea failed;
+        # use it as the reverse TP and calculate a closer stop from target RR.
+        if side == 'BUY':
+            new_tp = old_sl
+            reward_dist = float(entry - new_tp)
+            if reward_dist <= 0:
+                _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
+                _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_invalid_sell_reward')
+                return setup
+            new_sl = entry + (reward_dist / target_rr)
+        else:
+            new_tp = old_sl
+            reward_dist = float(new_tp - entry)
+            if reward_dist <= 0:
+                _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
+                _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_invalid_buy_reward')
+                return setup
+            new_sl = entry - (reward_dist / target_rr)
+
         if new_side == 'BUY' and not (new_sl < entry < new_tp):
             _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
             _setup_strategy_set_attr(setup, 'strategy_reason', 'reverse_invalid_buy_geometry')
@@ -3341,6 +3386,9 @@ def _setup_strategy_reverse_setup(setup, session_name: str = '', user_id: int = 
             'original_sl': float(old_sl),
             'original_tp': float(old_tp),
             'normal_signal_side': side,
+            'reverse_target_rr': float(target_rr),
+            'reverse_reward_dist': float(abs(float(entry) - float(new_tp))),
+            'reverse_risk_dist': float(abs(float(new_sl) - float(entry))),
             'strategy_meta_json': json.dumps(dict(meta or {}), separators=(',', ':'), ensure_ascii=False)[:1500],
         }.items():
             _setup_strategy_set_attr(rev, name, value)
@@ -3366,7 +3414,29 @@ def _setup_adaptive_strategy_route_setup(setup, session_name: str = '', user_id:
             return setup
         decision, reason, meta = _setup_strategy_decision_for_setup(setup, session_name=session_name, user_id=int(user_id or 0))
         if decision == 'REVERSE':
-            return _setup_strategy_reverse_setup(setup, session_name=session_name, user_id=int(user_id or 0), reason=reason, meta=meta)
+            rev = _setup_strategy_reverse_setup(setup, session_name=session_name, user_id=int(user_id or 0), reason=reason, meta=meta)
+            try:
+                if _setup_strategy_label(rev) == 'REVERSE':
+                    db_log_setup_pipeline_event(
+                        int(user_id or 0),
+                        stage='nor_to_rev_router',
+                        status='routed',
+                        session=str(session_name or ''),
+                        mode='setup_generation',
+                        setup_id=str(_setup_strategy_attr(rev, 'setup_id', '') or ''),
+                        symbol=str(_setup_strategy_attr(rev, 'symbol', '') or ''),
+                        side=str(_setup_strategy_attr(rev, 'side', '') or ''),
+                        details={
+                            'reason': str(reason or ''),
+                            'from_side': str(_setup_strategy_attr(rev, 'original_side', '') or ''),
+                            'to_side': str(_setup_strategy_attr(rev, 'side', '') or ''),
+                            'reverse_target_rr': float(_setup_strategy_attr(rev, 'reverse_target_rr', 0.0) or 0.0),
+                            'source_combo': str((meta or {}).get('combo_strategy_side') or (meta or {}).get('combo_strategy') or (meta or {}).get('combo') or ''),
+                        },
+                    )
+            except Exception:
+                pass
+            return rev
         _setup_strategy_set_attr(setup, 'setup_strategy', 'NORMAL')
         _setup_strategy_set_attr(setup, 'strategy', 'NORMAL')
         _setup_strategy_set_attr(setup, 'strategy_mode', 'NORMAL')
@@ -39250,6 +39320,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
             f"SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED = {'true' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'false'}",
             f"SETUP_ADAPTIVE_REVERSE_FOR_DISABLED = {'true' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'false'}",
+            f"SETUP_REVERSE_TARGET_RR = {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.20)):.2f}",
             "",
             "Examples:",
             "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.0   (base risk)",
@@ -39287,6 +39358,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_ISOLATED true",
             "• /autotrade_config SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED true",
             "• /autotrade_config SETUP_ADAPTIVE_REVERSE_FOR_DISABLED true",
+            "• /autotrade_config SETUP_REVERSE_TARGET_RR 1.20",
             "",
             "Note: AutoTrade risk caps are controlled here only; /dailycap is manual-only.",
         ]
@@ -39313,7 +39385,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY',
         'AUTOTRADE_STRICT_TPSL_ONLY', 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL',
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
-        'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED'
+        'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -39457,6 +39529,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['SETUP_ADAPTIVE_REVERSE_FOR_DISABLED'] = bool(val)
             _autotrade_config_set('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 1 if val else 0)
+        elif key == 'SETUP_REVERSE_TARGET_RR':
+            val = max(1.05, min(2.50, float(value_raw)))
+            globals()['SETUP_REVERSE_TARGET_RR'] = float(val)
+            _autotrade_config_set('SETUP_REVERSE_TARGET_RR', float(val))
         else:
             raise ValueError('unsupported key')
     except Exception as e:
