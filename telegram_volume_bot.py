@@ -10,6 +10,7 @@
 # - Ver57: keeps clean-start legacy rows ignored but re-enables fresh daily/intraday safety, policy-view auto-safety, micro-edge learning, respects runtime blackout config even in keep-all mode, and prevents AutoTrade/email divergence by requiring emailed setups for entries.
 # - Ver56: policy table clean-start/unlocked by default for fresh forward testing.
 # CHANGE SUMMARY
+# - Ver69 yver69: Flat-before-ASIA carryover guard now runs once per Melbourne date only after the configured flat cutoff, preventing midnight/day-reset carryover spam.
 # - Ver54 yver54: forward-test keep-all mode for NORMAL/REVERSE comparison: disables automatic flat/max-hold/carryover closes by default, extends setup entry life for test observation, and lets scheduled AutoTrade continue placing multiple eligible queued setups per tick while retaining SL/TP, risk caps, duplicate guards and exchange safety checks.
 # - Ver53 yver53: fixes post-unblock execution gaps: removes MON from combo identity (NOR/REV only), routes weak combos to REV earlier, lets AutoTrade execute already queued/emailed setups during setup-generation blackout, retries Bybit leverage at exchange max, and continues candidate attempts after leverage/setup-specific skips.
 # - yver61: AutoTrade risk caps are controlled only by /autotrade_config; /dailycap is manual-only; AutoTrade reports use one clear Reason column with pre-ASIA closes renamed.
@@ -549,6 +550,7 @@ AUTOTRADE_CFG_VER58_TIME_EXIT_RUNTIME_VERSION_KEY = 'ver58_time_exit_runtime_con
 # making the 10:00 ASIA session start fresh.
 AUTOTRADE_CFG_COOLDOWN_RESET_TS_KEY = 'cooldown_reset_after_ts'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_LAST_DATE_KEY = 'flat_before_asia_last_local_date'
+AUTOTRADE_CFG_CARRYOVER_FLAT_LAST_DATE_KEY = 'carryover_flat_last_local_date'
 AUTOTRADE_CFG_VER11_LEVERAGE_POLICY_VERSION_KEY = 'ver11_leverage_policy_version'
 
 # 15May_ver07 safer live defaults after poor 24h forward-test result.
@@ -7373,17 +7375,18 @@ def _setup_generation_blackout_now(now_ts: float | None = None) -> tuple[bool, s
 
 
 
-def _autotrade_close_carried_live_positions_after_reset(uid: int, reason: str = 'post_asia_reset_carryover_guard') -> dict:
-    """Close bot-owned live positions carried from before the current Melbourne trading day.
+def _autotrade_close_carried_live_positions_after_reset(uid: int, reason: str = 'post_asia_flat_carryover_guard') -> dict:
+    """Close bot-owned live positions that existed before the configured ASIA flat cutoff.
 
-    When AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED is ON, the design rule is: after the
-    10:00 Melbourne trading-day reset there should be no carried AutoTrade risk.
-    The exact 09:55 flat job can be missed or can skip positions whose journal row
-    was reset/recreated, so this guard uses the same live-position classification
-    as /open_trades and closes any bot-owned position whose resolved open time is
-    before the current 10:00→10:00 Melbourne trading day start.
+    Ver69: the previous guard used the trading-day reset boundary. In current runtime
+    the trading-day reset can be 00:00 Melbourne, which caused repeated "carryover flat
+    after ASIA reset" messages before the intended 09:55 ASIA flat. The zero-carryover
+    guard must be tied to AUTOTRADE_FLAT_BEFORE_ASIA_TIME instead:
+      - before today's configured flat cutoff: do nothing;
+      - after the cutoff: close only bot-owned positions opened before the cutoff;
+      - leave current-day positions opened after the cutoff untouched.
     """
-    out = {'ok': True, 'reason': str(reason or 'post_asia_reset_carryover_guard'), 'closed': [], 'skipped': [], 'errors': []}
+    out = {'ok': True, 'reason': str(reason or 'post_asia_flat_carryover_guard'), 'closed': [], 'skipped': [], 'errors': []}
     try:
         uid_i = int(uid or 0)
         if uid_i <= 0:
@@ -7393,14 +7396,22 @@ def _autotrade_close_carried_live_positions_after_reset(uid: int, reason: str = 
         if not bool(_autotrade_flat_before_asia_enabled()):
             out['skipped'].append({'reason': 'flat_before_asia_disabled'})
             return out
-        now_ts = time.time()
-        user = _autotrade_user_settings(uid_i)
-        start_utc, _end_utc = _admin_today_window_utc(uid=uid_i, user=user)
-        start_ts = float(start_utc.timestamp())
-        # Do nothing before the new 10:00 Melbourne trading day has started.
-        if now_ts < start_ts:
-            out['skipped'].append({'reason': 'before_trading_day_start', 'start_ts': start_ts})
+
+        now_dt = datetime.now(MEL_TZ)
+        cutoff_dt, cutoff_date_s = _autotrade_flat_before_asia_local_cutoff(now_dt)
+        now_ts = float(now_dt.timestamp())
+        cutoff_ts = float(cutoff_dt.timestamp())
+
+        # Do not perform carryover flattening before the configured ASIA flat time.
+        # This prevents midnight/day-reset cleanup messages before 09:55 Melbourne.
+        if now_dt < cutoff_dt:
+            out['skipped'].append({
+                'reason': 'before_flat_before_asia_cutoff',
+                'cutoff_local': cutoff_dt.strftime('%Y-%m-%d %H:%M'),
+                'now_local': now_dt.strftime('%Y-%m-%d %H:%M'),
+            })
             return out
+
         live_positions = list(_bybit_get_open_positions_linear() or [])
         journal_open = list(_autotrade_db_open_trades(uid_i) or [])
         bot_positions, external_positions, _jr = _autotrade_collect_live_position_rows(
@@ -7421,19 +7432,28 @@ def _autotrade_close_carried_live_positions_after_reset(uid: int, reason: str = 
                 if opened_ts <= 0:
                     out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'open_time_unknown'})
                     continue
-                if opened_ts >= start_ts:
-                    out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'current_day_position', 'opened_ts': opened_ts})
+                if opened_ts >= cutoff_ts:
+                    out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'opened_after_flat_cutoff', 'opened_ts': opened_ts, 'cutoff_ts': cutoff_ts})
                     continue
                 qty = abs(float(_pos_size(p) or 0.0))
                 if qty <= 0:
                     out['skipped'].append({'symbol': sym, 'side': side, 'reason': 'zero_qty'})
                     continue
                 res = _autotrade_force_close_live_position(sym, side, qty=qty)
-                row = {'symbol': sym, 'side': side, 'qty': qty, 'retCode': (res or {}).get('retCode'), 'retMsg': (res or {}).get('retMsg'), 'opened_ts': opened_ts, 'day_start_ts': start_ts}
+                row = {
+                    'symbol': sym,
+                    'side': side,
+                    'qty': qty,
+                    'retCode': (res or {}).get('retCode'),
+                    'retMsg': (res or {}).get('retMsg'),
+                    'opened_ts': opened_ts,
+                    'cutoff_ts': cutoff_ts,
+                    'cutoff_local_date': cutoff_date_s,
+                }
                 out['closed'].append(row)
                 try:
                     if tr and str((tr or {}).get('trade_id') or ''):
-                        _autotrade_db_close_trade(str(tr.get('trade_id')), time.time(), 0.0, 'CARRYOVER_FLAT', str(reason or 'post_asia_reset_carryover_guard'))
+                        _autotrade_db_close_trade(str(tr.get('trade_id')), time.time(), 0.0, 'CARRYOVER_FLAT', str(reason or 'post_asia_flat_carryover_guard'))
                 except Exception:
                     pass
             except Exception as exc:
@@ -7452,7 +7472,7 @@ def _autotrade_close_carried_live_positions_after_reset(uid: int, reason: str = 
             out['ok'] = False
         return out
     except Exception as exc:
-        return {'ok': False, 'reason': str(reason or 'post_asia_reset_carryover_guard'), 'closed': [], 'skipped': [], 'errors': [f'{type(exc).__name__}: {exc}']}
+        return {'ok': False, 'reason': str(reason or 'post_asia_flat_carryover_guard'), 'closed': [], 'skipped': [], 'errors': [f'{type(exc).__name__}: {exc}']}
 
 def _autotrade_close_owned_live_positions(uid: int, reason: str = 'scheduled_flat', max_opened_before_ts: float | None = None) -> dict:
     """Close AutoTrade-owned live positions.
@@ -7625,22 +7645,37 @@ async def autotrade_flat_before_asia_catchup_job(context: ContextTypes.DEFAULT_T
         uid = int(AUTOTRADE_OWNER_UID or 0)
         if uid <= 0:
             return
-        # Ver25: also enforce the zero-carryover rule after the Melbourne 10:00 reset.
-        # This runs even when the normal 09:55 flat was marked complete, because a
-        # position can survive due to journal reset/linkage issues or Render timing.
+        # Ver69: zero-carryover is a once-per-day post-09:55 safety pass.
+        # Do not run it at midnight/day-reset, and do not spam the owner every catch-up tick.
         try:
-            carry_res = await to_thread_autotrade(_autotrade_close_carried_live_positions_after_reset, uid, 'catchup_zero_carryover_after_10_melbourne', timeout=60)
-            carry_closed = list((carry_res or {}).get('closed') or [])
-            if carry_closed:
-                try:
-                    cd_reset2 = _autotrade_clear_execution_cooldowns(uid, 'catchup_zero_carryover_after_10_melbourne')
-                except Exception:
-                    cd_reset2 = {}
-                msg2 = '🧹 AutoTrade carryover flat after ASIA reset\n' + f"Closed carried positions: {len(carry_closed)}"
-                if cd_reset2:
-                    msg2 += f"\nCooldown reset: cleared {int((cd_reset2 or {}).get('deleted_emailed_symbols') or 0)} email/setup cooldown rows"
-                msg2 += '\n' + '\n'.join([f"• {x.get('symbol')} {x.get('side')} ret={x.get('retCode')}" for x in carry_closed[:12]])
-                await context.bot.send_message(chat_id=uid, text=msg2)
+            now_local = datetime.now(MEL_TZ)
+            carry_cutoff, carry_date_s = _autotrade_flat_before_asia_local_cutoff(now_local)
+            last_carry_date = str(_autotrade_config_get(AUTOTRADE_CFG_CARRYOVER_FLAT_LAST_DATE_KEY, '') or '').strip()
+            if now_local >= carry_cutoff and last_carry_date != carry_date_s:
+                carry_res = await to_thread_autotrade(_autotrade_close_carried_live_positions_after_reset, uid, f'carryover_flat_after_asia_cutoff_{carry_date_s}', timeout=60)
+                carry_closed = list((carry_res or {}).get('closed') or [])
+                carry_errors = list((carry_res or {}).get('errors') or [])
+                if carry_closed:
+                    try:
+                        cd_reset2 = _autotrade_clear_execution_cooldowns(uid, f'carryover_flat_after_asia_cutoff_{carry_date_s}')
+                    except Exception:
+                        cd_reset2 = {}
+                    try:
+                        _autotrade_config_set(AUTOTRADE_CFG_CARRYOVER_FLAT_LAST_DATE_KEY, carry_date_s)
+                    except Exception:
+                        pass
+                    msg2 = '🧹 AutoTrade carryover flat after ASIA cutoff\n' + f"Cutoff: {carry_cutoff.strftime('%H:%M')} Melbourne | Closed carried positions: {len(carry_closed)}"
+                    if cd_reset2:
+                        msg2 += f"\nCooldown reset: cleared {int((cd_reset2 or {}).get('deleted_emailed_symbols') or 0)} email/setup cooldown rows"
+                    msg2 += '\n' + '\n'.join([f"• {x.get('symbol')} {x.get('side')} ret={x.get('retCode')}" for x in carry_closed[:12]])
+                    await context.bot.send_message(chat_id=uid, text=msg2)
+                elif not carry_errors:
+                    # Nothing carried across the cutoff. Mark today done so the 5-minute
+                    # catch-up guardian remains quiet until tomorrow.
+                    try:
+                        _autotrade_config_set(AUTOTRADE_CFG_CARRYOVER_FLAT_LAST_DATE_KEY, carry_date_s)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
