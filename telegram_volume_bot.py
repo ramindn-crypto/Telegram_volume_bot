@@ -1,4 +1,4 @@
-# yver70: fixes NOR→REV starvation: disabled/tightened NOR lanes are routed before NORMAL policy blocking/strong-keep shortcuts, and REVERSE geometry now uses a valid forward-test RR target instead of old TP/SL swap.
+# yver71: end-to-end NOR→REV execution hardening: preserves REV metadata through email/cache/DB fallbacks, locks already-delivered setup lanes so AutoTrade executes the exact emailed/executable side, and keeps routing only in raw setup generation before final gates.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
 # - yver65: fixes remaining report/policy wording and display sanity: /setup_matrix deep now labels exact disabled lanes vs micro-edge tightened lanes, and /autotrade_report prevents impossible Open > Close timestamps while refreshing report caches.
 # - yver66: minor deep-analysis sync: the summary table now uses the full Family-Session-Strategy-Side lane key, not the older side-mixed Family-Session-Strategy key.
@@ -2861,6 +2861,45 @@ def _setup_strategy_set_attr(setup_or_row, name: str, value) -> None:
             setattr(setup_or_row, name, value)
     except Exception:
         pass
+
+
+def _setup_delivery_lane_locked(setup_or_row=None, source_kind: str = '') -> bool:
+    """True when a setup has already become an authoritative delivery/execution lane.
+
+    yver71: NOR→REV routing must happen once, before email/executable persistence.
+    After a setup is emailed or written into the owner executable queue, AutoTrade
+    must execute that exact lane (same setup_id/side/SL/TP/strategy) instead of
+    re-routing it again after a later policy update.
+    """
+    try:
+        src = str(source_kind or _setup_strategy_attr(setup_or_row, 'source_kind', '') or '').lower().strip()
+        if src in {
+            'emailed_setups', 'setup_email', 'recent_email_cache',
+            'email_autotrade_immediate', 'bigmove_email_autotrade_immediate',
+            'email_sent_immediate', 'setup_delivery',
+        }:
+            return True
+        if bool(_setup_strategy_attr(setup_or_row, 'delivery_lane_locked', False)):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _setup_route_unless_delivery_locked(setup, session_name: str = '', user_id: int = 0, source_kind: str = ''):
+    try:
+        if _setup_delivery_lane_locked(setup, source_kind=source_kind):
+            sess = str(session_name or '').upper().strip()
+            if sess:
+                _setup_strategy_set_attr(setup, 'source_session', sess)
+                if not _setup_strategy_attr(setup, 'session', ''):
+                    _setup_strategy_set_attr(setup, 'session', sess)
+            if not float(_setup_strategy_attr(setup, 'created_ts', 0.0) or 0.0):
+                _setup_strategy_set_attr(setup, 'created_ts', float(time.time()))
+            return setup
+    except Exception:
+        pass
+    return _setup_route_candidate_for_executable_lane(setup, session_name=session_name, user_id=int(user_id or 0))
 
 
 def _setup_strategy_label(setup_or_row) -> str:
@@ -11449,7 +11488,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
 
     s = setups[0]
     try:
-        s = _setup_route_candidate_for_executable_lane(s, session_label, int(uid))
+        # yver71: AutoTrade is a consumer, not a second strategy router.
+        # Execute already-emailed/executable lanes exactly as delivered; only raw
+        # ad-hoc candidates may still be routed before execution.
+        s = _setup_route_unless_delivery_locked(s, session_label, int(uid))
     except Exception:
         pass
     side = str(getattr(s, 'side', '') or '').upper()
@@ -17920,6 +17962,7 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
         setattr(s, 'quality_score', 0.0)
         setattr(s, 'source_kind', 'emailed_setups')
         setattr(s, 'source_session', str(session_name or '').upper().strip())
+        setattr(s, 'delivery_lane_locked', True)
         setattr(s, 'email_logged_ts', float(time.time()))
         setattr(s, 'emailed_ts', float(time.time()))
         setattr(s, 'bigmove_signal', True)
@@ -18030,6 +18073,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                 try:
                     setattr(_s, 'source_kind', 'emailed_setups')
                     setattr(_s, 'source_session', sess)
+                    setattr(_s, 'delivery_lane_locked', True)
                     setattr(_s, 'email_logged_ts', now_ts)
                     setattr(_s, 'emailed_ts', now_ts)
                     setattr(_s, 'created_ts', float(getattr(_s, 'created_ts', 0.0) or now_ts))
@@ -21984,7 +22028,13 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
             for _target_uid in target_uids:
                 stats['attempted'] += 1
                 try:
-                    s_eff = _setup_adaptive_strategy_route_setup(s, sess, int(_target_uid))
+                    # yver71: raw generation must route NOR→REV here, but already
+                    # delivered/email candidates are locked to the exact lane that
+                    # the user received and that was persisted for AutoTrade.
+                    if _setup_delivery_lane_locked(s, source_kind=str(source_kind or '')):
+                        s_eff = s
+                    else:
+                        s_eff = _setup_adaptive_strategy_route_setup(s, sess, int(_target_uid))
                 except Exception:
                     s_eff = s
                 sid = str(getattr(s_eff, 'setup_id', '') or '').strip()
@@ -22166,6 +22216,7 @@ def _executable_rows_to_setup_objects(rows: List[dict], session_name: str = '') 
                 strategy_reason=str(row.get('strategy_reason') or ''),
                 original_setup_id=str(row.get('original_setup_id') or ''),
                 original_side=str(row.get('original_side') or ''),
+                delivery_lane_locked=True,
             )
             item = _research_finalize_setup(item, session_name=str(row.get('session') or session_name or ''))
             out.append(item)
@@ -22255,6 +22306,13 @@ def _cache_recent_emailed_setup(user_id: int, setup: Any, session: str = '', ema
         'generated_logged_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
         'source_session': str(session or ''),
         'source_kind': str(source_kind or 'recent_email_cache'),
+        'setup_strategy': _setup_strategy_label(setup),
+        'strategy': _setup_strategy_label(setup),
+        'strategy_mode': _setup_strategy_label(setup),
+        'strategy_reason': str(getattr(setup, 'strategy_reason', '') or ''),
+        'original_setup_id': str(getattr(setup, 'original_setup_id', '') or ''),
+        'original_side': str(getattr(setup, 'original_side', '') or ''),
+        'delivery_lane_locked': True,
     }
     if not row['setup_id']:
         return
@@ -22319,6 +22377,10 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
         cutoff = float(time.time()) - float(SCREEN_FALLBACK_MAX_AGE_MIN) * 60.0
     req_session_u = str(session_name or '').upper().strip()
     try:
+        try:
+            _setup_strategy_db_migrate()
+        except Exception:
+            pass
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
@@ -22356,7 +22418,11 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
                     COALESCE(x.ema_support_period, 0) AS ema_support_period,
                     COALESCE(x.ema_support_dist_pct, 0) AS ema_support_dist_pct,
                     COALESCE(NULLIF(x.family_id,''), NULLIF(s.family_id,''), '') AS family_id,
-                    COALESCE(NULLIF(x.source_kind,''), 'emailed_setups') AS source_kind
+                    COALESCE(NULLIF(x.source_kind,''), 'emailed_setups') AS source_kind,
+                    COALESCE(NULLIF(x.setup_strategy,''), NULLIF(s.setup_strategy,''), 'NORMAL') AS setup_strategy,
+                    COALESCE(NULLIF(x.original_setup_id,''), NULLIF(s.original_setup_id,''), '') AS original_setup_id,
+                    COALESCE(NULLIF(x.original_side,''), NULLIF(s.original_side,''), '') AS original_side,
+                    COALESCE(NULLIF(x.strategy_reason,''), NULLIF(s.strategy_reason,''), '') AS strategy_reason
                 FROM emailed_setups e
                 LEFT JOIN signals s ON s.setup_id = e.setup_id
                 LEFT JOIN executable_setups x ON x.user_id = e.user_id AND x.setup_id = e.setup_id
@@ -22422,6 +22488,13 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
                 source_session=str(row.get('session') or ''),
                 family_id=str(row.get('family_id') or ''),
                 family_version=str(row.get('family_version') or RESEARCH_FAMILY_VERSION),
+                setup_strategy=str(row.get('setup_strategy') or 'NORMAL'),
+                strategy=str(row.get('setup_strategy') or 'NORMAL'),
+                strategy_mode=str(row.get('setup_strategy') or 'NORMAL'),
+                strategy_reason=str(row.get('strategy_reason') or ''),
+                original_setup_id=str(row.get('original_setup_id') or ''),
+                original_side=str(row.get('original_side') or ''),
+                delivery_lane_locked=True,
             )
             out.append(item)
             if len(out) >= int(limit):
@@ -50296,6 +50369,13 @@ def _remember_recent_screen_signal(s: Setup, session: str = "", user_id: int | N
             "ch4": float(getattr(s, "ch4", 0.0) or 0.0),
             "ch1": float(getattr(s, "ch1", 0.0) or 0.0),
             "ch15": float(getattr(s, "ch15", 0.0) or 0.0),
+            "setup_strategy": _setup_strategy_label(s),
+            "strategy": _setup_strategy_label(s),
+            "strategy_mode": _setup_strategy_label(s),
+            "strategy_reason": str(getattr(s, "strategy_reason", "") or ""),
+            "original_setup_id": str(getattr(s, "original_setup_id", "") or ""),
+            "original_side": str(getattr(s, "original_side", "") or ""),
+            "delivery_lane_locked": True,
         }
         _RECENT_SCREEN_SIGNALS[sid] = (time.time(), payload)
         _recent_screen_signal_prune()
@@ -51312,7 +51392,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             # Only setups that are valid for the background email/autotrade lane
             # may be emailed and queued here.
             try:
-                s = _setup_route_candidate_for_executable_lane(s, target_session, int(uid))
+                s = _setup_route_unless_delivery_locked(s, target_session, int(uid), source_kind=str(getattr(s, 'source_kind', '') or ''))
                 _exec_ok, _exec_why = is_executable_setup_eligible(s, session_name=target_session)
             except Exception:
                 _exec_ok, _exec_why = False, 'screen_sync_exec_gate_exception'
@@ -52210,6 +52290,7 @@ def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, s
                 setattr(s, 'emailed_ts', float(now_ts))
                 setattr(s, 'source_kind', 'emailed_setups')
                 setattr(s, 'source_session', sess_u)
+                setattr(s, 'delivery_lane_locked', True)
             except Exception:
                 pass
             sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
@@ -56076,6 +56157,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         try:
                             setattr(_s, 'source_kind', 'emailed_setups')
                             setattr(_s, 'source_session', sess)
+                            setattr(_s, 'delivery_lane_locked', True)
                             if not float(getattr(_s, 'created_ts', 0.0) or 0.0):
                                 setattr(_s, 'created_ts', time.time())
                         except Exception:
@@ -56119,7 +56201,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             db_setups = []
             for _s in list(chosen_list or []):
                 try:
-                    _s_eff = _setup_route_candidate_for_executable_lane(_s, sess, owner_uid)
+                    _s_eff = _setup_route_unless_delivery_locked(_s, sess, owner_uid, source_kind=str(getattr(_s, 'source_kind', '') or 'emailed_setups'))
                     ok_s, _why_s = is_executable_setup_eligible(_s_eff, session_name=sess)
                     if ok_s:
                         db_setups.append(_s_eff)
