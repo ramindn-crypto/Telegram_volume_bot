@@ -1,5 +1,6 @@
 # yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
+# yver84: strict audit/report reconciliation: setup compare loads full pre-close setup history, fixes Bybit closed-PnL original-side inference, ignores exchange-only rows for audit scoring, and disables automatic time exits under strict TP/SL-only mode.
 # yver83: adds /setup_audit_compare to reconcile setup price-path audit versus actual AutoTrade report rows, so /setup_audit is not confused with real Bybit PnL.
 # yver82: /autotrade_closed is Bybit Closed-PnL authoritative, sorted by exact exchange close time in Melbourne, with seconds and exact realised PnL rows.
 # yver81: /autotrade_closed close time is forced to Australia/Melbourne display, with robust UTC/ms/ISO timestamp normalization.
@@ -1061,12 +1062,23 @@ def _autotrade_candidate_lookback_hours(default_hours: float = 12.0) -> float:
 
 
 def _autotrade_flat_before_asia_enabled() -> bool:
-    # yver58: /autotrade_config is the authority. Keep-all forward testing must not
-    # force this OFF; the daily 09:55 Melbourne flat is the clean session reset.
+    # yver84: strict TP/SL-only means positions must finish only by their native
+    # Bybit TP or SL. Scheduled ASIA flat is therefore disabled while strict mode
+    # is ON, unless AUTOTRADE_TPSL_ONLY_DISABLE_TIME_EXITS=0 is explicitly set.
+    try:
+        if bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True)) and env_bool('AUTOTRADE_TPSL_ONLY_DISABLE_TIME_EXITS', True):
+            return False
+    except Exception:
+        pass
     return _autotrade_bool_cfg(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
 
 
 def _autotrade_flat_before_asia_catchup_enabled() -> bool:
+    try:
+        if bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True)) and env_bool('AUTOTRADE_TPSL_ONLY_DISABLE_TIME_EXITS', True):
+            return False
+    except Exception:
+        pass
     return _autotrade_bool_cfg(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY, 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)
 
 
@@ -1087,8 +1099,12 @@ def _autotrade_flat_before_asia_minute() -> int:
 
 
 def _autotrade_max_position_hours_enabled() -> bool:
-    # yver58: fully runtime-configurable. Default is OFF for the current forward
-    # test, but /autotrade_config can turn it ON at any time.
+    # yver84: strict TP/SL-only disables automatic max-hold market closes.
+    try:
+        if bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True)) and env_bool('AUTOTRADE_TPSL_ONLY_DISABLE_TIME_EXITS', True):
+            return False
+    except Exception:
+        pass
     return _autotrade_bool_cfg(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False)
 
 
@@ -8708,6 +8724,55 @@ def _bybit_closed_pnl_event_side_candidates(row: dict) -> set[str]:
     return out or {'BUY', 'SELL'}
 
 
+
+
+def _bybit_closed_pnl_position_side(row: dict) -> str:
+    """Infer the original position side for a Bybit Closed-PnL row.
+
+    Bybit Closed P&L can expose the closing execution side, not the original
+    position side. For reporting/reconciliation we need the original position
+    side so SELL winners such as 1000PEPE are matched to SELL setup rows instead
+    of being shown as BUY/NO_SETUP. Use entry/exit prices + realised PnL when
+    available; fall back to the exchange side only when inference is impossible.
+    """
+    raw = str((row or {}).get('side') or '').upper().strip()
+    if raw not in {'BUY', 'SELL'}:
+        raw = ''
+    def _num(keys):
+        for k in keys:
+            try:
+                v = (row or {}).get(k)
+                if v not in (None, ''):
+                    x = abs(float(v or 0.0))
+                    if x > 0:
+                        return x
+            except Exception:
+                pass
+        return 0.0
+    try:
+        entry = _num(('avgEntryPrice', 'avg_entry_price', 'entryPrice', 'entry_price', 'createdPrice', 'openPrice'))
+        exitp = _num(('avgExitPrice', 'avg_exit_price', 'exitPrice', 'exit_price', 'orderPrice', 'price', 'closedPrice'))
+        pnl = float((row or {}).get('closedPnl') if (row or {}).get('closedPnl') is not None else (row or {}).get('closed_pnl') if (row or {}).get('closed_pnl') is not None else (row or {}).get('pnl') or 0.0)
+        if entry > 0 and exitp > 0 and abs(exitp - entry) > max(entry * 1e-7, 1e-12) and abs(pnl) >= 0.05:
+            if pnl > 0:
+                return 'BUY' if exitp > entry else 'SELL'
+            if pnl < 0:
+                return 'BUY' if exitp < entry else 'SELL'
+    except Exception:
+        pass
+    return raw or ''
+
+
+def _bybit_closed_pnl_original_side_candidates(row: dict) -> set[str]:
+    """Candidate original position sides, preferring price/PnL inference."""
+    try:
+        inferred = _bybit_closed_pnl_position_side(row)
+        if inferred in {'BUY', 'SELL'}:
+            return {inferred}
+    except Exception:
+        pass
+    return _bybit_closed_pnl_event_side_candidates(row)
+
 def _bybit_get_closed_pnl_linear(start_ts: float, end_ts: float, symbol: str | None = None, limit: int = 200) -> list[dict]:
     """Fetch Bybit closed-PnL rows for the requested window.
 
@@ -9252,7 +9317,7 @@ def _autotrade_exchange_close_fallback_rows(uid: int, days: int = 7) -> list[dic
             pnl = round(float((ev or {}).get('closedPnl') or 0.0), 8)
             if not sym or ts <= 0:
                 continue
-            sides = _bybit_closed_pnl_event_side_candidates(ev) or {''}
+            sides = _bybit_closed_pnl_original_side_candidates(ev) or _bybit_closed_pnl_event_side_candidates(ev) or {''}
             if any((sym, str(side or '').upper(), int(ts), pnl) in excluded for side in sides):
                 continue
             matched_side = ''
@@ -9262,7 +9327,7 @@ def _autotrade_exchange_close_fallback_rows(uid: int, days: int = 7) -> list[dic
                     matched_side = str(side or '').upper()
                     break
             if not matched_side:
-                matched_side = str(sorted(sides)[0] if sides else '').upper()
+                matched_side = str(_bybit_closed_pnl_position_side(ev) or (sorted(sides)[0] if sides else '')).upper()
             fallback.append({
                 'symbol': sym,
                 'side': matched_side,
@@ -38348,7 +38413,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; /setup_audit compare 24 reconciles real AutoTrade rows vs setup path",
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall Family-Session-Strategy-Side summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR",
-    "setup_audit_compare": "Reconcile /autotrade_report closed rows against /setup_audit price-path results: /setup_audit_compare 24",
+    "setup_audit_compare": "Reconcile bot-created AutoTrade closes against /setup_audit price-path results; exchange-only rows are marked BYBIT_ONLY: /setup_audit_compare 24",
     "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
     "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
     "setup_deep_analysis": "Deep setup analytics: family/session, symbol, side, Melbourne hour/day, regime buckets. Usage: /setup_deep_analysis 168",
@@ -42768,8 +42833,11 @@ def _setup_audit_payload_result_from_candles(row: dict, candles: list, horizon_h
         for c in (candles or []):
             try:
                 ts_s = float(c[0]) / 1000.0
-                # Include the candle that contains the setup timestamp.
-                if ts_s + tf_sec < created_ts - 5:
+                # yver84: only evaluate candles whose open time is at/after the
+                # setup timestamp. Using the whole candle that started before the
+                # setup can falsely count a TP/SL touch that happened before the
+                # setup existed.
+                if ts_s < created_ts - 2:
                     continue
                 if ts_s > horizon_end + tf_sec:
                     continue
@@ -43184,8 +43252,21 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
     horizon_hours = int(_setup_audit_result_horizon_hours())
     audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
 
+    # A closed trade inside the selected window can belong to a setup generated
+    # before the window (up to the audit horizon, plus buffer). Load that full
+    # pre-close setup history and do not de-duplicate; exact setup matching matters
+    # more than compact daily reporting here.
+    compare_setup_start_ts = max(0.0, float(start_ts) - float(horizon_hours + 6) * 3600.0)
     try:
-        setup_rows = _setup_audit_load_rows(owner_uid, hours=hours, limit=0, dedup=True)
+        setup_rows = _setup_audit_load_rows(
+            owner_uid,
+            hours=None,
+            limit=0,
+            dedup=False,
+            start_ts=compare_setup_start_ts,
+            apply_final_quality_gate=False,
+            source_mode_override='ALL',
+        )
     except Exception:
         setup_rows = []
     candles_by_symbol = {}
@@ -43236,9 +43317,8 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
 
     def _actual_from_trade(row: dict) -> str:
         try:
-            # Use the same high-level practical convention as /autotrade_report:
-            # positive realised close = TP/win, negative realised close = SL/loss,
-            # near-zero = OTHER.
+            # Use realised close PnL only for the real AutoTrade side of the
+            # comparison. /setup_audit itself remains price-path based.
             pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
             if pnl > 0.05:
                 return 'TP'
@@ -43248,13 +43328,30 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         except Exception:
             return 'OTHER'
 
+    def _trade_side_for_compare(tr: dict) -> str:
+        try:
+            inferred = _bybit_closed_pnl_position_side(tr)
+            if inferred in {'BUY', 'SELL'}:
+                return inferred
+        except Exception:
+            pass
+        return str((tr or {}).get('side') or '').upper().strip()
+
+    def _is_exchange_only_unlinked(tr: dict) -> bool:
+        try:
+            tid = str((tr or {}).get('trade_id') or '').strip().lower()
+            note = str((tr or {}).get('note') or (tr or {}).get('close_reason') or '').strip().lower()
+            return bool((tr or {}).get('exchange_only')) or tid.startswith(('exchange::', 'report::', 'manual::')) or 'exchange_only_fallback' in note or 'exchange_closed_pnl_fallback' in note
+        except Exception:
+            return False
+
     def _match_setup_for_trade(tr: dict) -> dict | None:
         try:
             sid = str((tr or {}).get('setup_id') or '').strip()
             if sid and sid in setup_by_id:
                 return setup_by_id.get(sid)
             sym = str(_bybit_linear_symbol((tr or {}).get('symbol') or '')).upper().strip()
-            side = str((tr or {}).get('side') or '').upper().strip()
+            side = _trade_side_for_compare(tr)
             close_ts = float((tr or {}).get('closed_ts') or (tr or {}).get('ts') or 0.0)
             open_ts = float((tr or {}).get('opened_ts') or 0.0)
             ref_ts = open_ts if open_ts > 0 else close_ts
@@ -43277,6 +43374,26 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 if score < best_score:
                     best = item
                     best_score = score
+            if best:
+                return best
+            # If the source row carried a closing execution side instead of the
+            # original position side, try the opposite side as a last-resort match.
+            opp = _opposite_side_text(side)
+            if opp in {'BUY', 'SELL'}:
+                for item in setup_items:
+                    if item.get('symbol') != sym or item.get('side') != opp:
+                        continue
+                    sts = float(item.get('setup_ts') or 0.0)
+                    if sts <= 0:
+                        continue
+                    if close_ts > 0 and sts > close_ts + 300:
+                        continue
+                    if ref_ts > 0 and abs(sts - ref_ts) > max(3 * 3600.0, float(horizon_hours) * 3600.0):
+                        continue
+                    score = abs((ref_ts or close_ts or now_ts) - sts) + 600.0
+                    if score < best_score:
+                        best = item
+                        best_score = score
             return best
         except Exception:
             return None
@@ -43286,7 +43403,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
     for tr in sorted((trade_rows or []), key=lambda r: float((r or {}).get('closed_ts') or 0.0), reverse=True):
         try:
             sym = _short_sym(tr.get('symbol') or '')
-            side = str(tr.get('side') or '-').upper().strip() or '-'
+            side = _trade_side_for_compare(tr) or '-'
             close_ts = float(tr.get('closed_ts') or tr.get('ts') or 0.0)
             pnl = float(tr.get('pnl_usdt') if tr.get('pnl_usdt') is not None else tr.get('pnl') or 0.0)
             actual = _actual_from_trade(tr)
@@ -43303,7 +43420,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
             else:
                 setup_time = '-'
                 audit_res = '-'
-                verdict = 'NO_SETUP'
+                verdict = 'BYBIT_ONLY' if _is_exchange_only_unlinked(tr) else 'NO_SETUP'
             if verdict == 'OK':
                 match_ok += 1
             elif verdict == 'DIFF':
@@ -43337,7 +43454,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         colalign=('left', 'left', 'center', 'right', 'center', 'left', 'center', 'center'),
     )
     lines.append("<pre>" + html.escape(table) + "</pre>")
-    lines.append("Chk: OK=same TP/SL direction, DIFF=real trade result disagrees with setup path, PENDING=audit still OPEN/NOHIT, NO_SETUP=no safe setup match.")
+    lines.append("Chk: OK=same TP/SL direction, DIFF=real trade result disagrees with setup path, PENDING=audit still OPEN/NOHIT, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
     return "\n".join(lines)
 # ===========================================================================
 
@@ -49191,7 +49308,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                     'closed_ts': float(ts),
                     'close': _closed_time_text(ts),
                     'symbol': _sym_short(sym),
-                    'side': _bybit_position_side(ev),
+                    'side': (_bybit_closed_pnl_position_side(ev) or _bybit_position_side(ev)),
                     'risk': _match_risk_for_exchange_event(sym, pnl, ts),
                     'pnl': pnl,
                 })
