@@ -1,3 +1,4 @@
+# yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
 # yver71: end-to-end NOR→REV execution hardening: preserves REV metadata through email/cache/DB fallbacks, locks already-delivered setup lanes so AutoTrade executes the exact emailed/executable side, and keeps routing only in raw setup generation before final gates.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
 # - yver65: fixes remaining report/policy wording and display sanity: /setup_matrix deep now labels exact disabled lanes vs micro-edge tightened lanes, and /autotrade_report prevents impossible Open > Close timestamps while refreshing report caches.
@@ -522,6 +523,7 @@ AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY = 'flat_before_asia_hour'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY = 'flat_before_asia_minute'
 AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY = 'flat_before_asia_catchup_enabled'
 AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY = 'strict_tpsl_only'
+AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY = 'immutable_tpsl_after_entry'
 AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY = 'market_reduce_on_risk_breach'
 AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY = 'market_close_on_exit_attach_fail'
 AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY = 'report_require_verified_tpsl'
@@ -759,6 +761,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18),
         AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True) else 0,
         AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY: 1 if env_bool('AUTOTRADE_STRICT_TPSL_ONLY', True) else 0,
+        AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY: 1 if env_bool('AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', True) else 0,
         AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY: 1 if env_bool('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False) else 0,
         AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY: 1 if env_bool('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False) else 0,
         AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY: 1 if env_bool('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True) else 0,
@@ -805,6 +808,19 @@ def _autotrade_entry_enabled() -> bool:
     """
     try:
         return bool(_autotrade_bool_cfg(AUTOTRADE_CFG_ENTRY_ENABLED_KEY, 'AUTOTRADE_ENTRY_ENABLED', True))
+    except Exception:
+        return True
+
+
+def _autotrade_immutable_tpsl_after_entry() -> bool:
+    """When ON, an already protected live position keeps its first native TP/SL.
+
+    The guardian may still attach TP/SL if one side is missing, but it must not
+    keep moving an existing full TP/SL because of a later setup payload, cache
+    fallback, merged same-symbol row, or live mark-price drift.
+    """
+    try:
+        return bool(_autotrade_bool_cfg(AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY, 'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', True))
     except Exception:
         return True
 
@@ -1188,6 +1204,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN': int(_autotrade_safe_leverage_downgrade_min()),
         'AUTOTRADE_EMERGENCY_RISK_MAX_MULT': float(_autotrade_emergency_risk_max_mult()),
         'AUTOTRADE_STRICT_TPSL_ONLY': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True)),
+        'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY': bool(_autotrade_immutable_tpsl_after_entry()),
         'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY, 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)),
         'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY, 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)),
         'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED': bool(_autotrade_flat_before_asia_enabled()),
@@ -7955,10 +7972,12 @@ async def autotrade_flat_now_cmd(update: Update, context: ContextTypes.DEFAULT_T
 # normally finish only via native Bybit position TP or SL. Manual /autotrade_flat_now and configured time exits
 # remain available as explicit owner-approved exceptions.
 AUTOTRADE_STRICT_TPSL_ONLY = env_bool('AUTOTRADE_STRICT_TPSL_ONLY', True)
+AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY = env_bool('AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', True)
 AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = env_bool('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)
 AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = env_bool('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)
 try:
     AUTOTRADE_STRICT_TPSL_ONLY = bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True))
+    AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY = bool(_autotrade_immutable_tpsl_after_entry())
     AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = bool(_autotrade_bool_cfg(AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY, 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False))
     AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = bool(_autotrade_bool_cfg(AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY, 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False))
     AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = bool(_autotrade_bool_cfg(AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY, 'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True))
@@ -8172,8 +8191,21 @@ def _autotrade_exact_setup_exit_targets(trade_row: dict, side: str = '', fallbac
         except Exception:
             return False
 
-    # Prefer original setup payload by setup_id (signals/executable/archived),
-    # because autotrade_trades can be affected by later adoption/repair paths.
+    # yver72: the journal row is the immutable contract after entry. It is
+    # written with the rounded live TP/SL that were sent to Bybit. Do not prefer
+    # the original setup payload here because that can be an older/unrounded cache
+    # or later-hydrated payload and would make the guardian move live TP/SL.
+    try:
+        e = float(row.get('entry') or fallback_entry or 0.0)
+        sl = float(row.get('sl') or 0.0)
+        tp = float(_resolve_single_tp(e, sl, row.get('tp'), row.get('alt_target_a'), row.get('alt_target_b'), side_u) or 0.0)
+        if _valid(e, sl, tp):
+            out.update({'entry': e, 'sl': sl, 'tp': tp, 'source': 'trade_row_immutable'})
+            return out
+    except Exception:
+        pass
+
+    # Fallback only for adopted/orphan rows that have no valid stored TP/SL.
     setup_id = str(row.get('setup_id') or '').strip()
     if setup_id:
         try:
@@ -8182,21 +8214,10 @@ def _autotrade_exact_setup_exit_targets(trade_row: dict, side: str = '', fallbac
             sl = float(payload.get('sl') or 0.0)
             tp = float(_resolve_single_tp(e, sl, payload.get('tp'), payload.get('alt_target_a'), payload.get('alt_target_b'), side_u) or 0.0)
             if _valid(e, sl, tp):
-                out.update({'entry': e, 'sl': sl, 'tp': tp, 'source': 'setup_payload'})
+                out.update({'entry': e, 'sl': sl, 'tp': tp, 'source': 'setup_payload_fallback_missing_row_targets'})
                 return out
         except Exception:
             pass
-
-    # Fall back to the journal row, but still keep fixed row TP/SL.
-    try:
-        e = float(row.get('entry') or fallback_entry or 0.0)
-        sl = float(row.get('sl') or 0.0)
-        tp = float(_resolve_single_tp(e, sl, row.get('tp'), row.get('alt_target_a'), row.get('alt_target_b'), side_u) or 0.0)
-        if _valid(e, sl, tp):
-            out.update({'entry': e, 'sl': sl, 'tp': tp, 'source': 'trade_row'})
-            return out
-    except Exception:
-        pass
     return out
 
 
@@ -8279,6 +8300,39 @@ def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: 
             'native_sl_ok_before': bool(native_sl_ok),
             'native_tp_ok_before': bool(native_tp_ok),
         })
+
+        # yver72 immutable TP/SL rule: once Bybit already has both native Full
+        # position TP and SL, never move them in the background guardian. A live
+        # position can only have one Full TP/SL in one-way mode; changing it later
+        # is exactly the behaviour the forward test must avoid. The guardian still
+        # fixes missing TP/SL and still cleans legacy standalone Conditional exits.
+        if bool(_autotrade_immutable_tpsl_after_entry()) and native_sl > 0 and native_tp > 0 and not (native_sl_ok and native_tp_ok):
+            immutable_liq_detail = {}
+            try:
+                # Keep the fixed exchange SL/TP, but still allow leverage-only safety
+                # repair if liquidation would sit before the existing native SL.
+                liq_px = float(_pos_liq_price(pos) or 0.0)
+                entry_for_liq = float(_pos_entry(pos) or entry or 0.0)
+                if liq_px > 0 and not _autotrade_live_liq_guard_ok(side, liq_px, native_sl, entry_for_liq, _autotrade_runtime_liq_buffer_pct()):
+                    lev_start = int(float((pos or {}).get('leverage') or _autotrade_runtime_leverage() or 1))
+                    immutable_liq_detail = _autotrade_adjust_live_liq_beyond_sl(sym, side, native_sl, entry_for_liq, lev_start) or {}
+            except Exception as _immut_liq_exc:
+                immutable_liq_detail = {'error': f'{type(_immut_liq_exc).__name__}: {_immut_liq_exc}'}
+            cancelled_before = _autotrade_cancel_legacy_conditional_exit_orders(sym, side=side)
+            partial_cancelled_before = _autotrade_cancel_partial_tpsl_exit_orders(sym, side=side)
+            result.update({
+                'immutable_existing_tpsl_kept': True,
+                'sl_fixed': False,
+                'tp_fixed': False,
+                'pending_missing': [],
+                'legacy_conditional_cancelled': int(cancelled_before or 0),
+                'partial_tpsl_cancelled': int(partial_cancelled_before or 0),
+                'native_sl_after': float(native_sl or 0.0),
+                'native_tp_after': float(native_tp or 0.0),
+                'immutable_liq_repair': immutable_liq_detail,
+                'reason': 'existing_native_tpsl_not_moved_after_entry',
+            })
+            return result
 
         # Liquidation must stay beyond the setup SL. If leverage is unsafe, lower it
         # before applying/repairing TP/SL. If it cannot be made safe, flatten rather
@@ -10382,6 +10436,13 @@ def _autotrade_can_open_symbol(uid: int, symbol: str, side: str, session_label: 
 
     if str(_autotrade_runtime_mode()).lower() == 'live':
         try:
+            # yver72: use a fresh live position snapshot for the duplicate/same-symbol
+            # gate. A stale pre-entry cache can allow a second same-symbol setup to
+            # merge into the same Bybit position and overwrite its Full TP/SL.
+            _bybit_invalidate_live_order_position_cache(sym)
+        except Exception:
+            pass
+        try:
             conflict = _autotrade_live_symbol_conflict(uid, sym, side=sd)
         except Exception:
             conflict = {}
@@ -12146,6 +12207,10 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         }
         open_payload = {k: v for k, v in open_payload.items() if v is not None}
         open_res = _bybit_v5_request('POST', '/v5/order/create', open_payload)
+        try:
+            _bybit_invalidate_live_order_position_cache(sym)
+        except Exception:
+            pass
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'open_payload': open_payload, 'open_res': open_res})
         except Exception:
@@ -39368,6 +39433,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN = {int(summary.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 4))}x",
             f"AUTOTRADE_EMERGENCY_RISK_MAX_MULT = {float(summary.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', 2.0)):.2f}x",
             f"AUTOTRADE_STRICT_TPSL_ONLY = {'true' if bool(summary.get('AUTOTRADE_STRICT_TPSL_ONLY', True)) else 'false'}",
+            f"AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY = {'true' if bool(summary.get('AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', True)) else 'false'}",
             f"AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = {'true' if bool(summary.get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)) else 'false'}",
             f"AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = {'true' if bool(summary.get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)) else 'false'}",
             f"AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = {'true' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)) else 'false'}",
@@ -39456,7 +39522,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS',
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS',
         'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY',
-        'AUTOTRADE_STRICT_TPSL_ONLY', 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL',
+        'AUTOTRADE_STRICT_TPSL_ONLY', 'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL',
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR'
     }:
@@ -39578,6 +39644,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_STRICT_TPSL_ONLY'] = bool(val)
             _autotrade_config_set(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH'] = bool(val)
