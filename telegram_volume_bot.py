@@ -1,3 +1,4 @@
+# yver73: /setup_audit_overall and /autotrade_report_overall now report the full fixed window from 2026-05-15 Melbourne instead of rolling 24h/168h windows.
 # yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
 # yver71: end-to-end NOR→REV execution hardening: preserves REV metadata through email/cache/DB fallbacks, locks already-delivered setup lanes so AutoTrade executes the exact emailed/executable side, and keeps routing only in raw setup generation before final gates.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
@@ -46415,9 +46416,58 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+
+# yver73 fixed overall-report baseline.
+# Ramin's WR/PnL decision view must not reset to the last 24h. These helpers keep
+# /setup_audit_overall and /autotrade_report_overall anchored to the same live-test
+# start date while leaving all other reports unchanged.
+OVERALL_REPORT_START_LOCAL_YEAR = 2026
+OVERALL_REPORT_START_LOCAL_MONTH = 5
+OVERALL_REPORT_START_LOCAL_DAY = 15
+
+def _overall_report_start_local_dt() -> datetime:
+    try:
+        return datetime(
+            int(OVERALL_REPORT_START_LOCAL_YEAR),
+            int(OVERALL_REPORT_START_LOCAL_MONTH),
+            int(OVERALL_REPORT_START_LOCAL_DAY),
+            0,
+            0,
+            0,
+            tzinfo=MEL_TZ,
+        )
+    except Exception:
+        return datetime(2026, 5, 15, 0, 0, 0, tzinfo=timezone.utc).astimezone(MEL_TZ)
+
+def _overall_report_start_ts() -> float:
+    try:
+        return float(_overall_report_start_local_dt().astimezone(timezone.utc).timestamp())
+    except Exception:
+        return 0.0
+
+def _overall_report_start_txt() -> str:
+    try:
+        return _overall_report_start_local_dt().strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        return '2026-05-15 00:00'
+
+def _overall_report_hours_since_start(now_ts: float | None = None) -> int:
+    try:
+        end_ts = float(now_ts or time.time())
+        start_ts = float(_overall_report_start_ts() or 0.0)
+        if start_ts <= 0 or end_ts <= start_ts:
+            return 1
+        return max(1, int(math.ceil((end_ts - start_ts) / 3600.0)))
+    except Exception:
+        return 1
+
+
 def _setup_audit_overall_text(uid: int) -> str:
-    """Overall family-level setup audit summary across all stored setup rows."""
+    """Overall family-level setup audit summary from the fixed 15 May baseline."""
+    report_start_ts = float(_overall_report_start_ts() or 0.0)
     rows = _setup_audit_load_rows(int(uid), hours=None, limit=0, dedup=True)
+    if report_start_ts > 0:
+        rows = [r for r in (rows or []) if float(_setup_audit_row_ts(r) or 0.0) >= report_start_ts]
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     # yver60: keep reporting the full Family-Session-NOR/REV-BUY/SELL universe
     # even when no setup has fired yet; zeros are useful for clean forward tests.
@@ -46475,8 +46525,14 @@ def _setup_audit_overall_text(uid: int) -> str:
     decided_total = total_tp + total_sl + total_nohit
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
     win = _setup_audit_window_summary(rows)
-    dur_days = float(win.get('duration_days') or 0.0)
-    avg_daily = float(win.get('avg_daily') or 0.0)
+    try:
+        period_end_ts = float(win.get('end_ts') or time.time())
+        period_start_ts = float(report_start_ts or win.get('start_ts') or period_end_ts)
+        dur_days = max(1.0 / 24.0, (period_end_ts - period_start_ts) / 86400.0) if period_end_ts > period_start_ts else (1.0 / 24.0)
+        avg_daily = float(total_setups or 0) / dur_days if dur_days > 0 else 0.0
+    except Exception:
+        dur_days = float(win.get('duration_days') or 0.0)
+        avg_daily = float(win.get('avg_daily') or 0.0)
     try:
         keep_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) >= SETUP_COMBO_POLICY_KEEP_WR and int(r[2]) + int(r[3]) + int(r[4]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
         weak_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) < SETUP_COMBO_POLICY_DISABLE_WR and int(r[2]) + int(r[3]) + int(r[4]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
@@ -46494,8 +46550,9 @@ def _setup_audit_overall_text(uid: int) -> str:
         "📊 <b>Setup Audit Overall</b>",
         HDR,
         f"Families: <b>{len(fam_codes_seen or [])}</b> | Family/session/strategy/side rows: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
-        f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        f"Duration: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        f"Window: <b>from {html.escape(_overall_report_start_txt())} Melbourne</b>",
+        f"Data start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | Data end: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        f"Duration from 15 May: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
         f"Quick read: strongest now = <b>{html.escape(keep_txt)}</b> | weakest now = <b>{html.escape(weak_txt)}</b>.",
         f"Current live disabled policy combos: <b>{html.escape(pol_txt)}</b>.",
@@ -48426,17 +48483,15 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     return out
 
 def _autotrade_report_overall_text_cached(owner: int, lookback_h: int = 24) -> str:
-    """/autotrade_report_overall — practical AutoTrade overall matrix.
+    """/autotrade_report_overall — practical AutoTrade overall matrix from 15 May.
 
-    Ver05: the old lifecycle-weighted summary could show 0 decided / hundreds
-    untracked while /autotrade_report had real closed PnL. Delegate to the same
-    merged Bybit+journal position logic as /autotrade_report_overall so this
-    command is immediately useful for WR/PnL/family-session review.
+    yver73: this command is the owner's main WR/PnL decision view, so it is
+    anchored to the fixed forward-test baseline instead of a rolling 24h window.
+    The lookback argument is kept for handler compatibility but ignored here.
     """
     try:
         owner = int(owner)
-        lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-        return _autoytrade_report_overall_text_cached(owner, lookback_h)
+        return _autoytrade_report_overall_text_cached(owner, 0)
     except Exception as exc:
         return f"❌ /autotrade_report_overall failed: {type(exc).__name__}: {exc}"
 
@@ -49180,10 +49235,14 @@ async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAUL
 
 
 def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24) -> str:
-    """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
+    """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL from 15 May."""
     owner_uid = int(owner_uid)
-    lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autoytrade_report_overall:v65_policy_labels_matrix:{owner_uid}:{lookback_h}"
+    now_ts = float(time.time())
+    start_ts = float(_overall_report_start_ts() or 0.0)
+    if start_ts <= 0 or start_ts >= now_ts:
+        start_ts = now_ts - 24.0 * 3600.0
+    lookback_h = int(_overall_report_hours_since_start(now_ts))
+    cache_key = f"autoytrade_report_overall:v73_since_2026_05_15:{owner_uid}:{int(start_ts)}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -49192,8 +49251,9 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     except Exception:
         pass
     _autotrade_migrate_tables()
-    now_ts = float(time.time())
-    start_ts = now_ts - float(lookback_h) * 3600.0
+    # yver73: fixed all-forward-test window. Do not replace this with a rolling
+    # lookback; the owner uses this command to decide whether WR is above 50%.
+    # now_ts/start_ts/lookback_h are already set above.
 
     def _family_for_report(row: dict) -> str:
         try:
@@ -49226,6 +49286,8 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     for p, tr in (bot_positions or []):
         row = _setup_audit_merge_trade_setup_row(tr)
         ts = float(row.get('opened_ts') or now_ts)
+        if ts > 0 and ts < float(start_ts or 0.0):
+            continue
         rows.append({
             'ts': ts,
             'time': datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M'),
@@ -49323,7 +49385,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     lines = [
         '📊 AutoTrade Report Overall',
         HDR,
-        f'Window: last {lookback_h}h (Melbourne)' + (f' | Now: {now_txt}' if now_txt else ''),
+        f'Window: from {_overall_report_start_txt()} Melbourne' + (f' | Now: {now_txt}' if now_txt else ''),
         f'Position rows: {total_trades} | Raw fragments merged: {raw_fragments} | TP: {total_tp} | SL: {total_sl} | Other: {total_other} | Open: {total_open} | WR: {wr:.1f}% | PnL: {total_pnl:+.2f} USDT',
         'TP/SL counts are realised outcomes and use the same classifier as /autotrade_report. Other should only be near-zero/unknown rows; time exits and inferred loss reasons are tracked in the detailed report.',
     ]
@@ -49371,18 +49433,12 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
 
 
 async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autotrade_report_overall [hours] — family/session AutoTrade matrix."""
+    """/autotrade_report_overall — family/session AutoTrade matrix from 15 May."""
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
-    lookback_h = 24
-    try:
-        if context.args and str(context.args[0]).strip():
-            lookback_h = int(float(context.args[0]))
-    except Exception:
-        lookback_h = 24
-    lookback_h = int(clamp(lookback_h, 1, 168))
+    lookback_h = int(_overall_report_hours_since_start())
     owner = int(AUTOTRADE_OWNER_UID or uid)
     try:
         text_out = await to_thread_heavy(_autoytrade_report_overall_text_cached, owner, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
@@ -49395,19 +49451,13 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await send_long_message(update, str(text_out or 'No AutoTrade data found yet.'), parse_mode=ParseMode.HTML)
 
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
+    """/autotrade_report_overall — Overall performance summary for bot-opened trades from 15 May."""
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
 
-    lookback_h = 24
-    try:
-        if context.args and str(context.args[0]).strip():
-            lookback_h = int(float(context.args[0]))
-    except Exception:
-        lookback_h = 24
-    lookback_h = int(clamp(lookback_h, 1, 168))
+    lookback_h = int(_overall_report_hours_since_start())
     owner = int(AUTOTRADE_OWNER_UID or uid)
     try:
         text_out = await to_thread_heavy(_autotrade_report_overall_text_cached, owner, lookback_h, timeout=PERFORMANCE_REPORT_TIMEOUT_SEC)
