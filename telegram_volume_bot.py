@@ -2,6 +2,7 @@
 # yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
 # yver84: strict audit/report reconciliation: setup compare loads full pre-close setup history, fixes Bybit closed-PnL original-side inference, ignores exchange-only rows for audit scoring, and disables automatic time exits under strict TP/SL-only mode.
+# yver86: setup audit now prefers fresh candle price-path over stale cached outcomes, and compare rejects future/unrelated setup matches.
 # yver83: adds /setup_audit_compare to reconcile setup price-path audit versus actual AutoTrade report rows, so /setup_audit is not confused with real Bybit PnL.
 # yver82: /autotrade_closed is Bybit Closed-PnL authoritative, sorted by exact exchange close time in Melbourne, with seconds and exact realised PnL rows.
 # yver81: /autotrade_closed close time is forced to Australia/Melbourne display, with robust UTC/ms/ISO timestamp normalization.
@@ -42888,51 +42889,62 @@ def _setup_audit_payload_result_from_candles(row: dict, candles: list, horizon_h
 def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, candles_by_symbol: dict | None = None, audit_timeframe: str = '5m', actual_pnl_usdt: float = 0.0) -> dict:
     """Authoritative result resolver for /setup_audit.
 
-    Priority:
-    1) already-decided cached TP/SL result;
-    2) grouped OHLCV price path after setup time;
-    3) full evaluator if enabled/forced by env;
-    4) current-price fallback.
-    OPEN is never trusted from cache because it can change during the 24h window.
+    yver86: fresh OHLCV candle path is the authority. Older builds cached some
+    TP/SL/NOHIT decisions before the candle-start filtering fix, so trusting cache
+    first can keep a wrong setup result alive forever. We now recompute from the
+    post-setup candle path whenever candles are available, overwrite the cached
+    result, and use cached/outcome rows only as fallback when price candles are not
+    available.
     """
     try:
         rr = _setup_audit_payload_from_row(row)
         sid = str(rr.get('setup_id') or '').strip()
-        cached = _setup_audit_cached_result(sid, horizon_hours, allow_open_fresh_sec=0) if sid else {}
-        if cached and _setup_audit_result_label(cached.get('result')) in {'TP', 'SL', 'NOHIT'}:
-            return {'result': _setup_audit_result_label(cached.get('result')), 'hit_level': cached.get('hit_level'), 'hit_ts': cached.get('hit_ts'), 'note': cached.get('note') or 'cached_decided_result'}
-
-        # Existing signal outcome table can be a decided source if background sync already resolved it.
-        try:
-            if sid:
-                out0 = db_get_outcome(sid) or {}
-                oc0 = _setup_audit_result_label((out0 or {}).get('outcome'))
-                if oc0 in {'TP', 'SL'}:
-                    return {'result': oc0, 'hit_level': oc0, 'hit_ts': (out0 or {}).get('hit_ts'), 'note': 'signal_outcome_decided'}
-        except Exception:
-            pass
-
         ms = _setup_audit_market_symbol_for_row(rr)
         candles = (candles_by_symbol or {}).get(ms) or []
+        last_ev = {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'no_grouped_candles'}
+
+        # 1) Fresh price-path evaluation first. This is the only source that should
+        # drive self-improvement when candles are available.
         if candles:
             ev = _setup_audit_payload_result_from_candles(rr, candles, horizon_hours=horizon_hours, timeframe=audit_timeframe)
-            if _setup_audit_result_label(ev.get('result')) in {'TP', 'SL', 'NOHIT'}:
+            canon = _setup_audit_result_label(ev.get('result'))
+            if canon in {'TP', 'SL', 'NOHIT'}:
+                ev['result'] = canon
                 try:
                     _setup_audit_upsert_result(int(user_id or 0), rr, ev, int(horizon_hours), actual_pnl_usdt=actual_pnl_usdt)
                 except Exception:
                     pass
                 return ev
-            last_ev = ev
-        else:
-            last_ev = {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'no_grouped_candles'}
+            last_ev = ev or last_ev
 
+        # 2) Only if candles were unavailable/ambiguous, use cached decided rows.
+        # Keep this fallback configurable so future audits can be forced fully live.
+        trust_cache = env_bool('SETUP_AUDIT_TRUST_CACHE_WHEN_NO_CANDLES', True)
+        if trust_cache and sid and str((last_ev or {}).get('note') or '').lower() in {'no_grouped_candles', 'no_price_candles'}:
+            try:
+                cached = _setup_audit_cached_result(sid, horizon_hours, allow_open_fresh_sec=0) if sid else {}
+                if cached and _setup_audit_result_label(cached.get('result')) in {'TP', 'SL', 'NOHIT'}:
+                    return {'result': _setup_audit_result_label(cached.get('result')), 'hit_level': cached.get('hit_level'), 'hit_ts': cached.get('hit_ts'), 'note': cached.get('note') or 'cached_decided_result_no_candles'}
+            except Exception:
+                pass
+
+            # Existing signal outcome table can be a decided source only when candles
+            # are missing. It must not override freshly recomputed price-path evidence.
+            try:
+                out0 = db_get_outcome(sid) or {}
+                oc0 = _setup_audit_result_label((out0 or {}).get('outcome'))
+                if oc0 in {'TP', 'SL'}:
+                    return {'result': oc0, 'hit_level': oc0, 'hit_ts': (out0 or {}).get('hit_ts'), 'note': 'signal_outcome_decided_no_candles'}
+            except Exception:
+                pass
+
+        # 3) Optional heavy fallback for rows where grouped candles were missing.
         allow_heavy = str(os.environ.get('SETUP_AUDIT_HEAVY_EVAL', '0')).strip().lower() in {'1', 'true', 'yes', 'on'}
-        # Only do targeted heavy fallback for rows where grouped candles were missing or ambiguous.
-        if allow_heavy and str(last_ev.get('note') or '').lower() in {'no_grouped_candles', 'no_price_candles'}:
+        if allow_heavy and str((last_ev or {}).get('note') or '').lower() in {'no_grouped_candles', 'no_price_candles'}:
             try:
                 tmp = evaluate_signal_hit_order(rr, horizon_hours=int(horizon_hours), timeframe=str(audit_timeframe or '5m'))
                 canon = _setup_audit_result_label((tmp or {}).get('outcome') or (tmp or {}).get('result'))
-                if canon in {'TP', 'SL'}:
+                if canon in {'TP', 'SL', 'NOHIT'}:
                     ev = dict(tmp or {})
                     ev['result'] = canon
                     try:
@@ -42943,9 +42955,7 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
             except Exception:
                 pass
 
-        # Last live/current price fallback. It catches active rows that just crossed TP/SL and prevents stale OPEN labels.
-        # Note: OPEN in setup audit means price path not yet hit TP/SL; it is not the same as an open AutoTrade position.
-        # Last live/current price fallback. It catches active rows that just crossed TP/SL.
+        # 4) Current-price fallback catches active rows that just crossed TP/SL.
         quick = _setup_audit_result_from_cached_price_moves(rr, horizon_hours=horizon_hours)
         canon = _setup_audit_result_label(quick)
         if canon in {'TP', 'SL'}:
@@ -42964,7 +42974,6 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
         return ev
     except Exception as exc:
         return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'setup_audit_resolve_error:{type(exc).__name__}'}
-
 
 def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts: float = 0.0) -> dict:
     """Optional AutoTrade PnL lookup for diagnostics only.
@@ -43447,11 +43456,44 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         except Exception:
             return False
 
+    def _setup_match_time_safe(item: dict, tr: dict) -> bool:
+        """Reject future/unrelated setup matches for compare.
+
+        A setup can be generated shortly before/at AutoTrade open, and must be before
+        the practical position close. Older metadata fallbacks can accidentally attach
+        a later same-symbol setup_id/nearest setup to an older close; that creates a
+        false DIFF and must be ignored.
+        """
+        try:
+            sts = float((item or {}).get('setup_ts') or 0.0)
+            close_ts = float((tr or {}).get('closed_ts') or (tr or {}).get('last_ts') or (tr or {}).get('ts') or 0.0)
+            open_ts = float((tr or {}).get('opened_ts') or (tr or {}).get('first_ts') or 0.0)
+            if sts <= 0:
+                return False
+            if close_ts > 0 and sts > close_ts + 300.0:
+                return False
+            if open_ts > 0:
+                # Setup should not be after the recorded open time. Allow a small
+                # timestamp/order-fill tolerance only.
+                if sts > open_ts + 300.0:
+                    return False
+                # Avoid matching an old same-symbol setup from a previous cycle.
+                if open_ts - sts > float(max(3 * 3600.0, horizon_hours * 3600.0 + 1800.0)):
+                    return False
+            elif close_ts > 0:
+                if close_ts - sts > float(max(3 * 3600.0, horizon_hours * 3600.0 + 1800.0)):
+                    return False
+            return True
+        except Exception:
+            return False
+
     def _match_setup_for_trade(tr: dict) -> dict | None:
         try:
             sid = str((tr or {}).get('setup_id') or '').strip()
             if sid and sid in setup_by_id:
-                return setup_by_id.get(sid)
+                item = setup_by_id.get(sid)
+                if item and _setup_match_time_safe(item, tr):
+                    return item
             sym = str(_bybit_linear_symbol((tr or {}).get('symbol') or '')).upper().strip()
             side = _trade_side_for_compare(tr)
             close_ts = float((tr or {}).get('closed_ts') or (tr or {}).get('last_ts') or (tr or {}).get('ts') or 0.0)
@@ -43462,16 +43504,9 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
             for item in setup_items:
                 if item.get('symbol') != sym or item.get('side') != side:
                     continue
+                if not _setup_match_time_safe(item, tr):
+                    continue
                 sts = float(item.get('setup_ts') or 0.0)
-                if sts <= 0:
-                    continue
-                # A real AutoTrade close should belong to a setup generated before
-                # the close, and usually near/before the open time. Keep this window
-                # deliberately conservative to avoid matching old unrelated closes.
-                if close_ts > 0 and sts > close_ts + 300:
-                    continue
-                if ref_ts > 0 and abs(sts - ref_ts) > max(3 * 3600.0, float(horizon_hours) * 3600.0):
-                    continue
                 score = abs((ref_ts or close_ts or now_ts) - sts)
                 if score < best_score:
                     best = item
@@ -43485,13 +43520,9 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 for item in setup_items:
                     if item.get('symbol') != sym or item.get('side') != opp:
                         continue
+                    if not _setup_match_time_safe(item, tr):
+                        continue
                     sts = float(item.get('setup_ts') or 0.0)
-                    if sts <= 0:
-                        continue
-                    if close_ts > 0 and sts > close_ts + 300:
-                        continue
-                    if ref_ts > 0 and abs(sts - ref_ts) > max(3 * 3600.0, float(horizon_hours) * 3600.0):
-                        continue
                     score = abs((ref_ts or close_ts or now_ts) - sts) + 600.0
                     if score < best_score:
                         best = item
@@ -43513,13 +43544,11 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
             if setup:
                 setup_time = _fmt_ts(float(setup.get('setup_ts') or 0.0))
                 audit_res = str(setup.get('audit_res') or '-').upper()
-                if actual in {'TP', 'SL'} and audit_res in {'TP', 'SL'}:
-                    if actual == audit_res:
-                        verdict = 'OK'
-                    elif _setup_audit_compare_non_tpsl_exit(tr):
-                        verdict = 'NON_TPSL'
-                    else:
-                        verdict = 'DIFF'
+                non_tpsl = _setup_audit_compare_non_tpsl_exit(tr)
+                if non_tpsl:
+                    verdict = 'NON_TPSL'
+                elif actual in {'TP', 'SL'} and audit_res in {'TP', 'SL'}:
+                    verdict = 'OK' if actual == audit_res else 'DIFF'
                 elif audit_res in {'OPEN', 'NOHIT'}:
                     verdict = 'PENDING'
                 else:
