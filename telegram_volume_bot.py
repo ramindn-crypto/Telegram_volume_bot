@@ -1,5 +1,6 @@
 # yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
+# yver80: /autotrade_closed now shows Close time and sorts strictly by closed time newest first.
 # yver78: /autotrade_report sorted by Open time; added /autotrade_closed and /autotrade/closed hours for compact closed positions.
 # yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
 # yver71: end-to-end NOR→REV execution hardening: preserves REV metadata through email/cache/DB fallbacks, locks already-delivered setup lanes so AutoTrade executes the exact emailed/executable side, and keeps routing only in raw setup generation before final gates.
@@ -38355,7 +38356,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_fix_exits": "Force native Full TP/SL on all live AutoTrade positions and cancel legacy Conditional exit orders",
     "autotrade_flat_now": "Manually close AutoTrade-owned live positions now",
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows), sorted by Open time",
-    "autotrade_closed": "Last closed AutoTrade positions: /autotrade_closed 24 or /autotrade/closed 24 shows Symbol, Side, Risk, PnL",
+    "autotrade_closed": "Last closed AutoTrade positions: /autotrade_closed 24 or /autotrade/closed 24 shows Close, Symbol, Side, Risk, PnL",
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "autoytrade_report_overall": "Family/session/strategy/side AutoTrade matrix: /autotrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
     "autotrade_report_matrix": "Alias of /autotrade_report_overall for the family/session AutoTrade matrix",
@@ -48734,13 +48735,13 @@ def _performance_report_payload_cached(owner: int, days: int) -> dict:
 def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> str:
     """Return compact closed AutoTrade positions for /autotrade_closed and /autotrade/closed.
 
-    yver78: admin quick close table. It deliberately shows only Symbol, Side,
-    Risk and PnL, matching the compact open-position risk table style in
-    /autotrade_debug. Rows are sorted by close time newest first.
+    yver80: admin quick close table. It now shows Close time plus Symbol, Side,
+    Risk and PnL. Rows are sorted strictly by closed time newest first so the
+    most recent realised positions are always at the top.
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v78:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v80:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -48789,15 +48790,41 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
             pass
         return '-'
 
+    def _closed_ts_value(row: dict, fallback_row: dict | None = None) -> float:
+        """Best available close timestamp for compact closed-position sorting/display."""
+        try:
+            rr = row or {}
+            fb = fallback_row or {}
+            for src in (rr, fb):
+                for k in ('closed_ts', 'close_ts', 'exit_ts', 'last_ts', 'updated_ts', 'ts'):
+                    try:
+                        v = float((src or {}).get(k) or 0.0)
+                        if v > 0:
+                            return float(v)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return 0.0
+
+    def _closed_time_text(ts: float) -> str:
+        try:
+            if float(ts or 0.0) <= 0:
+                return '-'
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M')
+        except Exception:
+            return '-'
+
     table_rows = []
     for r in (closed_rows or []):
         try:
             row = _setup_audit_merge_trade_setup_row(dict(r or {}))
             row = _autotrade_report_enrich_amounts(row, report_equity)
             pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
-            closed_ts = float(row.get('closed_ts') or r.get('closed_ts') or row.get('last_ts') or row.get('ts') or 0.0)
+            closed_ts = _closed_ts_value(row, r)
             table_rows.append({
-                'closed_ts': closed_ts,
+                'closed_ts': float(closed_ts or 0.0),
+                'close': _closed_time_text(closed_ts),
                 'symbol': _sym_short(row.get('symbol') or r.get('symbol') or ''),
                 'side': str(row.get('side') or r.get('side') or '-').upper().strip() or '-',
                 'risk': _risk_cell(row),
@@ -48817,19 +48844,19 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
         "📕 <b>AutoTrade Closed Positions</b>",
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
-        "Sorted by close time newest first. Columns: Symbol, Side, Risk, PnL.",
+        "Sorted by close time newest first. Columns: Close, Symbol, Side, Risk, PnL.",
     ]
     if not table_rows:
         lines.append(SEP)
         lines.append("No closed AutoTrade positions found in this window.")
         out = "\n".join(lines)
     else:
-        plain_rows = [[r['symbol'], r['side'], r['risk'], f"{float(r['pnl'] or 0.0):+.2f}"] for r in table_rows]
+        plain_rows = [[r.get('close') or '-', r['symbol'], r['side'], r['risk'], f"{float(r['pnl'] or 0.0):+.2f}"] for r in table_rows]
         table = tabulate(
             plain_rows,
-            headers=['Symbol', 'Side', 'Risk', 'PnL'],
+            headers=['Close', 'Symbol', 'Side', 'Risk', 'PnL'],
             tablefmt='plain',
-            colalign=('left', 'center', 'right', 'right'),
+            colalign=('left', 'left', 'center', 'right', 'right'),
         )
         lines.append(f"Rows shown: <b>{len(plain_rows)}</b> closed position rows. Time: <b>Melbourne</b>.")
         out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
@@ -48856,7 +48883,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v78:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v80:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
