@@ -1,4 +1,3 @@
-# yver74: corrected fixed 15 May 2026 Melbourne baseline for /setup_audit_overall and /autotrade_report_overall only; starts both command windows from that date without changing trading/execution logic.
 # yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
 # yver71: end-to-end NOR→REV execution hardening: preserves REV metadata through email/cache/DB fallbacks, locks already-delivered setup lanes so AutoTrade executes the exact emailed/executable side, and keeps routing only in raw setup generation before final gates.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
@@ -42919,7 +42918,7 @@ def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts
     return out
 
 
-def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True) -> list[dict]:
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None) -> list[dict]:
     """Load setup rows for audit.
 
     Default source is executable_setups only. Raw generated_setups can be enabled with
@@ -42935,10 +42934,15 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
     except Exception:
         pass
     cutoff = 0.0
-    if hours is not None and int(hours or 0) > 0:
-        cutoff = float(time.time()) - float(int(hours)) * 3600.0
+    try:
+        if start_ts is not None and float(start_ts or 0.0) > 0:
+            cutoff = float(start_ts or 0.0)
+        elif hours is not None and int(hours or 0) > 0:
+            cutoff = float(time.time()) - float(int(hours)) * 3600.0
+    except Exception:
+        cutoff = 0.0
 
-    mode = str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE') or 'EXECUTABLE').strip().upper()
+    mode = str(source_mode_override if source_mode_override is not None else (globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE') or 'EXECUTABLE')).strip().upper()
     include_exec = mode in {'EXEC', 'EXECUTABLE', 'ACTIONABLE', 'EMAIL', 'AUTOTRADE', 'ALL'}
     include_gen = mode in {'GEN', 'GENERATED', 'RAW', 'RAW_GENERATED', 'ALL'}
     fallback_to_generated = bool(globals().get('SETUP_AUDIT_FALLBACK_TO_GENERATED', True))
@@ -43030,7 +43034,8 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                 rr['setup_id'] = _setup_audit_unique_key(rr)
             if not _setup_volume_ok(float(rr.get('fut_vol_usd') or 0.0)):
                 continue
-            if bool(globals().get('SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE', True)):
+            _apply_gate = bool(globals().get('SETUP_AUDIT_APPLY_FINAL_QUALITY_GATE', True)) if apply_final_quality_gate is None else bool(apply_final_quality_gate)
+            if _apply_gate:
                 try:
                     sess_rr = str(rr.get('session') or rr.get('source_session') or '').upper().strip()
                     final_ok, _final_why, _final_meta = _setup_final_quality_gate_allows_setup(rr, sess_rr, user_id=int(uid or 0))
@@ -46417,9 +46422,8 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# yver74 fixed reporting baseline for the two owner decision commands only.
-# Do not use this for trading gates, setup generation, email, /setup_audit,
-# /autotrade_report, or policy jobs.
+# yver75: fixed reporting baseline requested for only these two overall commands.
+# This must not affect trading, setup generation, email, /setup_audit, /autotrade_report, or policy jobs.
 OVERALL_REPORT_START_LOCAL_YEAR = 2026
 OVERALL_REPORT_START_LOCAL_MONTH = 5
 OVERALL_REPORT_START_LOCAL_DAY = 15
@@ -46466,8 +46470,25 @@ def _overall_report_hours_since_start(now_ts: float | None = None) -> int:
 
 def _setup_audit_overall_text(uid: int) -> str:
     """Overall family-level setup audit summary from the fixed 15 May reporting baseline."""
-    report_lookback_h = int(_overall_report_hours_since_start())
-    rows = _setup_audit_load_rows(int(uid), hours=report_lookback_h, limit=0, dedup=True)
+    _overall_start_ts = float(_overall_report_start_ts() or 0.0)
+    _overall_source_label = str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()
+    # Historical overall must not re-apply today's final quality/policy gate to old executable rows.
+    # The executable table already represents what was executable at the time.
+    rows = _setup_audit_load_rows(int(uid), hours=None, limit=0, dedup=True, start_ts=_overall_start_ts, apply_final_quality_gate=False)
+    # If the current executable table does not contain the older baseline period, use the same
+    # deduped setup-audit path against the historical generated table so the 15 May window is real.
+    try:
+        if rows:
+            _row_start = min([_setup_audit_row_ts(r) for r in rows if _setup_audit_row_ts(r) > 0] or [0.0])
+        else:
+            _row_start = 0.0
+        if _overall_start_ts > 0 and (_row_start <= 0 or _row_start > _overall_start_ts + 36 * 3600):
+            _hist_rows = _setup_audit_load_rows(int(uid), hours=None, limit=0, dedup=True, start_ts=_overall_start_ts, apply_final_quality_gate=False, source_mode_override='ALL')
+            if len(_hist_rows or []) > len(rows or []):
+                rows = list(_hist_rows or [])
+                _overall_source_label = 'EXECUTABLE+GENERATED'
+    except Exception:
+        pass
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     # yver60: keep reporting the full Family-Session-NOR/REV-BUY/SELL universe
     # even when no setup has fired yet; zeros are useful for clean forward tests.
@@ -46525,15 +46546,8 @@ def _setup_audit_overall_text(uid: int) -> str:
     decided_total = total_tp + total_sl + total_nohit
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
     win = _setup_audit_window_summary(rows)
-    try:
-        report_start_ts = float(_overall_report_start_ts() or 0.0)
-        period_end_ts = float(win.get('end_ts') or time.time())
-        period_start_ts = float(report_start_ts or win.get('start_ts') or period_end_ts)
-        dur_days = max(1.0 / 24.0, (period_end_ts - period_start_ts) / 86400.0) if period_end_ts > period_start_ts else (1.0 / 24.0)
-        avg_daily = float(total_setups or 0) / dur_days if dur_days > 0 else 0.0
-    except Exception:
-        dur_days = float(win.get('duration_days') or 0.0)
-        avg_daily = float(win.get('avg_daily') or 0.0)
+    dur_days = float(win.get('duration_days') or 0.0)
+    avg_daily = float(win.get('avg_daily') or 0.0)
     try:
         keep_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) >= SETUP_COMBO_POLICY_KEEP_WR and int(r[2]) + int(r[3]) + int(r[4]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
         weak_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) < SETUP_COMBO_POLICY_DISABLE_WR and int(r[2]) + int(r[3]) + int(r[4]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
@@ -46551,10 +46565,10 @@ def _setup_audit_overall_text(uid: int) -> str:
         "📊 <b>Setup Audit Overall</b>",
         HDR,
         f"Families: <b>{len(fam_codes_seen or [])}</b> | Family/session/strategy/side rows: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
-        f"Window: <b>from {html.escape(_overall_report_start_txt())} Melbourne</b>",
+        f"Window: <b>from {_overall_report_start_txt()} Melbourne</b>",
         f"Data start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | Data end: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        f"Duration from 15 May: <b>{dur_days:.1f} days</b> | Avg generated: <b>{avg_daily:.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
-        f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
+        f"Duration from 15 May: <b>{max(0.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0):.1f} days</b> | Avg generated: <b>{(float(total_setups) / max(1.0/24.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0)):.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={html.escape(str(_overall_source_label or 'EXECUTABLE'))} lane.",
         f"Quick read: strongest now = <b>{html.escape(keep_txt)}</b> | weakest now = <b>{html.escape(weak_txt)}</b>.",
         f"Current live disabled policy combos: <b>{html.escape(pol_txt)}</b>.",
         html.escape(_setup_edge_guard_snapshot_text(int(uid))),
@@ -48486,8 +48500,10 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
 def _autotrade_report_overall_text_cached(owner: int, lookback_h: int = 24) -> str:
     """/autotrade_report_overall — practical AutoTrade overall matrix.
 
-    yver74: keep the original report engine, but allow the command wrapper to pass
-    a fixed-baseline lookback from 2026-05-15 instead of being capped at 168h.
+    Ver05: the old lifecycle-weighted summary could show 0 decided / hundreds
+    untracked while /autotrade_report had real closed PnL. Delegate to the same
+    merged Bybit+journal position logic as /autotrade_report_overall so this
+    command is immediately useful for WR/PnL/family-session review.
     """
     try:
         owner = int(owner)
@@ -49235,11 +49251,81 @@ async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAUL
 
 
 
+
+def _autotrade_closed_report_rows_for_fixed_overall(owner_uid: int, start_ts: float, end_ts: float) -> list[dict]:
+    """Load closed AutoTrade rows for the fixed 15 May overall window.
+
+    The original 24h report works because Bybit/reconstruction calls stay inside a short
+    range. A single 8+ day exchange request can return no rows on some Bybit endpoints, so
+    this helper keeps the original classifier but splits only the history load into safe
+    sub-windows and deduplicates the merged result.
+    """
+    owner_uid = int(owner_uid)
+    start_ts = float(start_ts or 0.0)
+    end_ts = float(end_ts or 0.0)
+    if start_ts <= 0 or end_ts <= start_ts:
+        return []
+    collected: list[dict] = []
+    try:
+        direct_hours = int(math.ceil((end_ts - start_ts) / 3600.0))
+        direct = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(end_ts), lookback_h=max(24, direct_hours), limit=0) or []
+        collected.extend(list(direct or []))
+    except Exception:
+        pass
+    # If the single wide-window call comes back empty/near-empty, rebuild in <=3-day chunks.
+    # This keeps the exact same row classifier but avoids wide Bybit history-window failures.
+    if len(collected or []) < 3 and (end_ts - start_ts) > 3 * 86400.0:
+        try:
+            chunk_sec = 3 * 86400.0
+            cur = float(start_ts)
+            while cur < end_ts - 1:
+                nxt = min(float(end_ts), cur + chunk_sec)
+                chunk_hours = max(24, int(math.ceil((nxt - cur) / 3600.0)))
+                try:
+                    part = _autotrade_closed_report_rows(owner_uid, float(cur), float(nxt), lookback_h=chunk_hours, limit=0) or []
+                    collected.extend(list(part or []))
+                except Exception:
+                    pass
+                cur = float(nxt)
+        except Exception:
+            pass
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for r in collected or []:
+        try:
+            rr = dict(r or {})
+            sid = str(rr.get('setup_id') or '').strip()
+            tid = str(rr.get('trade_id') or '').strip()
+            sym = str(_bybit_linear_symbol(rr.get('symbol') or '')).upper().strip()
+            side = str(rr.get('side') or '').upper().strip()
+            cts = int(float(rr.get('closed_ts') or rr.get('ts') or 0.0) // 60)
+            pnl = round(float(rr.get('pnl_usdt') if rr.get('pnl_usdt') is not None else rr.get('pnl') or 0.0), 8)
+            if sid:
+                key = ('setup', sid)
+            elif tid and not tid.startswith(('exchange::', 'report::', 'prov::', 'manual::')):
+                key = ('trade', tid)
+            else:
+                key = ('event', sym, side, cts, pnl)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(rr)
+        except Exception:
+            continue
+    try:
+        out.sort(key=lambda x: float((x or {}).get('closed_ts') or (x or {}).get('ts') or 0.0), reverse=True)
+    except Exception:
+        pass
+    return out
+
 def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24) -> str:
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 8760))
-    cache_key = f"autoytrade_report_overall:v74_policy_labels_matrix:{owner_uid}:{lookback_h}"
+    _now_for_key = float(time.time())
+    _fixed_overall = bool(lookback_h >= max(1, int(_overall_report_hours_since_start(_now_for_key)) - 1))
+    _fixed_start_ts = float(_overall_report_start_ts() or 0.0) if _fixed_overall else 0.0
+    cache_key = f"autoytrade_report_overall:v75_fixed_start:{owner_uid}:{lookback_h}:{int(_fixed_start_ts or 0)}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -49249,7 +49335,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         pass
     _autotrade_migrate_tables()
     now_ts = float(time.time())
-    start_ts = now_ts - float(lookback_h) * 3600.0
+    start_ts = float(_fixed_start_ts or 0.0) if _fixed_overall and float(_fixed_start_ts or 0.0) > 0 else (now_ts - float(lookback_h) * 3600.0)
 
     def _family_for_report(row: dict) -> str:
         try:
@@ -49275,7 +49361,10 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
     bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(owner_uid, positions=open_positions, fallback_unmatched_as_owned=True)
     try:
-        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=0) or []
+        if _fixed_overall:
+            closed_rows = _autotrade_closed_report_rows_for_fixed_overall(owner_uid, float(start_ts), float(now_ts)) or []
+        else:
+            closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=0) or []
     except Exception:
         closed_rows = []
 
@@ -49379,7 +49468,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     lines = [
         '📊 AutoTrade Report Overall',
         HDR,
-        (f'Window: from {_overall_report_start_txt()} Melbourne' if int(lookback_h or 24) >= int(_overall_report_hours_since_start(now_ts)) - 1 else f'Window: last {lookback_h}h (Melbourne)') + (f' | Now: {now_txt}' if now_txt else ''),
+        (f'Window: from {_overall_report_start_txt()} Melbourne' if _fixed_overall else f'Window: last {lookback_h}h (Melbourne)') + (f' | Now: {now_txt}' if now_txt else ''),
         f'Position rows: {total_trades} | Raw fragments merged: {raw_fragments} | TP: {total_tp} | SL: {total_sl} | Other: {total_other} | Open: {total_open} | WR: {wr:.1f}% | PnL: {total_pnl:+.2f} USDT',
         'TP/SL counts are realised outcomes and use the same classifier as /autotrade_report. Other should only be near-zero/unknown rows; time exits and inferred loss reasons are tracked in the detailed report.',
     ]
@@ -49457,8 +49546,8 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
 
-    # yver74: this owner decision command is fixed to 2026-05-15 Melbourne.
-    # Leave /autotrade_report and all execution logic unchanged.
+    # yver75: fixed owner decision window from 2026-05-15 Melbourne.
+    # Do not change /autotrade_report or any execution/risk logic.
     lookback_h = int(_overall_report_hours_since_start())
     owner = int(AUTOTRADE_OWNER_UID or uid)
     try:
