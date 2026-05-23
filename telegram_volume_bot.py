@@ -1,3 +1,4 @@
+# yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
 # yver78: /autotrade_report sorted by Open time; added /autotrade_closed and /autotrade/closed hours for compact closed positions.
 # yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
@@ -57146,7 +57147,7 @@ def main():
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_closed", autotrade_closed_cmd, block=False))
     app.add_handler(CommandHandler("autotradeclosed", autotrade_closed_cmd, block=False))
-    app.add_handler(MessageHandler(filters.Regex(r"^/autotrade/closed(?:@\w+)?(?:\s|$)"), autotrade_closed_cmd), block=False)
+    app.add_handler(MessageHandler(filters.Regex(r"^/autotrade/closed(?:@\w+)?(?:\s|$)"), autotrade_closed_cmd, block=False))
     app.add_handler(CommandHandler("performance_report", performance_report_cmd, block=False))
     app.add_handler(CommandHandler("trade_lifecycle", trade_lifecycle_cmd, block=False))
     app.add_handler(CommandHandler("trade_lifecycle_detail", trade_lifecycle_detail_cmd, block=False))
