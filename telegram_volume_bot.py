@@ -1,3 +1,4 @@
+# yver85: setup-audit compare now reconciles merged practical AutoTrade positions, not raw Bybit closed-PnL fragments; non-TP/SL historical exits are INFO instead of corrupting setup-audit DIFF counts.
 # yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
 # yver84: strict audit/report reconciliation: setup compare loads full pre-close setup history, fixes Bybit closed-PnL original-side inference, ignores exchange-only rows for audit scoring, and disables automatic time exits under strict TP/SL-only mode.
@@ -43233,7 +43234,107 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
+
 # ================= SETUP AUDIT ↔ AUTOTRADE RECONCILIATION =================
+def _setup_audit_compare_prepare_closed_positions(trade_rows: list[dict]) -> list[dict]:
+    """Return practical merged closed AutoTrade positions for audit comparison.
+
+    /autotrade_closed intentionally mirrors raw Bybit Closed-PnL rows, because that
+    command is used to verify exchange P&L.  /setup_audit_compare has a different
+    job: decide whether a real bot position agreed with the setup price-path audit.
+    Bybit can split one practical position into several closed-PnL fragments, for
+    example one partial close with positive PnL and another with negative PnL.  If
+    those fragments are compared one-by-one, the command shows false DIFF rows even
+    when the merged position outcome agrees with the setup audit.  This helper
+    normalises rows into the same shape used by /autotrade_report and then reuses
+    the report merge logic so comparison is done per practical position.
+    """
+    prepared: list[dict] = []
+    for tr in (trade_rows or []):
+        try:
+            base = dict(tr or {})
+            try:
+                row = _setup_audit_merge_trade_setup_row(base)
+            except Exception:
+                row = dict(base)
+            try:
+                cts = float(row.get('closed_ts') or row.get('last_ts') or row.get('ts') or base.get('closed_ts') or base.get('ts') or 0.0)
+            except Exception:
+                cts = 0.0
+            try:
+                opened_ts = float(row.get('opened_ts') or row.get('first_ts') or base.get('opened_ts') or 0.0)
+            except Exception:
+                opened_ts = 0.0
+            try:
+                pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') if row.get('pnl') is not None else base.get('pnl_usdt') if base.get('pnl_usdt') is not None else base.get('pnl') or 0.0)
+            except Exception:
+                pnl = 0.0
+            sym = str(_bybit_linear_symbol(row.get('symbol') or base.get('symbol') or '')).upper().strip()
+            if not sym or cts <= 0:
+                continue
+            side = ''
+            try:
+                side = str(_bybit_closed_pnl_position_side(row) or row.get('side') or base.get('side') or '').upper().strip()
+            except Exception:
+                side = str(row.get('side') or base.get('side') or '').upper().strip()
+            if side not in {'BUY', 'SELL'}:
+                side = str(row.get('side') or base.get('side') or '').upper().strip()
+            row['state'] = 'CLOSED'
+            row['symbol'] = sym
+            row['side'] = side
+            row['closed_ts'] = float(cts)
+            row['ts'] = float(cts)
+            row['last_ts'] = float(cts)
+            if opened_ts > 0:
+                row['opened_ts'] = float(opened_ts)
+                row.setdefault('first_ts', float(opened_ts))
+            row['pnl'] = float(pnl)
+            row['pnl_usdt'] = float(pnl)
+            try:
+                row['family'] = _setup_audit_family_display(row, compact=True)
+            except Exception:
+                row['family'] = str(row.get('family') or row.get('family_id') or 'F0').upper().strip() or 'F0'
+            try:
+                row['session'] = _autotrade_report_row_session(row)
+            except Exception:
+                row['session'] = str(row.get('session') or row.get('session_code') or '-').upper().strip() or '-'
+            try:
+                row['setup_strategy'] = _setup_strategy_label(row)
+                row['strategy'] = row['setup_strategy']
+            except Exception:
+                pass
+            prepared.append(row)
+        except Exception:
+            continue
+    if not prepared:
+        return []
+    try:
+        merged = _autotrade_merge_position_report_rows(prepared)
+        return [dict(r or {}) for r in (merged or []) if str((r or {}).get('state') or '').upper().strip() != 'OPEN']
+    except Exception:
+        return prepared
+
+
+def _setup_audit_compare_non_tpsl_exit(row: dict) -> bool:
+    """True when a row closed by a non-native/manual/time/profit mechanism.
+
+    These rows are useful operationally, but they should not be counted as a
+    setup-audit DIFF because the position was not allowed to finish naturally at
+    the setup's TP/SL path.  Strict TP/SL mode prevents these going forward; this
+    guard keeps older historical rows from corrupting the reconciliation score.
+    """
+    try:
+        txt = ' '.join(str((row or {}).get(k) or '') for k in (
+            'close_reason', 'exit_reason', 'note', 'source_note', 'result_path', 'result_label'
+        )).upper()
+        markers = (
+            'PROFIT_CLOSE', 'LOSS_CLOSE', 'COUNTER_TREND', 'MANUAL', 'MANUAL_OR_UNKNOWN',
+            'MAX_HOLD', 'CLOSE_BEFORE_ASIA', 'TIME_EXIT', 'FLAT', 'EXCHANGE_ONLY',
+            'FALLBACK', 'PARTIAL_CLOSE', 'REDUCE_ONLY'
+        )
+        return any(m in txt for m in markers)
+    except Exception:
+        return False
 def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
     """Compare setup price-path audit against actual AutoTrade report rows.
 
@@ -43296,6 +43397,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
 
     try:
         trade_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts) + 60.0, lookback_h=hours, limit=0) or []
+        trade_rows = _setup_audit_compare_prepare_closed_positions(trade_rows)
     except Exception:
         trade_rows = []
 
@@ -43352,8 +43454,8 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 return setup_by_id.get(sid)
             sym = str(_bybit_linear_symbol((tr or {}).get('symbol') or '')).upper().strip()
             side = _trade_side_for_compare(tr)
-            close_ts = float((tr or {}).get('closed_ts') or (tr or {}).get('ts') or 0.0)
-            open_ts = float((tr or {}).get('opened_ts') or 0.0)
+            close_ts = float((tr or {}).get('closed_ts') or (tr or {}).get('last_ts') or (tr or {}).get('ts') or 0.0)
+            open_ts = float((tr or {}).get('opened_ts') or (tr or {}).get('first_ts') or 0.0)
             ref_ts = open_ts if open_ts > 0 else close_ts
             best = None
             best_score = 10**18
@@ -43400,11 +43502,11 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
 
     rows = []
     match_ok = mismatch = unresolved = 0
-    for tr in sorted((trade_rows or []), key=lambda r: float((r or {}).get('closed_ts') or 0.0), reverse=True):
+    for tr in sorted((trade_rows or []), key=lambda r: float((r or {}).get('closed_ts') or (r or {}).get('last_ts') or (r or {}).get('ts') or 0.0), reverse=True):
         try:
             sym = _short_sym(tr.get('symbol') or '')
             side = _trade_side_for_compare(tr) or '-'
-            close_ts = float(tr.get('closed_ts') or tr.get('ts') or 0.0)
+            close_ts = float(tr.get('closed_ts') or tr.get('last_ts') or tr.get('ts') or 0.0)
             pnl = float(tr.get('pnl_usdt') if tr.get('pnl_usdt') is not None else tr.get('pnl') or 0.0)
             actual = _actual_from_trade(tr)
             setup = _match_setup_for_trade(tr)
@@ -43412,7 +43514,12 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 setup_time = _fmt_ts(float(setup.get('setup_ts') or 0.0))
                 audit_res = str(setup.get('audit_res') or '-').upper()
                 if actual in {'TP', 'SL'} and audit_res in {'TP', 'SL'}:
-                    verdict = 'OK' if actual == audit_res else 'DIFF'
+                    if actual == audit_res:
+                        verdict = 'OK'
+                    elif _setup_audit_compare_non_tpsl_exit(tr):
+                        verdict = 'NON_TPSL'
+                    else:
+                        verdict = 'DIFF'
                 elif audit_res in {'OPEN', 'NOHIT'}:
                     verdict = 'PENDING'
                 else:
@@ -43439,7 +43546,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         "🔎 <b>Setup Audit ↔ AutoTrade Compare</b>",
         HDR,
         f"Window: <b>last {hours}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
-        "Purpose: compare real AutoTrade closed rows against the nearest setup price-path audit row.",
+        "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
         "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
         f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
     ]
@@ -43454,7 +43561,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         colalign=('left', 'left', 'center', 'right', 'center', 'left', 'center', 'center'),
     )
     lines.append("<pre>" + html.escape(table) + "</pre>")
-    lines.append("Chk: OK=same TP/SL direction, DIFF=real trade result disagrees with setup path, PENDING=audit still OPEN/NOHIT, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
+    lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close disagrees with setup path, NON_TPSL=historical/manual/time/profit close ignored for setup-audit scoring, PENDING=audit still OPEN/NOHIT, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
     return "\n".join(lines)
 # ===========================================================================
 
