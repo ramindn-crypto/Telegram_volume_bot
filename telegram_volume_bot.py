@@ -1,5 +1,6 @@
 # yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
+# yver83: adds /setup_audit_compare to reconcile setup price-path audit versus actual AutoTrade report rows, so /setup_audit is not confused with real Bybit PnL.
 # yver82: /autotrade_closed is Bybit Closed-PnL authoritative, sorted by exact exchange close time in Melbourne, with seconds and exact realised PnL rows.
 # yver81: /autotrade_closed close time is forced to Australia/Melbourne display, with robust UTC/ms/ISO timestamp normalization.
 # yver80: /autotrade_closed now shows Close time and sorts strictly by closed time newest first.
@@ -37806,7 +37807,7 @@ KNOWN_COMMANDS = sorted(set([
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
-    "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis", "email_decision", "adaptive_status",
+    "setup_audit_overall", "setup_audit_compare", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis", "email_decision", "adaptive_status",
     "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
@@ -38344,9 +38345,10 @@ ADMIN_HELP_DESCRIPTIONS = {
     "lessons_learned": "Cached latest learning takeaways",
     "email_decision": "Last email pipeline decision",
     "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
-    "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; shows Symbol, Side, Family-Session-Strategy-Side combo, Conf, Result",
+    "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; /setup_audit compare 24 reconciles real AutoTrade rows vs setup path",
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall Family-Session-Strategy-Side summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR",
+    "setup_audit_compare": "Reconcile /autotrade_report closed rows against /setup_audit price-path results: /setup_audit_compare 24",
     "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
     "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
     "setup_deep_analysis": "Deep setup analytics: family/session, symbol, side, Melbourne hour/day, regime buckets. Usage: /setup_deep_analysis 168",
@@ -38403,7 +38405,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
+    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autotrade_closed", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_test_data", "admin_reset_signal_reports", "reset", "restore"]),
@@ -43163,6 +43165,183 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
+# ================= SETUP AUDIT ↔ AUTOTRADE RECONCILIATION =================
+def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
+    """Compare setup price-path audit against actual AutoTrade report rows.
+
+    /setup_audit is intentionally AutoTrade-independent: it asks whether price hit
+    setup TP or SL first after the setup was generated. /autotrade_report asks what
+    happened to real positions. This command makes the difference visible by matching
+    real AutoTrade closes back to the nearest setup row when possible.
+    """
+    owner_uid = int(uid or 0)
+    try:
+        hours = max(1, min(336, int(float(hours or 24))))
+    except Exception:
+        hours = 24
+    now_ts = float(time.time())
+    start_ts = now_ts - float(hours) * 3600.0
+    horizon_hours = int(_setup_audit_result_horizon_hours())
+    audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
+
+    try:
+        setup_rows = _setup_audit_load_rows(owner_uid, hours=hours, limit=0, dedup=True)
+    except Exception:
+        setup_rows = []
+    candles_by_symbol = {}
+    try:
+        if setup_rows:
+            candles_by_symbol = _setup_audit_preload_ohlcv(setup_rows, hours=horizon_hours, timeframe=audit_tf)
+    except Exception:
+        candles_by_symbol = {}
+
+    setup_items = []
+    setup_by_id = {}
+    for r in (setup_rows or []):
+        try:
+            rr = dict(r or {})
+            sid = str(rr.get('setup_id') or '').strip()
+            sym = str(_bybit_linear_symbol(rr.get('symbol') or rr.get('market_symbol') or '')).upper().strip()
+            side = str(rr.get('side') or '').upper().strip()
+            sts = float(_setup_audit_row_ts(rr) or 0.0)
+            ev = _setup_audit_resolve_result(rr, horizon_hours=horizon_hours, user_id=owner_uid, candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf)
+            audit_res = _setup_audit_result_label(ev.get('result'))
+            item = {'setup_id': sid, 'symbol': sym, 'side': side, 'setup_ts': sts, 'audit_res': audit_res, 'row': rr}
+            setup_items.append(item)
+            if sid:
+                setup_by_id[sid] = item
+        except Exception:
+            continue
+
+    try:
+        trade_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts) + 60.0, lookback_h=hours, limit=0) or []
+    except Exception:
+        trade_rows = []
+
+    def _fmt_ts(ts: float) -> str:
+        try:
+            ts = float(_ts_seconds_from_any(ts) or ts or 0.0)
+            if ts <= 0:
+                return '-'
+            return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M')
+        except Exception:
+            return '-'
+
+    def _short_sym(sym: str) -> str:
+        try:
+            ss = str(_bybit_linear_symbol(sym or '')).upper().strip()
+            return ss[:-4] if ss.endswith('USDT') else ss
+        except Exception:
+            return str(sym or '-').upper().strip() or '-'
+
+    def _actual_from_trade(row: dict) -> str:
+        try:
+            # Use the same high-level practical convention as /autotrade_report:
+            # positive realised close = TP/win, negative realised close = SL/loss,
+            # near-zero = OTHER.
+            pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
+            if pnl > 0.05:
+                return 'TP'
+            if pnl < -0.05:
+                return 'SL'
+            return 'OTHER'
+        except Exception:
+            return 'OTHER'
+
+    def _match_setup_for_trade(tr: dict) -> dict | None:
+        try:
+            sid = str((tr or {}).get('setup_id') or '').strip()
+            if sid and sid in setup_by_id:
+                return setup_by_id.get(sid)
+            sym = str(_bybit_linear_symbol((tr or {}).get('symbol') or '')).upper().strip()
+            side = str((tr or {}).get('side') or '').upper().strip()
+            close_ts = float((tr or {}).get('closed_ts') or (tr or {}).get('ts') or 0.0)
+            open_ts = float((tr or {}).get('opened_ts') or 0.0)
+            ref_ts = open_ts if open_ts > 0 else close_ts
+            best = None
+            best_score = 10**18
+            for item in setup_items:
+                if item.get('symbol') != sym or item.get('side') != side:
+                    continue
+                sts = float(item.get('setup_ts') or 0.0)
+                if sts <= 0:
+                    continue
+                # A real AutoTrade close should belong to a setup generated before
+                # the close, and usually near/before the open time. Keep this window
+                # deliberately conservative to avoid matching old unrelated closes.
+                if close_ts > 0 and sts > close_ts + 300:
+                    continue
+                if ref_ts > 0 and abs(sts - ref_ts) > max(3 * 3600.0, float(horizon_hours) * 3600.0):
+                    continue
+                score = abs((ref_ts or close_ts or now_ts) - sts)
+                if score < best_score:
+                    best = item
+                    best_score = score
+            return best
+        except Exception:
+            return None
+
+    rows = []
+    match_ok = mismatch = unresolved = 0
+    for tr in sorted((trade_rows or []), key=lambda r: float((r or {}).get('closed_ts') or 0.0), reverse=True):
+        try:
+            sym = _short_sym(tr.get('symbol') or '')
+            side = str(tr.get('side') or '-').upper().strip() or '-'
+            close_ts = float(tr.get('closed_ts') or tr.get('ts') or 0.0)
+            pnl = float(tr.get('pnl_usdt') if tr.get('pnl_usdt') is not None else tr.get('pnl') or 0.0)
+            actual = _actual_from_trade(tr)
+            setup = _match_setup_for_trade(tr)
+            if setup:
+                setup_time = _fmt_ts(float(setup.get('setup_ts') or 0.0))
+                audit_res = str(setup.get('audit_res') or '-').upper()
+                if actual in {'TP', 'SL'} and audit_res in {'TP', 'SL'}:
+                    verdict = 'OK' if actual == audit_res else 'DIFF'
+                elif audit_res in {'OPEN', 'NOHIT'}:
+                    verdict = 'PENDING'
+                else:
+                    verdict = 'INFO'
+            else:
+                setup_time = '-'
+                audit_res = '-'
+                verdict = 'NO_SETUP'
+            if verdict == 'OK':
+                match_ok += 1
+            elif verdict == 'DIFF':
+                mismatch += 1
+            else:
+                unresolved += 1
+            rows.append([_fmt_ts(close_ts), sym, side, f"{pnl:.2f}".rstrip('0').rstrip('.'), actual, setup_time, audit_res, verdict])
+        except Exception:
+            continue
+
+    try:
+        now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        now_txt = ''
+    lines = [
+        "🔎 <b>Setup Audit ↔ AutoTrade Compare</b>",
+        HDR,
+        f"Window: <b>last {hours}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
+        "Purpose: compare real AutoTrade closed rows against the nearest setup price-path audit row.",
+        "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
+        f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
+    ]
+    if not rows:
+        lines.append(SEP)
+        lines.append("No closed AutoTrade rows found for comparison in this window.")
+        return "\n".join(lines)
+    table = tabulate(
+        rows,
+        headers=['Close', 'Sym', 'Side', 'PnL', 'AT', 'Setup', 'Audit', 'Chk'],
+        tablefmt='plain',
+        colalign=('left', 'left', 'center', 'right', 'center', 'left', 'center', 'center'),
+    )
+    lines.append("<pre>" + html.escape(table) + "</pre>")
+    lines.append("Chk: OK=same TP/SL direction, DIFF=real trade result disagrees with setup path, PENDING=audit still OPEN/NOHIT, NO_SETUP=no safe setup match.")
+    return "\n".join(lines)
+# ===========================================================================
+
+
 # =========================================================
 # 07May_v01 — DB-backed setup family/session edge matrix
 # =========================================================
@@ -46466,6 +46645,16 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=180)
             await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             return
+        if args and args[0].lower() in {'compare', 'reconcile', 'traded', 'autotrade'}:
+            cmp_hours = 24
+            try:
+                if len(args) >= 2 and re.fullmatch(r'\d+(\.\d+)?', str(args[1])):
+                    cmp_hours = int(float(args[1]))
+            except Exception:
+                cmp_hours = 24
+            text = await to_thread_heavy(_setup_audit_compare_text, int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours), timeout=180)
+            await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
         # Primary/simple usage: /setup_audit 1 means last 1 hour, not 1 row.
         # Optional advanced usage: /setup_audit rows 20 24 OR /setup_audit limit 20 24.
         if len(args) == 1:
@@ -46721,6 +46910,25 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
         text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
     except Exception as e:
         text = f"❌ setup_audit_overall failed: {type(e).__name__}: {html.escape(str(e))}"
+    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    hours = 24
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and re.fullmatch(r'\d+(\.\d+)?', args[0]):
+            hours = int(float(args[0]))
+    except Exception:
+        hours = 24
+    try:
+        text = await to_thread_heavy(_setup_audit_compare_text, int(AUTOTRADE_OWNER_UID or uid), int(hours), timeout=180)
+    except Exception as e:
+        text = f"❌ setup_audit_compare failed: {type(e).__name__}: {html.escape(str(e))}"
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
@@ -57321,6 +57529,8 @@ def main():
     app.add_handler(CommandHandler("setup_audit", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_compare", setup_audit_compare_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_reconcile", setup_audit_compare_cmd, block=False))
     app.add_handler(CommandHandler("setup_matrix", setup_matrix_cmd, block=False))
     app.add_handler(CommandHandler("setup_edge_matrix", setup_matrix_cmd, block=False))
     app.add_handler(CommandHandler("setup_deep_analysis", setup_deep_analysis_cmd, block=False))
