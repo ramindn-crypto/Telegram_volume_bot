@@ -3,6 +3,7 @@
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
 # yver84: strict audit/report reconciliation: setup compare loads full pre-close setup history, fixes Bybit closed-PnL original-side inference, ignores exchange-only rows for audit scoring, and disables automatic time exits under strict TP/SL-only mode.
 # yver86: setup audit now prefers fresh candle price-path over stale cached outcomes, and compare rejects future/unrelated setup matches.
+# yver87: refines setup_audit_compare so matching TP/SL rows show OK even if old rows carry fallback/non-native notes; NON_TPSL is reserved for mismatches caused by historical/manual/time exits.
 # yver83: adds /setup_audit_compare to reconcile setup price-path audit versus actual AutoTrade report rows, so /setup_audit is not confused with real Bybit PnL.
 # yver82: /autotrade_closed is Bybit Closed-PnL authoritative, sorted by exact exchange close time in Melbourne, with seconds and exact realised PnL rows.
 # yver81: /autotrade_closed close time is forced to Australia/Melbourne display, with robust UTC/ms/ISO timestamp normalization.
@@ -43325,23 +43326,43 @@ def _setup_audit_compare_prepare_closed_positions(trade_rows: list[dict]) -> lis
 
 
 def _setup_audit_compare_non_tpsl_exit(row: dict) -> bool:
-    """True when a row closed by a non-native/manual/time/profit mechanism.
+    """True only for explicit non-native/manual/time/profit closes.
 
-    These rows are useful operationally, but they should not be counted as a
-    setup-audit DIFF because the position was not allowed to finish naturally at
-    the setup's TP/SL path.  Strict TP/SL mode prevents these going forward; this
-    guard keeps older historical rows from corrupting the reconciliation score.
+    Ver87: do not treat generic exchange-fallback/source-note text as NON_TPSL.
+    /setup_audit_compare is a reconciliation tool: if the realised result and
+    setup price-path result are both TP/SL and they agree, the row must be OK.
+    NON_TPSL is reserved for mismatches that came from an explicit historical
+    manual/time/profit/counter-trend close, so old non-natural rows do not create
+    false DIFF alerts.
     """
     try:
-        txt = ' '.join(str((row or {}).get(k) or '') for k in (
-            'close_reason', 'exit_reason', 'note', 'source_note', 'result_path', 'result_label'
+        # Prefer explicit lifecycle/reason fields.  Avoid broad NOTE/FALLBACK
+        # matching because Bybit closed-PnL fallback rows can still be valid
+        # TP/SL rows and should compare as OK when the setup path agrees.
+        reason_txt = ' '.join(str((row or {}).get(k) or '') for k in (
+            'close_reason', 'exit_reason', 'reason', 'result_reason', 'close_type',
+            'exit_type', 'result_label', 'result'
         )).upper()
-        markers = (
-            'PROFIT_CLOSE', 'LOSS_CLOSE', 'COUNTER_TREND', 'MANUAL', 'MANUAL_OR_UNKNOWN',
-            'MAX_HOLD', 'CLOSE_BEFORE_ASIA', 'TIME_EXIT', 'FLAT', 'EXCHANGE_ONLY',
-            'FALLBACK', 'PARTIAL_CLOSE', 'REDUCE_ONLY'
+        explicit_markers = (
+            'CLOSE_BEFORE_ASIA', 'BEFORE_ASIA', 'MAX_HOLD', 'TIME_EXIT',
+            'PROFIT_CLOSE', 'LOSS_CLOSE', 'COUNTER_TREND', 'MANUAL',
+            'MANUAL_OR_UNKNOWN', 'FLAT_NOW', 'AUTOTRADE_FLAT', 'FORCE_FLAT',
+            'EMERGENCY_CLOSE', 'RISK_REDUCE', 'MARKET_REDUCE', 'LIQUIDATION'
         )
-        return any(m in txt for m in markers)
+        if any(m in reason_txt for m in explicit_markers):
+            return True
+
+        # Some older rows only carried the explicit non-native reason in note.
+        # Keep this note scan narrow; do not match generic FALLBACK/EXCHANGE_ONLY.
+        note_txt = ' '.join(str((row or {}).get(k) or '') for k in (
+            'note', 'source_note'
+        )).upper()
+        note_markers = (
+            'CLOSE_BEFORE_ASIA', 'MAX_HOLD', 'TIME_EXIT', 'PROFIT_CLOSE',
+            'LOSS_CLOSE', 'COUNTER_TREND', 'MANUAL CLOSE', 'AUTOTRADE_FLAT',
+            'FORCE_FLAT', 'EMERGENCY_CLOSE', 'MARKET_REDUCE'
+        )
+        return any(m in note_txt for m in note_markers)
     except Exception:
         return False
 def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
@@ -43545,14 +43566,17 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 setup_time = _fmt_ts(float(setup.get('setup_ts') or 0.0))
                 audit_res = str(setup.get('audit_res') or '-').upper()
                 non_tpsl = _setup_audit_compare_non_tpsl_exit(tr)
-                if non_tpsl:
-                    verdict = 'NON_TPSL'
-                elif actual in {'TP', 'SL'} and audit_res in {'TP', 'SL'}:
-                    verdict = 'OK' if actual == audit_res else 'DIFF'
+                if actual in {'TP', 'SL'} and audit_res in {'TP', 'SL'}:
+                    # Matching TP/SL evidence is always OK.  Old fallback or
+                    # non-native notes should not hide a valid agreement.
+                    if actual == audit_res:
+                        verdict = 'OK'
+                    else:
+                        verdict = 'NON_TPSL' if non_tpsl else 'DIFF'
                 elif audit_res in {'OPEN', 'NOHIT'}:
-                    verdict = 'PENDING'
+                    verdict = 'NON_TPSL' if non_tpsl else 'PENDING'
                 else:
-                    verdict = 'INFO'
+                    verdict = 'NON_TPSL' if non_tpsl else 'INFO'
             else:
                 setup_time = '-'
                 audit_res = '-'
@@ -43590,7 +43614,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         colalign=('left', 'left', 'center', 'right', 'center', 'left', 'center', 'center'),
     )
     lines.append("<pre>" + html.escape(table) + "</pre>")
-    lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close disagrees with setup path, NON_TPSL=historical/manual/time/profit close ignored for setup-audit scoring, PENDING=audit still OPEN/NOHIT, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
+    lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close disagrees with setup path, NON_TPSL=historical/manual/time/profit close with mismatched or unresolved setup path ignored for setup-audit scoring, PENDING=audit still OPEN/NOHIT, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
     return "\n".join(lines)
 # ===========================================================================
 
