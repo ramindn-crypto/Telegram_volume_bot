@@ -1,5 +1,7 @@
 # yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
+# yver82: /autotrade_closed is Bybit Closed-PnL authoritative, sorted by exact exchange close time in Melbourne, with seconds and exact realised PnL rows.
+# yver81: /autotrade_closed close time is forced to Australia/Melbourne display, with robust UTC/ms/ISO timestamp normalization.
 # yver80: /autotrade_closed now shows Close time and sorts strictly by closed time newest first.
 # yver78: /autotrade_report sorted by Open time; added /autotrade_closed and /autotrade/closed hours for compact closed positions.
 # yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
@@ -38356,7 +38358,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_fix_exits": "Force native Full TP/SL on all live AutoTrade positions and cancel legacy Conditional exit orders",
     "autotrade_flat_now": "Manually close AutoTrade-owned live positions now",
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows), sorted by Open time",
-    "autotrade_closed": "Last closed AutoTrade positions: /autotrade_closed 24 or /autotrade/closed 24 shows Close, Symbol, Side, Risk, PnL",
+    "autotrade_closed": "Last closed Bybit P&L rows: /autotrade_closed 24 or /autotrade/closed 24 shows exact Melbourne Close, Symbol, Side, Risk, PnL",
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "autoytrade_report_overall": "Family/session/strategy/side AutoTrade matrix: /autotrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
     "autotrade_report_matrix": "Alias of /autotrade_report_overall for the family/session AutoTrade matrix",
@@ -48732,16 +48734,20 @@ def _performance_report_payload_cached(owner: int, days: int) -> dict:
 
 
 
-def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> str:
-    """Return compact closed AutoTrade positions for /autotrade_closed and /autotrade/closed.
 
-    yver80: admin quick close table. It now shows Close time plus Symbol, Side,
-    Risk and PnL. Rows are sorted strictly by closed time newest first so the
-    most recent realised positions are always at the top.
+def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> str:
+    """Return compact closed position rows for /autotrade_closed and /autotrade/closed.
+
+    ver82: for this command, Bybit Closed P&L is the authority. The table mirrors
+    the exchange closed-PnL rows in the requested window: exact exchange close time
+    (shown in Australia/Melbourne), symbol, inferred/open side, risk if a matching
+    bot journal row exists, and exact realised PnL. This fixes the old behaviour
+    where bot lifecycle/provisional rows could use a different close timestamp from
+    Bybit's P&L page.
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v80:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v82:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -48763,17 +48769,25 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     except Exception:
         report_equity = 0.0
 
-    try:
-        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=0) or []
-    except Exception:
-        closed_rows = []
-
     def _sym_short(value) -> str:
         try:
             s = str(_bybit_linear_symbol(value or '')).upper().strip()
             return s[:-4] if s.endswith('USDT') else (s or '-')
         except Exception:
             return '-'
+
+    def _num_from_keys(row: dict, keys: tuple[str, ...]) -> float:
+        for k in keys:
+            try:
+                v = row.get(k)
+                if v is None or str(v).strip() == '':
+                    continue
+                x = float(v)
+                if x != 0:
+                    return x
+            except Exception:
+                continue
+        return 0.0
 
     def _risk_cell(row: dict) -> str:
         try:
@@ -48790,50 +48804,213 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
             pass
         return '-'
 
+    def _coerce_ts_utc_seconds(value) -> float:
+        try:
+            if value in (None, '', 0, '0'):
+                return 0.0
+            try:
+                v = float(value)
+                if v <= 0:
+                    return 0.0
+                try:
+                    vv = float(_ts_seconds_from_any(v) or 0.0)
+                    if vv > 0:
+                        return vv
+                except Exception:
+                    pass
+                return (v / 1000.0) if v > 10_000_000_000 else v
+            except Exception:
+                pass
+            try:
+                dt = _parse_iso_utcish(str(value))
+                if dt is not None:
+                    return float(dt.timestamp())
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return 0.0
+
     def _closed_ts_value(row: dict, fallback_row: dict | None = None) -> float:
-        """Best available close timestamp for compact closed-position sorting/display."""
         try:
             rr = row or {}
             fb = fallback_row or {}
             for src in (rr, fb):
-                for k in ('closed_ts', 'close_ts', 'exit_ts', 'last_ts', 'updated_ts', 'ts'):
-                    try:
-                        v = float((src or {}).get(k) or 0.0)
-                        if v > 0:
-                            return float(v)
-                    except Exception:
-                        pass
+                # For raw Bybit Closed P&L rows, updatedTime is the Trade Time shown
+                # on Bybit's P&L / Closed Orders page. Keep it first.
+                for k in ('updatedTime', 'updated_time', 'closed_ts', 'close_ts', 'exit_ts', 'closeTime', 'closedTime', 'createdTime', 'created_time', 'execTime', 'fillTime', 'last_ts', 'updated_ts', 'ts'):
+                    v = _coerce_ts_utc_seconds((src or {}).get(k))
+                    if v > 0:
+                        return float(v)
         except Exception:
             pass
         return 0.0
 
     def _closed_time_text(ts: float) -> str:
+        """Render a UTC epoch-second close timestamp in Australia/Melbourne time."""
         try:
-            if float(ts or 0.0) <= 0:
+            ts_sec = float(_ts_seconds_from_any(ts) or ts or 0.0)
+            if ts_sec <= 0:
                 return '-'
-            return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M')
+            return datetime.fromtimestamp(ts_sec, tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M:%S')
         except Exception:
             return '-'
 
-    table_rows = []
-    for r in (closed_rows or []):
+    def _bybit_position_side(ev: dict) -> str:
+        """Infer the original position side for a Bybit Closed-PnL row.
+
+        Bybit Closed-PnL payloads can expose the execution/closing side in some
+        environments. If entry/exit prices plus PnL clearly identify the position
+        direction, use that; otherwise fall back to the raw exchange side.
+        """
+        raw = str((ev or {}).get('side') or '').upper().strip()
+        if raw not in {'BUY', 'SELL'}:
+            raw = ''
         try:
-            row = _setup_audit_merge_trade_setup_row(dict(r or {}))
+            entry = abs(float(_num_from_keys(ev, ('avgEntryPrice', 'avg_entry_price', 'entryPrice', 'entry_price')) or 0.0))
+            exitp = abs(float(_num_from_keys(ev, ('avgExitPrice', 'avg_exit_price', 'exitPrice', 'exit_price', 'orderPrice', 'price')) or 0.0))
+            pnl = float((ev or {}).get('closedPnl') if (ev or {}).get('closedPnl') is not None else (ev or {}).get('pnl') or 0.0)
+            # Do not infer direction for tiny near-zero outcomes where fees/funding can
+            # flip the sign versus the price movement.
+            if entry > 0 and exitp > 0 and abs(exitp - entry) > max(entry * 1e-7, 1e-12) and abs(pnl) >= 0.50:
+                if pnl > 0:
+                    return 'BUY' if exitp > entry else 'SELL'
+                if pnl < 0:
+                    return 'BUY' if exitp < entry else 'SELL'
+        except Exception:
+            pass
+        return raw or '-'
+
+    def _exchange_event_key(ev: dict) -> tuple:
+        try:
+            return (
+                str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper(),
+                int(round(float(_closed_ts_value(ev) or 0.0) * 1000)),
+                str((ev or {}).get('orderId') or (ev or {}).get('execId') or (ev or {}).get('createdTime') or ''),
+                round(float((ev or {}).get('closedPnl') or 0.0), 8),
+                round(float(_bybit_closed_pnl_event_qty(ev) or 0.0), 8),
+            )
+        except Exception:
+            return (str(ev),)
+
+    def _pnl_text(value) -> str:
+        try:
+            x = float(value or 0.0)
+            # Match Bybit-style precision for small/normal values without adding a
+            # plus sign, so visual comparison against Bybit P&L is straightforward.
+            if abs(x) >= 100:
+                return f"{x:.2f}".rstrip('0').rstrip('.')
+            return f"{x:.4f}".rstrip('0').rstrip('.')
+        except Exception:
+            return '-'
+
+    # Journal/lifecycle rows are only used to enrich the Risk column. The row list
+    # itself comes from Bybit Closed P&L so time/PnL/counts match the exchange.
+    enrich_rows = []
+    try:
+        enrich_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts) - 6 * 3600.0, float(now_ts) + 6 * 3600.0, lookback_h=lookback_h, limit=0) or []
+    except Exception:
+        enrich_rows = []
+
+    enrich_candidates = []
+    for er in (enrich_rows or []):
+        try:
+            row = _setup_audit_merge_trade_setup_row(dict(er or {}))
             row = _autotrade_report_enrich_amounts(row, report_equity)
+            sym = str(_bybit_linear_symbol(row.get('symbol') or er.get('symbol') or '')).upper().strip()
+            if not sym:
+                continue
             pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
-            closed_ts = _closed_ts_value(row, r)
-            table_rows.append({
-                'closed_ts': float(closed_ts or 0.0),
-                'close': _closed_time_text(closed_ts),
-                'symbol': _sym_short(row.get('symbol') or r.get('symbol') or ''),
-                'side': str(row.get('side') or r.get('side') or '-').upper().strip() or '-',
-                'risk': _risk_cell(row),
-                'pnl': pnl,
-            })
+            cts = _closed_ts_value(row, er)
+            risk = _risk_cell(row)
+            if risk == '-':
+                continue
+            enrich_candidates.append({'symbol': sym, 'pnl': pnl, 'closed_ts': float(cts or 0.0), 'risk': risk})
         except Exception:
             continue
 
-    table_rows.sort(key=lambda x: float(x.get('closed_ts') or 0.0), reverse=True)
+    def _match_risk_for_exchange_event(sym: str, pnl: float, ts: float) -> str:
+        best = None
+        best_score = 10**18
+        for cand in enrich_candidates:
+            try:
+                if str(cand.get('symbol') or '') != str(sym or ''):
+                    continue
+                cpnl = float(cand.get('pnl') or 0.0)
+                pnl_diff = abs(cpnl - float(pnl or 0.0))
+                # Closed-PnL rows can be rounded slightly differently between the
+                # exchange payload and bot report; keep matching strict enough not to
+                # attach an unrelated risk amount.
+                if pnl_diff > max(0.08, abs(float(pnl or 0.0)) * 0.01):
+                    continue
+                cts = float(cand.get('closed_ts') or 0.0)
+                dt = abs(float(ts or 0.0) - cts) if cts > 0 and ts > 0 else 999999.0
+                if dt > 12 * 3600:
+                    continue
+                score = dt + pnl_diff * 1000.0
+                if score < best_score:
+                    best = cand
+                    best_score = score
+            except Exception:
+                continue
+        return str((best or {}).get('risk') or '-') if best else '-'
+
+    bybit_events = []
+    if str(_autotrade_runtime_mode()).lower() == 'live':
+        try:
+            bybit_events = _bybit_get_closed_pnl_linear(float(start_ts), float(now_ts) + 60.0, limit=max(200, min(10000, int(lookback_h) * 100))) or []
+        except Exception:
+            bybit_events = []
+
+    table_rows = []
+    source_txt = 'Bybit Closed P&L'
+    if bybit_events:
+        seen = set()
+        for ev in (bybit_events or []):
+            try:
+                ts = float(_closed_ts_value(ev) or _bybit_closed_pnl_event_ts(ev) or 0.0)
+                if ts <= 0 or ts < start_ts or ts > now_ts + 120.0:
+                    continue
+                key = _exchange_event_key(ev)
+                if key in seen:
+                    continue
+                seen.add(key)
+                sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper().strip()
+                if not sym:
+                    continue
+                pnl = float((ev or {}).get('closedPnl') if (ev or {}).get('closedPnl') is not None else (ev or {}).get('pnl') or 0.0)
+                table_rows.append({
+                    'closed_ts': float(ts),
+                    'close': _closed_time_text(ts),
+                    'symbol': _sym_short(sym),
+                    'side': _bybit_position_side(ev),
+                    'risk': _match_risk_for_exchange_event(sym, pnl, ts),
+                    'pnl': pnl,
+                })
+            except Exception:
+                continue
+    else:
+        # Fallback for paper mode or temporary Bybit API failure: use the previous
+        # journal/lifecycle source, but keep the same display contract.
+        source_txt = 'Bot journal/lifecycle fallback'
+        for r in (enrich_rows or []):
+            try:
+                row = _setup_audit_merge_trade_setup_row(dict(r or {}))
+                row = _autotrade_report_enrich_amounts(row, report_equity)
+                pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
+                closed_ts = _closed_ts_value(row, r)
+                table_rows.append({
+                    'closed_ts': float(closed_ts or 0.0),
+                    'close': _closed_time_text(closed_ts),
+                    'symbol': _sym_short(row.get('symbol') or r.get('symbol') or ''),
+                    'side': str(row.get('side') or r.get('side') or '-').upper().strip() or '-',
+                    'risk': _risk_cell(row),
+                    'pnl': pnl,
+                })
+            except Exception:
+                continue
+
+    table_rows.sort(key=lambda x: (float(x.get('closed_ts') or 0.0), str(x.get('symbol') or ''), float(x.get('pnl') or 0.0)), reverse=True)
     now_txt = ''
     try:
         now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
@@ -48844,21 +49021,22 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
         "📕 <b>AutoTrade Closed Positions</b>",
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
-        "Sorted by close time newest first. Columns: Close, Symbol, Side, Risk, PnL.",
+        f"Source: <b>{html.escape(source_txt)}</b>. Sorted by exact exchange close time newest first. Close time is Australia/Melbourne.",
+        "Columns: Close, Symbol, Side, Risk, PnL. Risk shows '-' when no matching bot journal risk exists.",
     ]
     if not table_rows:
         lines.append(SEP)
-        lines.append("No closed AutoTrade positions found in this window.")
+        lines.append("No closed position rows found in this window.")
         out = "\n".join(lines)
     else:
-        plain_rows = [[r.get('close') or '-', r['symbol'], r['side'], r['risk'], f"{float(r['pnl'] or 0.0):+.2f}"] for r in table_rows]
+        plain_rows = [[r.get('close') or '-', r['symbol'], r['side'], r['risk'], _pnl_text(r['pnl'])] for r in table_rows]
         table = tabulate(
             plain_rows,
             headers=['Close', 'Symbol', 'Side', 'Risk', 'PnL'],
             tablefmt='plain',
             colalign=('left', 'left', 'center', 'right', 'right'),
         )
-        lines.append(f"Rows shown: <b>{len(plain_rows)}</b> closed position rows. Time: <b>Melbourne</b>.")
+        lines.append(f"Rows shown: <b>{len(plain_rows)}</b> closed P&amp;L rows. Time: <b>Melbourne</b>.")
         out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
     try:
         cache_set(cache_key, out)
@@ -48883,7 +49061,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v80:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v82:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
