@@ -3077,7 +3077,7 @@ def _setup_nor_rev_router_note(uid: int = 0, rows: list[dict] | None = None) -> 
             pass
         # Micro-edge tightened lanes: soft/strict quality route candidates.
         try:
-            gd = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+            gd = _setup_edge_guard_build(int(uid or 0), hours=_overall_report_effective_hours(hours) if fixed_start_ts > 0 else int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
             for combo in sorted(((gd or {}).get('combo_strategy_side_block') or (gd or {}).get('combo_side_block') or {}).keys()):
                 c = str(combo or '').upper().strip()
                 tgt = _setup_reverse_target_lane_for_combo(c)
@@ -43909,7 +43909,7 @@ def _setup_combo_apply_adaptive_parameter_bridge(uid: int, rows: list[dict], pol
         return report
 
 
-def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
+def _setup_combo_run_daily_safety_policy(uid: int, start_ts: float | None = None) -> dict:
     """Run the daily 10:00 safety review.
 
     It persists the 24h score snapshot, then inserts temporary DISABLE rows only for
@@ -43928,7 +43928,14 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
             out['reason'] = 'no_uid'
             return out
         hours = max(1, int(globals().get('SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS', 24) or 24))
-        res = _setup_combo_matrix_build(uid, hours=hours, persist=True, allow_policy_update=False, policy_kind='daily_safety')
+        fixed_start_ts = 0.0
+        try:
+            fixed_start_ts = float(start_ts or 0.0)
+        except Exception:
+            fixed_start_ts = 0.0
+        if fixed_start_ts > 0:
+            hours = _overall_report_effective_hours(hours)
+        res = _setup_combo_matrix_build(uid, hours=hours, persist=True, allow_policy_update=False, policy_kind='daily_safety', start_ts=(fixed_start_ts if fixed_start_ts > 0 else None))
         rows = list((res or {}).get('rows') or [])
         run_id = str((res or {}).get('run_id') or ('SCM-DAILY-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')))
         now_ts = float(time.time())
@@ -43967,7 +43974,7 @@ def _setup_combo_run_daily_safety_policy(uid: int) -> dict:
                 bridge_report = _setup_combo_apply_adaptive_parameter_bridge(int(uid), bridge_rows, 'daily_safety', int(hours), str(run_id))
         except Exception:
             bridge_report = {}
-        out.update({'ok': True, 'disabled': [_setup_combo_strategy_side_key(str((r or {}).get('family') or ''), str((r or {}).get('session') or ''), str((r or {}).get('strategy') or 'NOR'), str((r or {}).get('side') or '')) for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'bridge_report': bridge_report, 'reason': 'ok'})
+        out.update({'ok': True, 'disabled': [_setup_combo_strategy_side_key(str((r or {}).get('family') or ''), str((r or {}).get('session') or ''), str((r or {}).get('strategy') or 'NOR'), str((r or {}).get('side') or '')) for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'bridge_report': bridge_report, 'reason': 'ok', 'window_hours': int(hours), 'start_ts': float(fixed_start_ts or 0.0), 'source_label': str((res or {}).get('source_label') or 'EXECUTABLE')})
         try:
             logger.info('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
         except Exception:
@@ -45173,9 +45180,10 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         return True, f'guard_error_allowed:{type(exc).__name__}: {exc}'
 
 
-def _setup_edge_guard_snapshot_text(uid: int = 0) -> str:
+def _setup_edge_guard_snapshot_text(uid: int = 0, hours: int | None = None) -> str:
     try:
-        data = _setup_edge_guard_build(int(uid or 0), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+        _guard_hours = int(hours if hours is not None else (globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
+        data = _setup_edge_guard_build(int(uid or 0), hours=_guard_hours, force=False)
         cs = sorted(list((data or {}).get('combo_strategy_side_block') or (data or {}).get('combo_side_block') or {}))
         sy = sorted(list((data or {}).get('symbol_block') or {}))
         hw = sorted(list((data or {}).get('hour_watch') or {}))
@@ -45429,7 +45437,7 @@ def _setup_combo_adjust_action_for_side_split(st: dict, side_stats: dict, family
     except Exception:
         return action, int(enabled_next), notes, float(score), '-'
 
-def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False, policy_kind: str = 'manual') -> dict:
+def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False, policy_kind: str = 'manual', start_ts: float | None = None) -> dict:
     """Build the setup edge matrix.
 
     yver59: scoring rows are Family-Session-Strategy-Side, e.g. F1-ASIA-NOR-BUY.
@@ -45439,11 +45447,23 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
     """
     _setup_combo_policy_migrate()
     hours = max(1, min(8760, int(hours or 168)))
+    fixed_start_ts = 0.0
+    try:
+        fixed_start_ts = float(start_ts or 0.0)
+    except Exception:
+        fixed_start_ts = 0.0
+    if fixed_start_ts > 0:
+        hours = _overall_report_effective_hours(hours)
     result_horizon = _setup_audit_result_horizon_hours()
-    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=0, dedup=True)
+    source_label = str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()
+    if fixed_start_ts > 0:
+        rows, source_label = _overall_report_source_rows(int(uid), start_ts=fixed_start_ts, limit=0, dedup=True)
+    else:
+        rows = _setup_audit_load_rows(int(uid), hours=hours, limit=0, dedup=True)
     audit_tf = str(os.environ.get('SETUP_COMBO_MATRIX_TIMEFRAME', os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m'))) or '15m').strip().lower() or '15m'
     candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf) if rows else {}
-    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+    _pnl_start_ts = fixed_start_ts if fixed_start_ts > 0 else (float(time.time()) - float(hours) * 3600.0)
+    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(_pnl_start_ts), end_ts=float(time.time()) + 3600.0)
 
     def _new_bucket(fam: str, sess: str, strat: str = 'NOR', side: str = 'BOTH') -> dict:
         return {'family': fam, 'session': sess, 'strategy': strat, 'side': side, 'setups': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0, 'r_sum': 0.0, 'conf_sum': 0.0, 'quality_sum': 0.0, 'vol_sum': 0.0}
@@ -45594,11 +45614,11 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
                 bridge_report = _setup_combo_sync_active_policy_bridge(int(uid), bridge_input, str(run_id), int(hours), 'matrix_view')
     except Exception:
         bridge_report = {}
-    return {'run_id': run_id, 'rows': out_rows, 'policy_rows': policy_rows, 'source_rows': len(rows), 'window_hours': hours, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_updated': bool(policy_updated), 'policy_update_allowed': bool(allow_policy_update), 'policy_kind': str(policy_kind or 'manual'), 'bridge_report': bridge_report, 'last_policy': _setup_combo_latest_policy_update_info(int(uid))}
+    return {'run_id': run_id, 'rows': out_rows, 'policy_rows': policy_rows, 'source_rows': len(rows), 'window_hours': hours, 'start_ts': float(fixed_start_ts or 0.0), 'source_label': source_label, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_updated': bool(policy_updated), 'policy_update_allowed': bool(allow_policy_update), 'policy_kind': str(policy_kind or 'manual'), 'bridge_report': bridge_report, 'last_policy': _setup_combo_latest_policy_update_info(int(uid))}
 
 
-def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False) -> str:
-    res = _setup_combo_matrix_build(int(uid), hours=hours, persist=persist, allow_policy_update=allow_policy_update, policy_kind='manual')
+def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False, start_ts: float | None = None) -> str:
+    res = _setup_combo_matrix_build(int(uid), hours=hours, persist=persist, allow_policy_update=allow_policy_update, policy_kind='manual', start_ts=start_ts)
     rows = _setup_combo_enrich_rows_with_active_policy(int(uid), list((res or {}).get('rows') or []))
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not rows:
@@ -45660,15 +45680,19 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         next_review_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
     except Exception:
         next_review_txt = '-'
+    try:
+        window_txt = _overall_report_window_label(hours) if float((res or {}).get('start_ts') or 0.0) > 0 else f"{int(res.get('window_hours') or hours)}h"
+    except Exception:
+        window_txt = f"{int(res.get('window_hours') or hours)}h"
     header = [
         "📈 <b>Setup Edge Matrix</b>",
         HDR,
-        f"Window: <b>{int(res.get('window_hours') or hours)}h</b> | Run: <b>{html.escape(str(res.get('run_id') or '-'))}</b> | Scores persisted: <b>{'YES' if persist else 'NO'}</b> | Weekly policy updated: <b>{'YES' if bool(res.get('policy_updated')) else 'NO'}</b>",
+        f"Window: <b>{html.escape(str(window_txt))}</b> | Run: <b>{html.escape(str(res.get('run_id') or '-'))}</b> | Scores persisted: <b>{'YES' if persist else 'NO'}</b> | Weekly policy updated: <b>{'YES' if bool(res.get('policy_updated')) else 'NO'}</b>",
         f"Policy update time: <b>{html.escape(str(last_pol.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(last_pol.get('kind') or '-'))}</b> | Next scheduled review: <b>{html.escape(str(next_review_txt))}</b>",
-        f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | NOHIT: <b>{nh}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b>",
+        f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | NOHIT: <b>{nh}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b> | Source: <b>{html.escape(str((res or {}).get('source_label') or 'EXECUTABLE'))}</b>",
         f"Matrix recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b>",
         f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | WATCH gate=<b>{'STRICT' if SETUP_COMBO_WATCH_STRICT_QUALITY_GATE else ('BLOCK' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OPEN')}</b>",
-        html.escape(_setup_edge_guard_snapshot_text(int(uid))),
+        html.escape(_setup_edge_guard_snapshot_text(int(uid), _overall_report_effective_hours(hours) if float((res or {}).get('start_ts') or 0.0) > 0 else None)),
         html.escape(_setup_nor_rev_router_note(int(uid), rows)),
         f"Policy schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b>. Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> (temporary severe-disable only).",
         "Manual <code>/setup_matrix</code> rows are advisory. <b>Combo</b> is Family-Session-Strategy-Side (NOR/REV + BUY/SELL); <b>Reco</b> is what this selected window recommends; <b>Policy</b> is the currently enforced state used by executable queue + emails + AutoTrade + optimizer bridge. Score is blank for lanes with no decided evidence yet.",
@@ -45783,7 +45807,7 @@ def _setup_edge_stats_table(stats: dict, title: str, *, sort_mode: str = 'score'
     return f"{title}\n<pre>{html.escape(table)}</pre>"
 
 
-def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
+def _setup_edge_deep_text(uid: int, hours: int = 168, start_ts: float | None = None) -> str:
     """Deep setup analytics with the same canonical lane key used everywhere else.
 
     yver66: keep this command compact and decision-useful.  The primary unit is now
@@ -45793,14 +45817,27 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
     try:
         uid = int(uid or 0)
         hours = max(1, min(8760, int(hours or 168)))
+        fixed_start_ts = 0.0
+        try:
+            fixed_start_ts = float(start_ts or 0.0)
+        except Exception:
+            fixed_start_ts = 0.0
+        if fixed_start_ts > 0:
+            hours = _overall_report_effective_hours(hours)
         result_horizon = _setup_audit_result_horizon_hours()
-        rows = _setup_audit_load_rows(uid, hours=hours, limit=0, dedup=True)
+        source_label = str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()
+        if fixed_start_ts > 0:
+            rows, source_label = _overall_report_source_rows(uid, start_ts=fixed_start_ts, limit=0, dedup=True)
+        else:
+            rows = _setup_audit_load_rows(uid, hours=hours, limit=0, dedup=True)
         min_vol_m = _setup_min_volume_floor_usd() / 1e6
+        window_desc = _overall_report_window_label(hours) if fixed_start_ts > 0 else f"last {hours}h"
         if not rows:
-            return f"🧠 <b>Setup Deep Analysis</b>\n{HDR}\nNo unique executable setup rows above ${min_vol_m:.0f}M in the last {hours}h."
+            return f"🧠 <b>Setup Deep Analysis</b>\n{HDR}\nNo unique setup rows above ${min_vol_m:.0f}M for {html.escape(str(window_desc))}."
         audit_tf = str(os.environ.get('SETUP_EDGE_DEEP_TIMEFRAME', os.environ.get('SETUP_COMBO_MATRIX_TIMEFRAME', os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', '15m'))) or '15m').strip().lower() or '15m'
         candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
-        actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(uid, start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+        _pnl_start_ts = fixed_start_ts if fixed_start_ts > 0 else (float(time.time()) - float(hours) * 3600.0)
+        actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(uid, start_ts=float(_pnl_start_ts), end_ts=float(time.time()) + 3600.0)
 
         # Canonical buckets.  by_lane is the authoritative learning/reporting view.
         by_lane = {}
@@ -45904,11 +45941,11 @@ def _setup_edge_deep_text(uid: int, hours: int = 168) -> str:
         lines = [
             "🧠 <b>Setup Deep Analysis</b>",
             HDR,
-            f"Window: <b>{hours}h</b> | Rows evaluated: <b>{evaluated}</b> | Start: <b>{html.escape(start_txt)}</b> | End: <b>{html.escape(end_txt)}</b>",
-            f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | TP=<b>{tp_n}</b> SL=<b>{sl_n}</b> OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
+            f"Window: <b>{html.escape(str(window_desc))}</b> | Rows evaluated: <b>{evaluated}</b> | Start: <b>{html.escape(start_txt)}</b> | End: <b>{html.escape(end_txt)}</b>",
+            f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | Source: <b>{html.escape(str(source_label))}</b> | TP=<b>{tp_n}</b> SL=<b>{sl_n}</b> OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
             f"Exact disabled policy lanes now: <b>{html.escape(', '.join(coarse_disabled[:12]) if coarse_disabled else '-')}</b> | WATCH rows: <b>{len(watch_now)}</b>",
             f"Micro-edge tightened lanes now: <b>{html.escape(', '.join(guard_lane_blocks[:12]) if guard_lane_blocks else '-')}</b>",
-            html.escape(_setup_edge_guard_snapshot_text(uid)),
+            html.escape(_setup_edge_guard_snapshot_text(uid, _overall_report_effective_hours(hours) if fixed_start_ts > 0 else None)),
             f"Data recommendation from this window (exact lanes): DISABLE/TIGHTEN=<b>{html.escape(', '.join(rec_disable) if rec_disable else '-')}</b> | WATCH/TIGHTEN=<b>{html.escape(', '.join(rec_tighten) if rec_tighten else '-')}</b>",
             "Action rule: weak NOR-BUY/SELL evidence only tightens that exact NOR side; REV remains available until REV itself has decided evidence. If REV also fails, that exact REV side is then tightened/disabled.",
             html.escape(_setup_nor_rev_router_note(uid, [])),
@@ -45957,7 +45994,24 @@ def _setup_combo_policy_text(uid: int) -> str:
         owner_uid = int(uid or 0)
         if owner_uid <= 0:
             owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
-        _setup_combo_policy_view_maybe_auto_safety(int(owner_uid))
+
+        # yver76: /setup_matrix policy must be based on the same fixed historical
+        # evidence window as /setup_audit_overall, not a stale last-24h/168h score run.
+        # This refresh writes the enforceable lane policy and optimizer bridge from
+        # 2026-05-15 00:00 Melbourne before rendering the policy table.
+        baseline_res = {}
+        try:
+            baseline_res = _setup_combo_matrix_build(
+                int(owner_uid),
+                _overall_report_effective_hours(SETUP_COMBO_REVIEW_WINDOW_HOURS),
+                True,
+                True,
+                'scheduled',
+                start_ts=_overall_report_start_ts(),
+            )
+        except Exception as _baseline_exc:
+            baseline_res = {'ok': False, 'reason': f'{type(_baseline_exc).__name__}: {_baseline_exc}'}
+
         _setup_combo_policy_migrate()
         with sqlite3.connect(DB_PATH) as conn:
             conn.row_factory = sqlite3.Row
@@ -46038,7 +46092,7 @@ def _setup_combo_policy_text(uid: int) -> str:
                 pass
 
         try:
-            guard_data = _setup_edge_guard_build(int(owner_uid), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+            guard_data = _setup_edge_guard_build(int(owner_uid), hours=_overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168)), force=False)
             side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_strategy_side_block') or (guard_data or {}).get('combo_side_block') or {}).keys())
             legacy_side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('legacy_combo_side_block') or {}).keys())
         except Exception:
@@ -46130,20 +46184,20 @@ def _setup_combo_policy_text(uid: int) -> str:
 
         info = _setup_combo_latest_policy_update_info(int(owner_uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
-        guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid)))
+        guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid), _overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168))))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
             f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL). <b>ExecNow</b> is the actual executable state now. <b>Policy</b> is the enforced policy state. <b>Reco</b> is this window's recommendation only. <b>PART</b>=this exact lane is tightened by its own evidence. <b>OFF</b>=this exact lane is disabled by scheduled/daily safety policy. No-evidence lanes show '-' metrics."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
-            f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_REVIEW_WINDOW_HOURS)}h</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
-            f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Window: <b>{int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS)}h</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
+            f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
+            f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
             f"{guard_txt}\n{html.escape(_setup_nor_rev_router_note(int(owner_uid), []))}\n{note}\n"
-            f"Manual /setup_matrix rows are advisory; scheduled weekly policies, daily safety policies, temporary weekly-review overrides, the micro edge guard, the final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity now includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately in reports.\n"
+            f"Self-improvement flow: /setup_audit_overall and /setup_matrix policy now use the same fixed 15 May setup-result evidence; /setup_matrix policy refreshes the enforceable lane policy first, then the optimizer bridge mirrors those policy rows into runtime family/session gates. Manual /setup_matrix rows remain advisory; scheduled/baseline policy rows, daily safety rows, micro-edge guard, final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately.\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -46167,15 +46221,15 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 hours_deep = int(float(args[1]))
         except Exception:
             hours_deep = SETUP_COMBO_REVIEW_WINDOW_HOURS
-        text = await to_thread_heavy(_setup_edge_deep_text, int(AUTOTRADE_OWNER_UID or uid), int(hours_deep), timeout=240)
+        text = await to_thread_heavy(_setup_edge_deep_text, int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts(), timeout=240)
         await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         return
     if args and args[0].lower() in {'safety', 'daily_safety', 'run_safety'}:
-        res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
+        res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(AUTOTRADE_OWNER_UID or uid), _overall_report_start_ts(), timeout=240)
         disabled = ', '.join(list((res or {}).get('disabled') or [])) or '-'
         expires = _setup_combo_format_policy_ts((res or {}).get('expires_ts'))
         try:
-            guard_data = _setup_edge_guard_build(int(AUTOTRADE_OWNER_UID or uid), hours=int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False)
+            guard_data = _setup_edge_guard_build(int(AUTOTRADE_OWNER_UID or uid), hours=_overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168)), force=False)
             exact_disabled = sorted([str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_strategy_side_block') or (guard_data or {}).get('combo_side_block') or {}).keys() if str(x or '').strip()])
         except Exception:
             exact_disabled = []
@@ -46197,6 +46251,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"🛡️ <b>Setup Combo Daily Safety</b>\n{HDR}\n"
             f"Status: <b>{'OK' if (res or {}).get('ok') else 'SKIP/ERROR'}</b> | Run: <b>{html.escape(str((res or {}).get('run_id') or '-'))}</b>\n"
+            f"Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Source: <b>{html.escape(str((res or {}).get('source_label') or 'EXECUTABLE'))}</b>\n"
             f"Rows reviewed: <b>{int((res or {}).get('rows') or 0)}</b> | Newly disabled by this run: <b>{html.escape(disabled)}</b> | Expires: <b>{html.escape(expires)}</b>\n"
             f"Currently active disabled/tightened lanes: <b>{html.escape(active_disabled_txt)}</b>\n"
             f"Reason: <b>{html.escape(str((res or {}).get('reason') or '-'))}</b>"
@@ -46210,7 +46265,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
     try:
-        text = await to_thread_heavy(_setup_combo_matrix_text, int(AUTOTRADE_OWNER_UID or uid), int(hours), True, False, timeout=240)
+        text = await to_thread_heavy(_setup_combo_matrix_text, int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts(), timeout=240)
     except Exception as e:
         text = f"❌ setup_matrix failed: {type(e).__name__}: {html.escape(str(e))}"
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -46229,11 +46284,12 @@ async def setup_combo_review_job(context: ContextTypes.DEFAULT_TYPE):
                 uid = 0
         if uid <= 0:
             return
-        res = await to_thread_heavy(_setup_combo_matrix_build, int(uid), max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)), True, True, 'scheduled', timeout=240)
+        res = await to_thread_heavy(_setup_combo_matrix_build, int(uid), _overall_report_effective_hours(max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS))), True, True, 'scheduled', _overall_report_start_ts(), timeout=240)
         try:
             rows = list((res or {}).get('rows') or [])
             db_log_setup_pipeline_event(uid, stage='setup_combo_review', status='ok', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={
-                'window_hours': max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)),
+                'window_hours': int((res or {}).get('window_hours') or _overall_report_effective_hours(max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)))),
+                'baseline_start': _overall_report_start_txt(),
                 'rows': len(rows),
                 'keep': sum(1 for r in rows if str(r.get('action') or '').upper() == 'KEEP'),
                 'watch': sum(1 for r in rows if str(r.get('action') or '').upper() == 'WATCH'),
@@ -46312,16 +46368,18 @@ async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
                     res = await to_thread_heavy(
                         _setup_combo_matrix_build,
                         int(uid),
-                        max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)),
+                        _overall_report_effective_hours(max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS))),
                         True,
                         True,
                         'scheduled',
+                        _overall_report_start_ts(),
                         timeout=240,
                     )
                     try:
                         db_log_setup_pipeline_event(uid, stage='setup_combo_review_catchup', status='ok', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={
                             'scheduled_for': _setup_combo_format_policy_ts(prev_weekly_ts),
-                            'window_hours': max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)),
+                            'window_hours': int((res or {}).get('window_hours') or _overall_report_effective_hours(max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)))),
+                            'baseline_start': _overall_report_start_txt(),
                             'rows': len(list((res or {}).get('rows') or [])),
                             'policy_updated': bool((res or {}).get('policy_updated')),
                         })
@@ -46373,7 +46431,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     except Exception:
         hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
     try:
-        text = await to_thread_heavy(_setup_edge_deep_text, int(AUTOTRADE_OWNER_UID or uid), int(hours), timeout=240)
+        text = await to_thread_heavy(_setup_edge_deep_text, int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts(), timeout=240)
     except Exception as e:
         text = f"❌ setup_deep_analysis failed: {type(e).__name__}: {html.escape(str(e))}"
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -46422,8 +46480,11 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# yver75: fixed reporting baseline requested for only these two overall commands.
-# This must not affect trading, setup generation, email, /setup_audit, /autotrade_report, or policy jobs.
+# yver76: one reporting/policy evidence baseline for the Setup Audit / Reports section.
+# Reports and setup-policy evidence use the fixed 15 May baseline so /setup_audit_overall,
+# /setup_matrix, /setup_matrix policy, /setup_matrix deep, /setup_matrix safety and
+# /setup_deep_analysis all read the same historical setup evidence. Trading/live scans
+# still use their own normal runtime gates unless a scheduled/manual policy refresh writes policy rows.
 OVERALL_REPORT_START_LOCAL_YEAR = 2026
 OVERALL_REPORT_START_LOCAL_MONTH = 5
 OVERALL_REPORT_START_LOCAL_DAY = 15
@@ -46467,6 +46528,60 @@ def _overall_report_hours_since_start(now_ts: float | None = None) -> int:
         return max(1, int(math.ceil((end_ts - start_ts) / 3600.0)))
     except Exception:
         return 24
+
+
+def _overall_report_effective_hours(requested_hours: int | float | None = None, now_ts: float | None = None) -> int:
+    """Return an hour value large enough to cover the fixed 15 May baseline.
+
+    Existing matrix/deep/safety code is hours-based. This helper lets those commands
+    keep their old signatures while ensuring the practical data start is 2026-05-15
+    when a command belongs to the Setup Audit / Reports evidence section.
+    """
+    try:
+        requested = int(float(requested_hours or 0))
+    except Exception:
+        requested = 0
+    try:
+        baseline = int(_overall_report_hours_since_start(now_ts))
+    except Exception:
+        baseline = 24
+    return max(1, min(8760, max(requested, baseline)))
+
+
+def _overall_report_window_label(requested_hours: int | float | None = None) -> str:
+    try:
+        eff = _overall_report_effective_hours(requested_hours)
+        req = int(float(requested_hours or 0))
+        suffix = f" | effective {eff}h" if req and eff != req else f" | {eff}h"
+        return f"from {_overall_report_start_txt()} Melbourne{suffix}"
+    except Exception:
+        return f"from {_overall_report_start_txt()} Melbourne"
+
+
+def _overall_report_source_rows(uid: int, *, start_ts: float | None = None, limit: int = 0, dedup: bool = True) -> tuple[list[dict], str]:
+    """Load the same historical setup rows used by /setup_audit_overall.
+
+    First use the executable/actionable table. If that table starts after the fixed
+    baseline, fall back to EXECUTABLE+GENERATED so matrix/policy/deep reports do not
+    silently look like a last-24h report.
+    """
+    rows: list[dict] = []
+    source_label = str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()
+    try:
+        start = float(start_ts if start_ts is not None else (_overall_report_start_ts() or 0.0))
+    except Exception:
+        start = 0.0
+    try:
+        rows = _setup_audit_load_rows(int(uid), hours=None, limit=int(limit or 0), dedup=bool(dedup), start_ts=start, apply_final_quality_gate=False)
+        row_start = min([_setup_audit_row_ts(r) for r in rows if _setup_audit_row_ts(r) > 0] or [0.0]) if rows else 0.0
+        if start > 0 and (row_start <= 0 or row_start > start + 36 * 3600):
+            hist_rows = _setup_audit_load_rows(int(uid), hours=None, limit=int(limit or 0), dedup=bool(dedup), start_ts=start, apply_final_quality_gate=False, source_mode_override='ALL')
+            if len(hist_rows or []) > len(rows or []):
+                rows = list(hist_rows or [])
+                source_label = 'EXECUTABLE+GENERATED'
+    except Exception:
+        rows = []
+    return rows, source_label
 
 def _setup_audit_overall_text(uid: int) -> str:
     """Overall family-level setup audit summary from the fixed 15 May reporting baseline."""
