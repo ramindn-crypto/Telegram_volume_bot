@@ -3,6 +3,7 @@
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
 # yver84: strict audit/report reconciliation: setup compare loads full pre-close setup history, fixes Bybit closed-PnL original-side inference, ignores exchange-only rows for audit scoring, and disables automatic time exits under strict TP/SL-only mode.
 # yver86: setup audit now prefers fresh candle price-path over stale cached outcomes, and compare rejects future/unrelated setup matches.
+# yver88: hardens setup_audit_compare: mismatch rows are rechecked with 1m candles before DIFF, and inferred/legacy loss-reason closes are NON_TPSL instead of false natural TP/SL mismatches.
 # yver87: refines setup_audit_compare so matching TP/SL rows show OK even if old rows carry fallback/non-native notes; NON_TPSL is reserved for mismatches caused by historical/manual/time exits.
 # yver83: adds /setup_audit_compare to reconcile setup price-path audit versus actual AutoTrade report rows, so /setup_audit is not confused with real Bybit PnL.
 # yver82: /autotrade_closed is Bybit Closed-PnL authoritative, sorted by exact exchange close time in Melbourne, with seconds and exact realised PnL rows.
@@ -43347,7 +43348,12 @@ def _setup_audit_compare_non_tpsl_exit(row: dict) -> bool:
             'CLOSE_BEFORE_ASIA', 'BEFORE_ASIA', 'MAX_HOLD', 'TIME_EXIT',
             'PROFIT_CLOSE', 'LOSS_CLOSE', 'COUNTER_TREND', 'MANUAL',
             'MANUAL_OR_UNKNOWN', 'FLAT_NOW', 'AUTOTRADE_FLAT', 'FORCE_FLAT',
-            'EMERGENCY_CLOSE', 'RISK_REDUCE', 'MARKET_REDUCE', 'LIQUIDATION'
+            'EMERGENCY_CLOSE', 'RISK_REDUCE', 'MARKET_REDUCE', 'LIQUIDATION',
+            # Inferred analytic loss reasons are not exchange-native TP/SL proof.
+            # If they disagree with setup price-path, they should not become a
+            # false natural DIFF; keep them out of self-improvement scoring.
+            'LOW_CONFIDENCE', 'WEAK_COMBO', 'WEAK_SYMBOL', 'WEAK_HOUR',
+            'LOW_VOLUME', 'MISSING_SETUP_DATA', 'LOSS_CLOSE'
         )
         if any(m in reason_txt for m in explicit_markers):
             return True
@@ -43552,6 +43558,46 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         except Exception:
             return None
 
+    def _setup_audit_compare_refine_mismatch_1m(setup: dict | None, actual: str, current_audit_res: str) -> str:
+        """Re-check only mismatched comparison rows with 1m candles.
+
+        The main /setup_audit commands may use 5m/15m for speed.  For the small
+        number of AutoTrade comparison mismatches, use targeted 1m candles so a
+        coarse candle ordering error does not create a false DIFF.  This updates
+        the in-memory matched setup item only; /setup_audit itself will recalc the
+        stored result when run with its configured timeframe.
+        """
+        try:
+            if actual not in {'TP', 'SL'}:
+                return str(current_audit_res or '-').upper()
+            cur = str(current_audit_res or '-').upper().strip()
+            if cur == actual:
+                return cur
+            item = setup or {}
+            rr = dict(item.get('row') or {})
+            if not rr:
+                return cur
+            ms = _setup_audit_market_symbol_for_row(rr)
+            created_ts = float(_setup_audit_row_ts(rr) or rr.get('created_ts') or rr.get('ts') or 0.0)
+            if not ms or created_ts <= 0:
+                return cur
+            since_ms = int(max(0.0, created_ts - 90.0) * 1000)
+            until_ms = int(min(float(time.time()) + 60.0, created_ts + float(horizon_hours) * 3600.0 + 120.0) * 1000)
+            c1 = fetch_ohlcv_paged(ms, '1m', since_ms=since_ms, until_ms=until_ms, limit=1500) or []
+            if not c1:
+                return cur
+            ev1 = _setup_audit_payload_result_from_candles(rr, sorted(c1, key=lambda x: x[0]), horizon_hours=horizon_hours, timeframe='1m')
+            refined = _setup_audit_result_label((ev1 or {}).get('result'))
+            if refined in {'TP', 'SL', 'NOHIT', 'OPEN'}:
+                try:
+                    item['audit_res'] = refined
+                except Exception:
+                    pass
+                return refined
+            return cur
+        except Exception:
+            return str(current_audit_res or '-').upper().strip() or '-'
+
     rows = []
     match_ok = mismatch = unresolved = 0
     for tr in sorted((trade_rows or []), key=lambda r: float((r or {}).get('closed_ts') or (r or {}).get('last_ts') or (r or {}).get('ts') or 0.0), reverse=True):
@@ -43564,8 +43610,10 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
             setup = _match_setup_for_trade(tr)
             if setup:
                 setup_time = _fmt_ts(float(setup.get('setup_ts') or 0.0))
-                audit_res = str(setup.get('audit_res') or '-').upper()
+                audit_res = str(setup.get('audit_res') or '-').upper().strip() or '-'
                 non_tpsl = _setup_audit_compare_non_tpsl_exit(tr)
+                if actual in {'TP', 'SL'} and audit_res in {'TP', 'SL'} and actual != audit_res:
+                    audit_res = _setup_audit_compare_refine_mismatch_1m(setup, actual, audit_res)
                 if actual in {'TP', 'SL'} and audit_res in {'TP', 'SL'}:
                     # Matching TP/SL evidence is always OK.  Old fallback or
                     # non-native notes should not hide a valid agreement.
@@ -43601,6 +43649,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         f"Window: <b>last {hours}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
         "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
         "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
+        "Precision: mismatched TP/SL rows are rechecked with targeted 1m candles before DIFF is shown.",
         f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
     ]
     if not rows:
@@ -43614,7 +43663,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         colalign=('left', 'left', 'center', 'right', 'center', 'left', 'center', 'center'),
     )
     lines.append("<pre>" + html.escape(table) + "</pre>")
-    lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close disagrees with setup path, NON_TPSL=historical/manual/time/profit close with mismatched or unresolved setup path ignored for setup-audit scoring, PENDING=audit still OPEN/NOHIT, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
+    lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close still disagrees with setup path after targeted 1m recheck, NON_TPSL=historical/manual/time/profit/inferred close with mismatched or unresolved setup path ignored for setup-audit scoring, PENDING=audit still OPEN/NOHIT, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
     return "\n".join(lines)
 # ===========================================================================
 
