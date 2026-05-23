@@ -1,4 +1,5 @@
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
+# yver78: /autotrade_report sorted by Open time; added /autotrade_closed and /autotrade/closed hours for compact closed positions.
 # yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
 # yver71: end-to-end NOR→REV execution hardening: preserves REV metadata through email/cache/DB fallbacks, locks already-delivered setup lanes so AutoTrade executes the exact emailed/executable side, and keeps routing only in raw setup generation before final gates.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
@@ -37797,7 +37798,7 @@ KNOWN_COMMANDS = sorted(set([
     "health", "health_sys",
 
     # AutoTrade (admin)
-    "open_trades", "autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_report", "autotrade_last", "autotrade_fix_exits", "autotrade_debug_reset", "autotrade_report_overall", "autoytrade_report_overall", "autotrade_report_matrix", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
+    "open_trades", "autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_report", "autotrade_closed", "autotrade/closed", "autotrade_last", "autotrade_fix_exits", "autotrade_debug_reset", "autotrade_report_overall", "autoytrade_report_overall", "autotrade_report_matrix", "autotrade_sessions", "autotrade_config", "trade_lifecycle", "trade_lifecycle_detail",
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
@@ -38352,7 +38353,8 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_last": "Show last autotrade attempt details",
     "autotrade_fix_exits": "Force native Full TP/SL on all live AutoTrade positions and cancel legacy Conditional exit orders",
     "autotrade_flat_now": "Manually close AutoTrade-owned live positions now",
-    "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows)",
+    "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows), sorted by Open time",
+    "autotrade_closed": "Last closed AutoTrade positions: /autotrade_closed 24 or /autotrade/closed 24 shows Symbol, Side, Risk, PnL",
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "autoytrade_report_overall": "Family/session/strategy/side AutoTrade matrix: /autotrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
     "autotrade_report_matrix": "Alias of /autotrade_report_overall for the family/session AutoTrade matrix",
@@ -38398,7 +38400,7 @@ ADMIN_HELP_GROUPS = [
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
     ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autotrade_closed", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_test_data", "admin_reset_signal_reports", "reset", "restore"]),
 ]
@@ -48315,7 +48317,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v65_display_sanity:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v78_open_sort:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -48518,7 +48520,22 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         })
 
     journal_rows = _autotrade_merge_position_report_rows(journal_rows)
-    journal_rows.sort(key=lambda x: float(x.get('ts') or 0.0), reverse=True)
+
+    # yver78: /autotrade_report must be ordered by the Open column, not by
+    # latest close/update time. Closed rows can otherwise jump ahead of newer
+    # opens just because they closed recently. Keep newest opens first.
+    def _open_time_sort_key(x: dict) -> tuple[float, float]:
+        try:
+            open_ts, close_ts = _report_display_open_close_ts(x)
+            if float(open_ts or 0.0) <= 0:
+                open_ts = float((x or {}).get('opened_ts') or (x or {}).get('first_ts') or (x or {}).get('ts') or 0.0)
+            if float(close_ts or 0.0) <= 0:
+                close_ts = float((x or {}).get('closed_ts') or (x or {}).get('last_ts') or (x or {}).get('ts') or 0.0)
+            return (float(open_ts or 0.0), float(close_ts or 0.0))
+        except Exception:
+            return (float((x or {}).get('opened_ts') or (x or {}).get('ts') or 0.0), float((x or {}).get('ts') or 0.0))
+
+    journal_rows.sort(key=_open_time_sort_key, reverse=True)
     try:
         now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
     except Exception:
@@ -48712,6 +48729,158 @@ def _performance_report_payload_cached(owner: int, days: int) -> dict:
 
 
 
+
+def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> str:
+    """Return compact closed AutoTrade positions for /autotrade_closed and /autotrade/closed.
+
+    yver78: admin quick close table. It deliberately shows only Symbol, Side,
+    Risk and PnL, matching the compact open-position risk table style in
+    /autotrade_debug. Rows are sorted by close time newest first.
+    """
+    owner_uid = int(owner_uid)
+    lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
+    cache_key = f"autotrade_closed_positions:v78:{owner_uid}:{lookback_h}"
+    try:
+        if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
+            cached = cache_get(cache_key)
+            if isinstance(cached, str) and cached.strip():
+                return cached
+    except Exception:
+        pass
+
+    _autotrade_migrate_tables()
+    try:
+        _migrate_generated_setups()
+    except Exception:
+        pass
+
+    now_ts = float(time.time())
+    start_ts = now_ts - float(lookback_h) * 3600.0
+    try:
+        report_equity = float(_effective_equity_for_risk(_autotrade_user_settings(owner_uid), prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
+    except Exception:
+        report_equity = 0.0
+
+    try:
+        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=0) or []
+    except Exception:
+        closed_rows = []
+
+    def _sym_short(value) -> str:
+        try:
+            s = str(_bybit_linear_symbol(value or '')).upper().strip()
+            return s[:-4] if s.endswith('USDT') else (s or '-')
+        except Exception:
+            return '-'
+
+    def _risk_cell(row: dict) -> str:
+        try:
+            # Prefer real stored/geometry risk. Do not invent a fake risk number
+            # when the row has no usable risk metadata.
+            q = str((row or {}).get('risk_report_quality') or '').strip().lower()
+            src = str((row or {}).get('risk_usd_source') or '').strip()
+            v = float((row or {}).get('risk_usd') or 0.0)
+            if v > 0 and (q in {'real', 'pct_only'} or src in {'stored_amount', 'geometry_qty', 'risk_usd_equity', 'risk_actual_pct', 'filled_risk_pct'}):
+                return f"${v:.2f}"
+            if v > 0 and not q and not src:
+                return f"${v:.2f}"
+        except Exception:
+            pass
+        return '-'
+
+    table_rows = []
+    for r in (closed_rows or []):
+        try:
+            row = _setup_audit_merge_trade_setup_row(dict(r or {}))
+            row = _autotrade_report_enrich_amounts(row, report_equity)
+            pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
+            closed_ts = float(row.get('closed_ts') or r.get('closed_ts') or row.get('last_ts') or row.get('ts') or 0.0)
+            table_rows.append({
+                'closed_ts': closed_ts,
+                'symbol': _sym_short(row.get('symbol') or r.get('symbol') or ''),
+                'side': str(row.get('side') or r.get('side') or '-').upper().strip() or '-',
+                'risk': _risk_cell(row),
+                'pnl': pnl,
+            })
+        except Exception:
+            continue
+
+    table_rows.sort(key=lambda x: float(x.get('closed_ts') or 0.0), reverse=True)
+    now_txt = ''
+    try:
+        now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        pass
+
+    lines = [
+        "📕 <b>AutoTrade Closed Positions</b>",
+        HDR,
+        f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
+        "Sorted by close time newest first. Columns: Symbol, Side, Risk, PnL.",
+    ]
+    if not table_rows:
+        lines.append(SEP)
+        lines.append("No closed AutoTrade positions found in this window.")
+        out = "\n".join(lines)
+    else:
+        plain_rows = [[r['symbol'], r['side'], r['risk'], f"{float(r['pnl'] or 0.0):+.2f}"] for r in table_rows]
+        table = tabulate(
+            plain_rows,
+            headers=['Symbol', 'Side', 'Risk', 'PnL'],
+            tablefmt='plain',
+            colalign=('left', 'center', 'right', 'right'),
+        )
+        lines.append(f"Rows shown: <b>{len(plain_rows)}</b> closed position rows. Time: <b>Melbourne</b>.")
+        out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
+    try:
+        cache_set(cache_key, out)
+    except Exception:
+        pass
+    return out
+
+
+async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autotrade_closed [hours] or /autotrade/closed [hours]."""
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+
+    lookback_h = 24
+    try:
+        args = _command_args_from_message(update, context)
+        if args and str(args[0]).strip():
+            lookback_h = int(float(str(args[0]).strip()))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))
+    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+    cache_key = f"autotrade_closed_positions:v78:{owner_uid}:{lookback_h}"
+    stale_cached = ''
+    try:
+        raw_cached = cache_get(cache_key)
+        stale_cached = raw_cached if isinstance(raw_cached, str) else ''
+    except Exception:
+        stale_cached = ''
+
+    try:
+        text_out = await to_thread_heavy(_autotrade_closed_positions_text_cached, owner_uid, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
+    except asyncio.TimeoutError:
+        if stale_cached:
+            text_out = stale_cached + "\n" + SEP + "Showing cached snapshot while a fresh closed-position report rebuild is still busy."
+        else:
+            await update.message.reply_text(f"⚠️ /autotrade_closed timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
+            return
+    except Exception as e:
+        if stale_cached:
+            text_out = stale_cached + "\n" + SEP + f"Showing cached snapshot after refresh failure ({type(e).__name__})."
+        else:
+            await update.message.reply_text(f"❌ /autotrade_closed failed: {type(e).__name__}: {e}")
+            return
+
+    await send_long_message(update, text_out, parse_mode=ParseMode.HTML)
+
+
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/autotrade_report [hours] — live journal with explicit SL / TP hit state."""
     uid = update.effective_user.id
@@ -48728,7 +48897,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
 
-    cache_key = f"autotrade_report_text_cmd:v65_display_sanity:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text_cmd:v78_open_sort:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
@@ -56975,6 +57144,9 @@ def main():
     
     app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
     app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_closed", autotrade_closed_cmd, block=False))
+    app.add_handler(CommandHandler("autotradeclosed", autotrade_closed_cmd, block=False))
+    app.add_handler(MessageHandler(filters.Regex(r"^/autotrade/closed(?:@\w+)?(?:\s|$)"), autotrade_closed_cmd), block=False)
     app.add_handler(CommandHandler("performance_report", performance_report_cmd, block=False))
     app.add_handler(CommandHandler("trade_lifecycle", trade_lifecycle_cmd, block=False))
     app.add_handler(CommandHandler("trade_lifecycle_detail", trade_lifecycle_detail_cmd, block=False))
