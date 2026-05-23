@@ -1,3 +1,4 @@
+# yver89: adds directional leader/loser coherence guard so leader symbols cannot emit SELL setups and loser symbols cannot emit BUY setups across setup email, executable queue, F8/BigMove, and AutoTrade lanes.
 # yver85: setup-audit compare now reconciles merged practical AutoTrade positions, not raw Bybit closed-PnL fragments; non-TP/SL historical exits are INFO instead of corrupting setup-audit DIFF counts.
 # yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
 # yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
@@ -4157,6 +4158,18 @@ EMA7_1H_MAX_DIST_PCT = float(os.environ.get("EMA7_1H_MAX_DIST_PCT", "0.95") or 0
 MOVER_VOL_USD_MIN = 5_000_000
 MOVER_UP_24H_MIN = 10.0
 MOVER_DN_24H_MAX = -10.0
+
+# yver89 directional coherence guard:
+# The market snapshot's Directional Leaders/Losers are a hard context filter for
+# executable/email/AutoTrade setups. If a symbol is a confirmed leader, do not send
+# a SELL setup; if it is a confirmed loser, do not send a BUY setup. This prevents
+# NOR→REV routing or F8/BigMove conversion from producing counter-move setups such
+# as SELL GMT/BILL while the same symbols are shown in Leaders.
+DIRECTIONAL_CONTEXT_GUARD_ENABLED = env_bool("DIRECTIONAL_CONTEXT_GUARD_ENABLED", True)
+DIRECTIONAL_CONTEXT_GUARD_MIN_VOL_USD = float(os.environ.get("DIRECTIONAL_CONTEXT_GUARD_MIN_VOL_USD", str(MOVER_VOL_USD_MIN)) or MOVER_VOL_USD_MIN)
+DIRECTIONAL_CONTEXT_GUARD_LEADER_24H_MIN = float(os.environ.get("DIRECTIONAL_CONTEXT_GUARD_LEADER_24H_MIN", str(MOVER_UP_24H_MIN)) or MOVER_UP_24H_MIN)
+DIRECTIONAL_CONTEXT_GUARD_LOSER_24H_MAX = float(os.environ.get("DIRECTIONAL_CONTEXT_GUARD_LOSER_24H_MAX", str(MOVER_DN_24H_MAX)) or MOVER_DN_24H_MAX)
+DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H = float(os.environ.get("DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H", "0.01") or 0.01)
 
 
 # =========================================================
@@ -45110,6 +45123,70 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
         meta['error'] = f'{type(exc).__name__}: {exc}'
         return False, f'{reason_prefix}_exception', meta
 
+
+def _setup_directional_context_guard_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    """Hard block setup direction when it fights Directional Leaders/Losers.
+
+    Uses the same concept shown in email/screen Market Snapshot:
+    - Leader: 24H >= +threshold, 4H aligned up, enough futures volume.
+    - Loser: 24H <= -threshold, 4H aligned down, enough futures volume.
+
+    A leader must not produce SELL and a loser must not produce BUY. This is applied in
+    the shared final gate, so it covers normal setup emails, executable queue,
+    AutoTrade consumption, and BigMove/F8 setup emails after NOR→REV routing.
+    """
+    meta = {}
+    try:
+        if not bool(globals().get('DIRECTIONAL_CONTEXT_GUARD_ENABLED', True)):
+            return True, 'directional_context_guard_disabled', meta
+        side = str(_autotrade_setup_attr(setup_or_row, 'side', '') or '').upper().strip()
+        sym = str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or _autotrade_setup_attr(setup_or_row, 'market_symbol', '') or '').upper().strip()
+        if sym.endswith('USDT'):
+            sym = sym[:-4]
+        if side not in {'BUY', 'SELL'} or not sym:
+            return True, 'directional_context_missing_side_symbol', meta
+        try:
+            ch24 = float(_autotrade_setup_attr(setup_or_row, 'ch24', 0.0) or _autotrade_setup_attr(setup_or_row, 'pct24', 0.0) or _autotrade_setup_attr(setup_or_row, 'change24h', 0.0) or 0.0)
+        except Exception:
+            ch24 = 0.0
+        try:
+            ch4 = float(_autotrade_setup_attr(setup_or_row, 'ch4', 0.0) or _autotrade_setup_attr(setup_or_row, 'pct4h', 0.0) or _autotrade_setup_attr(setup_or_row, 'change4h', 0.0) or 0.0)
+        except Exception:
+            ch4 = 0.0
+        try:
+            fut_vol = float(_autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or _autotrade_setup_attr(setup_or_row, 'vol_usd', 0.0) or 0.0)
+        except Exception:
+            fut_vol = 0.0
+        try:
+            min_vol = float(globals().get('DIRECTIONAL_CONTEXT_GUARD_MIN_VOL_USD', globals().get('MOVER_VOL_USD_MIN', 5_000_000)) or 5_000_000)
+            leader_min = float(globals().get('DIRECTIONAL_CONTEXT_GUARD_LEADER_24H_MIN', globals().get('MOVER_UP_24H_MIN', 10.0)) or 10.0)
+            loser_max = float(globals().get('DIRECTIONAL_CONTEXT_GUARD_LOSER_24H_MAX', globals().get('MOVER_DN_24H_MAX', -10.0)) or -10.0)
+            min_abs_4h = max(0.0, float(globals().get('DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H', 0.01) or 0.01))
+        except Exception:
+            min_vol, leader_min, loser_max, min_abs_4h = 5_000_000.0, 10.0, -10.0, 0.01
+        is_leader = bool(fut_vol >= min_vol and ch24 >= leader_min and ch4 >= min_abs_4h)
+        is_loser = bool(fut_vol >= min_vol and ch24 <= loser_max and ch4 <= -min_abs_4h)
+        meta.update({
+            'directional_context_guard': 'ON',
+            'directional_context_symbol': sym,
+            'directional_context_side': side,
+            'directional_context_ch24': round(float(ch24), 4),
+            'directional_context_ch4': round(float(ch4), 4),
+            'directional_context_vol_m': round(float(fut_vol) / 1_000_000.0, 3),
+            'directional_context_is_leader': bool(is_leader),
+            'directional_context_is_loser': bool(is_loser),
+        })
+        if is_leader and side == 'SELL':
+            return False, f'directional_context_blocks_sell_leader:{sym}:24h{ch24:+.1f}%:4h{ch4:+.1f}%', meta
+        if is_loser and side == 'BUY':
+            return False, f'directional_context_blocks_buy_loser:{sym}:24h{ch24:+.1f}%:4h{ch4:+.1f}%', meta
+        return True, 'directional_context_ok', meta
+    except Exception as exc:
+        meta['directional_context_guard_error'] = f'{type(exc).__name__}: {exc}'
+        # Fail-open on unexpected data issues so a malformed old row cannot break the bot.
+        return True, 'directional_context_guard_error_allowed', meta
+
+
 def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
     """Shared final gate for executable queue, setup emails, AutoTrade and audit.
 
@@ -45132,6 +45209,14 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         sess = str(sess or sess2 or '').upper().strip()
         if sess not in {'ASIA', 'LON', 'NY'}:
             return False, 'final_missing_session', meta
+
+        try:
+            dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
+            meta.update(dict(dir_meta or {}))
+            if not dir_ok:
+                return False, str(dir_why or 'directional_context_blocked'), meta
+        except Exception as _dir_exc:
+            meta['directional_context_guard_error'] = f'{type(_dir_exc).__name__}: {_dir_exc}'
 
         info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
         found = bool(info.get('found'))
