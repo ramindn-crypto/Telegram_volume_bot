@@ -1,3 +1,4 @@
+# yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
 # yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
 # yver71: end-to-end NOR→REV execution hardening: preserves REV metadata through email/cache/DB fallbacks, locks already-delivered setup lanes so AutoTrade executes the exact emailed/executable side, and keeps routing only in raw setup generation before final gates.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
@@ -45984,7 +45985,7 @@ def _setup_combo_policy_view_maybe_auto_safety(uid: int) -> dict:
         if now_ts - float(_SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_LAST_TS or 0.0) < cd:
             return {'ok': False, 'reason': 'cooldown'}
         _SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_LAST_TS = now_ts
-        return _setup_combo_run_daily_safety_policy(int(uid or 0))
+        return _setup_combo_run_daily_safety_policy(int(uid or 0), _overall_report_start_ts())
     except Exception as exc:
         return {'ok': False, 'reason': f'{type(exc).__name__}: {exc}'}
 
@@ -46211,7 +46212,13 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
     if args and args[0].lower() in {'policy', 'rules', 'status'}:
-        text = await to_thread_heavy(_setup_combo_policy_text, int(AUTOTRADE_OWNER_UID or uid), timeout=60)
+        try:
+            # yver77: policy refresh uses the fixed 15 May baseline and can be heavier
+            # than the old rolling 168h view. Keep it guarded but do not let a timeout
+            # bubble up as a Telegram handler/job crash in Render logs.
+            text = await to_thread_heavy(_setup_combo_policy_text, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
+        except Exception as e:
+            text = f"❌ setup_matrix policy failed: {type(e).__name__}: {html.escape(str(e))}"
         await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         return
     if args and args[0].lower() in {'deep', 'analysis', 'analytics', 'timing', 'times'}:
@@ -46321,7 +46328,7 @@ async def setup_combo_daily_safety_job(context: ContextTypes.DEFAULT_TYPE):
                 uid = 0
         if uid <= 0:
             return
-        res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(uid), timeout=240)
+        res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(uid), _overall_report_start_ts(), timeout=240)
         try:
             db_log_setup_pipeline_event(uid, stage='setup_combo_daily_safety', status='ok' if (res or {}).get('ok') else 'skip', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={
                 'window_hours': int(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS),
@@ -46398,7 +46405,7 @@ async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
             age_h = (now_ts - prev_daily_ts) / 3600.0
             if bool(SETUP_COMBO_DAILY_SAFETY_ENABLED) and 0.0 <= age_h <= float(SETUP_COMBO_DAILY_SAFETY_CATCHUP_MAX_HOURS or 2.5):
                 if not _setup_combo_policy_kind_updated_since(int(uid), 'daily_safety', prev_daily_ts - 300.0):
-                    res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(uid), timeout=240)
+                    res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(uid), _overall_report_start_ts(), timeout=240)
                     try:
                         db_log_setup_pipeline_event(uid, stage='setup_combo_daily_safety_catchup', status='ok' if (res or {}).get('ok') else 'skip', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={
                             'scheduled_for': _setup_combo_format_policy_ts(prev_daily_ts),
