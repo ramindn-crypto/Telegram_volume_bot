@@ -9,6 +9,7 @@
 # yver88: hardens setup_audit_compare: mismatch rows are rechecked with 1m candles before DIFF, and inferred/legacy loss-reason closes are NON_TPSL instead of false natural TP/SL mismatches.
 # yver87: refines setup_audit_compare so matching TP/SL rows show OK even if old rows carry fallback/non-native notes; NON_TPSL is reserved for mismatches caused by historical/manual/time exits.
 # yver83: adds /setup_audit_compare to reconcile setup price-path audit versus actual AutoTrade report rows, so /setup_audit is not confused with real Bybit PnL.
+# yver94: /autotrade_report and /autotrade_closed share Bybit Closed-PnL close time/PnL authority; strict combo-side enrichment.
 # yver82: /autotrade_closed is Bybit Closed-PnL authoritative, sorted by exact exchange close time in Melbourne, with seconds and exact realised PnL rows.
 # yver81: /autotrade_closed close time is forced to Australia/Melbourne display, with robust UTC/ms/ISO timestamp normalization.
 # yver80: /autotrade_closed now shows Close time and sorts strictly by closed time newest first.
@@ -49347,6 +49348,271 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
     out.sort(key=lambda r: float(r.get('ts') or r.get('last_ts') or 0.0), reverse=True)
     return out
 
+
+
+def _autotrade_combo_side_from_key(combo: str = '') -> str:
+    try:
+        parts = [x for x in str(combo or '').upper().strip().split('-') if x]
+        if len(parts) >= 4 and parts[-1] in {'BUY', 'SELL'}:
+            return parts[-1]
+    except Exception:
+        pass
+    return ''
+
+
+def _autotrade_combo_parts_from_key(combo: str = '') -> tuple[str, str, str, str]:
+    try:
+        parts = [x for x in str(combo or '').upper().strip().split('-') if x]
+        if len(parts) >= 4:
+            fam, sess, strat, side = parts[0], parts[1], parts[2], parts[3]
+            if side in {'BUY', 'SELL'}:
+                return fam, sess, strat, side
+    except Exception:
+        pass
+    return 'F0', 'UNK', 'NOR', ''
+
+
+def _autotrade_report_bybit_canonical_closed_rows(owner_uid: int, start_ts: float, end_ts: float, lookback_h: int = 24, report_equity: float = 0.0) -> list[dict]:
+    """Return closed rows using Bybit Closed-PnL as the time/PnL authority.
+
+    This keeps /autotrade_report aligned with /autotrade_closed. Bot journal and
+    lifecycle rows are used only as metadata enrichment (combo, risk, setup fields),
+    never as the source of the exchange close time or realised PnL.
+    """
+    if str(_autotrade_runtime_mode()).lower() != 'live':
+        return []
+    owner_uid = int(owner_uid or 0)
+    start_ts = float(start_ts or 0.0)
+    end_ts = float(end_ts or 0.0)
+    try:
+        bybit_events = _bybit_get_closed_pnl_linear(float(start_ts), float(end_ts) + 60.0, limit=max(200, min(10000, int(max(1, lookback_h)) * 100))) or []
+    except Exception:
+        bybit_events = []
+    if not bybit_events:
+        return []
+
+    def _num(row: dict, keys: tuple[str, ...]) -> float:
+        for k in keys:
+            try:
+                v = (row or {}).get(k)
+                if v is None or str(v).strip() == '':
+                    continue
+                x = float(v)
+                if x != 0:
+                    return x
+            except Exception:
+                continue
+        return 0.0
+
+    def _closed_ts(ev: dict) -> float:
+        try:
+            for k in ('updatedTime', 'updated_time', 'closed_ts', 'close_ts', 'exit_ts', 'closeTime', 'closedTime', 'createdTime', 'created_time', 'execTime', 'fillTime', 'last_ts', 'updated_ts', 'ts'):
+                try:
+                    v = (ev or {}).get(k)
+                    ts = float(_ts_seconds_from_any(v) or 0.0)
+                    if ts > 0:
+                        return ts
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            return float(_bybit_closed_pnl_event_ts(ev) or 0.0)
+        except Exception:
+            return 0.0
+
+    def _position_side(ev: dict) -> str:
+        raw = str((ev or {}).get('side') or '').upper().strip()
+        if raw not in {'BUY', 'SELL'}:
+            raw = ''
+        try:
+            entry = abs(float(_num(ev, ('avgEntryPrice', 'avg_entry_price', 'entryPrice', 'entry_price')) or 0.0))
+            exitp = abs(float(_num(ev, ('avgExitPrice', 'avg_exit_price', 'exitPrice', 'exit_price', 'orderPrice', 'price')) or 0.0))
+            pnl = float((ev or {}).get('closedPnl') if (ev or {}).get('closedPnl') is not None else (ev or {}).get('pnl') or 0.0)
+            if entry > 0 and exitp > 0 and abs(exitp - entry) > max(entry * 1e-7, 1e-12) and abs(pnl) >= 0.50:
+                if pnl > 0:
+                    return 'BUY' if exitp > entry else 'SELL'
+                if pnl < 0:
+                    return 'BUY' if exitp < entry else 'SELL'
+        except Exception:
+            pass
+        return raw or '-'
+
+    def _risk_value(row: dict, ev: dict | None = None) -> float:
+        ev = ev or {}
+        try:
+            v = float((row or {}).get('risk_usd') or (row or {}).get('risk_usdt') or (row or {}).get('filled_risk_usd') or (row or {}).get('risk_actual_usd') or 0.0)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        try:
+            entry = abs(float((row or {}).get('entry') or ev.get('avgEntryPrice') or ev.get('avg_entry_price') or ev.get('entryPrice') or ev.get('entry_price') or 0.0))
+            sl = abs(float((row or {}).get('sl') or (row or {}).get('stopLoss') or (row or {}).get('stop_loss') or 0.0))
+            qty = abs(float(_bybit_closed_pnl_event_qty(ev) or (row or {}).get('qty') or (row or {}).get('filled_qty') or (row or {}).get('closed_qty') or 0.0))
+            if entry > 0 and sl > 0 and qty > 0:
+                try:
+                    cs = float((row or {}).get('contract_size') or (row or {}).get('contractSize') or ev.get('contractSize') or 0.0)
+                    if cs <= 0:
+                        cs = float((_bybit_get_instr_filters(str((row or {}).get('symbol') or ev.get('symbol') or '')) or {}).get('contractSize') or 1.0)
+                except Exception:
+                    cs = 1.0
+                return abs(entry - sl) * qty * abs(float(cs or 1.0))
+        except Exception:
+            pass
+        return 0.0
+
+    def _combo_cell(row: dict) -> str:
+        try:
+            for k in ('combo', 'combo_key', 'combo_side_key', 'combo_strategy_side'):
+                v = str((row or {}).get(k) or '').upper().strip()
+                if v and v != '-':
+                    return v
+            combo = str(_autotrade_setup_exact_combo_key(row) or '').upper().strip()
+            if combo and combo not in {'F0-UNK-NOR-BOTH', 'F0-UNK-NOR', 'F0---NOR'}:
+                return combo
+            fam = _setup_audit_family_code(row) if isinstance(row, dict) else 'F0'
+            sess = str((row or {}).get('session') or (row or {}).get('source_session') or '-').upper().strip() or '-'
+            strat = _setup_strategy_suffix(row)
+            side = str((row or {}).get('side') or '').upper().strip()
+            combo = _setup_combo_strategy_side_key(fam, sess, strat, side)
+            return combo if combo and 'UNK' not in combo else '-'
+        except Exception:
+            return '-'
+
+    try:
+        enrich_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts) - 30 * 3600.0, float(end_ts) + 6 * 3600.0, lookback_h=max(lookback_h, 48), limit=0) or []
+    except Exception:
+        enrich_rows = []
+
+    candidates = []
+    for er in list(enrich_rows or []):
+        try:
+            row = _setup_audit_merge_trade_setup_row(dict(er or {}))
+            row = _autotrade_report_enrich_amounts(row, float(report_equity or 0.0))
+            sym = str(_bybit_linear_symbol(row.get('symbol') or er.get('symbol') or '')).upper().strip()
+            if not sym:
+                continue
+            combo = _combo_cell(row)
+            side = str(row.get('side') or er.get('side') or '').upper().strip()
+            combo_side = _autotrade_combo_side_from_key(combo)
+            if combo_side in {'BUY', 'SELL'}:
+                side = combo_side
+            cts = 0.0
+            for k in ('closed_ts', 'last_ts', 'ts', 'updated_ts'):
+                try:
+                    cts = float(row.get(k) or er.get(k) or 0.0)
+                    if cts > 0:
+                        break
+                except Exception:
+                    pass
+            pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or er.get('pnl_usdt') or er.get('pnl') or 0.0)
+            candidates.append({'symbol': sym, 'side': side, 'combo': combo, 'closed_ts': float(cts or 0.0), 'opened_ts': float(row.get('opened_ts') or er.get('opened_ts') or 0.0), 'pnl': float(pnl), 'risk_usd': _risk_value(row), 'row': dict(row or {})})
+        except Exception:
+            continue
+
+    def _match(sym: str, side: str, pnl: float, ts: float, ev: dict) -> dict:
+        best = None
+        best_score = 10**18
+        side = str(side or '').upper().strip()
+        for cand in candidates:
+            try:
+                if str(cand.get('symbol') or '') != sym:
+                    continue
+                cside = str(cand.get('side') or '').upper().strip()
+                combo = str(cand.get('combo') or '').upper().strip()
+                combo_side = _autotrade_combo_side_from_key(combo)
+                # Never attach BUY-lane metadata/risk to a SELL close, or vice versa.
+                if side in {'BUY', 'SELL'}:
+                    if combo_side in {'BUY', 'SELL'} and combo_side != side:
+                        continue
+                    if cside in {'BUY', 'SELL'} and cside != side and combo_side not in {'BUY', 'SELL'}:
+                        continue
+                cts = float(cand.get('closed_ts') or 0.0)
+                ots = float(cand.get('opened_ts') or 0.0)
+                cpnl = float(cand.get('pnl') or 0.0)
+                pnl_diff = abs(cpnl - float(pnl or 0.0))
+                if cts > 0 and ts > 0:
+                    dt = abs(ts - cts)
+                elif ots > 0 and ts > 0 and ots <= ts + 300.0:
+                    dt = min(abs(ts - ots), 24 * 3600.0)
+                else:
+                    dt = 999999.0
+                # Accept old journal close timestamps only when PnL is effectively
+                # the same; otherwise keep the Bybit event unlinked instead of
+                # showing wrong combo/risk.
+                if dt > 6 * 3600.0 and pnl_diff > 0.25:
+                    continue
+                if dt > 48 * 3600.0:
+                    continue
+                score = dt * 10.0 + min(pnl_diff, 100.0) * 250.0
+                if score < best_score:
+                    best = cand
+                    best_score = score
+            except Exception:
+                continue
+        return dict(best or {})
+
+    seen = set()
+    out = []
+    for ev in bybit_events:
+        try:
+            ts = float(_closed_ts(ev) or 0.0)
+            if ts <= 0 or ts < start_ts or ts > end_ts + 120.0:
+                continue
+            sym = str(_bybit_linear_symbol((ev or {}).get('symbol') or '')).upper().strip()
+            if not sym:
+                continue
+            pnl = float((ev or {}).get('closedPnl') if (ev or {}).get('closedPnl') is not None else (ev or {}).get('pnl') or 0.0)
+            side = _position_side(ev)
+            key = (sym, int(round(ts * 1000)), str((ev or {}).get('orderId') or (ev or {}).get('execId') or (ev or {}).get('createdTime') or ''), round(pnl, 8), round(float(_bybit_closed_pnl_event_qty(ev) or 0.0), 8))
+            if key in seen:
+                continue
+            seen.add(key)
+            cand = _match(sym, side, pnl, ts, ev)
+            base = dict(cand.get('row') or {}) if cand else {}
+            combo = str(cand.get('combo') or '').upper().strip() if cand else '-'
+            if combo and combo != '-' and _autotrade_combo_side_from_key(combo) not in {'', side}:
+                combo = '-'
+                base = {}
+            risk = float(cand.get('risk_usd') or 0.0) if cand else 0.0
+            if risk <= 0 and base:
+                risk = _risk_value(base, ev)
+            fam, sess, strat, combo_side = _autotrade_combo_parts_from_key(combo)
+            if combo_side in {'BUY', 'SELL'} and side in {'BUY', 'SELL'} and combo_side != side:
+                combo = '-'; fam, sess, strat = 'F0', 'UNK', 'NOR'
+            kind = 'TP' if pnl > 0.05 else ('SL' if pnl < -0.05 else 'OTHER')
+            row = dict(base or {})
+            row.update({
+                'state': 'CLOSED', 'status': 'CLOSED', 'symbol': sym, 'side': side,
+                'closed_ts': float(ts), 'last_ts': float(ts), 'ts': float(ts),
+                'pnl': float(pnl), 'pnl_usdt': float(pnl),
+                'closed_kind': kind, 'result_path': kind, 'result_label': kind,
+                'close_reason': str(row.get('close_reason') or 'BYBIT_CLOSED_PNL'),
+                'note': str(row.get('note') or 'bybit_closed_pnl_authority'),
+                'exchange_close_time_authority': True,
+                'parts': 1,
+            })
+            if combo and combo != '-':
+                row['combo'] = combo
+                row['family'] = fam
+                row['session'] = sess
+                row['setup_strategy'] = strat
+                row['strategy'] = strat
+            if risk > 0:
+                row['risk_usd'] = float(risk)
+            # Fill basic exchange quantities/prices for risk/debug display.
+            try:
+                row.setdefault('qty', abs(float(_bybit_closed_pnl_event_qty(ev) or 0.0)))
+                row.setdefault('entry', abs(float(_num(ev, ('avgEntryPrice', 'avg_entry_price', 'entryPrice', 'entry_price')) or 0.0)))
+            except Exception:
+                pass
+            out.append(row)
+        except Exception:
+            continue
+    out.sort(key=lambda r: float((r or {}).get('closed_ts') or 0.0), reverse=True)
+    return out
+
 def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """AutoTrade journal: one row per practical position, sorted by latest time.
 
@@ -49379,9 +49645,14 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     open_positions = _bybit_get_open_positions_linear() if str(_autotrade_runtime_mode()).lower() == 'live' else []
     bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(owner_uid, positions=open_positions, fallback_unmatched_as_owned=True)
     try:
-        closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=0) or []
+        closed_rows = _autotrade_report_bybit_canonical_closed_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, report_equity=_report_equity) or []
+        if not closed_rows:
+            closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=0) or []
     except Exception:
-        closed_rows = []
+        try:
+            closed_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts), lookback_h=lookback_h, limit=0) or []
+        except Exception:
+            closed_rows = []
 
     total_open = 0.0
     total_closed = 0.0
@@ -49781,7 +50052,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v93:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v94:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50034,11 +50305,17 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                 if str(cand.get('symbol') or '') != str(sym or ''):
                     continue
                 cside = str(cand.get('side') or '').upper().strip()
+                ccombo = str(cand.get('combo') or '').upper().strip()
+                ccombo_side = _autotrade_combo_side_from_key(ccombo)
+                if side in {'BUY', 'SELL'}:
+                    # Never enrich a SELL exchange close with BUY-lane combo/risk
+                    # or a BUY exchange close with SELL-lane combo/risk.  A wrong
+                    # metadata match is worse than showing '-' for Combo/Risk.
+                    if ccombo_side in {'BUY', 'SELL'} and ccombo_side != side:
+                        continue
+                    if cside in {'BUY', 'SELL'} and cside != side and ccombo_side not in {'BUY', 'SELL'}:
+                        continue
                 side_penalty = 0.0
-                if side in {'BUY', 'SELL'} and cside in {'BUY', 'SELL'} and side != cside:
-                    # Do not completely reject because some Bybit close rows expose
-                    # closing side, but strongly prefer the same original side.
-                    side_penalty = 3600.0
                 cpnl = float(cand.get('pnl') or 0.0)
                 pnl_diff = abs(cpnl - float(pnl or 0.0))
                 cts = float(cand.get('closed_ts') or 0.0)
@@ -50049,12 +50326,14 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                     dt = min(abs(float(ts or 0.0) - ots), 12 * 3600.0)
                 else:
                     dt = 999999.0
-                if dt > 24 * 3600:
+                if dt > 6 * 3600 and pnl_diff > 0.25:
+                    continue
+                if dt > 48 * 3600:
                     continue
                 # First priority is exact/near close-time match; PnL remains a strong
                 # tie-breaker but is not a hard filter because Bybit may split or
                 # aggregate realised P&L differently from the bot's practical row.
-                score = side_penalty + dt * 10.0 + min(pnl_diff, 100.0) * 100.0
+                score = side_penalty + dt * 10.0 + min(pnl_diff, 100.0) * 250.0
                 if score < best_score:
                     best = cand
                     best_score = score
@@ -50177,7 +50456,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v93:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v94:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
