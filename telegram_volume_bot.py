@@ -9,6 +9,7 @@
 # yver88: hardens setup_audit_compare: mismatch rows are rechecked with 1m candles before DIFF, and inferred/legacy loss-reason closes are NON_TPSL instead of false natural TP/SL mismatches.
 # yver87: refines setup_audit_compare so matching TP/SL rows show OK even if old rows carry fallback/non-native notes; NON_TPSL is reserved for mismatches caused by historical/manual/time exits.
 # yver83: adds /setup_audit_compare to reconcile setup price-path audit versus actual AutoTrade report rows, so /setup_audit is not confused with real Bybit PnL.
+# yver96: sync /setup_audit_compare with Bybit-canonical /autotrade_report closes; improve /autotrade_closed combo/risk fallback from setup evidence; cache v96.
 # yver95: sync /autotrade_report and /autotrade_closed metadata; merged close time uses latest Bybit close; /closed enriches from canonical report rows.
 # yver94: /autotrade_report and /autotrade_closed share Bybit Closed-PnL close time/PnL authority; strict combo-side enrichment.
 # yver82: /autotrade_closed is Bybit Closed-PnL authoritative, sorted by exact exchange close time in Melbourne, with seconds and exact realised PnL rows.
@@ -43789,7 +43790,19 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
             continue
 
     try:
-        trade_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts) + 60.0, lookback_h=hours, limit=0) or []
+        # yver96: use the same Bybit Closed-PnL canonical source as
+        # /autotrade_report, then merge to practical positions.  The previous
+        # compare path used the compact /autotrade_closed source directly and
+        # could miss the most recent closes after raw-fragment enrichment.
+        try:
+            cmp_equity = float(_effective_equity_for_risk(_autotrade_user_settings(owner_uid), prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
+        except Exception:
+            cmp_equity = 0.0
+        trade_rows = _autotrade_report_bybit_canonical_closed_rows(
+            owner_uid, float(start_ts), float(now_ts) + 60.0, lookback_h=hours, report_equity=cmp_equity
+        ) or []
+        if not trade_rows:
+            trade_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts), float(now_ts) + 60.0, lookback_h=hours, limit=0) or []
         trade_rows = _setup_audit_compare_prepare_closed_positions(trade_rows)
     except Exception:
         trade_rows = []
@@ -50063,7 +50076,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v95:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v96:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50297,6 +50310,89 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
         except Exception:
             continue
 
+    # yver96: when a raw Bybit Closed-PnL fragment cannot be safely enriched
+    # from canonical report rows (common for partial/profit-close fragments), use
+    # the nearest same-symbol/same-side setup row as a fallback for Combo and SL
+    # risk.  This is still display-only: Bybit remains the authority for close
+    # time and realised PnL.
+    setup_enrich_candidates = []
+    try:
+        setup_start = max(0.0, float(start_ts) - 36 * 3600.0)
+        setup_rows_for_closed = _setup_audit_load_rows(
+            owner_uid, hours=None, limit=0, dedup=False, start_ts=setup_start,
+            apply_final_quality_gate=False, source_mode_override='ALL'
+        ) or []
+        for sr in setup_rows_for_closed:
+            try:
+                row = dict(sr or {})
+                sym2 = str(_bybit_linear_symbol(row.get('symbol') or row.get('market_symbol') or '')).upper().strip()
+                side2 = str(row.get('side') or '').upper().strip()
+                sts2 = float(_setup_audit_row_ts(row) or row.get('created_ts') or row.get('ts') or 0.0)
+                if not sym2 or side2 not in {'BUY', 'SELL'} or sts2 <= 0:
+                    continue
+                fam2 = _setup_audit_family_code(row) if isinstance(row, dict) else 'F0'
+                sess2 = str(row.get('session') or row.get('source_session') or '-').upper().strip() or '-'
+                combo2 = _setup_combo_strategy_side_key(fam2, sess2, row, side2)
+                setup_enrich_candidates.append({
+                    'symbol': sym2, 'side': side2, 'setup_ts': float(sts2),
+                    'combo': combo2, 'risk': _risk_cell(row), 'row': row,
+                })
+            except Exception:
+                continue
+    except Exception:
+        setup_enrich_candidates = []
+
+    def _match_setup_enrichment_for_exchange_event(sym: str, side: str, ts: float, ev: dict | None = None) -> dict:
+        try:
+            side = str(side or '').upper().strip()
+            best = None
+            best_score = 10**18
+            max_age = max(36 * 3600.0, float(_setup_audit_result_horizon_hours() + 6) * 3600.0)
+            for cand in setup_enrich_candidates:
+                try:
+                    if str(cand.get('symbol') or '') != str(sym or ''):
+                        continue
+                    if side in {'BUY', 'SELL'} and str(cand.get('side') or '').upper().strip() != side:
+                        continue
+                    sts = float(cand.get('setup_ts') or 0.0)
+                    if sts <= 0 or ts <= 0 or sts > float(ts) + 300.0:
+                        continue
+                    age = float(ts) - sts
+                    if age < -300.0 or age > max_age:
+                        continue
+                    # Prefer the most recent valid setup before the Bybit close.
+                    score = age
+                    if score < best_score:
+                        best = cand
+                        best_score = score
+                except Exception:
+                    continue
+            if not best:
+                return {'risk': '-', 'combo': '-'}
+            risk = str(best.get('risk') or '-')
+            if risk.strip() == '-':
+                try:
+                    row = dict(best.get('row') or {})
+                    ev2 = ev or {}
+                    entry = abs(float(row.get('entry') or ev2.get('avgEntryPrice') or ev2.get('avg_entry_price') or ev2.get('entryPrice') or ev2.get('entry_price') or 0.0))
+                    sl = abs(float(row.get('sl') or row.get('stopLoss') or row.get('stop_loss') or 0.0))
+                    qty = abs(float(_bybit_closed_pnl_event_qty(ev2) or row.get('qty') or row.get('filled_qty') or row.get('closed_qty') or 0.0))
+                    if entry > 0 and sl > 0 and qty > 0:
+                        try:
+                            cs = float(row.get('contract_size') or row.get('contractSize') or ev2.get('contractSize') or 0.0)
+                            if cs <= 0:
+                                cs = float((_bybit_get_instr_filters(str(row.get('symbol') or ev2.get('symbol') or '')) or {}).get('contractSize') or 1.0)
+                        except Exception:
+                            cs = 1.0
+                        v = abs(entry - sl) * qty * abs(float(cs or 1.0))
+                        if v > 0:
+                            risk = f"${v:.2f}"
+                except Exception:
+                    pass
+            return {'risk': risk or '-', 'combo': str(best.get('combo') or '-').upper().strip() or '-'}
+        except Exception:
+            return {'risk': '-', 'combo': '-'}
+
     def _event_risk_from_candidate(cand: dict, ev: dict | None = None) -> str:
         try:
             risk = str((cand or {}).get('risk') or '-').strip()
@@ -50403,6 +50499,16 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                 pnl = float((ev or {}).get('closedPnl') if (ev or {}).get('closedPnl') is not None else (ev or {}).get('pnl') or 0.0)
                 pos_side = (_bybit_closed_pnl_position_side(ev) or _bybit_position_side(ev))
                 enrich = _match_enrichment_for_exchange_event(sym, pos_side, pnl, ts, ev)
+                # yver96 fallback: fill missing Combo/Risk from nearest setup evidence.
+                try:
+                    if str((enrich or {}).get('combo') or '-').strip() == '-' or str((enrich or {}).get('risk') or '-').strip() == '-':
+                        setup_enrich = _match_setup_enrichment_for_exchange_event(sym, pos_side, ts, ev)
+                        if str((enrich or {}).get('combo') or '-').strip() == '-' and str((setup_enrich or {}).get('combo') or '-').strip() != '-':
+                            enrich['combo'] = str(setup_enrich.get('combo') or '-')
+                        if str((enrich or {}).get('risk') or '-').strip() == '-' and str((setup_enrich or {}).get('risk') or '-').strip() != '-':
+                            enrich['risk'] = str(setup_enrich.get('risk') or '-')
+                except Exception:
+                    pass
                 table_rows.append({
                     'closed_ts': float(ts),
                     'close': _closed_time_text(ts),
@@ -50487,7 +50593,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v95:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v96:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
