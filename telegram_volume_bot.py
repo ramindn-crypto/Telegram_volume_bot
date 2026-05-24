@@ -543,6 +543,13 @@ AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY = 'market_reduce_on_risk_breach'
 AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY = 'market_close_on_exit_attach_fail'
 AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY = 'report_require_verified_tpsl'
 AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY = 'report_include_exchange_only_fallback'
+# yver92: runtime-controlled AutoTrade capital/context guards. These are
+# deliberately stored in autotrade_config so the owner can tune them without
+# redeploying (for example daily realised-loss stop 3% -> 5%).
+AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY = 'daily_realized_loss_stop_enabled'
+AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY = 'daily_realized_loss_stop_pct'
+AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY = 'require_realized_combo_edge'
+AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY = 'context_feed_guard_enabled'
 # Ver20: admin-controlled Melbourne blackout windows. AutoTrade entry blackout
 # controls live Bybit entries; setup-generation blackout controls executable/email
 # setup creation for all users. Both are stored in autotrade_config so the admin
@@ -781,6 +788,10 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY: 1 if env_bool('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False) else 0,
         AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY: 1 if env_bool('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True) else 0,
         AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY: 1 if env_bool('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True) else 0,
+        AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True) else 0,
+        AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: float(os.environ.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', '3.0') or 3.0),
+        AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True) else 0,
+        AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1 if env_bool('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True) else 0,
     }
     for k, v in defaults.items():
         try:
@@ -1041,6 +1052,35 @@ def _autotrade_bool_cfg(key: str, env_name: str, default: bool) -> bool:
         return bool(default)
 
 
+def _autotrade_daily_realized_loss_stop_enabled() -> bool:
+    try:
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY, 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True)
+    except Exception:
+        return bool(globals().get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True))
+
+
+def _autotrade_daily_realized_loss_stop_pct() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY, globals().get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)) or 3.0)
+    except Exception:
+        val = float(globals().get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0) or 3.0)
+    return max(0.0, min(100.0, float(val)))
+
+
+def _autotrade_require_realized_combo_edge() -> bool:
+    try:
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)
+    except Exception:
+        return bool(globals().get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True))
+
+
+def _autotrade_context_feed_guard_enabled() -> bool:
+    try:
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY, 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)
+    except Exception:
+        return bool(globals().get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True))
+
+
 def _autotrade_keep_all_test_mode() -> bool:
     try:
         return bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN', False))
@@ -1251,6 +1291,10 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_MAX_POSITION_HOURS': float(_autotrade_max_position_hours()),
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY, 'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)),
         'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY, 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)),
+        'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED': bool(_autotrade_daily_realized_loss_stop_enabled()),
+        'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT': float(_autotrade_daily_realized_loss_stop_pct()),
+        'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE': bool(_autotrade_require_realized_combo_edge()),
+        'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED': bool(_autotrade_context_feed_guard_enabled()),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)),
         'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)),
@@ -4216,13 +4260,13 @@ AUTOTRADE_CONTEXT_SESSION_ESCAPE_AVGR = float(os.environ.get("AUTOTRADE_CONTEXT_
 def _autotrade_daily_realized_loss_stop_allows(uid: int) -> tuple[bool, str]:
     """Hard real-money brake: do not open new AutoTrades after a bad Melbourne day."""
     try:
-        if not bool(globals().get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True)):
+        if not _autotrade_daily_realized_loss_stop_enabled():
             return True, 'daily_loss_stop_disabled'
         user = _autotrade_user_settings(int(uid))
         equity = float(_effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
         if equity <= 0:
             return True, 'daily_loss_stop_no_equity'
-        pct = max(0.0, float(globals().get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0) or 3.0))
+        pct = max(0.0, float(_autotrade_daily_realized_loss_stop_pct() or 0.0))
         if pct <= 0:
             return True, 'daily_loss_stop_pct_zero'
         m = _autotrade_day_risk_metrics_cached(int(uid), equity, ttl=10, force_refresh=False) or {}
@@ -4339,7 +4383,7 @@ def _autotrade_exact_lane_is_strong_from_setup_audit(data: dict, combo: str, *, 
 def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
     """Final real-money filter: policy KEEP + realised AutoTrade edge + setup-audit context."""
     try:
-        if not bool(globals().get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) and not bool(globals().get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)):
+        if not _autotrade_context_feed_guard_enabled() and not _autotrade_require_realized_combo_edge():
             return True, 'autotrade_context_guard_disabled'
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or user_id or 0)
         sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
@@ -4347,7 +4391,7 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         fam, sess_k, side, sym, hour = _setup_edge_guard_setup_key(setup_or_row, session_name=sess)
         side = str(side or '').upper().strip()
         # 1) Exact real AutoTrade combo performance must not be losing once it has enough samples.
-        if bool(globals().get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) and combo:
+        if _autotrade_require_realized_combo_edge() and combo:
             rm = dict((_autotrade_realized_combo_edge_metrics(owner_uid) or {}).get(combo) or {})
             dec = int(rm.get('decided') or 0)
             wr = float(rm.get('wr') or 0.0)
@@ -4355,7 +4399,7 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
             min_dec = int(globals().get('AUTOTRADE_REALIZED_COMBO_MIN_DECIDED', 3) or 3)
             if dec >= min_dec and (wr < float(globals().get('AUTOTRADE_REALIZED_COMBO_MIN_WR', 50.0) or 50.0) or pnl < float(globals().get('AUTOTRADE_REALIZED_COMBO_MIN_PNL', 0.0) or 0.0)):
                 return False, f'autotrade_realized_combo_block:{combo}:WR{wr:.1f}:PnL{pnl:+.2f}:n{dec}'
-        if not bool(globals().get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)):
+        if not _autotrade_context_feed_guard_enabled():
             return True, 'autotrade_realized_combo_ok'
         hours = _overall_report_effective_hours(int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
         data = _setup_edge_guard_build(owner_uid, hours=hours, force=False) or {}
@@ -39810,6 +39854,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MAX_POSITION_HOURS = {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 18.0)):.2f}",
             f"AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = {'true' if bool(summary.get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)) else 'false'}",
             f"AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK = {'true' if bool(summary.get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)) else 'false'}",
+            f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED = {'true' if bool(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT = {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)):.2f}",
+            f"AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) else 'false'}",
+            f"AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED = {'true' if bool(summary.get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
@@ -39844,6 +39892,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 12",
             "• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true",
             "• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK true",
+            "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true",
+            "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
+            "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE true",
+            "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
             "• Strict TP/SL lifecycle is ON. Scheduled ASIA flat is ON by default; max-hold is optional and controlled by AUTOTRADE_MAX_POSITION_HOURS_ENABLED.",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
@@ -39887,6 +39939,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY',
         'AUTOTRADE_STRICT_TPSL_ONLY', 'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL',
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
+        'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT',
+        'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED',
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
@@ -40027,6 +40081,22 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK'] = bool(val)
             _autotrade_config_set(AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT':
+            val = max(0.0, min(100.0, float(value_raw)))
+            globals()['AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT'] = float(val)
+            _autotrade_config_set(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY, val)
+        elif key == 'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY, 1 if val else 0)
         elif key == 'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED'] = bool(val)
@@ -46278,6 +46348,71 @@ def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int
 
 
 
+def _setup_combo_policy_context_feed_adjust_rows(uid: int, hours: int, rows: list[dict]) -> tuple[list[dict], dict]:
+    """Feed side/session context into the enforceable setup policy.
+
+    Exact lanes remain the main policy unit. A strong exact KEEP lane is not downgraded
+    just because the broad side/session is weak. But WATCH/probation lanes are disabled
+    when the broad side/session context is clearly negative. Symbol/hour context cannot
+    be written into a lane policy because rows do not represent a single symbol/hour,
+    so those stay enforced through the micro-edge/final-quality guard.
+    """
+    try:
+        if not env_bool('SETUP_POLICY_CONTEXT_FEED_ENABLED', True):
+            return list(rows or []), {'enabled': False, 'reason': 'SETUP_POLICY_CONTEXT_FEED_ENABLED=0'}
+        data = _setup_edge_guard_build(int(uid or 0), hours=int(hours or globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168), force=False) or {}
+        side_metrics = dict(data.get('side_metrics') or {})
+        session_metrics = dict(data.get('session_metrics') or {})
+        symbol_block = dict(data.get('symbol_block') or {})
+        hour_watch = dict(data.get('hour_watch') or {})
+        side_min = int(globals().get('AUTOTRADE_CONTEXT_SIDE_MIN_DECIDED', 40) or 40)
+        side_wr_max = float(globals().get('AUTOTRADE_CONTEXT_SIDE_WR_MAX', 40.0) or 40.0)
+        sess_min = int(globals().get('AUTOTRADE_CONTEXT_SESSION_MIN_DECIDED', 50) or 50)
+        sess_wr_max = float(globals().get('AUTOTRADE_CONTEXT_SESSION_WR_MAX', 38.0) or 38.0)
+        changed = []
+        out = []
+        for row in list(rows or []):
+            r = dict(row or {})
+            combo = str(r.get('combo') or '').upper().strip()
+            action = str(r.get('action') or 'WATCH').upper().strip() or 'WATCH'
+            # Do not downgrade a proven exact KEEP lane from broad context alone.
+            if action == 'KEEP':
+                out.append(r); continue
+            total = int(r.get('setups') or 0)
+            if total <= 0:
+                out.append(r); continue
+            side = str(r.get('side') or '').upper().strip()
+            sess = str(r.get('session') or '').upper().strip()
+            reasons = []
+            if side in {'BUY','SELL'}:
+                sm = dict(side_metrics.get(side) or {})
+                if int(sm.get('decided') or 0) >= side_min and float(sm.get('wr') or 0.0) <= side_wr_max and float(sm.get('avg_r') or 0.0) < 0:
+                    if not _autotrade_exact_lane_is_strong_from_setup_audit(data, combo, for_session_escape=False):
+                        reasons.append(f"weak side {side}: WR {float(sm.get('wr') or 0.0):.1f}%, AvgR {float(sm.get('avg_r') or 0.0):+.2f}")
+            if sess in {'ASIA','LON','NY'}:
+                ss = dict(session_metrics.get(sess) or {})
+                if int(ss.get('decided') or 0) >= sess_min and float(ss.get('wr') or 0.0) <= sess_wr_max and float(ss.get('avg_r') or 0.0) < 0:
+                    if not _autotrade_exact_lane_is_strong_from_setup_audit(data, combo, for_session_escape=True):
+                        reasons.append(f"weak session {sess}: WR {float(ss.get('wr') or 0.0):.1f}%, AvgR {float(ss.get('avg_r') or 0.0):+.2f}")
+            if reasons:
+                r['action'] = 'DISABLE'
+                r['enabled_next'] = 0
+                r['score'] = float(r.get('score') or 0.0) - 25.0
+                prior = str(r.get('notes') or '').strip()
+                r['notes'] = (prior + '; ' if prior else '') + 'Policy context feed: ' + '; '.join(reasons)
+                changed.append(combo or f"{r.get('family')}-{r.get('session')}-{r.get('strategy')}-{r.get('side')}")
+            out.append(r)
+        return out, {
+            'enabled': True, 'changed': changed,
+            'symbol_blocks': sorted(symbol_block.keys()),
+            'weak_hours': sorted(hour_watch.keys()),
+            'reason': 'side/session applied to lane policy; symbol/hour enforced by micro-edge/final gate',
+        }
+    except Exception as exc:
+        return list(rows or []), {'enabled': True, 'error': f'{type(exc).__name__}: {exc}'}
+
+
+
 def _setup_combo_adjust_action_for_side_split(st: dict, side_stats: dict, family: str, session: str, action: str, enabled_next: int, notes: str, score: float) -> tuple[str, int, str, float, str]:
     """Avoid disabling a whole family/session when only one direction is bad.
 
@@ -46422,6 +46557,14 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
         }
 
     out_rows = [_finalise_bucket(st, side_specific=True) for st in side_stats.values()]
+    # yver92: feed broad side/session context into enforceable lane policy.
+    # Symbol/hour context remains enforced by micro-edge/final gate because policy rows
+    # are Family-Session-Strategy-Side, not Symbol/Hour-specific.
+    policy_context_meta = {}
+    try:
+        out_rows, policy_context_meta = _setup_combo_policy_context_feed_adjust_rows(int(uid), int(hours), out_rows)
+    except Exception as _policy_ctx_exc:
+        policy_context_meta = {'enabled': True, 'error': f'{type(_policy_ctx_exc).__name__}: {_policy_ctx_exc}'}
     # Coarse aggregate rows are used only for the older scheduled policy table and bridge.
     policy_rows = [_finalise_bucket(st, side_specific=False) for st in aggregate_stats.values()]
     out_rows.sort(key=lambda x: (int(x.get('enabled_next') or 0), float(x.get('score') or 0.0), float(x.get('win_rate') or 0.0), int(x.get('decided') or 0)), reverse=True)
@@ -46483,7 +46626,7 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
                 bridge_report = _setup_combo_sync_active_policy_bridge(int(uid), bridge_input, str(run_id), int(hours), 'matrix_view')
     except Exception:
         bridge_report = {}
-    return {'run_id': run_id, 'rows': out_rows, 'policy_rows': policy_rows, 'source_rows': len(rows), 'window_hours': hours, 'start_ts': float(fixed_start_ts or 0.0), 'source_label': source_label, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_updated': bool(policy_updated), 'policy_update_allowed': bool(allow_policy_update), 'policy_kind': str(policy_kind or 'manual'), 'bridge_report': bridge_report, 'last_policy': _setup_combo_latest_policy_update_info(int(uid))}
+    return {'run_id': run_id, 'rows': out_rows, 'policy_rows': policy_rows, 'source_rows': len(rows), 'window_hours': hours, 'start_ts': float(fixed_start_ts or 0.0), 'source_label': source_label, 'horizon_hours': result_horizon, 'audit_tf': audit_tf, 'policy_context_meta': policy_context_meta, 'policy_updated': bool(policy_updated), 'policy_update_allowed': bool(allow_policy_update), 'policy_kind': str(policy_kind or 'manual'), 'bridge_report': bridge_report, 'last_policy': _setup_combo_latest_policy_update_info(int(uid))}
 
 
 def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, allow_policy_update: bool = False, start_ts: float | None = None) -> str:
@@ -47066,7 +47209,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
             f"{guard_txt}\n{html.escape(_setup_nor_rev_router_note(int(owner_uid), []))}\n{note}\n"
-            f"Self-improvement flow: /setup_audit_overall and /setup_matrix policy now use the same fixed 15 May setup-result evidence; /setup_matrix policy refreshes the enforceable lane policy first, then the optimizer bridge mirrors those policy rows into runtime family/session gates. Manual /setup_matrix rows remain advisory; scheduled/baseline policy rows, daily safety rows, micro-edge guard, final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately.\n"
+            f"Self-improvement flow: /setup_audit_overall and /setup_matrix policy now use the same fixed 15 May setup-result evidence; /setup_matrix policy refreshes the enforceable lane policy first, then the optimizer bridge mirrors those policy rows into runtime family/session gates. Side/session context is now fed into lane policy; weak symbol/hour evidence is enforced through the micro-edge/final gate because policy rows are not symbol/hour-specific. Manual /setup_matrix rows remain advisory; scheduled/baseline policy rows, daily safety rows, micro-edge guard, final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately.\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -50431,7 +50574,8 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         SEP,
         'Email / AutoTrade entry gate',
         f"AutoTrade lane filter: {'KEEP-only policy ON' if _autotrade_require_keep_policy() else 'WATCH/KEEP policy allowed'}",
-        f"AutoTrade capital guard: daily loss stop {'ON' if AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED else 'OFF'} {float(AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT or 0.0):.1f}% | realised-combo {'ON' if AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE else 'OFF'} | context feed {'ON' if AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED else 'OFF'}",
+        f"AutoTrade capital guard: daily loss stop {'ON' if _autotrade_daily_realized_loss_stop_enabled() else 'OFF'} {_autotrade_daily_realized_loss_stop_pct():.1f}% | realised-combo {'ON' if _autotrade_require_realized_combo_edge() else 'OFF'} | context feed {'ON' if _autotrade_context_feed_guard_enabled() else 'OFF'}",
+        f"AutoTrade capital gate: {'OPEN' if _autotrade_daily_realized_loss_stop_allows(int(uid))[0] else 'BLOCKED'} | {_autotrade_daily_realized_loss_stop_allows(int(uid))[1]}",
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
         f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
         f"Session email cap: {session_cap_txt} (configured)",
