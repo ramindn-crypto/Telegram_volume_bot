@@ -48998,6 +48998,8 @@ def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
     out = dict(row or {})
     try:
         eq = float(equity or 0.0)
+        if eq > 0:
+            out['report_equity'] = float(eq)
 
         def _first_num(keys, absval: bool = False) -> tuple[float, str]:
             for k in keys:
@@ -49319,23 +49321,43 @@ def _autotrade_report_repair_realized_amounts(row: dict) -> dict:
         # under-reports the loss by more than normal slippage/fees.
         if pnl < -eps and kind in {'SL', 'HIT_SL_LOSS'}:
             realized = abs(float(pnl))
-            if realized > 0 and (risk <= 0 or realized > max(risk * 1.65, risk + 3.0)):
+            # ver99: for a row that is displayed as SL, the user-facing Risk$
+            # must reconcile with the realised stop-loss impact.  Old/merged
+            # rows can be under-stated (one fragment risk only) or over-stated
+            # (summed risk from multiple fragments).  Repair in both directions
+            # when the difference is outside normal slippage/fee tolerance.
+            if realized > 0 and (
+                risk <= 0
+                or realized > max(risk * 1.35, risk + 3.0)
+                or risk > max(realized * 1.35, realized + 3.0)
+            ):
                 out['risk_usd'] = float(realized)
                 out['risk_usdt'] = float(realized)
                 out['risk_usd_source'] = 'realized_sl_pnl'
                 out['risk_report_quality'] = 'realized_sl_pnl'
-        # For genuine TP rows, repair TP$ when stored target is missing/too small.
+        # For genuine TP rows, repair TP$ when stored target is missing or far
+        # from realised TP PnL in either direction.
         if pnl > eps and kind in {'TP', 'HIT_TP_WIN'}:
             realized = abs(float(pnl))
-            if realized > 0 and (tp_usd <= 0 or realized > max(tp_usd * 1.65, tp_usd + 3.0)):
+            if realized > 0 and (
+                tp_usd <= 0
+                or realized > max(tp_usd * 1.35, tp_usd + 3.0)
+                or tp_usd > max(realized * 1.35, realized + 3.0)
+            ):
                 out['tp_usd'] = float(realized)
                 out['tp_usdt'] = float(realized)
                 out['tp_usd_source'] = 'realized_tp_pnl'
                 out['tp_report_quality'] = 'realized_tp_pnl'
         try:
-            eq = float(out.get('equity') or out.get('equity_usdt') or 0.0)
+            eq = float(out.get('equity') or out.get('equity_usdt') or out.get('report_equity') or out.get('_report_equity') or 0.0)
             if eq > 0 and float(out.get('risk_usd') or 0.0) > 0:
                 out['risk_pct'] = float(out.get('risk_usd') or 0.0) / eq * 100.0
+                if str(out.get('risk_report_quality') or '').lower() == 'realized_sl_pnl':
+                    out['risk_pct_source'] = 'realized_sl_pnl'
+            elif str(out.get('risk_report_quality') or '').lower() == 'realized_sl_pnl':
+                # Avoid showing a stale Risk% beside a repaired Risk$.
+                out['risk_pct'] = ''
+                out['risk_pct_source'] = ''
         except Exception:
             pass
     except Exception:
@@ -49755,7 +49777,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v98_bybit_sync:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v99_realized_risk_sync:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50194,7 +50216,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v98:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v99:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50395,7 +50417,11 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
             k = str(kind or '').upper().strip()
             if pnl_f < -float(globals().get('AUTOTRADE_REPORT_TPSL_SIGN_EPS_USD', 0.50) or 0.50) and (k in {'', 'SL'}):
                 realised = abs(pnl_f)
-                if realised > 0 and (v <= 0 or realised > max(v * 1.65, v + 3.0)):
+                if realised > 0 and (
+                    v <= 0
+                    or realised > max(v * 1.35, v + 3.0)
+                    or v > max(realised * 1.35, realised + 3.0)
+                ):
                     return f"${realised:.2f}"
             return txt
         except Exception:
@@ -50692,7 +50718,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
         f"Source: <b>{html.escape(source_txt)}</b>. Sorted by exact exchange close time newest first. Close time is Australia/Melbourne.",
-        "Columns: Close, Combo, Symbol, Side, Risk, PnL. Risk = Stop-Loss $ amount; for realised SL rows, missing/understated risk is repaired from Bybit realised SL PnL.",
+        "Columns: Close, Combo, Symbol, Side, Risk, PnL. Risk = realised Stop-Loss $ amount for SL rows; TP$/Risk$ are repaired from Bybit realised PnL when stored setup amounts are stale or partial.",
     ]
     if not table_rows:
         lines.append(SEP)
@@ -50731,7 +50757,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v98:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v99:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
@@ -50773,7 +50799,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
 
-    cache_key = f"autotrade_report_text_cmd:v98_bybit_sync:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text_cmd:v99_realized_risk_sync:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
