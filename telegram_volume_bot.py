@@ -9,6 +9,7 @@
 # yver88: hardens setup_audit_compare: mismatch rows are rechecked with 1m candles before DIFF, and inferred/legacy loss-reason closes are NON_TPSL instead of false natural TP/SL mismatches.
 # yver87: refines setup_audit_compare so matching TP/SL rows show OK even if old rows carry fallback/non-native notes; NON_TPSL is reserved for mismatches caused by historical/manual/time exits.
 # yver83: adds /setup_audit_compare to reconcile setup price-path audit versus actual AutoTrade report rows, so /setup_audit is not confused with real Bybit PnL.
+# yver95: sync /autotrade_report and /autotrade_closed metadata; merged close time uses latest Bybit close; /closed enriches from canonical report rows.
 # yver94: /autotrade_report and /autotrade_closed share Bybit Closed-PnL close time/PnL authority; strict combo-side enrichment.
 # yver82: /autotrade_closed is Bybit Closed-PnL authoritative, sorted by exact exchange close time in Melbourne, with seconds and exact realised PnL rows.
 # yver81: /autotrade_closed close time is forced to Australia/Melbourne display, with robust UTC/ms/ISO timestamp normalization.
@@ -49301,6 +49302,10 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
                 nr['first_ts'] = float(ts or 0.0)
                 nr['last_ts'] = float(ts or 0.0)
                 nr['ts'] = float(ts or 0.0)
+                # v95: for merged report rows, Close must follow the latest
+                # Bybit close event.  Do not leave a stale/first closed_ts on
+                # rows that later absorb additional Closed-PnL fragments.
+                nr['closed_ts'] = float(ts or nr.get('closed_ts') or 0.0)
                 nr['closed_kind_votes'] = [_autotrade_report_closed_kind(r)]
                 groups.append(nr)
             else:
@@ -49318,6 +49323,12 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
                 matched['first_ts'] = min(float(matched.get('first_ts') or ts), float(ts or 0.0))
                 matched['last_ts'] = max(float(matched.get('last_ts') or ts), float(ts or 0.0))
                 matched['ts'] = float(matched.get('last_ts') or matched.get('ts') or ts)
+                # v95: make the displayed Close column equal the newest
+                # exchange close time after merging partial fragments.
+                try:
+                    matched['closed_ts'] = max(float(matched.get('closed_ts') or 0.0), float(ts or 0.0))
+                except Exception:
+                    matched['closed_ts'] = float(ts or matched.get('closed_ts') or 0.0)
                 votes = list(matched.get('closed_kind_votes') or [])
                 votes.append(_autotrade_report_closed_kind(r))
                 matched['closed_kind_votes'] = votes
@@ -49621,7 +49632,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v78_open_sort:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v95_bybit_sync:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50052,7 +50063,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v94:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v95:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50240,13 +50251,27 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
         except Exception:
             return '-'
 
-    # Journal/lifecycle rows are only used to enrich the Risk column. The row list
-    # itself comes from Bybit Closed P&L so time/PnL/counts match the exchange.
+    # v95: use the same canonical Bybit Closed-PnL metadata layer as
+    # /autotrade_report first, so Combo/Risk in /autotrade_closed cannot drift
+    # from the journal report.  Fall back to the older journal/lifecycle source
+    # only if canonical enrichment is unavailable.  The displayed rows below
+    # still come directly from Bybit Closed P&L.
     enrich_rows = []
     try:
-        enrich_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts) - 6 * 3600.0, float(now_ts) + 6 * 3600.0, lookback_h=lookback_h, limit=0) or []
+        enrich_rows = _autotrade_report_bybit_canonical_closed_rows(
+            owner_uid,
+            float(start_ts) - 6 * 3600.0,
+            float(now_ts) + 6 * 3600.0,
+            lookback_h=max(lookback_h, 48),
+            report_equity=report_equity,
+        ) or []
     except Exception:
         enrich_rows = []
+    if not enrich_rows:
+        try:
+            enrich_rows = _autotrade_closed_report_rows(owner_uid, float(start_ts) - 6 * 3600.0, float(now_ts) + 6 * 3600.0, lookback_h=lookback_h, limit=0) or []
+        except Exception:
+            enrich_rows = []
 
     enrich_candidates = []
     for er in (enrich_rows or []):
@@ -50330,10 +50355,16 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                     continue
                 if dt > 48 * 3600:
                     continue
+                # Do not attach metadata from a candidate whose open time is clearly
+                # after the exchange close.  This prevents stale/future setup matches.
+                if ots > 0 and ts > 0 and ots > ts + 300.0:
+                    continue
                 # First priority is exact/near close-time match; PnL remains a strong
                 # tie-breaker but is not a hard filter because Bybit may split or
                 # aggregate realised P&L differently from the bot's practical row.
-                score = side_penalty + dt * 10.0 + min(pnl_diff, 100.0) * 250.0
+                # v95: exact Bybit-event canonical candidates get a strong priority.
+                exact_bonus = -500000.0 if (cts > 0 and ts > 0 and abs(float(ts) - float(cts)) <= 3.0 and pnl_diff <= 0.05) else 0.0
+                score = exact_bonus + side_penalty + dt * 10.0 + min(pnl_diff, 100.0) * 250.0
                 if score < best_score:
                     best = cand
                     best_score = score
@@ -50456,7 +50487,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v94:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v95:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
@@ -50498,7 +50529,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
 
-    cache_key = f"autotrade_report_text_cmd:v78_open_sort:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text_cmd:v95_bybit_sync:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
