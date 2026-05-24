@@ -1,3 +1,4 @@
+# yver90: AutoTrade now consumes KEEP policy lanes only by default, fixes misleading /autoytrade_report_overall rolling-window alias, and keeps /autotrade_report_overall fixed from 2026-05-15.
 # yver89: adds directional leader/loser coherence guard so leader symbols cannot emit SELL setups and loser symbols cannot emit BUY setups across setup email, executable queue, F8/BigMove, and AutoTrade lanes.
 # yver85: setup-audit compare now reconciles merged practical AutoTrade positions, not raw Bybit closed-PnL fragments; non-TP/SL historical exits are INFO instead of corrupting setup-audit DIFF counts.
 # yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
@@ -4170,6 +4171,18 @@ DIRECTIONAL_CONTEXT_GUARD_MIN_VOL_USD = float(os.environ.get("DIRECTIONAL_CONTEX
 DIRECTIONAL_CONTEXT_GUARD_LEADER_24H_MIN = float(os.environ.get("DIRECTIONAL_CONTEXT_GUARD_LEADER_24H_MIN", str(MOVER_UP_24H_MIN)) or MOVER_UP_24H_MIN)
 DIRECTIONAL_CONTEXT_GUARD_LOSER_24H_MAX = float(os.environ.get("DIRECTIONAL_CONTEXT_GUARD_LOSER_24H_MAX", str(MOVER_DN_24H_MAX)) or MOVER_DN_24H_MAX)
 DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H = float(os.environ.get("DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H", "0.01") or 0.01)
+
+# yver90: AutoTrade must be more selective than setup emails.
+# Emails/screen can still show WATCH/GATE candidates for observation, but live AutoTrade
+# should only consume lanes that the fixed 15-May evidence policy has promoted to KEEP.
+# This directly aligns execution with the self-improvement / best-setup selection layer.
+AUTOTRADE_REQUIRE_KEEP_POLICY = env_bool("AUTOTRADE_REQUIRE_KEEP_POLICY", True)
+
+def _autotrade_require_keep_policy() -> bool:
+    try:
+        return bool(globals().get('AUTOTRADE_REQUIRE_KEEP_POLICY', True))
+    except Exception:
+        return True
 
 
 # =========================================================
@@ -10852,6 +10865,21 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         except Exception:
             return (False, 'final_quality_gate_exception')
 
+        # yver90: AutoTrade execution is intentionally stricter than email/screen.
+        # The fixed 15-May policy layer selects the best lanes; AutoTrade should not
+        # spend real risk on WATCH/GATE/probation lanes while the overall WR is below target.
+        if _autotrade_require_keep_policy():
+            try:
+                policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+                pinfo = _setup_combo_policy_lookup_for_setup(s, session_name=sess, user_id=policy_uid)
+                pfound = bool((pinfo or {}).get('found'))
+                praw = str((pinfo or {}).get('status') or '').upper().strip()
+                pstatus = _setup_policy_effective_status(praw, found=pfound)
+                if pstatus != 'KEEP':
+                    return (False, f'autotrade_policy_not_keep:{pstatus or praw or "WATCH"}')
+            except Exception:
+                return (False, 'autotrade_keep_policy_check_exception')
+
         source_kind_u = str(getattr(s, "source_kind", "") or "").lower().strip()
         family_u = str(getattr(s, "family_id", "") or getattr(s, "engine", "") or "").upper().strip()
         # Rows that were already EMAILED are the authoritative execution lane.
@@ -11733,6 +11761,19 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         except Exception:
             pass
         return (False, str(exec_why))
+
+    if _autotrade_require_keep_policy():
+        try:
+            pinfo = _setup_combo_policy_lookup_for_setup(s, session_name=session_label, user_id=int(uid))
+            pstatus = _setup_policy_effective_status(str((pinfo or {}).get('status') or '').upper().strip(), found=bool((pinfo or {}).get('found')))
+            if pstatus != 'KEEP':
+                try:
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_policy_not_keep'), last_reason=f'autotrade_policy_not_keep:{pstatus}')
+                except Exception:
+                    pass
+                return (False, f'autotrade_policy_not_keep:{pstatus or "WATCH"}')
+        except Exception:
+            return (False, 'autotrade_keep_policy_check_exception')
 
     def _as_pos_float(x):
         try:
@@ -38444,8 +38485,8 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows), sorted by Open time",
     "autotrade_closed": "Last closed Bybit P&L rows: /autotrade_closed 24 or /autotrade/closed 24 shows exact Melbourne Close, Symbol, Side, Risk, PnL",
     "autotrade_report_overall": "AutoTrade overall performance summary",
-    "autoytrade_report_overall": "Family/session/strategy/side AutoTrade matrix: /autotrade_report_overall 24 or 168 shows Trades, TP, SL, Open, WR, PnL",
-    "autotrade_report_matrix": "Alias of /autotrade_report_overall for the family/session AutoTrade matrix",
+    "autoytrade_report_overall": "Typo alias for fixed /autotrade_report_overall from 15 May",
+    "autotrade_report_matrix": "Rolling AutoTrade matrix: /autotrade_report_matrix 24 or 168",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "trade_lifecycle": "Exchange-backed per-trade lifecycle analytics with TP/SL path classification",
     "trade_lifecycle_detail": "Detailed rolling lifecycle report for the last 48h (or N hours), optional session filter",
@@ -38488,7 +38529,7 @@ ADMIN_HELP_GROUPS = [
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
     ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
-    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autotrade_closed", "autoytrade_report_overall", "autotrade_report_overall", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
+    ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autotrade_closed", "autotrade_report_overall", "autotrade_report_matrix", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_test_data", "admin_reset_signal_reports", "reset", "restore"]),
 ]
@@ -50158,6 +50199,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         ('Daily risk remaining (AT): ∞' if not math.isfinite(float(_debug_remaining_display)) else f"Daily risk remaining (AT): ${float(_debug_remaining_display):.2f}"),
         SEP,
         'Email / AutoTrade entry gate',
+        f"AutoTrade lane filter: {'KEEP-only policy ON' if _autotrade_require_keep_policy() else 'WATCH/KEEP policy allowed'}",
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
         f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
         f"Session email cap: {session_cap_txt} (configured)",
@@ -50581,8 +50623,9 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
     except Exception:
         now_txt = ''
+    _report_title = '📊 AutoTrade Report Overall' if _fixed_overall else '📊 AutoTrade Report Matrix'
     lines = [
-        '📊 AutoTrade Report Overall',
+        _report_title,
         HDR,
         (f'Window: from {_overall_report_start_txt()} Melbourne' if _fixed_overall else f'Window: last {lookback_h}h (Melbourne)') + (f' | Now: {now_txt}' if now_txt else ''),
         f'Position rows: {total_trades} | Raw fragments merged: {raw_fragments} | TP: {total_tp} | SL: {total_sl} | Other: {total_other} | Open: {total_open} | WR: {wr:.1f}% | PnL: {total_pnl:+.2f} USDT',
@@ -50632,11 +50675,30 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
 
 
 async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autotrade_report_overall [hours] — family/session AutoTrade matrix."""
+    """Rolling matrix command, with typo overall aliases safely redirected to fixed overall."""
     uid = update.effective_user.id
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
+    # yver90: the typo commands /autoytrade_report_overall and /autoytrade_report_overal
+    # used to show a misleading rolling 24h report with the same title as /autotrade_report_overall.
+    # Keep the typo aliases for compatibility, but make them use the fixed 15-May overall window.
+    msg_txt = str(getattr(update.message, 'text', '') or '').lower()
+    is_matrix_cmd = msg_txt.startswith('/autotrade_report_matrix')
+    if not is_matrix_cmd:
+        owner = int(AUTOTRADE_OWNER_UID or uid)
+        lookback_h = int(_overall_report_hours_since_start())
+        try:
+            text_out = await to_thread_heavy(_autotrade_report_overall_text_cached, owner, lookback_h, timeout=PERFORMANCE_REPORT_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            await update.message.reply_text(f"⚠️ /autotrade_report_overall timed out after {int(PERFORMANCE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
+            return
+        except Exception as e:
+            await update.message.reply_text(f"❌ /autotrade_report_overall failed: {type(e).__name__}: {e}")
+            return
+        await send_long_message(update, str(text_out or 'No AutoTrade data found yet.'), parse_mode=ParseMode.HTML)
+        return
+
     lookback_h = 24
     try:
         if context.args and str(context.args[0]).strip():
