@@ -49755,7 +49755,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v97_bybit_sync:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v98_bybit_sync:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50020,9 +50020,17 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         def _real_money_cell(r: dict, key: str) -> str:
             try:
                 qkey = 'risk_report_quality' if key == 'risk_usd' else 'tp_report_quality'
-                src = str(r.get(f'{key}_source') or '').strip()
+                src = str(r.get(f'{key}_source') or '').strip().lower()
                 qual = str(r.get(qkey) or '').strip().lower()
-                if qual != 'real' and src not in {'stored_amount', 'geometry_qty', 'rr_from_real_risk'}:
+                # ver98: display reporting-repaired realised amounts.  ver97
+                # correctly repaired SL/TP values from Bybit realised PnL, but
+                # this cell still hid them because the quality was not exactly
+                # "real".  For closed rows, realised_sl_pnl / realised_tp_pnl
+                # are the safest user-facing amounts when original setup risk
+                # metadata was stale, missing, or only one partial fragment.
+                allowed_qual = {'real', 'realized_sl_pnl', 'realized_tp_pnl'}
+                allowed_src = {'stored_amount', 'geometry_qty', 'rr_from_real_risk', 'realized_sl_pnl', 'realized_tp_pnl'}
+                if qual not in allowed_qual and src not in allowed_src:
                     return '-'
                 return _autotrade_report_money(r.get(key))
             except Exception:
@@ -50030,8 +50038,8 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         def _real_pct_cell(r: dict) -> str:
             try:
                 qual = str(r.get('risk_report_quality') or '').strip().lower()
-                src = str(r.get('risk_pct_source') or '').strip()
-                if qual not in {'real', 'pct_only'} and src not in {'risk_usd_equity', 'risk_actual_pct', 'filled_risk_pct'}:
+                src = str(r.get('risk_pct_source') or '').strip().lower()
+                if qual not in {'real', 'pct_only', 'realized_sl_pnl'} and src not in {'risk_usd_equity', 'risk_actual_pct', 'filled_risk_pct', 'realized_sl_pnl'}:
                     return '-'
                 return _autotrade_report_pct(r.get('risk_pct'))
             except Exception:
@@ -50186,7 +50194,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v97:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v98:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50723,7 +50731,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v97:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v98:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
@@ -50765,7 +50773,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
 
-    cache_key = f"autotrade_report_text_cmd:v95_bybit_sync:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text_cmd:v98_bybit_sync:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
