@@ -38758,7 +38758,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_fix_exits": "Force native Full TP/SL on all live AutoTrade positions and cancel legacy Conditional exit orders",
     "autotrade_flat_now": "Manually close AutoTrade-owned live positions now",
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows), sorted by Open time",
-    "autotrade_closed": "Last closed Bybit P&L rows: /autotrade_closed 24 or /autotrade/closed 24 shows exact Melbourne Close, Symbol, Side, Risk, PnL",
+    "autotrade_closed": "Last closed Bybit P&L rows: /autotrade_closed 24 or /autotrade/closed 24 shows exact Melbourne Close, Combo, Symbol, Side, SL Risk$, PnL",
     "autotrade_report_overall": "AutoTrade overall performance summary",
     "autoytrade_report_overall": "Typo alias for fixed /autotrade_report_overall from 15 May",
     "autotrade_report_matrix": "Rolling AutoTrade matrix: /autotrade_report_matrix 24 or 168",
@@ -49781,7 +49781,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v82:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v93:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -49825,18 +49825,49 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
 
     def _risk_cell(row: dict) -> str:
         try:
-            # Prefer real stored/geometry risk. Do not invent a fake risk number
-            # when the row has no usable risk metadata.
-            q = str((row or {}).get('risk_report_quality') or '').strip().lower()
-            src = str((row or {}).get('risk_usd_source') or '').strip()
-            v = float((row or {}).get('risk_usd') or 0.0)
-            if v > 0 and (q in {'real', 'pct_only'} or src in {'stored_amount', 'geometry_qty', 'risk_usd_equity', 'risk_actual_pct', 'filled_risk_pct'}):
-                return f"${v:.2f}"
-            if v > 0 and not q and not src:
+            # Risk must mean the real Stop-Loss $ amount for this position, not a
+            # placeholder. Prefer stored/executed risk; otherwise use position
+            # geometry: abs(entry - SL) * qty * contract_size.
+            v = float((row or {}).get('risk_usd') or (row or {}).get('risk_usdt') or (row or {}).get('filled_risk_usd') or (row or {}).get('risk_actual_usd') or 0.0)
+            if v > 0:
                 return f"${v:.2f}"
         except Exception:
             pass
+        try:
+            entry = abs(float((row or {}).get('entry') or (row or {}).get('avgEntryPrice') or (row or {}).get('avg_entry_price') or 0.0))
+            sl = abs(float((row or {}).get('sl') or (row or {}).get('stop_loss') or (row or {}).get('stopLoss') or 0.0))
+            qty = abs(float((row or {}).get('qty') or (row or {}).get('filled_qty') or (row or {}).get('closed_qty') or (row or {}).get('closedSize') or (row or {}).get('closed_size') or 0.0))
+            if entry > 0 and sl > 0 and qty > 0:
+                try:
+                    cs = float((row or {}).get('contract_size') or (row or {}).get('contractSize') or 0.0)
+                    if cs <= 0:
+                        cs = float((_bybit_get_instr_filters(str((row or {}).get('symbol') or '')) or {}).get('contractSize') or 1.0)
+                except Exception:
+                    cs = 1.0
+                risk = abs(entry - sl) * qty * abs(float(cs or 1.0))
+                if risk > 0:
+                    return f"${risk:.2f}"
+        except Exception:
+            pass
         return '-'
+
+    def _combo_cell(row: dict) -> str:
+        try:
+            for k in ('combo', 'combo_key', 'combo_side_key', 'combo_strategy_side'):
+                v = str((row or {}).get(k) or '').upper().strip()
+                if v and v != '-':
+                    return v
+            combo = str(_autotrade_setup_exact_combo_key(row) or '').upper().strip()
+            if combo and combo not in {'F0-UNK-NOR-BOTH', 'F0-UNK-NOR', 'F0---NOR'}:
+                return combo
+            fam = _setup_audit_family_code(row) if isinstance(row, dict) else 'F0'
+            sess = str((row or {}).get('session') or (row or {}).get('source_session') or '-').upper().strip() or '-'
+            strat = _setup_strategy_suffix(row)
+            side = str((row or {}).get('side') or '').upper().strip()
+            combo = _setup_combo_strategy_side_key(fam, sess, strat, side)
+            return combo if combo and 'UNK' not in combo else '-'
+        except Exception:
+            return '-'
 
     def _coerce_ts_utc_seconds(value) -> float:
         try:
@@ -49956,38 +49987,85 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                 continue
             pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
             cts = _closed_ts_value(row, er)
-            risk = _risk_cell(row)
-            if risk == '-':
-                continue
-            enrich_candidates.append({'symbol': sym, 'pnl': pnl, 'closed_ts': float(cts or 0.0), 'risk': risk})
+            side = str(row.get('side') or er.get('side') or '').upper().strip()
+            enrich_candidates.append({
+                'symbol': sym,
+                'side': side,
+                'pnl': pnl,
+                'closed_ts': float(cts or 0.0),
+                'opened_ts': float(row.get('opened_ts') or er.get('opened_ts') or 0.0),
+                'risk': _risk_cell(row),
+                'combo': _combo_cell(row),
+                'row': dict(row or {}),
+            })
         except Exception:
             continue
 
-    def _match_risk_for_exchange_event(sym: str, pnl: float, ts: float) -> str:
+    def _event_risk_from_candidate(cand: dict, ev: dict | None = None) -> str:
+        try:
+            risk = str((cand or {}).get('risk') or '-').strip()
+            if risk and risk != '-':
+                return risk
+            row = dict((cand or {}).get('row') or {})
+            ev = ev or {}
+            entry = abs(float(row.get('entry') or ev.get('avgEntryPrice') or ev.get('avg_entry_price') or ev.get('entryPrice') or ev.get('entry_price') or 0.0))
+            sl = abs(float(row.get('sl') or row.get('stopLoss') or row.get('stop_loss') or 0.0))
+            qty = abs(float(_bybit_closed_pnl_event_qty(ev) or row.get('qty') or row.get('filled_qty') or row.get('closed_qty') or 0.0))
+            if entry > 0 and sl > 0 and qty > 0:
+                try:
+                    cs = float(row.get('contract_size') or row.get('contractSize') or ev.get('contractSize') or 0.0)
+                    if cs <= 0:
+                        cs = float((_bybit_get_instr_filters(str(row.get('symbol') or ev.get('symbol') or '')) or {}).get('contractSize') or 1.0)
+                except Exception:
+                    cs = 1.0
+                v = abs(entry - sl) * qty * abs(float(cs or 1.0))
+                if v > 0:
+                    return f"${v:.2f}"
+        except Exception:
+            pass
+        return '-'
+
+    def _match_enrichment_for_exchange_event(sym: str, side: str, pnl: float, ts: float, ev: dict | None = None) -> dict:
         best = None
         best_score = 10**18
+        side = str(side or '').upper().strip()
         for cand in enrich_candidates:
             try:
                 if str(cand.get('symbol') or '') != str(sym or ''):
                     continue
+                cside = str(cand.get('side') or '').upper().strip()
+                side_penalty = 0.0
+                if side in {'BUY', 'SELL'} and cside in {'BUY', 'SELL'} and side != cside:
+                    # Do not completely reject because some Bybit close rows expose
+                    # closing side, but strongly prefer the same original side.
+                    side_penalty = 3600.0
                 cpnl = float(cand.get('pnl') or 0.0)
                 pnl_diff = abs(cpnl - float(pnl or 0.0))
-                # Closed-PnL rows can be rounded slightly differently between the
-                # exchange payload and bot report; keep matching strict enough not to
-                # attach an unrelated risk amount.
-                if pnl_diff > max(0.08, abs(float(pnl or 0.0)) * 0.01):
-                    continue
                 cts = float(cand.get('closed_ts') or 0.0)
-                dt = abs(float(ts or 0.0) - cts) if cts > 0 and ts > 0 else 999999.0
-                if dt > 12 * 3600:
+                ots = float(cand.get('opened_ts') or 0.0)
+                if cts > 0 and ts > 0:
+                    dt = abs(float(ts or 0.0) - cts)
+                elif ots > 0 and ts > 0 and ots <= ts + 300.0:
+                    dt = min(abs(float(ts or 0.0) - ots), 12 * 3600.0)
+                else:
+                    dt = 999999.0
+                if dt > 24 * 3600:
                     continue
-                score = dt + pnl_diff * 1000.0
+                # First priority is exact/near close-time match; PnL remains a strong
+                # tie-breaker but is not a hard filter because Bybit may split or
+                # aggregate realised P&L differently from the bot's practical row.
+                score = side_penalty + dt * 10.0 + min(pnl_diff, 100.0) * 100.0
                 if score < best_score:
                     best = cand
                     best_score = score
             except Exception:
                 continue
-        return str((best or {}).get('risk') or '-') if best else '-'
+        if not best:
+            return {'risk': '-', 'combo': '-'}
+        return {
+            'risk': _event_risk_from_candidate(best, ev),
+            'combo': str((best or {}).get('combo') or '-').upper().strip() or '-',
+        }
 
     bybit_events = []
     if str(_autotrade_runtime_mode()).lower() == 'live':
@@ -50013,12 +50091,15 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                 if not sym:
                     continue
                 pnl = float((ev or {}).get('closedPnl') if (ev or {}).get('closedPnl') is not None else (ev or {}).get('pnl') or 0.0)
+                pos_side = (_bybit_closed_pnl_position_side(ev) or _bybit_position_side(ev))
+                enrich = _match_enrichment_for_exchange_event(sym, pos_side, pnl, ts, ev)
                 table_rows.append({
                     'closed_ts': float(ts),
                     'close': _closed_time_text(ts),
+                    'combo': str((enrich or {}).get('combo') or '-').upper().strip() or '-',
                     'symbol': _sym_short(sym),
-                    'side': (_bybit_closed_pnl_position_side(ev) or _bybit_position_side(ev)),
-                    'risk': _match_risk_for_exchange_event(sym, pnl, ts),
+                    'side': pos_side,
+                    'risk': str((enrich or {}).get('risk') or '-'),
                     'pnl': pnl,
                 })
             except Exception:
@@ -50036,6 +50117,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                 table_rows.append({
                     'closed_ts': float(closed_ts or 0.0),
                     'close': _closed_time_text(closed_ts),
+                    'combo': _combo_cell(row),
                     'symbol': _sym_short(row.get('symbol') or r.get('symbol') or ''),
                     'side': str(row.get('side') or r.get('side') or '-').upper().strip() or '-',
                     'risk': _risk_cell(row),
@@ -50056,19 +50138,19 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
         f"Source: <b>{html.escape(source_txt)}</b>. Sorted by exact exchange close time newest first. Close time is Australia/Melbourne.",
-        "Columns: Close, Symbol, Side, Risk, PnL. Risk shows '-' when no matching bot journal risk exists.",
+        "Columns: Close, Combo, Symbol, Side, Risk, PnL. Risk = Stop-Loss $ amount where matching setup/journal data exists.",
     ]
     if not table_rows:
         lines.append(SEP)
         lines.append("No closed position rows found in this window.")
         out = "\n".join(lines)
     else:
-        plain_rows = [[r.get('close') or '-', r['symbol'], r['side'], r['risk'], _pnl_text(r['pnl'])] for r in table_rows]
+        plain_rows = [[r.get('close') or '-', r.get('combo') or '-', r['symbol'], r['side'], r['risk'], _pnl_text(r['pnl'])] for r in table_rows]
         table = tabulate(
             plain_rows,
-            headers=['Close', 'Symbol', 'Side', 'Risk', 'PnL'],
+            headers=['Close', 'Combo', 'Symbol', 'Side', 'Risk', 'PnL'],
             tablefmt='plain',
-            colalign=('left', 'left', 'center', 'right', 'right'),
+            colalign=('left', 'left', 'left', 'center', 'right', 'right'),
         )
         lines.append(f"Rows shown: <b>{len(plain_rows)}</b> closed P&amp;L rows. Time: <b>Melbourne</b>.")
         out = "\n".join(lines) + "\n<pre>" + html.escape(table) + "</pre>"
@@ -50095,7 +50177,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v82:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v93:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
