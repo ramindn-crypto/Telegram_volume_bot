@@ -9,6 +9,7 @@
 # yver88: hardens setup_audit_compare: mismatch rows are rechecked with 1m candles before DIFF, and inferred/legacy loss-reason closes are NON_TPSL instead of false natural TP/SL mismatches.
 # yver87: refines setup_audit_compare so matching TP/SL rows show OK even if old rows carry fallback/non-native notes; NON_TPSL is reserved for mismatches caused by historical/manual/time exits.
 # yver83: adds /setup_audit_compare to reconcile setup price-path audit versus actual AutoTrade report rows, so /setup_audit is not confused with real Bybit PnL.
+# yver97: tighten TP/SL classification against expected Risk$/TP$, repair displayed SL Risk$ from realised SL PnL when stored risk is incomplete, and sync compare to strict natural TP/SL labels.
 # yver96: sync /setup_audit_compare with Bybit-canonical /autotrade_report closes; improve /autotrade_closed combo/risk fallback from setup evidence; cache v96.
 # yver95: sync /autotrade_report and /autotrade_closed metadata; merged close time uses latest Bybit close; /closed enriches from canonical report rows.
 # yver94: /autotrade_report and /autotrade_closed share Bybit Closed-PnL close time/PnL authority; strict combo-side enrichment.
@@ -43825,11 +43826,16 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
 
     def _actual_from_trade(row: dict) -> str:
         try:
-            # Use realised close PnL only for the real AutoTrade side of the
-            # comparison. /setup_audit itself remains price-path based.
+            # Use the same strict realised TP/SL classifier as /autotrade_report.
+            # Positive PnL alone is not a TP if the position was closed far before
+            # the configured target; those rows become OTHER/NON_TPSL and no longer
+            # create false DIFF against /setup_audit.
+            k = str(_autotrade_report_closed_kind(row) or '').upper().strip()
+            if k in {'TP', 'SL'}:
+                return k
+            if k == 'FLAT':
+                return 'OTHER'
             pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') or 0.0)
-            if pnl > 0.05:
-                return 'TP'
             if pnl < -0.05:
                 return 'SL'
             return 'OTHER'
@@ -49217,10 +49223,12 @@ def _autotrade_report_has_direct_tpsl_proof(row: dict, kind: str) -> bool:
 def _autotrade_report_closed_kind(row: dict) -> str:
     """Return the realised outcome label for AutoTrade reporting.
 
-    Ver27: TP/SL reporting is profit/loss sane. Direct TP/SL proof still wins,
-    but exchange-only/in-between closes are not left as OTHER when the realised
-    PnL clearly says profit or loss. The reason column separately explains
-    CLOSE_BEFORE_ASIA_SESSION, MAX_HOLD, PROFIT_CLOSE, LOSS_CLOSE, etc.
+    Ver97: TP/SL labels must mean a real/near-target TP or SL close, not just
+    positive/negative PnL.  Positive in-between/profit-protect exits are OTHER
+    unless they are close to the expected TP amount or have direct TP proof.
+    Losses remain SL when negative because Bybit realised loss is the account
+    impact, but reporting repairs the displayed Risk$ separately when stored
+    risk metadata is incomplete.
     """
     try:
         row = dict(row or {})
@@ -49231,23 +49239,108 @@ def _autotrade_report_closed_kind(row: dict) -> str:
         pnl = float(row.get('pnl') if row.get('pnl') is not None else row.get('pnl_usdt') or 0.0)
         eps = float(globals().get('AUTOTRADE_REPORT_TPSL_SIGN_EPS_USD', 0.50) or 0.50)
 
-        # Direct/near-target proof is kept, but still cannot contradict PnL sign.
+        exp = _autotrade_report_expected_pnl_targets(row) or {}
+        tp_expected = abs(float(exp.get('TP') or 0.0))
+        sl_expected = abs(float(exp.get('SL') or 0.0))
+        source_txt = ' '.join(str(row.get(k) or '') for k in ('source', 'source_bits', 'source_note', 'note', 'close_reason')).lower()
+
+        # For Bybit-Closed-PnL-authority rows we create result_path from PnL sign
+        # during import; do not let that synthetic path become "direct TP proof".
+        def _explicit_tpsl_proof(kind: str) -> bool:
+            try:
+                k = str(kind or '').upper().strip()
+                if k == 'TP':
+                    if float(row.get('tp_hit_ts') or 0.0) > 0 or float(row.get('alt_target_a_hit_ts') or 0.0) > 0:
+                        return True
+                    if 'tp' in str(row.get('close_reason') or '').lower() and 'order_history' in source_txt:
+                        return True
+                if k == 'SL':
+                    if float(row.get('sl_hit_ts') or 0.0) > 0:
+                        return True
+                    if 'sl' in str(row.get('close_reason') or '').lower() and 'order_history' in source_txt:
+                        return True
+                if 'bybit_closed_pnl_authority' in source_txt or 'bybit_closed_pnl' in source_txt:
+                    return False
+                return _autotrade_report_has_direct_tpsl_proof(row, k)
+            except Exception:
+                return False
+
         if path in {'HIT_TP_THEN_BE_SL', 'HIT_TP_THEN_SL', 'TP', 'HIT_TP_WIN'} or label == 'TP':
-            if _autotrade_report_pnl_sign_allows_kind(row, 'TP') and (_autotrade_report_has_direct_tpsl_proof(row, 'TP') or _autotrade_report_pnl_close_to_expected(row, 'TP')):
+            if _autotrade_report_pnl_sign_allows_kind(row, 'TP') and (_explicit_tpsl_proof('TP') or _autotrade_report_pnl_close_to_expected(row, 'TP')):
                 return 'TP'
         if path in {'SL', 'HIT_SL_LOSS'} or label == 'SL':
-            if _autotrade_report_pnl_sign_allows_kind(row, 'SL') and (_autotrade_report_has_direct_tpsl_proof(row, 'SL') or _autotrade_report_pnl_close_to_expected(row, 'SL')):
+            if _autotrade_report_pnl_sign_allows_kind(row, 'SL') and (_explicit_tpsl_proof('SL') or _autotrade_report_pnl_close_to_expected(row, 'SL') or pnl < -eps):
                 return 'SL'
 
-        # If the report row is exchange-only or closed by a time/flat rule, classify
-        # the realised outcome by PnL sign so the analytics table remains useful.
         if pnl > eps:
+            # Do not call a small profit-protect / manual / exchange-only close TP
+            # when it is far from the expected TP target.  This keeps WR and policy
+            # self-improvement based on real target hits.
+            if tp_expected > 0 and not _autotrade_report_pnl_close_to_expected(row, 'TP'):
+                return 'OTHER'
             return 'TP'
         if pnl < -eps:
+            # A realised loss is a risk event.  If stored Risk$ was incomplete or
+            # too small, the display layer will backfill Risk$ from realised SL PnL.
             return 'SL'
         return 'FLAT'
     except Exception:
         return 'OTHER'
+
+def _autotrade_report_repair_realized_amounts(row: dict) -> dict:
+    """Repair user-facing Risk$/TP$ amounts for realised closes.
+
+    The bot may have older rows where setup risk metadata is per-fragment, stale,
+    or missing, while Bybit Closed P&L is authoritative.  For a realised SL, the
+    actual account loss is the best available stop-loss dollar amount.  For a
+    genuine realised TP, the actual realised profit is the best available TP$
+    when stored TP$ is absent or clearly too small.  This is reporting-only and
+    prevents misleading rows such as Risk$ $3.67 with PnL -$22.62.
+    """
+    out = dict(row or {})
+    try:
+        if str(out.get('state') or '').upper().strip() == 'OPEN':
+            return out
+        pnl = float(out.get('pnl') if out.get('pnl') is not None else out.get('pnl_usdt') or 0.0)
+        kind = str(out.get('closed_kind') or out.get('result_label') or out.get('result_path') or '').upper().strip()
+        eps = float(globals().get('AUTOTRADE_REPORT_TPSL_SIGN_EPS_USD', 0.50) or 0.50)
+        risk = 0.0
+        try:
+            risk = abs(float(out.get('risk_usd') or out.get('risk_usdt') or out.get('filled_risk_usd') or out.get('risk_actual_usd') or 0.0))
+        except Exception:
+            risk = 0.0
+        tp_usd = 0.0
+        try:
+            tp_usd = abs(float(out.get('tp_usd') or out.get('tp_usdt') or out.get('target_tp_usd') or out.get('expected_tp_usd') or 0.0))
+        except Exception:
+            tp_usd = 0.0
+        # For actual SL rows, the realised negative PnL is the realised stop-loss
+        # amount.  Backfill only when the existing Risk$ is missing or clearly
+        # under-reports the loss by more than normal slippage/fees.
+        if pnl < -eps and kind in {'SL', 'HIT_SL_LOSS'}:
+            realized = abs(float(pnl))
+            if realized > 0 and (risk <= 0 or realized > max(risk * 1.65, risk + 3.0)):
+                out['risk_usd'] = float(realized)
+                out['risk_usdt'] = float(realized)
+                out['risk_usd_source'] = 'realized_sl_pnl'
+                out['risk_report_quality'] = 'realized_sl_pnl'
+        # For genuine TP rows, repair TP$ when stored target is missing/too small.
+        if pnl > eps and kind in {'TP', 'HIT_TP_WIN'}:
+            realized = abs(float(pnl))
+            if realized > 0 and (tp_usd <= 0 or realized > max(tp_usd * 1.65, tp_usd + 3.0)):
+                out['tp_usd'] = float(realized)
+                out['tp_usdt'] = float(realized)
+                out['tp_usd_source'] = 'realized_tp_pnl'
+                out['tp_report_quality'] = 'realized_tp_pnl'
+        try:
+            eq = float(out.get('equity') or out.get('equity_usdt') or 0.0)
+            if eq > 0 and float(out.get('risk_usd') or 0.0) > 0:
+                out['risk_pct'] = float(out.get('risk_usd') or 0.0) / eq * 100.0
+        except Exception:
+            pass
+    except Exception:
+        return out
+    return out
 
 def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: int | None = None) -> list[dict]:
     """Merge raw report fragments into one row per practical position close.
@@ -49325,7 +49418,19 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
                 matched['pnl'] = float(matched.get('pnl') or 0.0) + float(pnl)
                 matched['pnl_usdt'] = float(matched.get('pnl') or 0.0)
                 # Preserve the best available execution/reporting metadata for the merged position.
-                for _mk in ('risk_usd', 'risk_pct', 'tp_usd', 'risk_usd_source', 'risk_pct_source', 'tp_usd_source', 'risk_report_quality', 'tp_report_quality', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'entry', 'sl', 'tp', 'qty', 'conf', 'fut_vol_usd', 'ch24', 'ch4', 'ch1', 'setup_strategy', 'strategy', 'strategy_mode', 'original_setup_id', 'original_side', 'strategy_reason'):
+                # For Risk$/TP$, the merged practical row must represent the whole
+                # realised position, not only the first fragment.  Sum real/stored
+                # amounts when multiple exchange fragments are absorbed; the later
+                # realised-PnL repair below also protects old rows where fragment
+                # quantity/risk was missing.
+                for _sumk in ('risk_usd', 'risk_usdt', 'filled_risk_usd', 'risk_actual_usd', 'tp_usd', 'tp_usdt'):
+                    try:
+                        rv = abs(float(r.get(_sumk) or 0.0))
+                        if rv > 0:
+                            matched[_sumk] = abs(float(matched.get(_sumk) or 0.0)) + rv
+                    except Exception:
+                        pass
+                for _mk in ('risk_pct', 'risk_usd_source', 'risk_pct_source', 'tp_usd_source', 'risk_report_quality', 'tp_report_quality', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'entry', 'sl', 'tp', 'qty', 'conf', 'fut_vol_usd', 'ch24', 'ch4', 'ch1', 'setup_strategy', 'strategy', 'strategy_mode', 'original_setup_id', 'original_side', 'strategy_reason'):
                     try:
                         if float(matched.get(_mk) or 0.0) <= 0 and float(r.get(_mk) or 0.0) > 0:
                             matched[_mk] = r.get(_mk)
@@ -49366,6 +49471,11 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
                 g['result_path'] = 'MANUAL_OR_UNKNOWN_CLOSE'; g['result_label'] = 'FLAT'
             else:
                 g['result_path'] = 'MANUAL_OR_UNKNOWN_CLOSE'; g['result_label'] = 'OTHER'
+            try:
+                repaired = _autotrade_report_repair_realized_amounts(g)
+                g.update(repaired)
+            except Exception:
+                pass
         except Exception:
             pass
     out = list(open_rows) + list(groups)
@@ -49645,7 +49755,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v95_bybit_sync:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v97_bybit_sync:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50076,7 +50186,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v96:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v97:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50263,6 +50373,25 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
             return f"{x:.4f}".rstrip('0').rstrip('.')
         except Exception:
             return '-'
+
+    def _risk_text_for_closed_event(risk_txt: str, pnl_value: float, kind: str = '') -> str:
+        try:
+            txt = str(risk_txt or '-').strip() or '-'
+            v = 0.0
+            if txt != '-':
+                try:
+                    v = abs(float(txt.replace('$', '').replace(',', '').strip() or 0.0))
+                except Exception:
+                    v = 0.0
+            pnl_f = float(pnl_value or 0.0)
+            k = str(kind or '').upper().strip()
+            if pnl_f < -float(globals().get('AUTOTRADE_REPORT_TPSL_SIGN_EPS_USD', 0.50) or 0.50) and (k in {'', 'SL'}):
+                realised = abs(pnl_f)
+                if realised > 0 and (v <= 0 or realised > max(v * 1.65, v + 3.0)):
+                    return f"${realised:.2f}"
+            return txt
+        except Exception:
+            return str(risk_txt or '-')
 
     # v95: use the same canonical Bybit Closed-PnL metadata layer as
     # /autotrade_report first, so Combo/Risk in /autotrade_closed cannot drift
@@ -50509,13 +50638,14 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                             enrich['risk'] = str(setup_enrich.get('risk') or '-')
                 except Exception:
                     pass
+                _kind_for_risk = 'SL' if float(pnl or 0.0) < -float(globals().get('AUTOTRADE_REPORT_TPSL_SIGN_EPS_USD', 0.50) or 0.50) else ''
                 table_rows.append({
                     'closed_ts': float(ts),
                     'close': _closed_time_text(ts),
                     'combo': str((enrich or {}).get('combo') or '-').upper().strip() or '-',
                     'symbol': _sym_short(sym),
                     'side': pos_side,
-                    'risk': str((enrich or {}).get('risk') or '-'),
+                    'risk': _risk_text_for_closed_event(str((enrich or {}).get('risk') or '-'), float(pnl or 0.0), _kind_for_risk),
                     'pnl': pnl,
                 })
             except Exception:
@@ -50536,7 +50666,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
                     'combo': _combo_cell(row),
                     'symbol': _sym_short(row.get('symbol') or r.get('symbol') or ''),
                     'side': str(row.get('side') or r.get('side') or '-').upper().strip() or '-',
-                    'risk': _risk_cell(row),
+                    'risk': _risk_text_for_closed_event(_risk_cell(row), float(pnl or 0.0), 'SL' if float(pnl or 0.0) < -float(globals().get('AUTOTRADE_REPORT_TPSL_SIGN_EPS_USD', 0.50) or 0.50) else ''),
                     'pnl': pnl,
                 })
             except Exception:
@@ -50554,7 +50684,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
         f"Source: <b>{html.escape(source_txt)}</b>. Sorted by exact exchange close time newest first. Close time is Australia/Melbourne.",
-        "Columns: Close, Combo, Symbol, Side, Risk, PnL. Risk = Stop-Loss $ amount where matching setup/journal data exists.",
+        "Columns: Close, Combo, Symbol, Side, Risk, PnL. Risk = Stop-Loss $ amount; for realised SL rows, missing/understated risk is repaired from Bybit realised SL PnL.",
     ]
     if not table_rows:
         lines.append(SEP)
@@ -50593,7 +50723,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v96:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v97:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
