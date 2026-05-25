@@ -1,5 +1,7 @@
+# yver109: final live-test sync hardening: runtime-configurable KEEP+WATCH exposure, stronger AutoTrade candidate continuation, v109 cache separation, and end-to-end report/screen/email/AutoTrade alignment checks.
 # yver107: replaces fixed TP RR cap with dynamic live AutoTrade TP RR targeting (default 1.5R-4.0R) based on policy/quality/conf/volume/momentum; trailing remains off by default to preserve one TP + one SL lifecycle.
 # yver106: caps live AutoTrade TP RR to avoid unrealistic far targets, reports live open Risk$/TP$ from actual Bybit position geometry, and exposes AUTOTRADE_TP_RR_CAP settings in /autotrade_config.
+# yver108: AutoTrade now consumes KEEP+WATCH executable queue directly even if email delivery is delayed, broad side/session context is advisory for exact KEEP/WATCH lanes, and open-report Risk$/TP$ uses live Bybit TP/SL geometry without stale override.
 # yver105: adds /setup_audit_keep_watch and /setup_keep_watch_summary to show compact KEEP+WATCH totals: combo count, Set, TP, SL, NH, Open, and WR.
 # yver104: allows KEEP + strict WATCH policy lanes for /screen, setup emails, and AutoTrade; DISABLE remains blocked, KEEP is prioritized, and WATCH must still pass final/context/symbol guards.
 # yver103: recalibrates setup combo policy tiers so strong/positive small-sample lanes become WATCH instead of DISABLE, high AvgR 50%+ lanes can become KEEP, and broad context cannot downgrade promising exact lanes.
@@ -563,6 +565,10 @@ AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY = 'daily_realized_loss_stop_e
 AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY = 'daily_realized_loss_stop_pct'
 AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY = 'require_realized_combo_edge'
 AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY = 'context_feed_guard_enabled'
+# yver109: runtime-switchable policy exposure for final live testing.
+# Defaults remain KEEP+strict WATCH for /screen, setup emails and AutoTrade.
+AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY = 'allow_watch_policy'
+USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY = 'user_visible_allow_watch_policy'
 # yver106: cap live AutoTrade TP distance by RR so a tiny SL does not create an unrealistic far TP.
 AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY = 'tp_rr_cap_enabled'
 AUTOTRADE_CFG_MAX_LIVE_RR_KEY = 'max_live_rr'
@@ -813,6 +819,8 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: float(os.environ.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', '3.0') or 3.0),
         AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True) else 0,
         AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1 if env_bool('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True) else 0,
+        AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('AUTOTRADE_ALLOW_WATCH_POLICY', True) else 0,
+        USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('USER_VISIBLE_ALLOW_WATCH_POLICY', True) else 0,
         AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_TP_RR_CAP_ENABLED', True) else 0,
         AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_TP_RR_ENABLED', True) else 0,
         AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', '2.0') or 2.0),
@@ -1542,6 +1550,8 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT': float(_autotrade_daily_realized_loss_stop_pct()),
         'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE': bool(_autotrade_require_realized_combo_edge()),
         'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED': bool(_autotrade_context_feed_guard_enabled()),
+        'AUTOTRADE_ALLOW_WATCH_POLICY': bool(_autotrade_allow_watch_policy()),
+        'USER_VISIBLE_ALLOW_WATCH_POLICY': bool(_user_visible_allow_watch_policy()),
         'AUTOTRADE_TP_RR_CAP_ENABLED': bool(_autotrade_tp_rr_cap_enabled()),
         'AUTOTRADE_DYNAMIC_TP_RR_ENABLED': bool(_autotrade_dynamic_tp_rr_enabled()),
         'AUTOTRADE_DYNAMIC_TP_BASE_RR': float(_autotrade_dynamic_tp_base_rr()),
@@ -4537,7 +4547,8 @@ def _autotrade_require_keep_policy() -> bool:
 
 def _autotrade_allow_watch_policy() -> bool:
     try:
-        return bool(globals().get('AUTOTRADE_ALLOW_WATCH_POLICY', True))
+        raw = _autotrade_config_get(AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if bool(globals().get('AUTOTRADE_ALLOW_WATCH_POLICY', True)) else 0)
+        return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
     except Exception:
         return True
 
@@ -4571,12 +4582,18 @@ def _user_visible_require_keep_policy(lane: str = '') -> bool:
 
 def _user_visible_allow_watch_policy(lane: str = '') -> bool:
     try:
+        # yver109: one runtime switch for subscriber-facing exposure across /screen
+        # and setup emails. Defaults to KEEP+strict WATCH; set false for KEEP-only.
         l = str(lane or '').lower().strip()
+        fallback = True
         if l in {'screen', '/screen'}:
-            return bool(globals().get('SCREEN_ALLOW_WATCH_POLICY', True))
-        if l in {'email', 'setup_email', 'bigmove', 'f8', 'screen_sync'}:
-            return bool(globals().get('EMAIL_ALLOW_WATCH_POLICY', True))
-        return bool(globals().get('USER_VISIBLE_ALLOW_WATCH_POLICY', True))
+            fallback = bool(globals().get('SCREEN_ALLOW_WATCH_POLICY', True))
+        elif l in {'email', 'setup_email', 'bigmove', 'f8', 'screen_sync'}:
+            fallback = bool(globals().get('EMAIL_ALLOW_WATCH_POLICY', True))
+        else:
+            fallback = bool(globals().get('USER_VISIBLE_ALLOW_WATCH_POLICY', True))
+        raw = _autotrade_config_get(USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if fallback else 0)
+        return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
     except Exception:
         return True
 
@@ -4834,6 +4851,15 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or user_id or 0)
         sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
         combo = _autotrade_setup_exact_combo_key(setup_or_row, sess)
+        pstatus_exec = ''
+        try:
+            _pinfo_exec = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=owner_uid)
+            pstatus_exec = _setup_policy_effective_status(
+                str((_pinfo_exec or {}).get('status') or '').upper().strip(),
+                found=bool((_pinfo_exec or {}).get('found'))
+            )
+        except Exception:
+            pstatus_exec = ''
         fam, sess_k, side, sym, hour = _setup_edge_guard_setup_key(setup_or_row, session_name=sess)
         side = str(side or '').upper().strip()
         # 1) Exact real AutoTrade combo performance must not be losing once it has enough samples.
@@ -4855,13 +4881,16 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         if hour in dict((data or {}).get('hour_watch') or {}):
             return False, f'autotrade_weak_hour_block:{hour}'
         # 3) Feed broad side/session evidence into AutoTrade. Setup emails can still show them.
-        if side in {'BUY', 'SELL'} and bool(globals().get('AUTOTRADE_BLOCK_WEAK_SIDE_CONTEXT', True)):
+        # yver108: broad BUY/SELL weakness is advisory for exact KEEP/WATCH lanes.
+        # Exact lane policy + symbol/hour blocks are more precise. Do not let global BUY
+        # weakness hide an allowed F1-LON-REV-BUY/F5-LON-REV-SELL style lane.
+        if side in {'BUY', 'SELL'} and pstatus_exec not in _autotrade_allowed_policy_statuses() and bool(globals().get('AUTOTRADE_BLOCK_WEAK_SIDE_CONTEXT', True)):
             sm = dict(((data or {}).get('side_metrics') or {}).get(side) or {})
             if int(sm.get('decided') or 0) >= int(globals().get('AUTOTRADE_CONTEXT_SIDE_MIN_DECIDED', 40) or 40):
                 if float(sm.get('wr') or 0.0) <= float(globals().get('AUTOTRADE_CONTEXT_SIDE_WR_MAX', 40.0) or 40.0) and float(sm.get('avg_r') or 0.0) < 0:
                     if not _autotrade_exact_lane_is_strong_from_setup_audit(data, combo, for_session_escape=False):
                         return False, f'autotrade_weak_side_block:{side}:WR{float(sm.get("wr") or 0.0):.1f}:AvgR{float(sm.get("avg_r") or 0.0):+.2f}'
-        if sess_k in {'ASIA', 'LON', 'NY'} and bool(globals().get('AUTOTRADE_BLOCK_WEAK_SESSION_CONTEXT', True)):
+        if sess_k in {'ASIA', 'LON', 'NY'} and pstatus_exec not in _autotrade_allowed_policy_statuses() and bool(globals().get('AUTOTRADE_BLOCK_WEAK_SESSION_CONTEXT', True)):
             ss = dict(((data or {}).get('session_metrics') or {}).get(sess_k) or {})
             if int(ss.get('decided') or 0) >= int(globals().get('AUTOTRADE_CONTEXT_SESSION_MIN_DECIDED', 50) or 50):
                 if float(ss.get('wr') or 0.0) <= float(globals().get('AUTOTRADE_CONTEXT_SESSION_WR_MAX', 38.0) or 38.0) and float(ss.get('avg_r') or 0.0) < 0:
@@ -11680,7 +11709,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
-        require_email_entry = bool(_autotrade_require_setup_email_for_entry())
+        # yver108: AutoTrade must consume the authoritative executable queue directly.
+        # Email delivery is still aligned to the same KEEP+WATCH gate, but it must not be
+        # a hard prerequisite for live execution because SMTP delays/timeouts or a quiet
+        # email tick can otherwise leave valid KEEP/WATCH executable setups untraded.
+        require_email_entry = False
         cur.execute(
             """
             SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts
@@ -11866,7 +11899,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v100:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v109:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -12443,7 +12476,8 @@ def _autotrade_should_try_next_after_skip(reason: str) -> bool:
         'autotrade_symbol_block', 'autotrade_weak_hour_block',
         'autotrade_weak_side_block', 'autotrade_weak_session_block',
         'final_quality_gate', 'below_exec_conf', 'below_exec_rr',
-        'below_min_volume', 'directional_context_blocks',
+        'below_min_volume', 'directional_context_blocks', 'final_combo_disabled', 'final_combo_blocked',
+        'watch_final_gate', 'context_guard_block', 'context_gate', 'symbol_block',
         'not_keep', 'policy_not_keep',
     )
     return any(tok in r for tok in retry_tokens)
@@ -19126,7 +19160,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v100:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v109:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -40434,6 +40468,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT = {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)):.2f}",
             f"AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) else 'false'}",
             f"AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED = {'true' if bool(summary.get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('AUTOTRADE_ALLOW_WATCH_POLICY', True)) else 'false'}",
+            f"USER_VISIBLE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('USER_VISIBLE_ALLOW_WATCH_POLICY', True)) else 'false'}",
             f"AUTOTRADE_TP_RR_CAP_ENABLED = {'true' if bool(summary.get('AUTOTRADE_TP_RR_CAP_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_DYNAMIC_TP_RR_ENABLED = {'true' if bool(summary.get('AUTOTRADE_DYNAMIC_TP_RR_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_DYNAMIC_TP_BASE_RR = {float(summary.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', 2.0)):.2f}",
@@ -40477,6 +40513,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
             "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE true",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
+            "• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY true",
+            "• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY true",
             "• /autotrade_config AUTOTRADE_TP_RR_CAP_ENABLED true",
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED true",
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 2.0",
@@ -40527,6 +40565,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
         'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT',
         'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED',
+        'AUTOTRADE_ALLOW_WATCH_POLICY', 'USER_VISIBLE_ALLOW_WATCH_POLICY',
         'AUTOTRADE_TP_RR_CAP_ENABLED', 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED', 'AUTOTRADE_DYNAMIC_TP_BASE_RR', 'AUTOTRADE_MAX_LIVE_RR', 'AUTOTRADE_MIN_LIVE_RR',
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR'
     }:
@@ -40684,6 +40723,20 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED'] = bool(val)
             _autotrade_config_set(AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_ALLOW_WATCH_POLICY':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['AUTOTRADE_ALLOW_WATCH_POLICY'] = bool(val)
+            _autotrade_config_set(AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if val else 0)
+            try:
+                cache_delete(f"autotrade_db_setups_v109:{int(AUTOTRADE_OWNER_UID or 0)}:ASIA:24:30")
+                cache_delete(f"autotrade_db_setups_v109:{int(AUTOTRADE_OWNER_UID or 0)}:LON:24:30")
+                cache_delete(f"autotrade_db_setups_v109:{int(AUTOTRADE_OWNER_UID or 0)}:NY:24:30")
+            except Exception:
+                pass
+        elif key == 'USER_VISIBLE_ALLOW_WATCH_POLICY':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            globals()['USER_VISIBLE_ALLOW_WATCH_POLICY'] = bool(val)
+            _autotrade_config_set(USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_TP_RR_CAP_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY, 1 if val else 0)
@@ -49808,8 +49861,13 @@ def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
         tp_amount_keys = ('tp_usd', 'tp_usdt', 'target_tp_usd', 'expected_tp_usd')
         risk_usd, risk_src_key = _first_num(amount_keys, absval=True)
         tp_usd, tp_src_key = _first_num(tp_amount_keys, absval=True)
-        risk_src = 'stored_amount' if risk_usd > 0 else ''
-        tp_src = 'stored_amount' if tp_usd > 0 else ''
+        # yver108: preserve live Bybit geometry amounts injected by /autotrade_report.
+        # The generic geometry calculation below can be stale if it falls back to old
+        # setup metadata, so live_position_geometry must not be overwritten.
+        risk_src_existing = str(out.get('risk_usd_source') or '').strip()
+        tp_src_existing = str(out.get('tp_usd_source') or '').strip()
+        risk_src = risk_src_existing if risk_usd > 0 and risk_src_existing else ('stored_amount' if risk_usd > 0 else '')
+        tp_src = tp_src_existing if tp_usd > 0 and tp_src_existing else ('stored_amount' if tp_usd > 0 else '')
 
         entry = float(out.get('entry') or 0.0)
         sl = float(out.get('sl') or 0.0)
@@ -49824,12 +49882,12 @@ def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
             cs = 1.0
         cs = abs(float(cs or 1.0))
 
-        if entry > 0 and sl > 0 and qty > 0:
+        if risk_src != 'live_position_geometry' and entry > 0 and sl > 0 and qty > 0:
             geom_risk = abs(entry - sl) * qty * cs
             if geom_risk > 0:
                 risk_usd = float(geom_risk)
                 risk_src = 'geometry_qty'
-        if entry > 0 and tp > 0 and qty > 0:
+        if tp_src != 'live_position_geometry' and entry > 0 and tp > 0 and qty > 0:
             geom_tp = abs(tp - entry) * qty * cs
             if geom_tp > 0:
                 tp_usd = float(geom_tp)
@@ -49873,8 +49931,8 @@ def _autotrade_report_enrich_amounts(row: dict, equity: float = 0.0) -> dict:
         out['risk_usd_source'] = str(risk_src or '')
         out['risk_pct_source'] = str(risk_pct_src or '')
         out['tp_usd_source'] = str(tp_src or '')
-        out['risk_report_quality'] = 'real' if risk_src in {'stored_amount', 'geometry_qty'} else ('pct_only' if risk_pct > 0 else 'unknown')
-        out['tp_report_quality'] = 'real' if tp_src in {'stored_amount', 'geometry_qty', 'rr_from_real_risk'} else 'unknown'
+        out['risk_report_quality'] = 'real' if risk_src in {'stored_amount', 'geometry_qty', 'live_position_geometry'} else ('pct_only' if risk_pct > 0 else 'unknown')
+        out['tp_report_quality'] = 'real' if tp_src in {'stored_amount', 'geometry_qty', 'rr_from_real_risk', 'live_position_geometry'} else 'unknown'
         if tp > 0:
             out['tp'] = float(tp)
         if risk_usd > 0 and tp_usd > 0:
@@ -50565,7 +50623,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v106_rr_cap_live_geometry:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v108_live_geometry_no_stale_override:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50862,7 +50920,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 # are the safest user-facing amounts when original setup risk
                 # metadata was stale, missing, or only one partial fragment.
                 allowed_qual = {'real', 'realized_sl_pnl', 'realized_tp_pnl'}
-                allowed_src = {'stored_amount', 'geometry_qty', 'rr_from_real_risk', 'realized_sl_pnl', 'realized_tp_pnl'}
+                allowed_src = {'stored_amount', 'geometry_qty', 'rr_from_real_risk', 'realized_sl_pnl', 'realized_tp_pnl', 'live_position_geometry'}
                 if qual not in allowed_qual and src not in allowed_src:
                     return '-'
                 return _autotrade_report_money(r.get(key))
@@ -51610,7 +51668,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
 
-    cache_key = f"autotrade_report_text_cmd:v106_rr_cap_live_geometry:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text_cmd:v108_live_geometry_no_stale_override:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
@@ -59466,7 +59524,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v100:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v109:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
