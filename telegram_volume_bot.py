@@ -1,3 +1,4 @@
+# yver105: adds /setup_audit_keep_watch and /setup_keep_watch_summary to show compact KEEP+WATCH totals: combo count, Set, TP, SL, NH, Open, and WR.
 # yver104: allows KEEP + strict WATCH policy lanes for /screen, setup emails, and AutoTrade; DISABLE remains blocked, KEEP is prioritized, and WATCH must still pass final/context/symbol guards.
 # yver103: recalibrates setup combo policy tiers so strong/positive small-sample lanes become WATCH instead of DISABLE, high AvgR 50%+ lanes can become KEEP, and broad context cannot downgrade promising exact lanes.
 # yver102: makes evidence-based symbol blocks temporary using a short rolling symbol window, and aligns /screen/setup emails with AutoTrade context guards so blocked symbols are hidden from subscribers while background learning continues.
@@ -38426,7 +38427,7 @@ KNOWN_COMMANDS = sorted(set([
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
-    "setup_audit_overall", "setup_audit_compare", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis", "email_decision", "adaptive_status",
+    "setup_audit_overall", "setup_audit_keep_watch", "setup_keep_watch_summary", "setup_audit_compare", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis", "email_decision", "adaptive_status",
     "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
@@ -38967,6 +38968,8 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; /setup_audit compare 24 reconciles real AutoTrade rows vs setup path",
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall Family-Session-Strategy-Side summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR",
+    "setup_audit_keep_watch": "Compact total summary for current KEEP + WATCH policy lanes only: Combo count, Set, TP, SL, NH, Open, WR",
+    "setup_keep_watch_summary": "Alias of /setup_audit_keep_watch",
     "setup_audit_compare": "Reconcile bot-created AutoTrade closes against /setup_audit price-path results; exchange-only rows are marked BYBIT_ONLY: /setup_audit_compare 24",
     "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
     "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
@@ -39024,7 +39027,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
+    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_audit_keep_watch", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autotrade_closed", "autotrade_report_overall", "autotrade_report_matrix", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_test_data", "admin_reset_signal_reports", "reset", "restore"]),
@@ -48033,6 +48036,126 @@ def _setup_audit_overall_text(uid: int) -> str:
         colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
+
+
+def _setup_audit_keep_watch_summary_text(uid: int) -> str:
+    """Compact overall totals for current KEEP + WATCH policy lanes only.
+
+    Subscriber-facing /screen/email/AutoTrade use KEEP + strict WATCH. This report
+    gives the owner the matching high-level evidence total without the long combo table.
+    Background setup generation and audit still continue for all lanes.
+    """
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(owner_uid or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+
+    allowed_statuses = {'KEEP', 'WATCH'}
+    watch_like_statuses = {'WATCH', 'TIGHTEN', 'PART'}
+    allowed_combos: set[str] = set()
+    keep_count = 0
+    watch_count = 0
+    try:
+        pol_lookup = _setup_combo_enforceable_policy_lookup(uid_i)
+        for combo, pol in (pol_lookup or {}).items():
+            try:
+                combo_u = str(combo or '').upper().strip()
+                if not combo_u:
+                    continue
+                st = str((pol or {}).get('status') or '').upper().strip()
+                enabled = int((pol or {}).get('enabled') if (pol or {}).get('enabled') is not None else 1) == 1
+                if not enabled:
+                    continue
+                if st == 'KEEP':
+                    allowed_combos.add(combo_u)
+                    keep_count += 1
+                elif st in allowed_statuses or st in watch_like_statuses:
+                    allowed_combos.add(combo_u)
+                    watch_count += 1
+            except Exception:
+                continue
+    except Exception:
+        allowed_combos = set()
+        keep_count = watch_count = 0
+
+    rows, source_label = _overall_report_source_rows(uid_i, start_ts=float(_overall_report_start_ts() or 0.0), limit=0, dedup=True)
+    result_horizon = _setup_audit_result_horizon_hours()
+    audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
+    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
+
+    total_setups = total_tp = total_sl = total_nohit = total_open = 0
+    matched_combos: set[str] = set()
+    for r in list(rows or []):
+        try:
+            fam = _setup_audit_family_code(r)
+            sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+            strat = _setup_strategy_short_label(r)
+            side_row = _setup_side_suffix(value=str(r.get('side') or ''))
+            combo_key = _setup_combo_strategy_side_key(fam, sess_row, strat, side_row)
+            combo_u = str(combo_key or '').upper().strip()
+            if combo_u not in allowed_combos:
+                continue
+            matched_combos.add(combo_u)
+            ev = _setup_audit_resolve_result(
+                r,
+                horizon_hours=result_horizon,
+                user_id=uid_i,
+                candles_by_symbol=candles_by_symbol,
+                audit_timeframe=audit_tf,
+                actual_pnl_usdt=0.0,
+            )
+            result = _setup_audit_result_label(ev.get('result'))
+            total_setups += 1
+            if result == 'TP':
+                total_tp += 1
+            elif result == 'SL':
+                total_sl += 1
+            elif result == 'NOHIT':
+                total_nohit += 1
+            elif result == 'OPEN':
+                total_open += 1
+        except Exception:
+            continue
+
+    decided_total = total_tp + total_sl + total_nohit
+    wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
+    win = _setup_audit_window_summary(rows)
+
+    lines = [
+        "📊 <b>Setup KEEP + WATCH Summary</b>",
+        HDR,
+        f"Window: <b>from {_overall_report_start_txt()} Melbourne</b>",
+        f"Policy source: <b>current enforceable KEEP + WATCH lanes</b>",
+        f"Data start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b>",
+        f"Data end: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        HDR,
+        f"Total number of Combo: <b>{len(allowed_combos)}</b> (KEEP: <b>{keep_count}</b> | WATCH: <b>{watch_count}</b>)",
+        f"Set: <b>{total_setups}</b>",
+        f"TP: <b>{total_tp}</b>",
+        f"SL: <b>{total_sl}</b>",
+        f"NH: <b>{total_nohit}</b>",
+        f"Open: <b>{total_open}</b>",
+        f"WR: <b>{wr_total:.1f}%</b>",
+    ]
+    if not allowed_combos:
+        lines.append("No active KEEP/WATCH policy lanes found. Run <code>/setup_matrix policy</code> to refresh policy first.")
+    elif total_setups == 0:
+        lines.append("No historical setup rows matched the current KEEP/WATCH lanes in this baseline window yet.")
+    return "\n".join(lines)
+
+
+async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    try:
+        text = await to_thread_heavy(_setup_audit_keep_watch_summary_text, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
+    except Exception as e:
+        text = f"❌ setup_audit_keep_watch failed: {type(e).__name__}: {html.escape(str(e))}"
+    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59384,6 +59507,8 @@ def main():
     app.add_handler(CommandHandler("setup_audit", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_keep_watch", setup_audit_keep_watch_cmd, block=False))
+    app.add_handler(CommandHandler("setup_keep_watch_summary", setup_audit_keep_watch_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_compare", setup_audit_compare_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_reconcile", setup_audit_compare_cmd, block=False))
     app.add_handler(CommandHandler("setup_matrix", setup_matrix_cmd, block=False))
