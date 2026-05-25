@@ -1,3 +1,4 @@
+# yver101: User-facing setup quality lock: /screen and setup emails now expose KEEP-policy lanes only, while background generation/audit/matrix/daily-weekly safety and continuous learning still collect all executable evidence.
 # yver100: Fixes AutoTrade zero-attempt/zero-entry diagnostics and execution selection from ver99: deeper KEEP-lane queue scan, candidate-level skip continuation, fallback from disabled emailed setups to best KEEP executable queue, and /autotrade_last visibility for selector rejects.
 # yver91: Adds AutoTrade capital-protection guards: daily realised loss stop, setup-policy KEEP + realised AutoTrade combo edge, and setup audit side/session/symbol/hour context gating for execution.
 # yver90: AutoTrade now consumes KEEP policy lanes only by default, fixes misleading /autoytrade_report_overall rolling-window alias, and keeps /autotrade_report_overall fixed from 2026-05-15.
@@ -4234,6 +4235,91 @@ def _autotrade_require_keep_policy() -> bool:
         return bool(globals().get('AUTOTRADE_REQUIRE_KEEP_POLICY', True))
     except Exception:
         return True
+
+
+# yver101: subscriber-facing quality lock.  The scanner can still generate and
+# persist WATCH/DISABLE rows for audit, learning and daily/weekly policy reviews,
+# but what users see on /screen and receive by setup email should match the
+# AutoTrade philosophy: only lanes currently promoted to KEEP by /setup_matrix policy.
+USER_VISIBLE_REQUIRE_KEEP_POLICY = env_bool("USER_VISIBLE_REQUIRE_KEEP_POLICY", True)
+SCREEN_REQUIRE_KEEP_POLICY = env_bool("SCREEN_REQUIRE_KEEP_POLICY", True)
+EMAIL_REQUIRE_KEEP_POLICY = env_bool("EMAIL_REQUIRE_KEEP_POLICY", True)
+
+def _user_visible_require_keep_policy(lane: str = '') -> bool:
+    try:
+        l = str(lane or '').lower().strip()
+        if l in {'screen', '/screen'}:
+            return bool(globals().get('SCREEN_REQUIRE_KEEP_POLICY', True))
+        if l in {'email', 'setup_email', 'bigmove', 'f8', 'screen_sync'}:
+            return bool(globals().get('EMAIL_REQUIRE_KEEP_POLICY', True))
+        return bool(globals().get('USER_VISIBLE_REQUIRE_KEEP_POLICY', True))
+    except Exception:
+        return True
+
+def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '', user_id: int = 0, lane: str = 'screen') -> tuple[bool, str, dict]:
+    """Return whether a setup may be shown to subscribers or sent by setup email.
+
+    This is intentionally narrower than the background executable/audit lane.
+    It uses the owner/global policy rows so Standard/Pro users see the same curated
+    best-lane catalogue that live AutoTrade is allowed to consume.
+    """
+    meta = {}
+    try:
+        if not _user_visible_require_keep_policy(lane):
+            return True, 'user_visible_keep_policy_disabled', meta
+        sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            return False, 'user_visible_missing_session', meta
+        try:
+            owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        except Exception:
+            owner_uid = 0
+        try:
+            uid = int(user_id or 0)
+        except Exception:
+            uid = 0
+        policy_uid = owner_uid if owner_uid > 0 else uid
+        info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(policy_uid or 0))
+        found = bool((info or {}).get('found'))
+        raw_status = str((info or {}).get('status') or '').upper().strip()
+        status = _setup_policy_effective_status(raw_status, found=found)
+        combo = str((info or {}).get('combo') or '').upper().strip()
+        meta = dict(info or {})
+        meta.update({'policy_uid': int(policy_uid or 0), 'policy_status_effective': status, 'policy_combo': combo})
+        if status == 'KEEP':
+            return True, 'keep_policy_ok', meta
+        l = str(lane or 'screen').lower().strip() or 'screen'
+        return False, f'{l}_policy_not_keep:{status or raw_status or "WATCH"}{(":" + combo) if combo else ""}', meta
+    except Exception as exc:
+        return False, f'user_visible_keep_policy_exception:{type(exc).__name__}', meta
+
+def _filter_user_visible_keep_setups(setups: list, session_name: str = '', user_id: int = 0, lane: str = 'screen') -> list:
+    """Filter setup objects to KEEP-only for /screen and setup emails.
+
+    Background DB rows are not deleted by this helper; it only controls user-facing
+    exposure so learning and policy scoring continue normally.
+    """
+    out = []
+    seen = set()
+    try:
+        for s in list(setups or []):
+            try:
+                if not _setup_volume_ok(s):
+                    continue
+                ok, _why, _meta = _setup_user_visible_keep_policy_allows(s, session_name=session_name, user_id=int(user_id or 0), lane=lane)
+                if not ok:
+                    continue
+                ident = _setup_identity_from_obj(s) or str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '')
+                if ident and ident in seen:
+                    continue
+                if ident:
+                    seen.add(ident)
+                out.append(s)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return out
 
 
 # yver91: Capital-protection layer for live AutoTrade.
@@ -53283,7 +53369,10 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
         return "🟢" if p >= 0 else "🔴"
 
     visible_setups = [s for s in list(setups or []) if _setup_volume_ok(s)]
+    visible_setups = _filter_user_visible_keep_setups(visible_setups, session_name=session, user_id=int(uid or 0), lane='screen')
     if not visible_setups:
+        if _user_visible_require_keep_policy('screen'):
+            return "_No KEEP-policy setup right now. Background scanner is still collecting WATCH/DISABLE evidence for learning._"
         return f"_No setup above ${_setup_min_volume_floor_usd()/1e6:.0f}M 24h volume right now._"
 
     lines2 = []
@@ -53415,6 +53504,9 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                         ok_exec = False
                     if not ok_exec:
                         continue
+                    keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=sess, user_id=int(uid), lane='screen')
+                    if not keep_ok:
+                        continue
                     if not used_source_name:
                         used_source_name = str(source_name or '')
                     out.append(item)
@@ -53528,6 +53620,9 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                             except Exception:
                                 ok_exec, _why_exec = False, 'screen_lane_exec_gate_exception'
                         if ok_exec:
+                            keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=(req_session_u or src_session_u or _session), user_id=int(_uid), lane='screen')
+                            if not keep_ok:
+                                continue
                             out.append(item)
                             seen.add(dedupe_key)
                         if len(out) >= int(limit):
@@ -53591,12 +53686,14 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         setups = []
 
     if not setups and _exec_ready:
-        setups = list(_exec_ready[:max(1, int(SETUPS_N))])
+        _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=str(session or ''), user_id=int(uid), lane='screen')
+        setups = list(_screen_keep_ready[:max(1, int(SETUPS_N))])
 
     # Keep /screen readable. The executable queue can still hold more for email/autotrade;
     # /screen is an action dashboard, not a dump. Also enforce the production 24h-volume floor.
     try:
         setups = [s for s in list(setups or []) if _setup_volume_ok(s)]
+        setups = _filter_user_visible_keep_setups(setups, session_name=str(session or ''), user_id=int(uid), lane='screen')
     except Exception:
         setups = list(setups or [])
     try:
@@ -54887,6 +54984,14 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
                 reasons[str(why or 'not_executable')] += 1
                 try:
                     db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_presend_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(why or 'not_executable'), 'gate_uid': int(gate_uid or 0)})
+                except Exception:
+                    pass
+                continue
+            keep_ok, keep_why, keep_meta = _setup_user_visible_keep_policy_allows(eff, session_name=sess, user_id=int(gate_uid or uid or 0), lane=str(lane or 'email'))
+            if not keep_ok:
+                reasons[str(keep_why or 'email_policy_not_keep')] += 1
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
                 except Exception:
                     pass
                 continue
