@@ -2425,6 +2425,8 @@ from telegram import (
     Bot,
     BotCommand,
     MenuButtonCommands,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
 )
 
 
@@ -58171,6 +58173,151 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # MAIN (Background Worker = POLLING)
 # =========================================================
 
+def _pf_menu_command(name: str, desc: str) -> BotCommand:
+    """Build a Telegram menu command with a safe, short description."""
+    d = str(desc or "").replace("\n", " ").strip()
+    if len(d) > 250:
+        d = d[:247].rstrip() + "..."
+    return BotCommand(str(name).strip().lstrip("/"), d)
+
+
+def _pf_registered_commands_safe() -> set[str]:
+    try:
+        return set(_registered_command_names_from_source() or set())
+    except Exception:
+        return set()
+
+
+def _pf_filter_registered(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    registered = _pf_registered_commands_safe()
+    if not registered:
+        return rows
+    return [(c, d) for c, d in rows if str(c).strip().lstrip("/") in registered]
+
+
+def _pf_public_menu_rows() -> list[tuple[str, str]]:
+    # Telegram menus are flat (no visual sections). Keep the default menu clean for
+    # Standard/Pro users and leave deep/admin tooling for admin-scoped menus.
+    return [
+        ("start", "Start"),
+        ("status", "Your plan & enabled features"),
+        ("screen", "High-quality trade setups"),
+        ("size", "Position size calculator"),
+        ("equity", "Set your equity"),
+        ("riskmode", "Set manual risk mode"),
+        ("dailycap", "Set manual daily risk cap"),
+        ("trade_open", "Log an opened trade"),
+        ("trade_sl", "Update Stop Loss"),
+        ("trade_rf", "Risk-free a trade"),
+        ("trade_close", "Log a closed trade"),
+        ("sessions", "View session settings"),
+        ("sessions_on", "Enable a session"),
+        ("sessions_off", "Disable a session"),
+        ("sessions_on_unlimited", "24-hour mode ON"),
+        ("sessions_off_unlimited", "24-hour mode OFF"),
+        ("trade_window", "Set trading window"),
+        ("email", "Setup email on/off"),
+        ("email_test", "Send a test email"),
+        ("limits", "Set email caps/gaps"),
+        ("bigmove_alert", "Big-move alerts"),
+        ("tz", "Show/set timezone"),
+        ("dayreset", "Set daily reset anchor"),
+        ("report_daily", "Daily performance report"),
+        ("report_weekly", "Weekly performance report"),
+        ("report_overall", "All-time performance report"),
+        ("performance_report", "Performance trend"),
+        ("billing", "Subscription & payment info"),
+        ("support", "Submit support request"),
+        ("support_status", "Check support ticket"),
+        ("health", "Bot & data health"),
+        ("help", "User guide"),
+        ("commands", "Full user command guide"),
+        ("guide_full", "Download full user guide PDF"),
+    ]
+
+
+def _pf_admin_menu_rows() -> list[tuple[str, str]]:
+    # Admin menu = user essentials + admin / owner commands. Telegram cannot render
+    # section headers inside the Menu button, so descriptions clearly mark Admin rows.
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(cmd: str, desc: str):
+        c = str(cmd).strip().lstrip("/")
+        if not c or c in seen:
+            return
+        seen.add(c)
+        rows.append((c, desc))
+
+    # Keep the first screen user-friendly for the owner/admin too.
+    for c, d in _pf_public_menu_rows():
+        add(c, d)
+
+    add("help_admin", "Admin guide / operations menu")
+
+    # Prioritise daily operational admin commands first.
+    priority = [
+        "autotrade_debug", "autotrade_last", "autotrade_report", "autotrade_closed",
+        "autotrade_report_overall", "autotrade_report_matrix", "autotrade_config",
+        "autotrade_on", "autotrade_off", "autotrade_fix_exits", "autotrade_flat_now",
+        "setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_audit_keep_watch",
+        "setup_matrix", "setup_deep_analysis", "email_decision", "open_trades",
+        "health_sys", "dev_status", "why", "edge_status", "learning_status", "goal_status",
+        "dayrisk_reset", "cooldown_clear", "cooldown_clear_all",
+    ]
+    for c in priority:
+        add(c, "Admin: " + ADMIN_HELP_DESCRIPTIONS.get(c, "Admin command"))
+
+    for _title, commands in ADMIN_HELP_GROUPS:
+        for c in commands:
+            add(c, "Admin: " + ADMIN_HELP_DESCRIPTIONS.get(c, "Admin command"))
+
+    # Bot API limit is 100 commands per scope. Keep deterministic ordering.
+    return rows[:100]
+
+
+def _pf_admin_menu_target_ids() -> list[int]:
+    ids: set[int] = set()
+    for x in list(globals().get("ADMIN_IDS", set()) or set()) + list(globals().get("ADMIN_USER_IDS", set()) or set()):
+        try:
+            if int(x) > 0:
+                ids.add(int(x))
+        except Exception:
+            pass
+    for k in ("AUTOTRADE_OWNER_UID", "ADMIN_TELEGRAM_ID", "OWNER_USER_ID", "ADMIN_ID"):
+        try:
+            v = int(globals().get(k, 0) or os.environ.get(k, 0) or 0)
+            if v > 0:
+                ids.add(v)
+        except Exception:
+            pass
+    return sorted(ids)
+
+
+async def _pf_apply_telegram_command_menus(app: Application):
+    """Apply clean user menu + admin-scoped extended menu.
+
+    Default scope is used by Standard/Pro users. Per-admin chat scope overrides the
+    default list for owner/admin accounts, keeping /help and /help_admin separate.
+    """
+    public_rows = _pf_filter_registered(_pf_public_menu_rows())
+    public_cmds = [_pf_menu_command(c, d) for c, d in public_rows]
+    await app.bot.set_my_commands(public_cmds, scope=BotCommandScopeDefault())
+
+    admin_rows = _pf_filter_registered(_pf_admin_menu_rows())
+    admin_cmds = [_pf_menu_command(c, d) for c, d in admin_rows[:100]]
+    for admin_id in _pf_admin_menu_target_ids():
+        try:
+            await app.bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=int(admin_id)))
+        except Exception as e:
+            logger.warning("set admin command menu failed for chat_id=%s (ignored): %s", admin_id, e)
+
+    try:
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception:
+        pass
+
+
 async def _post_init(app: Application):
     # If webhook was set previously, remove it so polling starts cleanly
     try:
@@ -58178,67 +58325,21 @@ async def _post_init(app: Application):
     except Exception as e:
         logger.warning("delete_webhook failed (ignored): %s", e)
 
-    # Bot menu + command list (Telegram "Menu" button)
+    # Telegram Menu button:
+    # - Default scope: clean Standard/Pro user menu from /help.
+    # - Admin chat scope: extended operations menu from /help_admin.
+    # This avoids exposing admin commands to subscribers while giving the owner a
+    # usable one-tap admin menu.
     try:
-        cmds = [
-            BotCommand("start", "Start"),
-            BotCommand("status", "Shows your plan & enabled features"),
-            BotCommand("screen", "Scans the market for high-quality setups"),
-
-            BotCommand("equity", "Set your equity"),
-            BotCommand("riskmode", "Set your per-trade risk (used by /size)"),
-            BotCommand("dailycap", "Set manual daily risk cap"),
-                BotCommand("autotrade_on", "Enable AutoTrade entries"),
-                BotCommand("autotrade_off", "Pause AutoTrade entries"),
-            BotCommand("dayrisk_reset", "Admin: reset today risk usage"),
-            BotCommand("size", "Position size calculator"),
-
-            BotCommand("trade_open", "Log an opened position"),
-            BotCommand("trade_sl", "Update Stop Loss"),
-            BotCommand("trade_rf", "Risk-Free a position"),
-            BotCommand("trade_close", "Log a closed position"),
-
-            BotCommand("sessions", "View your session settings"),
-            BotCommand("sessions_on", "Enable a session"),
-            BotCommand("sessions_off", "Disable a session"),
-            BotCommand("sessions_on_unlimited", "24-hour mode ON"),
-            BotCommand("sessions_off_unlimited", "24-hour mode OFF"),
-            BotCommand("trade_window", "Set allowed trading time window"),
-
-            BotCommand("email", "Set email / email on|off"),
-            BotCommand("email_test", "Send a test email"),
-            BotCommand("limits", "Set email caps/gaps"),
-            BotCommand("bigmove_alert", "Big move alerts"),
-
-            BotCommand("tz", "Show/set your timezone"),
-            BotCommand("dayreset", "Set your daily reset anchor"),
-
-            BotCommand("report_daily", "Daily performance report"),
-            BotCommand("report_weekly", "Weekly performance report"),
-            BotCommand("report_overall", "All-time performance report"),
-
-            BotCommand("help", "Quick overview"),
-            BotCommand("commands", "Full command guide"),
-            BotCommand("guide_full", "Download full user guide (PDF)"),
-
-            BotCommand("support", "Submit support request"),
-            BotCommand("support_status", "Check your latest support ticket"),
-
-            BotCommand("health", "Bot & data health check"),
-            BotCommand("health_sys", "Admin engine health"),
-            BotCommand("dev_status", "Developer system summary"),
-
-            BotCommand("billing", "Subscription & payment info"),
-        ]
-        await app.bot.set_my_commands(cmds)
-        # Ensure menu button is enabled for private chats
-        try:
-            await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-        except Exception:
-            pass
+        await _pf_apply_telegram_command_menus(app)
+        logger.info(
+            "telegram_command_menus_applied public=%s admin=%s admin_chats=%s",
+            len(_pf_filter_registered(_pf_public_menu_rows())),
+            min(100, len(_pf_filter_registered(_pf_admin_menu_rows()))),
+            len(_pf_admin_menu_target_ids()),
+        )
     except Exception as e:
         logger.warning("set_my_commands failed (ignored): %s", e)
-
 
 
 # =========================================================
