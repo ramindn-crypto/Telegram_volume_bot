@@ -1,4 +1,4 @@
-# yver110: final live-test sync hardening: runtime-configurable KEEP+WATCH exposure, stronger AutoTrade candidate continuation, v110 cache separation, and end-to-end report/screen/email/AutoTrade alignment checks.
+# yver111: user-facing /screen/email sync lock: /screen shows only setups that were actually emailed/recent delivery-logged; raw executable queue remains for AutoTrade/audit only.
 # yver107: replaces fixed TP RR cap with dynamic live AutoTrade TP RR targeting (default 1.5R-4.0R) based on policy/quality/conf/volume/momentum; trailing remains off by default to preserve one TP + one SL lifecycle.
 # yver106: caps live AutoTrade TP RR to avoid unrealistic far targets, reports live open Risk$/TP$ from actual Bybit position geometry, and exposes AUTOTRADE_TP_RR_CAP settings in /autotrade_config.
 # yver108: AutoTrade now consumes KEEP+WATCH executable queue directly even if email delivery is delayed, broad side/session context is advisory for exact KEEP/WATCH lanes, and open-report Risk$/TP$ uses live Bybit TP/SL geometry without stale override.
@@ -53993,7 +53993,7 @@ def _screen_body_has_trade_setups(body: str) -> bool:
             return False
         if 'no confirmed setup' in low:
             return False
-        return ('PF-' in t and 'Entry:' in t and ('BUY' in t or 'SELL' in t))
+        return ((('PF-' in t) or ('BMAT-' in t) or ('BIGMOVE-' in t)) and 'Entry:' in t and ('BUY' in t or 'SELL' in t))
     except Exception:
         return False
 
@@ -54020,8 +54020,8 @@ def _screen_cache_put(cache_key: str, body: str, kb: list | None = None, ts: flo
         # Keep the exact setup-email batch visible while it is still actionable.
         # A background /screen rebuild can legitimately find a different pool one
         # minute later, but Pro/Admin /screen must stay synced with email/autotrade.
-        old_is_email = ('Showing latest sent setup email' in old_body) or ('Emailed at ' in old_body)
-        new_is_email = ('Showing latest sent setup email' in body_s) or ('Emailed at ' in body_s)
+        old_is_email = ('Showing latest sent setup email' in old_body) or ('Showing recent emailed setup queue' in old_body) or ('Emailed at ' in old_body)
+        new_is_email = ('Showing latest sent setup email' in body_s) or ('Showing recent emailed setup queue' in body_s) or ('Emailed at ' in body_s)
         if (not allow_empty_overwrite) and old_is_email and (not new_is_email) and old_has and old_age <= keep_window:
             try:
                 db_log_setup_pipeline_event(0, stage='screen_cache_put', status='kept_recent_email_cache', session=str(key).split('::')[-1], mode='screen', details={'old_age_sec': round(old_age, 1)})
@@ -54068,7 +54068,7 @@ def _screen_choose_best_cache(cache_keys: list[str]) -> tuple[dict, float]:
                 continue
             _age = now_ts - float(_ce.get('ts', 0.0) or 0.0)
             _has = _screen_body_has_trade_setups(_body)
-            _is_email = ('Showing latest sent setup email' in _body) or ('Emailed at ' in _body)
+            _is_email = ('Showing latest sent setup email' in _body) or ('Showing recent emailed setup queue' in _body) or ('Emailed at ' in _body)
             candidates.append((_is_email, _has, _age, _ce))
         if not candidates:
             return {}, 999999.0
@@ -54085,6 +54085,98 @@ def _screen_display_limit() -> int:
         return max(1, min(4, int(os.environ.get('SCREEN_MAX_CARDS_DISPLAY', '4') or 4)))
     except Exception:
         return 4
+
+
+def _screen_requires_emailed_delivery_for_setup() -> bool:
+    """User-facing sync rule for /screen.
+
+    /screen is a subscriber-facing surface, so it must not expose a raw executable
+    setup that the email lane did not actually deliver/log. AutoTrade may still
+    consume the executable queue directly; this helper is only for /screen UX.
+    """
+    try:
+        return str(os.environ.get('SCREEN_REQUIRE_EMAILED_SETUP', '1') or '1').strip().lower() not in {'0', 'false', 'no', 'off'}
+    except Exception:
+        return True
+
+
+def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: float | None = None) -> float:
+    """Return recent email timestamp for this exact setup/identity, else 0.
+
+    This deliberately uses setup_id and setup identity, not only symbol cooldown,
+    because /screen should match the exact email-delivered setup batch.
+    """
+    try:
+        ts0 = float(getattr(setup, 'email_logged_ts', 0.0) or getattr(setup, 'emailed_ts', 0.0) or 0.0)
+        if ts0 > 0:
+            return ts0
+    except Exception:
+        pass
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        return 0.0
+    try:
+        hours = float(lookback_hours if lookback_hours is not None else max(1.0, float(SCREEN_FALLBACK_MAX_AGE_MIN or 45) / 60.0))
+    except Exception:
+        hours = 1.0
+    cutoff = float(time.time()) - max(1.0, hours) * 3600.0
+    sid = str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip()
+    ident = ''
+    try:
+        ident = str(_setup_identity_from_obj(setup) or '').strip()
+    except Exception:
+        ident = ''
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            if sid:
+                row = cur.execute(
+                    "SELECT emailed_ts FROM emailed_setups WHERE user_id=? AND setup_id=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
+                    (uid, sid, float(cutoff)),
+                ).fetchone()
+                if row and row[0] is not None:
+                    return float(row[0] or 0.0)
+            if ident:
+                cur.execute("""CREATE TABLE IF NOT EXISTS emailed_setup_identities (
+                    user_id INTEGER NOT NULL,
+                    identity_key TEXT NOT NULL,
+                    symbol TEXT NOT NULL DEFAULT '',
+                    side TEXT NOT NULL DEFAULT '',
+                    setup_id TEXT NOT NULL DEFAULT '',
+                    emailed_ts REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY(user_id, identity_key)
+                )""")
+                row = cur.execute(
+                    "SELECT emailed_ts FROM emailed_setup_identities WHERE user_id=? AND identity_key=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
+                    (uid, ident, float(cutoff)),
+                ).fetchone()
+                if row and row[0] is not None:
+                    return float(row[0] or 0.0)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def _screen_attach_email_delivery_or_skip(user_id: int, setup, lookback_hours: float | None = None) -> bool:
+    """Attach email timestamp metadata to a setup or reject it for /screen."""
+    try:
+        if not _screen_requires_emailed_delivery_for_setup():
+            return True
+        ts = _screen_recent_emailed_ts_for_setup(int(user_id or 0), setup, lookback_hours=lookback_hours)
+        if ts <= 0:
+            return False
+        try:
+            setattr(setup, 'email_logged_ts', float(ts))
+            setattr(setup, 'emailed_ts', float(ts))
+            setattr(setup, 'source_kind', 'emailed_setups')
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
 
 
 def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
@@ -54240,8 +54332,10 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=sess, user_id=int(uid), lane='screen')
                     if not keep_ok:
                         continue
+                    if source_name != 'emailed' and not _screen_attach_email_delivery_or_skip(int(uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
+                        continue
                     if not used_source_name:
-                        used_source_name = str(source_name or '')
+                        used_source_name = 'emailed' if _screen_requires_emailed_delivery_for_setup() else str(source_name or '')
                     out.append(item)
                     seen.add(dedupe_key)
                     if len(out) >= _screen_display_limit():
@@ -54258,7 +54352,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         except Exception:
             up_list, dn_list = [], []
         market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
-        source_note = '_Showing latest sent setup email while the live scan refreshes._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue while the live scan refreshes._'
+        source_note = '_Showing recent emailed setup queue while the live scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else ('_Showing latest sent setup email while the live scan refreshes._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue while the live scan refreshes._')
         body = "\n".join([
             "",
             "*Top Trade Setups*",
@@ -54356,6 +54450,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                             keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=(req_session_u or src_session_u or _session), user_id=int(_uid), lane='screen')
                             if not keep_ok:
                                 continue
+                            if source_name != 'emailed' and not _screen_attach_email_delivery_or_skip(int(_uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
+                                continue
                             out.append(item)
                             seen.add(dedupe_key)
                         if len(out) >= int(limit):
@@ -54418,9 +54514,13 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     except Exception:
         setups = []
 
-    if not setups and _exec_ready:
+    if not setups and _exec_ready and not _screen_requires_emailed_delivery_for_setup():
         _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=str(session or ''), user_id=int(uid), lane='screen')
         setups = list(_screen_keep_ready[:max(1, int(SETUPS_N))])
+    elif not setups and _exec_ready and _screen_requires_emailed_delivery_for_setup():
+        _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=str(session or ''), user_id=int(uid), lane='screen')
+        _screen_emailed_ready = [s for s in list(_screen_keep_ready or []) if _screen_attach_email_delivery_or_skip(int(uid), s, lookback_hours=max(1.0, float(SCREEN_FALLBACK_MAX_AGE_MIN or 45) / 60.0))]
+        setups = list(_screen_emailed_ready[:max(1, int(SETUPS_N))])
 
     # Keep /screen readable. The executable queue can still hold more for email/autotrade;
     # /screen is an action dashboard, not a dump. Also enforce the production 24h-volume floor.
@@ -54878,9 +54978,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             _body_is_latest_email = False
                         _source_note_e = (
-                            "_Showing latest sent setup email while the live scan refreshes._\n"
-                            if _body_is_latest_email else
-                            "_Showing recent executable setup queue while the live scan refreshes._\n"
+                            "_Showing recent emailed setup queue while the live scan refreshes._\n"
+                            if _screen_requires_emailed_delivery_for_setup() else
+                            ("_Showing latest sent setup email while the live scan refreshes._\n"
+                             if _body_is_latest_email else
+                             "_Showing recent executable setup queue while the live scan refreshes._\n")
                         )
                         header_e = (
                             f"*PulseFutures — Market Scan*\n"
@@ -54958,7 +55060,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"{HDR}\n"
                         f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                         f"{_screen_when_line('Displayed setup source', source_ts)}"
-                        f"_Showing recent executable setup queue while full scan refreshes._\n"
+                        f"{('_Showing recent emailed setup queue while full scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else '_Showing recent executable setup queue while full scan refreshes._')}\n"
                     )
                     keyboard = [
                         [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
