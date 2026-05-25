@@ -1,3 +1,4 @@
+# yver113: fixes Telegram slowdowns from heavy KEEP/WATCH summary and scheduler misfire noise: /setup_audit_keep_watch is cached/fast-cached-result based, autonomous screen/alert jobs get wider misfire grace, and ver112 menu changes are intentionally not included.
 # yver111: user-facing /screen/email sync lock: /screen shows only setups that were actually emailed/recent delivery-logged; raw executable queue remains for AutoTrade/audit only.
 # yver107: replaces fixed TP RR cap with dynamic live AutoTrade TP RR targeting (default 1.5R-4.0R) based on policy/quality/conf/volume/momentum; trailing remains off by default to preserve one TP + one SL lifecycle.
 # yver106: caps live AutoTrade TP RR to avoid unrealistic far targets, reports live open Risk$/TP$ from actual Bybit position geometry, and exposes AUTOTRADE_TP_RR_CAP settings in /autotrade_config.
@@ -48477,18 +48478,64 @@ def _setup_audit_overall_text(uid: int) -> str:
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
-def _setup_audit_keep_watch_summary_text(uid: int) -> str:
-    """Compact overall totals for current KEEP + WATCH policy lanes only.
 
-    Subscriber-facing /screen/email/AutoTrade use KEEP + strict WATCH. This report
-    gives the owner the matching high-level evidence total without the long combo table.
-    Background setup generation and audit still continue for all lanes.
+# yver113: /setup_audit_keep_watch must be an instant admin summary, not a
+# full historical OHLCV re-evaluation.  The full audit commands remain available
+# for deep recalculation; this compact summary uses cached audit decisions and
+# cached price moves only, then caches the rendered text for a short TTL.
+_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE = {}
+SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC = int(os.environ.get("SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC", "300") or 300)
+
+def _setup_audit_keep_watch_fast_result_label(row: dict, horizon_hours: int) -> str:
+    try:
+        sid = str((row or {}).get('setup_id') or '').strip()
+        if sid:
+            try:
+                cached = _setup_audit_cached_result(sid, int(horizon_hours or 24), allow_open_fresh_sec=900) or {}
+                lab = _setup_audit_result_label((cached or {}).get('result'))
+                if lab in {'TP', 'SL', 'NOHIT', 'OPEN'}:
+                    return lab
+            except Exception:
+                pass
+        try:
+            fast = str(_setup_audit_result_from_cached_price_moves(row or {}, int(horizon_hours or 24)) or '').upper().strip()
+            if fast in {'WIN', 'TP'}:
+                return 'TP'
+            if fast in {'LOSE', 'LOSS', 'SL'}:
+                return 'SL'
+            if fast in {'NOHIT', 'NH'}:
+                return 'NOHIT'
+            if fast in {'OPEN', ''}:
+                return 'OPEN'
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return 'OPEN'
+
+
+def _setup_audit_keep_watch_summary_text(uid: int) -> str:
+    """Compact totals for current KEEP + WATCH policy lanes only.
+
+    yver113: fast/cached admin summary. It deliberately avoids live OHLCV
+    preloading so Telegram commands stay responsive while Render background jobs
+    are running. Deep/full candle recomputation remains in /setup_audit_overall
+    and /setup_matrix policy.
     """
     try:
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
         uid_i = int(owner_uid or uid or 0)
     except Exception:
         uid_i = int(uid or 0)
+
+    try:
+        cache_key = f"keep_watch_summary::{uid_i}::{int(float(_overall_report_start_ts() or 0.0))}"
+        cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
+        cached = cache.get(cache_key) if isinstance(cache, dict) else None
+        if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
+            return str(cached.get('text') or '')
+    except Exception:
+        cache_key = ''
 
     allowed_statuses = {'KEEP', 'WATCH'}
     watch_like_statuses = {'WATCH', 'TIGHTEN', 'PART'}
@@ -48518,10 +48565,13 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         allowed_combos = set()
         keep_count = watch_count = 0
 
-    rows, source_label = _overall_report_source_rows(uid_i, start_ts=float(_overall_report_start_ts() or 0.0), limit=0, dedup=True)
+    try:
+        rows, source_label = _overall_report_source_rows(uid_i, start_ts=float(_overall_report_start_ts() or 0.0), limit=0, dedup=True)
+    except Exception:
+        rows, source_label = [], 'EXECUTABLE'
+
     result_horizon = _setup_audit_result_horizon_hours()
     audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
-    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
 
     total_setups = total_tp = total_sl = total_nohit = total_open = 0
     matched_combos: set[str] = set()
@@ -48536,15 +48586,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
             if combo_u not in allowed_combos:
                 continue
             matched_combos.add(combo_u)
-            ev = _setup_audit_resolve_result(
-                r,
-                horizon_hours=result_horizon,
-                user_id=uid_i,
-                candles_by_symbol=candles_by_symbol,
-                audit_timeframe=audit_tf,
-                actual_pnl_usdt=0.0,
-            )
-            result = _setup_audit_result_label(ev.get('result'))
+            result = _setup_audit_keep_watch_fast_result_label(r, result_horizon)
             total_setups += 1
             if result == 'TP':
                 total_tp += 1
@@ -48552,7 +48594,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
                 total_sl += 1
             elif result == 'NOHIT':
                 total_nohit += 1
-            elif result == 'OPEN':
+            else:
                 total_open += 1
         except Exception:
             continue
@@ -48569,6 +48611,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         f"Data start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b>",
         f"Data end: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        "Mode: <b>fast cached audit</b> (deep candle recompute remains in /setup_audit_overall)",
         HDR,
         f"Total number of Combo: <b>{len(allowed_combos)}</b> (KEEP: <b>{keep_count}</b> | WATCH: <b>{watch_count}</b>)",
         f"Set: <b>{total_setups}</b>",
@@ -48582,8 +48625,13 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         lines.append("No active KEEP/WATCH policy lanes found. Run <code>/setup_matrix policy</code> to refresh policy first.")
     elif total_setups == 0:
         lines.append("No historical setup rows matched the current KEEP/WATCH lanes in this baseline window yet.")
-    return "\n".join(lines)
-
+    txt = "\n".join(lines)
+    try:
+        if cache_key:
+            _SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE[cache_key] = {'ts': float(time.time()), 'text': txt}
+    except Exception:
+        pass
+    return txt
 
 async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
@@ -48591,7 +48639,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("⛔ Admin only.")
         return
     try:
-        text = await to_thread_heavy(_setup_audit_keep_watch_summary_text, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
+        text = await to_thread_fast(_setup_audit_keep_watch_summary_text, int(AUTOTRADE_OWNER_UID or uid), timeout=45)
     except Exception as e:
         text = f"❌ setup_audit_keep_watch failed: {type(e).__name__}: {html.escape(str(e))}"
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -60185,7 +60233,7 @@ def main():
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 90,
+                "misfire_grace_time": 300,
             },
         )
 
@@ -60207,7 +60255,7 @@ def main():
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 180,
+                "misfire_grace_time": 900,
             },
         )
 
