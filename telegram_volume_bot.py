@@ -1,3 +1,4 @@
+# yver104: allows KEEP + strict WATCH policy lanes for /screen, setup emails, and AutoTrade; DISABLE remains blocked, KEEP is prioritized, and WATCH must still pass final/context/symbol guards.
 # yver103: recalibrates setup combo policy tiers so strong/positive small-sample lanes become WATCH instead of DISABLE, high AvgR 50%+ lanes can become KEEP, and broad context cannot downgrade promising exact lanes.
 # yver102: makes evidence-based symbol blocks temporary using a short rolling symbol window, and aligns /screen/setup emails with AutoTrade context guards so blocked symbols are hidden from subscribers while background learning continues.
 # yver101: User-facing setup quality lock: /screen and setup emails now expose KEEP-policy lanes only, while background generation/audit/matrix/daily-weekly safety and continuous learning still collect all executable evidence.
@@ -4237,11 +4238,15 @@ DIRECTIONAL_CONTEXT_GUARD_LEADER_24H_MIN = float(os.environ.get("DIRECTIONAL_CON
 DIRECTIONAL_CONTEXT_GUARD_LOSER_24H_MAX = float(os.environ.get("DIRECTIONAL_CONTEXT_GUARD_LOSER_24H_MAX", str(MOVER_DN_24H_MAX)) or MOVER_DN_24H_MAX)
 DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H = float(os.environ.get("DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H", "0.01") or 0.01)
 
-# yver90: AutoTrade must be more selective than setup emails.
-# Emails/screen can still show WATCH/GATE candidates for observation, but live AutoTrade
-# should only consume lanes that the fixed 15-May evidence policy has promoted to KEEP.
-# This directly aligns execution with the self-improvement / best-setup selection layer.
+# yver104: approved-policy exposure/execution.
+# The bot should not show/trade DISABLE lanes, but it should not starve waiting only for
+# mature KEEP lanes.  The correct product/live-trading behaviour is:
+# - KEEP: preferred and highest priority.
+# - WATCH: allowed only after the strict final WATCH quality gate + context/symbol/hour
+#   guards pass.
+# - DISABLE/OFF/BLOCK/PAUSE: never shown, emailed or AutoTraded.
 AUTOTRADE_REQUIRE_KEEP_POLICY = env_bool("AUTOTRADE_REQUIRE_KEEP_POLICY", True)
+AUTOTRADE_ALLOW_WATCH_POLICY = env_bool("AUTOTRADE_ALLOW_WATCH_POLICY", True)
 
 def _autotrade_require_keep_policy() -> bool:
     try:
@@ -4249,14 +4254,28 @@ def _autotrade_require_keep_policy() -> bool:
     except Exception:
         return True
 
+def _autotrade_allow_watch_policy() -> bool:
+    try:
+        return bool(globals().get('AUTOTRADE_ALLOW_WATCH_POLICY', True))
+    except Exception:
+        return True
 
-# yver101: subscriber-facing quality lock.  The scanner can still generate and
-# persist WATCH/DISABLE rows for audit, learning and daily/weekly policy reviews,
-# but what users see on /screen and receive by setup email should match the
-# AutoTrade philosophy: only lanes currently promoted to KEEP by /setup_matrix policy.
+def _autotrade_allowed_policy_statuses() -> set:
+    try:
+        return {'KEEP', 'WATCH'} if _autotrade_allow_watch_policy() else {'KEEP'}
+    except Exception:
+        return {'KEEP'}
+
+
+# yver104: subscriber-facing quality lock.  The scanner can still generate and
+# persist all rows for audit/learning, but /screen and setup emails expose only
+# approved policy lanes: KEEP + strict WATCH by default.
 USER_VISIBLE_REQUIRE_KEEP_POLICY = env_bool("USER_VISIBLE_REQUIRE_KEEP_POLICY", True)
 SCREEN_REQUIRE_KEEP_POLICY = env_bool("SCREEN_REQUIRE_KEEP_POLICY", True)
 EMAIL_REQUIRE_KEEP_POLICY = env_bool("EMAIL_REQUIRE_KEEP_POLICY", True)
+USER_VISIBLE_ALLOW_WATCH_POLICY = env_bool("USER_VISIBLE_ALLOW_WATCH_POLICY", True)
+SCREEN_ALLOW_WATCH_POLICY = env_bool("SCREEN_ALLOW_WATCH_POLICY", True)
+EMAIL_ALLOW_WATCH_POLICY = env_bool("EMAIL_ALLOW_WATCH_POLICY", True)
 
 def _user_visible_require_keep_policy(lane: str = '') -> bool:
     try:
@@ -4268,6 +4287,23 @@ def _user_visible_require_keep_policy(lane: str = '') -> bool:
         return bool(globals().get('USER_VISIBLE_REQUIRE_KEEP_POLICY', True))
     except Exception:
         return True
+
+def _user_visible_allow_watch_policy(lane: str = '') -> bool:
+    try:
+        l = str(lane or '').lower().strip()
+        if l in {'screen', '/screen'}:
+            return bool(globals().get('SCREEN_ALLOW_WATCH_POLICY', True))
+        if l in {'email', 'setup_email', 'bigmove', 'f8', 'screen_sync'}:
+            return bool(globals().get('EMAIL_ALLOW_WATCH_POLICY', True))
+        return bool(globals().get('USER_VISIBLE_ALLOW_WATCH_POLICY', True))
+    except Exception:
+        return True
+
+def _user_visible_allowed_policy_statuses(lane: str = '') -> set:
+    try:
+        return {'KEEP', 'WATCH'} if _user_visible_allow_watch_policy(lane) else {'KEEP'}
+    except Exception:
+        return {'KEEP'}
 
 def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '', user_id: int = 0, lane: str = 'screen') -> tuple[bool, str, dict]:
     """Return whether a setup may be shown to subscribers or sent by setup email.
@@ -4300,11 +4336,24 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
         meta = dict(info or {})
         meta.update({'policy_uid': int(policy_uid or 0), 'policy_status_effective': status, 'policy_combo': combo})
         l = str(lane or 'screen').lower().strip() or 'screen'
-        if status == 'KEEP':
-            # yver102: subscriber-facing setup exposure must match the real AutoTrade
-            # selection philosophy, not only the coarse KEEP lane.  KEEP is necessary,
-            # but weak symbol/hour/context guards can still make a setup unsuitable for
-            # AutoTrade and therefore unsuitable for /screen/email subscribers.
+        allowed_statuses = _user_visible_allowed_policy_statuses(l)
+        if status in allowed_statuses:
+            # yver104: WATCH can be shown/emailed only if it still passes the same
+            # shared final quality gate used by the executable queue. This prevents
+            # weak WATCH/probation rows from being shown to subscribers.
+            if status == 'WATCH':
+                try:
+                    final_ok, final_why, final_meta = _setup_final_quality_gate_allows_setup(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0))
+                    meta['watch_final_gate_reason'] = str(final_why or '')
+                    if isinstance(final_meta, dict):
+                        for _k, _v in final_meta.items():
+                            meta.setdefault(f'final_{_k}', _v)
+                    if not final_ok:
+                        return False, f'{l}_watch_final_gate:{final_why or "blocked"}', meta
+                except Exception as _final_exc:
+                    return False, f'{l}_watch_final_gate_exception:{type(_final_exc).__name__}', meta
+            # Subscriber-facing setup exposure must also match the real AutoTrade
+            # context layer: weak symbol/hour/session/side blocks hide the setup.
             try:
                 ctx_ok, ctx_why = _autotrade_policy_context_execution_allows(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0))
                 meta['context_gate_reason'] = str(ctx_why or '')
@@ -4312,13 +4361,13 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
                     return False, f'{l}_{ctx_why or "context_guard_block"}', meta
             except Exception as _ctx_exc:
                 return False, f'{l}_context_gate_exception:{type(_ctx_exc).__name__}', meta
-            return True, 'keep_policy_and_context_ok', meta
-        return False, f'{l}_policy_not_keep:{status or raw_status or "WATCH"}{(":" + combo) if combo else ""}', meta
+            return True, f'{status.lower()}_policy_and_context_ok', meta
+        return False, f'{l}_policy_not_allowed:{status or raw_status or "WATCH"}{(":" + combo) if combo else ""}', meta
     except Exception as exc:
         return False, f'user_visible_keep_policy_exception:{type(exc).__name__}', meta
 
 def _filter_user_visible_keep_setups(setups: list, session_name: str = '', user_id: int = 0, lane: str = 'screen') -> list:
-    """Filter setup objects to KEEP-only for /screen and setup emails.
+    """Filter setup objects to approved KEEP/WATCH policy rows for /screen and setup emails.
 
     Background DB rows are not deleted by this helper; it only controls user-facing
     exposure so learning and policy scoring continue normally.
@@ -11232,8 +11281,8 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
                 pfound = bool((pinfo or {}).get('found'))
                 praw = str((pinfo or {}).get('status') or '').upper().strip()
                 pstatus = _setup_policy_effective_status(praw, found=pfound)
-                if pstatus != 'KEEP':
-                    return (False, f'autotrade_policy_not_keep:{pstatus or praw or "WATCH"}')
+                if pstatus not in _autotrade_allowed_policy_statuses():
+                    return (False, f'autotrade_policy_not_allowed:{pstatus or praw or "WATCH"}')
             except Exception:
                 return (False, 'autotrade_keep_policy_check_exception')
 
@@ -12059,7 +12108,7 @@ def _autotrade_should_try_next_after_skip(reason: str) -> bool:
         'post_fill_risk_breach', 'exchange_reject', 'no_sltp',
         'leverage_set_failed_for_liq_guard', 'configured_leverage_not_safe',
         # yver100: these are candidate-level selection rejects, not whole-engine stops.
-        'autotrade_policy_not_keep', 'autotrade_realized_combo_block',
+        'autotrade_policy_not_keep', 'autotrade_policy_not_allowed', 'autotrade_realized_combo_block',
         'autotrade_symbol_block', 'autotrade_weak_hour_block',
         'autotrade_weak_side_block', 'autotrade_weak_session_block',
         'final_quality_gate', 'below_exec_conf', 'below_exec_rr',
@@ -12200,12 +12249,12 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         try:
             pinfo = _setup_combo_policy_lookup_for_setup(s, session_name=session_label, user_id=int(uid))
             pstatus = _setup_policy_effective_status(str((pinfo or {}).get('status') or '').upper().strip(), found=bool((pinfo or {}).get('found')))
-            if pstatus != 'KEEP':
+            if pstatus not in _autotrade_allowed_policy_statuses():
                 try:
-                    _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_policy_not_keep'), last_reason=f'autotrade_policy_not_keep:{pstatus}')
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_policy_not_allowed'), last_reason=f'autotrade_policy_not_allowed:{pstatus}')
                 except Exception:
                     pass
-                return (False, f'autotrade_policy_not_keep:{pstatus or "WATCH"}')
+                return (False, f'autotrade_policy_not_allowed:{pstatus or "WATCH"}')
         except Exception:
             return (False, 'autotrade_keep_policy_check_exception')
 
@@ -51480,7 +51529,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         ('Daily risk remaining (AT): ∞' if not math.isfinite(float(_debug_remaining_display)) else f"Daily risk remaining (AT): ${float(_debug_remaining_display):.2f}"),
         SEP,
         'Email / AutoTrade entry gate',
-        f"AutoTrade lane filter: {'KEEP-only policy ON' if _autotrade_require_keep_policy() else 'WATCH/KEEP policy allowed'}",
+        f"AutoTrade lane filter: {('KEEP+WATCH policy ON' if _autotrade_allow_watch_policy() else 'KEEP-only policy ON') if _autotrade_require_keep_policy() else 'policy filter OFF'}",
         f"AutoTrade capital guard: daily loss stop {'ON' if _autotrade_daily_realized_loss_stop_enabled() else 'OFF'} {_autotrade_daily_realized_loss_stop_pct():.1f}% | realised-combo {'ON' if _autotrade_require_realized_combo_edge() else 'OFF'} | context feed {'ON' if _autotrade_context_feed_guard_enabled() else 'OFF'}",
         f"AutoTrade capital gate: {'OPEN' if _autotrade_daily_realized_loss_stop_allows(int(uid))[0] else 'BLOCKED'} | {_autotrade_daily_realized_loss_stop_allows(int(uid))[1]}",
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
@@ -53466,7 +53515,7 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
     visible_setups = _filter_user_visible_keep_setups(visible_setups, session_name=session, user_id=int(uid or 0), lane='screen')
     if not visible_setups:
         if _user_visible_require_keep_policy('screen'):
-            return "_No KEEP-policy setup right now. Background scanner is still collecting WATCH/DISABLE evidence for learning._"
+            return "_No KEEP/WATCH policy setup right now. Background scanner is still collecting DISABLE/probation evidence for learning._"
         return f"_No setup above ${_setup_min_volume_floor_usd()/1e6:.0f}M 24h volume right now._"
 
     lines2 = []
@@ -58700,8 +58749,8 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                 if tf_cooling:
                     skip_reason = 'autotrade_refresh_deferred_rate_limit_cooldown'
                 elif selector_reasons:
-                    if any(str(k).startswith('autotrade_policy_not_keep') for k in selector_reasons):
-                        skip_reason = 'no_keep_executable_setup'
+                    if any(str(k).startswith(('autotrade_policy_not_keep', 'autotrade_policy_not_allowed')) for k in selector_reasons):
+                        skip_reason = 'no_keep_or_watch_executable_setup'
                     else:
                         skip_reason = 'no_tradable_setup_after_selector_filters'
                 else:
