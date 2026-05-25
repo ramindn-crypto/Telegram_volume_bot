@@ -1,3 +1,5 @@
+# yver103: recalibrates setup combo policy tiers so strong/positive small-sample lanes become WATCH instead of DISABLE, high AvgR 50%+ lanes can become KEEP, and broad context cannot downgrade promising exact lanes.
+# yver102: makes evidence-based symbol blocks temporary using a short rolling symbol window, and aligns /screen/setup emails with AutoTrade context guards so blocked symbols are hidden from subscribers while background learning continues.
 # yver101: User-facing setup quality lock: /screen and setup emails now expose KEEP-policy lanes only, while background generation/audit/matrix/daily-weekly safety and continuous learning still collect all executable evidence.
 # yver100: Fixes AutoTrade zero-attempt/zero-entry diagnostics and execution selection from ver99: deeper KEEP-lane queue scan, candidate-level skip continuation, fallback from disabled emailed setups to best KEEP executable queue, and /autotrade_last visibility for selector rejects.
 # yver91: Adds AutoTrade capital-protection guards: daily realised loss stop, setup-policy KEEP + realised AutoTrade combo edge, and setup audit side/session/symbol/hour context gating for execution.
@@ -2377,9 +2379,15 @@ except Exception:
 SETUP_COMBO_POLICY_MIN_DECIDED_DAILY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_DAILY", "8") or 8)
 SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY = int(os.environ.get("SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY", "4") or 4)
 SETUP_COMBO_POLICY_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_WR", "55") or 55)
-SETUP_COMBO_POLICY_DISABLE_WR = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_WR", "45") or 55)
 SETUP_COMBO_POLICY_KEEP_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_AVG_R", "0.05") or 0.05)
+# yver103: DISABLE must mean clearly bad evidence, not merely below KEEP.
+# Some deployed DB/env snapshots used 55 here, which incorrectly disabled lanes such as
+# F2-NY-NOR-BUY with WR >50% and positive AvgR. Clamp the hard-disable WR threshold to
+# <=45 so borderline/profitable lanes stay WATCH or KEEP.
+SETUP_COMBO_POLICY_DISABLE_WR = min(float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_WR", "45") or 45), 45.0)
 SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "0.00") or 0.00)
+SETUP_COMBO_POLICY_WATCH_WR = float(os.environ.get("SETUP_COMBO_POLICY_WATCH_WR", "50") or 50)
+SETUP_COMBO_POLICY_PROMOTE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_PROMOTE_AVG_R", "0.35") or 0.35)
 
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
 # matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
@@ -2394,6 +2402,11 @@ SETUP_EDGE_GUARD_SIDE_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_SIDE_WR_MA
 SETUP_EDGE_GUARD_SIDE_AVGR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_SIDE_AVGR_MAX", "-0.25") or -0.25)
 SETUP_EDGE_GUARD_SYMBOL_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_SYMBOL_MIN_DECIDED", "3") or 3)
 SETUP_EDGE_GUARD_SYMBOL_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_SYMBOL_WR_MAX", "5") or 5)
+# yver102: evidence-based symbol blocks are deliberately short-lived.
+# Family/session/strategy-side policy still uses the long review window, but a single
+# symbol can recover quickly after a volatility/liquidity shock.  A symbol therefore
+# stays blocked only while the RECENT symbol-specific evidence remains poor.
+SETUP_EDGE_GUARD_SYMBOL_WINDOW_HOURS = float(os.environ.get("SETUP_EDGE_GUARD_SYMBOL_WINDOW_HOURS", "24") or 24)
 SETUP_EDGE_GUARD_HOUR_MIN_DECIDED = int(os.environ.get("SETUP_EDGE_GUARD_HOUR_MIN_DECIDED", "5") or 5)
 SETUP_EDGE_GUARD_HOUR_WR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_HOUR_WR_MAX", "25") or 25)
 SETUP_EDGE_GUARD_HOUR_AVGR_MAX = float(os.environ.get("SETUP_EDGE_GUARD_HOUR_AVGR_MAX", "-0.30") or -0.30)
@@ -4286,9 +4299,20 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
         combo = str((info or {}).get('combo') or '').upper().strip()
         meta = dict(info or {})
         meta.update({'policy_uid': int(policy_uid or 0), 'policy_status_effective': status, 'policy_combo': combo})
-        if status == 'KEEP':
-            return True, 'keep_policy_ok', meta
         l = str(lane or 'screen').lower().strip() or 'screen'
+        if status == 'KEEP':
+            # yver102: subscriber-facing setup exposure must match the real AutoTrade
+            # selection philosophy, not only the coarse KEEP lane.  KEEP is necessary,
+            # but weak symbol/hour/context guards can still make a setup unsuitable for
+            # AutoTrade and therefore unsuitable for /screen/email subscribers.
+            try:
+                ctx_ok, ctx_why = _autotrade_policy_context_execution_allows(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0))
+                meta['context_gate_reason'] = str(ctx_why or '')
+                if not ctx_ok:
+                    return False, f'{l}_{ctx_why or "context_guard_block"}', meta
+            except Exception as _ctx_exc:
+                return False, f'{l}_context_gate_exception:{type(_ctx_exc).__name__}', meta
+            return True, 'keep_policy_and_context_ok', meta
         return False, f'{l}_policy_not_keep:{status or raw_status or "WATCH"}{(":" + combo) if combo else ""}', meta
     except Exception as exc:
         return False, f'user_visible_keep_policy_exception:{type(exc).__name__}', meta
@@ -46023,6 +46047,11 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
             return {'ok': True, 'enabled': True, 'combo_side_block': {}, 'combo_strategy_side_block': {}, 'legacy_combo_side_block': {}, 'symbol_block': {}, 'hour_watch': {}, 'reason': 'no_uid'}
         hrs = int(hours or globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168)
         now_ts = float(time.time())
+        try:
+            symbol_block_hours = max(1.0, min(float(hrs), float(globals().get('SETUP_EDGE_GUARD_SYMBOL_WINDOW_HOURS', 24) or 24)))
+        except Exception:
+            symbol_block_hours = min(float(hrs), 24.0)
+        symbol_block_cutoff_ts = now_ts - float(symbol_block_hours) * 3600.0
         cache = globals().setdefault('_SETUP_EDGE_GUARD_CACHE', {'ts': 0.0, 'uid': 0, 'hours': 0, 'data': {}})
         if (not force) and int(cache.get('uid') or 0) == eval_uid and int(cache.get('hours') or 0) == hrs and now_ts - float(cache.get('ts') or 0.0) < float(globals().get('SETUP_EDGE_GUARD_CACHE_SEC', 900) or 900):
             return dict(cache.get('data') or {})
@@ -46040,6 +46069,7 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
         by_session: dict[str, dict] = {}
         by_side: dict[str, dict] = {}
         by_symbol: dict[str, dict] = {}
+        by_symbol_recent: dict[str, dict] = {}
         by_hour: dict[str, dict] = {}
         for r in list(rows or []):
             try:
@@ -46068,6 +46098,8 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
                 _setup_edge_guard_add(by_side, side, result, r_mult)
                 _setup_edge_guard_add(by_symbol, sym, result, r_mult)
                 ts = float(_setup_audit_row_ts(r) or 0.0)
+                if ts > 0 and ts >= symbol_block_cutoff_ts:
+                    _setup_edge_guard_add(by_symbol_recent, sym, result, r_mult)
                 if ts > 0:
                     hr_key = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%H:00')
                     _setup_edge_guard_add(by_hour, hr_key, result, r_mult)
@@ -46100,10 +46132,13 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
                 combo_strategy_side_block[key] = {**m, 'reason': f"weak strategy-side lane {key}: {m['tp']}TP/{m['sl']}SL, WR {m['wr']:.1f}%, AvgR {m['avg_r']:+.2f}"}
 
         symbol_block = {}
-        for key, b in by_symbol.items():
+        # yver102: use the short recent symbol window for hard symbol blocks.
+        # Long-window symbol_metrics are still retained for analytics, but a symbol
+        # is allowed to recover automatically once its recent evidence is no longer bad.
+        for key, b in by_symbol_recent.items():
             m = _setup_edge_bucket_metrics(b)
             if m['decided'] >= symbol_min and m['wr'] <= max(symbol_wr_max, 25.0) and m['sl'] >= max(m['tp'] + 2, symbol_min):
-                symbol_block[key] = {**m, 'reason': f"weak symbol {key}: {m['tp']}TP/{m['sl']}SL in {m['decided']} decided setups, WR {m['wr']:.1f}%"}
+                symbol_block[key] = {**m, 'symbol_block_hours': float(symbol_block_hours), 'reason': f"temporary weak symbol {key}: {m['tp']}TP/{m['sl']}SL in {m['decided']} decided setups over last {symbol_block_hours:.0f}h, WR {m['wr']:.1f}%"}
 
         hour_watch = {}
         for key, b in by_hour.items():
@@ -46146,6 +46181,8 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
             'combo_strategy_side_block': combo_strategy_side_block,
             'legacy_combo_side_block': legacy_combo_side_block,
             'symbol_block': symbol_block, 'hour_watch': hour_watch,
+            'symbol_block_hours': float(symbol_block_hours),
+            'symbol_recent_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_symbol_recent.items()},
             'combo_side_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo_side.items()},
             'combo_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo.items()},
             'combo_strategy_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_combo_strategy.items()},
@@ -46293,7 +46330,11 @@ def _setup_edge_guard_snapshot_text(uid: int = 0, hours: int | None = None) -> s
         hw = sorted(list((data or {}).get('hour_watch') or {}))
         side_exp = _setup_combo_format_policy_ts(_setup_edge_guard_interim_until_ts()) if _setup_edge_guard_interim_active() else '-'
         static_sy = [str(x).upper().strip() for x in (globals().get('SETUP_EDGE_GUARD_INTERIM_SYMBOL_LIST', ()) or ()) if str(x).strip()]
-        sym_exp = (_setup_combo_format_policy_ts(_setup_edge_guard_symbol_until_ts()) if (static_sy and _setup_edge_guard_symbol_interim_active()) else 'rolling evidence only')
+        try:
+            sym_hours_txt = float((data or {}).get('symbol_block_hours') or globals().get('SETUP_EDGE_GUARD_SYMBOL_WINDOW_HOURS', 24) or 24)
+        except Exception:
+            sym_hours_txt = 24.0
+        sym_exp = (_setup_combo_format_policy_ts(_setup_edge_guard_symbol_until_ts()) if (static_sy and _setup_edge_guard_symbol_interim_active()) else f'rolling last {sym_hours_txt:.0f}h evidence')
         return (
             f"Micro edge guard: {'ON' if bool(globals().get('SETUP_EDGE_MICRO_GUARD_ENABLED', True)) else 'OFF'}"
             f" | Block lane={', '.join(cs[:10]) if cs else '-'}"
@@ -46491,6 +46532,15 @@ def _setup_combo_sync_active_policy_bridge(uid: int, matrix_rows: list[dict] | N
         return rep
 
 def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int, str, float]:
+    """Convert lane evidence into KEEP / WATCH / DISABLE.
+
+    yver103 policy intent:
+    - KEEP = enough decided evidence and a real positive edge.
+    - WATCH = promising, borderline, or insufficient evidence; still collected in the background
+      but not shown to subscribers when user-facing outputs are KEEP-only.
+    - DISABLE = clearly bad evidence only. A lane with WR >= 50% or positive AvgR must not be
+      disabled simply because it is below the KEEP threshold.
+    """
     try:
         total = int(st.get('setups') or 0)
         decided = int(st.get('decided') or 0)
@@ -46500,17 +46550,43 @@ def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int
         wr = float(st.get('wr') or 0.0)
         avg_r = float(st.get('avg_r') or 0.0)
         min_decided = int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY if int(window_hours or 0) >= 72 else SETUP_COMBO_POLICY_MIN_DECIDED_DAILY)
+        min_decided = max(1, int(min_decided))
+
         score = (wr - 50.0) * 1.20 + avg_r * 22.0 + min(20, decided) * 0.45 - ((op / max(1, total)) * 4.0)
-        if decided < max(1, min_decided):
-            return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'Need more decided results ({decided}/{min_decided})', float(score)
-        if wr >= float(SETUP_COMBO_POLICY_KEEP_WR) and avg_r >= float(SETUP_COMBO_POLICY_KEEP_AVG_R):
+
+        # No/low decided evidence is probation, not a hard block. This is why 100% WR
+        # from 1-3 decided rows should show WATCH, not DISABLE.
+        if decided < min_decided:
+            if decided <= 0:
+                return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'No decided results yet ({decided}/{min_decided}); probation/watch', float(score)
+            if wr >= float(SETUP_COMBO_POLICY_WATCH_WR) or avg_r > float(SETUP_COMBO_POLICY_DISABLE_AVG_R) or tp > 0:
+                return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'Promising but not enough decided results ({decided}/{min_decided}); keep collecting data', float(score)
+            return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'Insufficient decided results ({decided}/{min_decided}); keep collecting data', float(score)
+
+        # Strong normal promotion.
+        if wr >= float(SETUP_COMBO_POLICY_KEEP_WR) and avg_r >= float(SETUP_COMBO_POLICY_KEEP_AVG_R) and tp >= max(1, sl):
             return 'KEEP', 1, 'Positive edge: WR/AvgR above keep threshold', float(score)
-        if wr < float(SETUP_COMBO_POLICY_DISABLE_WR) or avg_r <= float(SETUP_COMBO_POLICY_DISABLE_AVG_R) or (sl >= tp + 2 and decided >= min_decided):
-            return 'DISABLE', 0, 'Negative edge: weak WR/AvgR or SL-heavy combo', float(score)
+
+        # Quality promotion for lanes just under 55% WR but with strong payoff profile.
+        # Example: 54.5% WR with AvgR +0.66 should be eligible for KEEP, not DISABLE.
+        if wr >= float(SETUP_COMBO_POLICY_WATCH_WR) and avg_r >= float(SETUP_COMBO_POLICY_PROMOTE_AVG_R) and tp > sl:
+            return 'KEEP', 1, 'Positive edge: WR >=50% with strong AvgR/payoff profile', float(score)
+
+        # Borderline/profitable lanes remain WATCH. They are not subscriber-facing while
+        # /screen/email are KEEP-only, but the bot continues learning them.
+        if wr >= float(SETUP_COMBO_POLICY_WATCH_WR) or avg_r > float(SETUP_COMBO_POLICY_DISABLE_AVG_R):
+            return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, 'Borderline/profitable edge; WATCH and keep collecting data', float(score)
+
+        # Hard disable only for clearly negative evidence.
+        severe_sl_heavy = (sl >= tp + 2 and decided >= min_decided and wr < float(SETUP_COMBO_POLICY_WATCH_WR))
+        clearly_weak = (wr < float(SETUP_COMBO_POLICY_DISABLE_WR) and avg_r <= float(SETUP_COMBO_POLICY_DISABLE_AVG_R))
+        negative_payoff = (wr < float(SETUP_COMBO_POLICY_WATCH_WR) and avg_r < -0.15)
+        if clearly_weak or negative_payoff or severe_sl_heavy:
+            return 'DISABLE', 0, 'Negative edge: clearly weak WR/AvgR or SL-heavy combo', float(score)
+
         return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, 'Borderline edge; keep collecting data', float(score)
     except Exception:
         return 'WATCH', 1, 'Policy calculation error; allowed by safety default', 0.0
-
 
 
 def _setup_combo_policy_context_feed_adjust_rows(uid: int, hours: int, rows: list[dict]) -> tuple[list[dict], dict]:
@@ -46545,6 +46621,22 @@ def _setup_combo_policy_context_feed_adjust_rows(uid: int, hours: int, rows: lis
                 out.append(r); continue
             total = int(r.get('setups') or 0)
             if total <= 0:
+                out.append(r); continue
+            decided_exact = int(r.get('decided') or 0)
+            tp_exact = int(r.get('tp') or 0)
+            sl_exact = int(r.get('sl') or 0)
+            wr_exact = float(r.get('win_rate') or 0.0)
+            avg_r_exact = float(r.get('avg_r') or 0.0)
+            min_decided_exact = int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY if int(hours or 0) >= 72 else SETUP_COMBO_POLICY_MIN_DECIDED_DAILY)
+            # yver103: broad side/session weakness can protect against unknown or weak lanes,
+            # but it must not hard-disable an exact lane that is already positive or promising.
+            exact_promising = (
+                (decided_exact > 0 and (wr_exact >= float(SETUP_COMBO_POLICY_WATCH_WR) or avg_r_exact > float(SETUP_COMBO_POLICY_DISABLE_AVG_R) or tp_exact > sl_exact))
+                or (decided_exact < max(1, min_decided_exact) and tp_exact > 0 and avg_r_exact >= 0.0)
+            )
+            if exact_promising:
+                prior = str(r.get('notes') or '').strip()
+                r['notes'] = (prior + '; ' if prior else '') + 'Policy context feed: exact lane is promising, kept as ' + action
                 out.append(r); continue
             side = str(r.get('side') or '').upper().strip()
             sess = str(r.get('session') or '').upper().strip()
@@ -47109,9 +47201,11 @@ def _setup_edge_deep_text(uid: int, hours: int = 168, start_ts: float | None = N
                 continue
             wr_i = tp / max(1, dec) * 100.0
             avg_r_i = float(b.get('r_sum') or 0.0) / max(1, dec)
-            if wr_i < float(SETUP_COMBO_POLICY_DISABLE_WR) or avg_r_i <= float(SETUP_COMBO_POLICY_DISABLE_AVG_R) or (sl >= tp + 2 and dec >= min_dec_weekly):
+            # yver103: deep-analysis recommendation mirrors the live policy tiers.
+            act_i, _en_i, _notes_i, _score_i = _setup_combo_action_for_stats({'setups': int(b.get('setups') or dec), 'decided': dec, 'tp': tp, 'sl': sl, 'nohit': nh, 'open': int(b.get('open') or 0), 'wr': wr_i, 'avg_r': avg_r_i}, hours)
+            if act_i == 'DISABLE':
                 rec_disable.append(lane)
-            elif wr_i < 50.0 or avg_r_i < 0.0:
+            elif act_i == 'WATCH':
                 rec_tighten.append(lane)
 
         # Keep Telegram output below the split threshold so code blocks do not break.
