@@ -1,4 +1,4 @@
-# yver109: final live-test sync hardening: runtime-configurable KEEP+WATCH exposure, stronger AutoTrade candidate continuation, v109 cache separation, and end-to-end report/screen/email/AutoTrade alignment checks.
+# yver110: final live-test sync hardening: runtime-configurable KEEP+WATCH exposure, stronger AutoTrade candidate continuation, v110 cache separation, and end-to-end report/screen/email/AutoTrade alignment checks.
 # yver107: replaces fixed TP RR cap with dynamic live AutoTrade TP RR targeting (default 1.5R-4.0R) based on policy/quality/conf/volume/momentum; trailing remains off by default to preserve one TP + one SL lifecycle.
 # yver106: caps live AutoTrade TP RR to avoid unrealistic far targets, reports live open Risk$/TP$ from actual Bybit position geometry, and exposes AUTOTRADE_TP_RR_CAP settings in /autotrade_config.
 # yver108: AutoTrade now consumes KEEP+WATCH executable queue directly even if email delivery is delayed, broad side/session context is advisory for exact KEEP/WATCH lanes, and open-report Risk$/TP$ uses live Bybit TP/SL geometry without stale override.
@@ -565,7 +565,7 @@ AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY = 'daily_realized_loss_stop_e
 AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY = 'daily_realized_loss_stop_pct'
 AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY = 'require_realized_combo_edge'
 AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY = 'context_feed_guard_enabled'
-# yver109: runtime-switchable policy exposure for final live testing.
+# yver110: runtime-switchable policy exposure for final live testing.
 # Defaults remain KEEP+strict WATCH for /screen, setup emails and AutoTrade.
 AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY = 'allow_watch_policy'
 USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY = 'user_visible_allow_watch_policy'
@@ -808,7 +808,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
         AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18),
-        AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True) else 0,
+        AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False) else 0,
         AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY: 1 if env_bool('AUTOTRADE_STRICT_TPSL_ONLY', True) else 0,
         AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY: 1 if env_bool('AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', True) else 0,
         AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY: 1 if env_bool('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False) else 0,
@@ -834,6 +834,14 @@ def _autotrade_bootstrap_runtime_config() -> None:
                 _autotrade_config_set(k, v)
         except Exception:
             pass
+    # Ver110: AutoTrade is queue-direct. Do not let an old persisted
+    # require-email flag silently block executable KEEP/WATCH setups or confuse
+    # /autotrade_config. Only an explicit environment override may keep it on.
+    try:
+        if 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY' not in os.environ:
+            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 0)
+    except Exception:
+        pass
 
 
 def _autotrade_risk_per_trade_pct() -> float:
@@ -1485,9 +1493,9 @@ def _setup_generation_blackout_windows() -> str:
 
 def _autotrade_require_setup_email_for_entry() -> bool:
     try:
-        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False)
     except Exception:
-        return bool(globals().get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True))
+        return bool(globals().get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False))
 
 def _autotrade_hard_risk_cap_usd(equity: float, multiplier: float | None = None) -> float:
     '''Hard per-position risk cap from base risk and dynamic max multiplier.'''
@@ -1561,7 +1569,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)),
         'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)),
         'SETUP_REVERSE_TARGET_RR': float(globals().get('SETUP_REVERSE_TARGET_RR', 1.20) or 1.20),
-        'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY': _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True),
+        'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY': _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False),
     }
 
 
@@ -2455,8 +2463,8 @@ _AUTONOMOUS_SCREEN_SYNC_LOCK = asyncio.Lock()
 # 07May_v01: this job was firing every 60s while one run often needed >60s,
 # which produced repeated APScheduler "maximum number of running instances" warnings.
 # Keep the autonomous lane hot, but make the schedule longer than the hard runtime budget.
-AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC", "120") or 120)
-AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC", "180") or 180)
+AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC", "90") or 90)
+AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC", "300") or 300)
 AUTONOMOUS_SCREEN_SYNC_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_FIRST_SEC", "45") or 55)
 AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_USERS", "1") or 1)
 
@@ -2905,7 +2913,7 @@ SETUP_ADAPTIVE_STRONG_MIN_DECIDED = max(2, int(globals().get('SETUP_ADAPTIVE_STR
 AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH = int(os.environ.get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', '0') or 0)
 # Ver57: AutoTrade must not open from a hidden executable row before the setup email is sent.
 # The scheduled job can still catch up emailed rows, but email is the authorising/sync point.
-AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
+AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False)
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
@@ -4582,7 +4590,7 @@ def _user_visible_require_keep_policy(lane: str = '') -> bool:
 
 def _user_visible_allow_watch_policy(lane: str = '') -> bool:
     try:
-        # yver109: one runtime switch for subscriber-facing exposure across /screen
+        # yver110: one runtime switch for subscriber-facing exposure across /screen
         # and setup emails. Defaults to KEEP+strict WATCH; set false for KEEP-only.
         l = str(lane or '').lower().strip()
         fallback = True
@@ -11899,7 +11907,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v109:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v110:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -19160,7 +19168,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v109:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v110:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -40482,7 +40490,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
             f"AUTOTRADE_MAX_TRADES_PER_DAY = {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0))} (default 50; env can allow 0=unlimited)",
             f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
-            f"AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)) else 'false'}",
+            f"AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False)) else 'false'} (queue-direct; false recommended)",
             f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
             f"SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED = {'true' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'false'}",
@@ -40520,7 +40528,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 2.0",
             "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
             "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 4.0",
-            "• Strict TP/SL lifecycle is ON. Scheduled ASIA flat is ON by default; max-hold is optional and controlled by AUTOTRADE_MAX_POSITION_HOURS_ENABLED.",
+            "• Strict TP/SL lifecycle is ON. Scheduled ASIA flat is configurable above; max-hold is optional and controlled by AUTOTRADE_MAX_POSITION_HOURS_ENABLED.",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
             "• /autotrade_config AUTOTRADE_MODE live",
@@ -40530,7 +40538,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (default; env can allow 0=unlimited)",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0",
-            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY true",
+            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (recommended; AutoTrade uses executable queue directly)",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
             "• /autotrade_config AUTOTRADE_ISOLATED true",
@@ -40728,9 +40736,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             globals()['AUTOTRADE_ALLOW_WATCH_POLICY'] = bool(val)
             _autotrade_config_set(AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if val else 0)
             try:
-                cache_delete(f"autotrade_db_setups_v109:{int(AUTOTRADE_OWNER_UID or 0)}:ASIA:24:30")
-                cache_delete(f"autotrade_db_setups_v109:{int(AUTOTRADE_OWNER_UID or 0)}:LON:24:30")
-                cache_delete(f"autotrade_db_setups_v109:{int(AUTOTRADE_OWNER_UID or 0)}:NY:24:30")
+                cache_delete(f"autotrade_db_setups_v110:{int(AUTOTRADE_OWNER_UID or 0)}:ASIA:24:30")
+                cache_delete(f"autotrade_db_setups_v110:{int(AUTOTRADE_OWNER_UID or 0)}:LON:24:30")
+                cache_delete(f"autotrade_db_setups_v110:{int(AUTOTRADE_OWNER_UID or 0)}:NY:24:30")
             except Exception:
                 pass
         elif key == 'USER_VISIBLE_ALLOW_WATCH_POLICY':
@@ -56920,6 +56928,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         if int(_bigmove_user_limit or 0) > 0:
             users_bigmove = users_bigmove[:int(_bigmove_user_limit)]
         for u in users_bigmove:
+            # Ver110: Big-Move is important, but it must not consume the entire
+            # alert_job runtime and starve the normal session setup/email/autotrade pool.
+            if _bigmove_session_reserve_hit():
+                logger.warning("alert_job bigmove queue reserved session budget after %.1fs", time.time() - job_started_ts)
+                break
             if _job_budget_exhausted():
                 logger.warning("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
                 break
@@ -59524,7 +59537,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v109:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v110:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
@@ -60058,7 +60071,9 @@ def main():
         # ALERT_LOCK already prevent overlap, so we do not stretch the interval to the
         # worst-case runtime. A slow tick is simply coalesced/skipped; the next tick keeps
         # the pipeline alive.
-        interval_sec = max(30, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60))
+        # Ver110: schedule interval must be longer than the allowed runtime to avoid
+        # APScheduler max_instances skipped-run warnings on Render.
+        interval_sec = max(90, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 30)
     
         app.job_queue.run_repeating(
             alert_job,
@@ -60075,10 +60090,12 @@ def main():
         # Ver22 major patch: run the /screen-equivalent setup/email/autotrade lane
         # automatically. This is the safety net that prevents manual /screen from being
         # the only thing that discovers and emails setups.
+        # Ver110: the screen sync lane is a safety/UX accelerator. Keep it slower
+        # than its runtime budget to prevent repeated max_instances warnings.
         auto_screen_interval_sec = max(
-            180,
-            int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 180),
-            int(AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC or 120) + 60,
+            300,
+            int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 300),
+            int(AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC or 90) + 120,
         )
         app.job_queue.run_repeating(
             autonomous_screen_sync_job,
