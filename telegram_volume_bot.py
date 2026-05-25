@@ -1,3 +1,5 @@
+# yver107: replaces fixed TP RR cap with dynamic live AutoTrade TP RR targeting (default 1.5R-4.0R) based on policy/quality/conf/volume/momentum; trailing remains off by default to preserve one TP + one SL lifecycle.
+# yver106: caps live AutoTrade TP RR to avoid unrealistic far targets, reports live open Risk$/TP$ from actual Bybit position geometry, and exposes AUTOTRADE_TP_RR_CAP settings in /autotrade_config.
 # yver105: adds /setup_audit_keep_watch and /setup_keep_watch_summary to show compact KEEP+WATCH totals: combo count, Set, TP, SL, NH, Open, and WR.
 # yver104: allows KEEP + strict WATCH policy lanes for /screen, setup emails, and AutoTrade; DISABLE remains blocked, KEEP is prioritized, and WATCH must still pass final/context/symbol guards.
 # yver103: recalibrates setup combo policy tiers so strong/positive small-sample lanes become WATCH instead of DISABLE, high AvgR 50%+ lanes can become KEEP, and broad context cannot downgrade promising exact lanes.
@@ -561,6 +563,14 @@ AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY = 'daily_realized_loss_stop_e
 AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY = 'daily_realized_loss_stop_pct'
 AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY = 'require_realized_combo_edge'
 AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY = 'context_feed_guard_enabled'
+# yver106: cap live AutoTrade TP distance by RR so a tiny SL does not create an unrealistic far TP.
+AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY = 'tp_rr_cap_enabled'
+AUTOTRADE_CFG_MAX_LIVE_RR_KEY = 'max_live_rr'
+AUTOTRADE_CFG_MIN_LIVE_RR_KEY = 'min_live_rr'
+# yver107: dynamic TP RR target. This keeps exactly one exchange TP and one SL,
+# but avoids both too-small fixed targets and unrealistic 10R+ TP targets.
+AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY = 'dynamic_tp_rr_enabled'
+AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY = 'dynamic_tp_base_rr'
 # Ver20: admin-controlled Melbourne blackout windows. AutoTrade entry blackout
 # controls live Bybit entries; setup-generation blackout controls executable/email
 # setup creation for all users. Both are stored in autotrade_config so the admin
@@ -803,6 +813,11 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: float(os.environ.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', '3.0') or 3.0),
         AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True) else 0,
         AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1 if env_bool('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True) else 0,
+        AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_TP_RR_CAP_ENABLED', True) else 0,
+        AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_TP_RR_ENABLED', True) else 0,
+        AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', '2.0') or 2.0),
+        AUTOTRADE_CFG_MAX_LIVE_RR_KEY: float(os.environ.get('AUTOTRADE_MAX_LIVE_RR', '4.0') or 4.0),
+        AUTOTRADE_CFG_MIN_LIVE_RR_KEY: float(os.environ.get('AUTOTRADE_MIN_LIVE_RR', '1.5') or 1.5),
     }
     for k, v in defaults.items():
         try:
@@ -1092,6 +1107,227 @@ def _autotrade_context_feed_guard_enabled() -> bool:
         return bool(globals().get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True))
 
 
+def _autotrade_tp_rr_cap_enabled() -> bool:
+    try:
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY, 'AUTOTRADE_TP_RR_CAP_ENABLED', True)
+    except Exception:
+        return True
+
+
+def _autotrade_max_live_rr() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, os.environ.get('AUTOTRADE_MAX_LIVE_RR', '4.0')) or 4.0)
+    except Exception:
+        val = 4.0
+    return max(1.05, min(10.0, float(val)))
+
+
+def _autotrade_min_live_rr() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_MIN_LIVE_RR_KEY, os.environ.get('AUTOTRADE_MIN_LIVE_RR', '1.5')) or 1.5)
+    except Exception:
+        val = 1.5
+    return max(0.50, min(5.0, float(val)))
+
+
+
+def _autotrade_dynamic_tp_rr_enabled() -> bool:
+    try:
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY, 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED', True)
+    except Exception:
+        return True
+
+
+def _autotrade_dynamic_tp_base_rr() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY, os.environ.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', '2.0')) or 2.0)
+    except Exception:
+        val = 2.0
+    return max(1.0, min(6.0, float(val)))
+
+
+def _setup_attr_float(setup, name: str, default: float = 0.0) -> float:
+    try:
+        if isinstance(setup, dict):
+            return float(setup.get(name, default) or default)
+        return float(getattr(setup, name, default) or default)
+    except Exception:
+        return float(default)
+
+
+def _setup_attr_str(setup, name: str, default: str = '') -> str:
+    try:
+        if isinstance(setup, dict):
+            return str(setup.get(name, default) or default)
+        return str(getattr(setup, name, default) or default)
+    except Exception:
+        return str(default)
+
+
+def _autotrade_dynamic_tp_rr_target(setup=None, session_name: str = '', user_id: int | None = None, original_rr: float = 0.0) -> tuple[float, dict]:
+    """Return the live AutoTrade TP RR target for this setup.
+
+    Design rule:
+    - Never create multiple TP orders.
+    - Do not use trailing by default because it conflicts with the user's preferred
+      one-TP/one-SL lifecycle and can close good trends too early in noisy 15m candles.
+    - Use dynamic target RR: weaker WATCH/low-quality setups near the floor, strong KEEP
+      setups can run toward the cap.
+    """
+    min_rr = float(_autotrade_min_live_rr())
+    max_rr = float(_autotrade_max_live_rr())
+    if max_rr < min_rr:
+        max_rr = min_rr
+    base_rr = max(min_rr, min(max_rr, float(_autotrade_dynamic_tp_base_rr())))
+    target = float(base_rr)
+    detail = {
+        'mode': 'dynamic',
+        'min_rr': float(min_rr),
+        'base_rr': float(base_rr),
+        'max_rr': float(max_rr),
+        'original_rr': float(original_rr or 0.0),
+    }
+    try:
+        conf = float(_setup_attr_float(setup, 'conf', 0.0))
+        dyn = float(_setup_attr_float(setup, 'quality_score', 0.0))
+        if dyn <= 0:
+            dyn = float(_setup_attr_float(setup, 'dynamic_risk_score', 0.0))
+        vol = float(_setup_attr_float(setup, 'fut_vol_usd', 0.0))
+        side_u = _setup_attr_str(setup, 'side', '').upper().strip()
+        ch15 = float(_setup_attr_float(setup, 'ch15', 0.0))
+        ch1 = float(_setup_attr_float(setup, 'ch1', 0.0))
+        ch4 = float(_setup_attr_float(setup, 'ch4', 0.0))
+        engine = _setup_attr_str(setup, 'engine', '').upper()
+        combo = ''
+        try:
+            combo = _setup_combo_key_for_setup(setup, session_name=session_name)
+        except Exception:
+            combo = ''
+        pstatus = ''
+        try:
+            pinfo = _setup_combo_policy_lookup_for_setup(setup, session_name=session_name, user_id=int(user_id or AUTOTRADE_OWNER_UID or 0))
+            pstatus = _setup_policy_effective_status(str((pinfo or {}).get('status') or '').upper().strip(), found=bool((pinfo or {}).get('found')))
+        except Exception:
+            pstatus = ''
+
+        adj = 0.0
+        if pstatus == 'KEEP':
+            adj += 0.35
+        elif pstatus == 'WATCH':
+            adj -= 0.15
+        elif pstatus:
+            adj -= 0.35
+
+        if conf >= 92:
+            adj += 0.55
+        elif conf >= 88:
+            adj += 0.35
+        elif conf >= 84:
+            adj += 0.15
+        elif conf > 0 and conf < 80:
+            adj -= 0.25
+
+        if dyn >= 90:
+            adj += 0.50
+        elif dyn >= 80:
+            adj += 0.30
+        elif dyn >= 65:
+            adj += 0.10
+        elif dyn > 0 and dyn < 55:
+            adj -= 0.30
+
+        if vol >= 500_000_000:
+            adj += 0.30
+        elif vol >= 150_000_000:
+            adj += 0.18
+        elif vol >= 50_000_000:
+            adj += 0.08
+        elif 0 < vol < 25_000_000:
+            adj -= 0.12
+
+        # Momentum confirmation: only a small influence, because REV lanes are not
+        # always trend-following. This avoids pushing weak/noisy setups to high RR.
+        direction_score = 0
+        if side_u == 'BUY':
+            direction_score = (1 if ch15 > 0 else -1 if ch15 < 0 else 0) + (1 if ch1 > 0 else -1 if ch1 < 0 else 0) + (1 if ch4 > 0 else -1 if ch4 < 0 else 0)
+        elif side_u == 'SELL':
+            direction_score = (1 if ch15 < 0 else -1 if ch15 > 0 else 0) + (1 if ch1 < 0 else -1 if ch1 > 0 else 0) + (1 if ch4 < 0 else -1 if ch4 > 0 else 0)
+        if direction_score >= 2:
+            adj += 0.25
+        elif direction_score <= -2:
+            adj -= 0.25
+
+        if 'BIG' in engine or 'F8' in combo:
+            adj += 0.20
+
+        target = max(min_rr, min(max_rr, base_rr + adj))
+        # Round target RR to a practical 0.05R increment.
+        target = round(float(target) / 0.05) * 0.05
+        target = max(min_rr, min(max_rr, target))
+        detail.update({
+            'policy': str(pstatus or ''),
+            'combo': str(combo or ''),
+            'conf': float(conf),
+            'dynamic_score': float(dyn),
+            'volume_usd': float(vol),
+            'momentum_direction_score': int(direction_score),
+            'adjustment': float(adj),
+            'target_rr': float(target),
+        })
+    except Exception as exc:
+        detail.update({'mode': 'dynamic_fallback', 'error': f'{type(exc).__name__}: {exc}', 'target_rr': float(target)})
+    return float(target), detail
+
+
+def _autotrade_tp_for_rr(symbol: str, entry: float, sl: float, side: str, rr: float) -> float:
+    try:
+        e = float(entry or 0.0); s = float(sl or 0.0); r = float(rr or 0.0)
+        if e <= 0 or s <= 0 or r <= 0:
+            return 0.0
+        risk = abs(e - s)
+        if risk <= 0:
+            return 0.0
+        side_u = str(side or '').upper().strip()
+        if side_u == 'SELL':
+            raw_tp = e - risk * r
+            rounding = ROUND_UP  # do not exceed target RR after tick rounding
+        else:
+            raw_tp = e + risk * r
+            rounding = ROUND_DOWN
+        try:
+            new_tp = _round_price_to_tick(str(symbol or ''), float(raw_tp), rounding=rounding)
+        except Exception:
+            new_tp = float(raw_tp)
+        return float(new_tp or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _autotrade_adjust_tp_to_dynamic_rr(symbol: str, entry: float, sl: float, tp: float, side: str, setup=None, session_name: str = '', user_id: int | None = None) -> tuple[float, bool, float, float, dict]:
+    """Apply dynamic RR target to a single full-position TP.
+
+    Returns (new_tp, changed, old_rr, new_rr, detail). This can cap far targets
+    and lift too-small targets to the configured minimum RR, while preserving one TP.
+    """
+    try:
+        old_rr = _autotrade_rr_value(entry, sl, tp, side)
+        if old_rr <= 0:
+            return float(tp or 0.0), False, 0.0, 0.0, {'mode': 'invalid_original_rr'}
+        if _autotrade_dynamic_tp_rr_enabled():
+            target_rr, detail = _autotrade_dynamic_tp_rr_target(setup=setup, session_name=session_name, user_id=user_id, original_rr=old_rr)
+        else:
+            target_rr = min(max(float(old_rr), float(_autotrade_min_live_rr())), float(_autotrade_max_live_rr()))
+            detail = {'mode': 'static_min_max', 'target_rr': float(target_rr), 'min_rr': float(_autotrade_min_live_rr()), 'max_rr': float(_autotrade_max_live_rr()), 'original_rr': float(old_rr)}
+        new_tp = _autotrade_tp_for_rr(symbol, entry, sl, side, target_rr)
+        new_rr = _autotrade_rr_value(entry, sl, new_tp, side)
+        if new_tp <= 0 or new_rr <= 0:
+            return float(tp or 0.0), False, float(old_rr), float(old_rr), {**detail, 'adjust_error': 'new_tp_invalid'}
+        changed = abs(float(new_tp) - float(tp or 0.0)) > max(abs(float(tp or 0.0)) * 1e-9, 1e-12)
+        detail.update({'target_rr': float(target_rr), 'new_rr': float(new_rr), 'changed': bool(changed), 'new_tp': float(new_tp)})
+        return float(new_tp), bool(changed), float(old_rr), float(new_rr), detail
+    except Exception as exc:
+        return float(tp or 0.0), False, 0.0, 0.0, {'mode': 'exception', 'error': f'{type(exc).__name__}: {exc}'}
+
 def _autotrade_keep_all_test_mode() -> bool:
     try:
         return bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN', False))
@@ -1306,6 +1542,11 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT': float(_autotrade_daily_realized_loss_stop_pct()),
         'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE': bool(_autotrade_require_realized_combo_edge()),
         'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED': bool(_autotrade_context_feed_guard_enabled()),
+        'AUTOTRADE_TP_RR_CAP_ENABLED': bool(_autotrade_tp_rr_cap_enabled()),
+        'AUTOTRADE_DYNAMIC_TP_RR_ENABLED': bool(_autotrade_dynamic_tp_rr_enabled()),
+        'AUTOTRADE_DYNAMIC_TP_BASE_RR': float(_autotrade_dynamic_tp_base_rr()),
+        'AUTOTRADE_MAX_LIVE_RR': float(_autotrade_max_live_rr()),
+        'AUTOTRADE_MIN_LIVE_RR': float(_autotrade_min_live_rr()),
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)),
         'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)),
@@ -1993,6 +2234,45 @@ def _autotrade_apply_ver47_runtime_defaults_resync() -> None:
     except Exception:
         pass
 
+
+
+def _autotrade_apply_ver107_dynamic_tp_defaults() -> None:
+    """yver107: migrate old fixed 2R live TP cap to dynamic 1.5R-4.0R defaults once.
+
+    Existing DBs from yver106 may already store max_live_rr=2.0 and min_live_rr=1.0.
+    Bootstrap does not overwrite stored values, so this migration upgrades only those
+    old defaults unless the owner has explicitly changed them.
+    """
+    try:
+        target_version = 'yver107_2026_05_25_dynamic_tp_rr'
+        if str(_autotrade_config_get('ver107_dynamic_tp_rr_version', '') or '').strip().lower() == target_version:
+            return
+        try:
+            old_max = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, 0) or 0)
+        except Exception:
+            old_max = 0.0
+        try:
+            old_min = float(_autotrade_config_get(AUTOTRADE_CFG_MIN_LIVE_RR_KEY, 0) or 0)
+        except Exception:
+            old_min = 0.0
+        try:
+            old_base = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY, 0) or 0)
+        except Exception:
+            old_base = 0.0
+
+        _autotrade_config_set(AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY, 1)
+        if old_base <= 0:
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY, 2.0)
+        # Upgrade the exact old yver106 defaults. If the admin had set a different
+        # value, keep it.
+        if old_min <= 0 or abs(old_min - 1.0) < 1e-9:
+            _autotrade_config_set(AUTOTRADE_CFG_MIN_LIVE_RR_KEY, 1.5)
+        if old_max <= 0 or abs(old_max - 2.0) < 1e-9:
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, 4.0)
+        _autotrade_config_set('ver107_dynamic_tp_rr_version', target_version)
+    except Exception:
+        pass
 
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
@@ -5889,6 +6169,7 @@ try:
     _autotrade_apply_ver36_user_runtime_defaults_resync()
     _autotrade_apply_ver43_runtime_defaults_resync()
     _autotrade_apply_ver47_runtime_defaults_resync()
+    _autotrade_apply_ver107_dynamic_tp_defaults()
 except Exception:
     pass
 
@@ -6979,6 +7260,23 @@ def _estimate_position_risk_usd(p: dict) -> float:
         except Exception:
             cs = 1.0
         return _autotrade_true_risk_usd(entry, sl, size, cs)
+    except Exception:
+        return 0.0
+
+
+def _estimate_position_tp_usd(p: dict) -> float:
+    """Estimate full-position TP reward using live entry, native TP and instrument size."""
+    try:
+        entry = _pos_entry(p)
+        tp = _pos_take_profit(p)
+        size = abs(_pos_size(p))
+        if entry <= 0 or tp <= 0 or size <= 0:
+            return 0.0
+        try:
+            cs = float((_bybit_get_instr_filters(_pos_symbol(p)) or {}).get('contractSize') or 1.0)
+        except Exception:
+            cs = 1.0
+        return abs(float(tp) - float(entry)) * float(size) * abs(float(cs or 1.0))
     except Exception:
         return 0.0
 
@@ -8696,6 +8994,38 @@ def _autotrade_rr_value(entry: float, sl: float, tp: float, side: str) -> float:
         return float(reward / risk)
     except Exception:
         return 0.0
+
+
+def _autotrade_cap_tp_to_rr(symbol: str, entry: float, sl: float, tp: float, side: str, max_rr: float) -> tuple[float, bool, float, float]:
+    """Cap TP distance by live RR while preserving the existing SL risk geometry.
+
+    Returns (new_tp, capped, old_rr, new_rr). This is used only before creating a new
+    AutoTrade TP/SL order. It does not automatically rewrite already-open positions.
+    """
+    try:
+        e = float(entry or 0.0); s = float(sl or 0.0); t = float(tp or 0.0)
+        side_u = str(side or '').upper().strip()
+        cap = float(max_rr or 0.0)
+        old_rr = _autotrade_rr_value(e, s, t, side_u)
+        if e <= 0 or s <= 0 or t <= 0 or cap <= 0 or old_rr <= cap:
+            return float(t), False, float(old_rr or 0.0), float(old_rr or 0.0)
+        risk = abs(e - s)
+        if side_u == 'SELL':
+            raw_tp = e - risk * cap
+            rounding = ROUND_DOWN
+        else:
+            raw_tp = e + risk * cap
+            rounding = ROUND_UP
+        try:
+            new_tp = _round_price_to_tick(str(symbol or ''), float(raw_tp), rounding=rounding)
+        except Exception:
+            new_tp = float(raw_tp)
+        new_rr = _autotrade_rr_value(e, s, new_tp, side_u)
+        if new_tp <= 0 or new_rr <= 0:
+            return float(t), False, float(old_rr or 0.0), float(old_rr or 0.0)
+        return float(new_tp), True, float(old_rr or 0.0), float(new_rr or 0.0)
+    except Exception:
+        return float(tp or 0.0), False, 0.0, 0.0
 
 def _autotrade_repair_live_exit_protection(uid: int, trade_row: dict, live_pos: dict | None = None) -> dict:
     """Repair AutoTrade exits using native Full-position TP/SL only.
@@ -12772,10 +13102,32 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         return (False, 'tp_not_below_live_entry')
     live_rr = _autotrade_rr_value(price_ref, sl_for_order, live_final_tp, side)
     try:
-        min_live_rr = float(os.environ.get('AUTOTRADE_MIN_LIVE_RR', '1.0') or 1.0)
-    except Exception:
-        min_live_rr = 1.0
-    min_live_rr = max(1.0, float(min_live_rr or 1.0))
+        if _autotrade_tp_rr_cap_enabled():
+            _tp_before_dynamic = float(live_final_tp or 0.0)
+            _new_tp, _tp_changed, _old_live_rr, _new_live_rr, _rr_detail = _autotrade_adjust_tp_to_dynamic_rr(
+                sym, price_ref, sl_for_order, live_final_tp, side, setup=s, session_name=session_label, user_id=int(uid)
+            )
+            if _tp_changed:
+                live_final_tp = float(_new_tp)
+            live_rr = float(_new_live_rr or _autotrade_rr_value(price_ref, sl_for_order, live_final_tp, side))
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'dynamic_tp_rr_enabled': bool(_autotrade_dynamic_tp_rr_enabled()),
+                'tp_rr_adjust_applied': bool(_tp_changed),
+                'tp_rr_before_adjust': float(_old_live_rr or 0.0),
+                'tp_rr_after_adjust': float(live_rr or 0.0),
+                'tp_rr_target': float((_rr_detail or {}).get('target_rr') or live_rr or 0.0),
+                'tp_rr_detail': _rr_detail,
+                'tp_after_rr_adjust': float(live_final_tp or 0.0),
+                'tp_before_rr_adjust': float(_tp_before_dynamic or 0.0),
+            })
+    except Exception as _rr_cap_exc:
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({'tp_rr_dynamic_error': f'{type(_rr_cap_exc).__name__}: {_rr_cap_exc}'})
+        except Exception:
+            pass
+    min_live_rr = max(0.50, float(_autotrade_min_live_rr() or 1.0))
     if live_rr < min_live_rr:
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_rr_below_floor', 'live_rr': float(live_rr), 'min_live_rr': float(min_live_rr), 'fixed_setup_tp': float(live_final_tp), 'fixed_setup_sl': float(sl_for_order), 'live_entry': float(price_ref)})
@@ -12792,8 +13144,8 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'live_exit_tp': float(live_final_tp or 0.0),
             'live_exit_sl': float(sl_for_order or 0.0),
             'live_exit_rr': float(live_rr),
-            'live_tp_design': 'fixed_setup_tp_sl_position_full',
-            'exit_target_source': 'setup_fixed',
+            'live_tp_design': 'dynamic_rr_single_full_tp',
+            'exit_target_source': 'setup_fixed_then_dynamic_rr',
         })
     except Exception:
         pass
@@ -40082,6 +40434,11 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT = {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)):.2f}",
             f"AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) else 'false'}",
             f"AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED = {'true' if bool(summary.get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_TP_RR_CAP_ENABLED = {'true' if bool(summary.get('AUTOTRADE_TP_RR_CAP_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_DYNAMIC_TP_RR_ENABLED = {'true' if bool(summary.get('AUTOTRADE_DYNAMIC_TP_RR_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_DYNAMIC_TP_BASE_RR = {float(summary.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', 2.0)):.2f}",
+            f"AUTOTRADE_MAX_LIVE_RR = {float(summary.get('AUTOTRADE_MAX_LIVE_RR', 4.0)):.2f}",
+            f"AUTOTRADE_MIN_LIVE_RR = {float(summary.get('AUTOTRADE_MIN_LIVE_RR', 1.5)):.2f}",
             f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
             f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
             f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
@@ -40120,6 +40477,11 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
             "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE true",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
+            "• /autotrade_config AUTOTRADE_TP_RR_CAP_ENABLED true",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED true",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 2.0",
+            "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
+            "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 4.0",
             "• Strict TP/SL lifecycle is ON. Scheduled ASIA flat is ON by default; max-hold is optional and controlled by AUTOTRADE_MAX_POSITION_HOURS_ENABLED.",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
@@ -40165,6 +40527,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
         'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT',
         'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED',
+        'AUTOTRADE_TP_RR_CAP_ENABLED', 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED', 'AUTOTRADE_DYNAMIC_TP_BASE_RR', 'AUTOTRADE_MAX_LIVE_RR', 'AUTOTRADE_MIN_LIVE_RR',
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
@@ -40321,6 +40684,21 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED'] = bool(val)
             _autotrade_config_set(AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_TP_RR_CAP_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_DYNAMIC_TP_BASE_RR':
+            val = max(1.0, min(6.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY, val)
+        elif key == 'AUTOTRADE_MAX_LIVE_RR':
+            val = max(1.05, min(10.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, val)
+        elif key == 'AUTOTRADE_MIN_LIVE_RR':
+            val = max(0.50, min(5.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_MIN_LIVE_RR_KEY, val)
         elif key == 'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED'] = bool(val)
@@ -50187,7 +50565,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v99_realized_risk_sync:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v106_rr_cap_live_geometry:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -50290,8 +50668,31 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
 
     for p, tr in (bot_positions or []):
         row = _setup_audit_merge_trade_setup_row(tr)
+        # yver106: for OPEN rows, Bybit live position geometry is the authority for
+        # displayed Risk$/TP$. Stored setup metadata can be stale after entry slippage or
+        # TP RR capping, so override entry/SL/TP/qty from the live position when present.
         try:
-            row['risk_usd'] = float(_estimate_position_risk_usd(p) or row.get('risk_usd') or 0.0)
+            _live_entry = float(_pos_entry(p) or 0.0)
+            _live_sl = float(_pos_stop(p) or 0.0)
+            _live_tp = float(_pos_take_profit(p) or 0.0)
+            _live_qty = abs(float(_pos_size(p) or 0.0))
+            if _live_entry > 0:
+                row['entry'] = float(_live_entry)
+            if _live_sl > 0:
+                row['sl'] = float(_live_sl)
+            if _live_tp > 0:
+                row['tp'] = float(_live_tp)
+            if _live_qty > 0:
+                row['qty'] = float(_live_qty)
+            _live_risk = float(_estimate_position_risk_usd(p) or 0.0)
+            _live_tp_usd = float(_estimate_position_tp_usd(p) or 0.0)
+            if _live_risk > 0:
+                row['risk_usd'] = float(_live_risk)
+                row['risk_actual_usd'] = float(_live_risk)
+                row['risk_usd_source'] = 'live_position_geometry'
+            if _live_tp_usd > 0:
+                row['tp_usd'] = float(_live_tp_usd)
+                row['tp_usd_source'] = 'live_position_geometry'
         except Exception:
             pass
         row = _autotrade_report_enrich_amounts(row, _report_equity)
@@ -50626,7 +51027,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v99:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v106:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -51167,7 +51568,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v99:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v106:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
@@ -51209,7 +51610,7 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
 
-    cache_key = f"autotrade_report_text_cmd:v99_realized_risk_sync:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text_cmd:v106_rr_cap_live_geometry:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
