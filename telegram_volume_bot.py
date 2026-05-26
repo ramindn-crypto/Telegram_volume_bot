@@ -1,4 +1,5 @@
 # yver116: AutoTrade timeout reconciliation display hardening and longer placement budget.
+# yver119: forces the audit-match AutoTrade runtime profile with a new one-time DB migration marker so deployed databases that already skipped/marked yver118 are corrected; values remain Telegram-editable after migration.
 # yver118: audit-match live-test config defaults are applied through runtime autotrade_config (Telegram-editable): fixed 1.0% risk, dynamic risk OFF, fixed 1.5R TP, realised-combo self-block OFF, daily flat/catchup OFF, max-hold OFF, and context/deep-analysis guard ON.
 # yver117: aligns AutoTrade defaults with setup-audit/live-test goals: fixed 1.5R TP profile, fixed 1.0% risk by default, disables realised-combo self-blocking, and feeds deep side/session/hour lessons into strict WATCH gates for /screen, email and AutoTrade.
 # yver113: fixes Telegram slowdowns from heavy KEEP/WATCH summary and scheduler misfire noise: /setup_audit_keep_watch is cached/fast-cached-result based, autonomous screen/alert jobs get wider misfire grace, and ver112 menu changes are intentionally not included.
@@ -2421,6 +2422,74 @@ def _autotrade_apply_ver118_audit_match_config_defaults() -> None:
         _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, 1.0)
 
         _autotrade_config_set('ver118_audit_match_config_version', target_version)
+    except Exception:
+        pass
+
+
+def _autotrade_apply_ver119_audit_match_config_defaults() -> None:
+    """yver119: force-correct audit-match runtime config once, then keep it editable.
+
+    yver118 updated the help/examples but some deployed DBs still kept older values
+    (dynamic risk ON, dynamic TP ON, daily flat ON, realised-combo ON).  This uses a
+    fresh migration marker and writes the actual autotrade_config rows once on deploy.
+
+    Important: this is NOT a hard lock. After this marker is stored, the owner can
+    change any value from Telegram and restarts will preserve those changes.
+    """
+    try:
+        target_version = 'yver119_2026_05_27_force_audit_match_runtime_config'
+        if str(_autotrade_config_get('ver119_audit_match_config_version', '') or '').strip().lower() == target_version:
+            return
+
+        desired = {
+            # Clean, comparable sizing. Risk size does not affect WR, but dynamic
+            # sizing distorts PnL comparison between setup-audit and AutoTrade.
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.0,
+
+            # Fixed 1.5R so the live TP/SL model is stable and comparable.
+            AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MIN_LIVE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MAX_LIVE_RR_KEY: 1.5,
+
+            # Policy should be the source of setup selection; do not allow a small
+            # live-only AutoTrade sample to block policy-approved KEEP/WATCH lanes.
+            AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 0,
+            AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 1,
+            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 1,
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 0,
+
+            # Match setup-audit TP/SL horizon better: no operational daily flat or
+            # max-hold market exit unless the owner turns them back on from Telegram.
+            AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 0,
+
+            # Preserve strict one-TP/one-SL lifecycle. Do not market-close from
+            # temporary attach/risk events during the audit-match test.
+            AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY: 1,
+            AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY: 1,
+            AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY: 0,
+            AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY: 0,
+
+            # Keep live entry close to the audited setup entry.
+            AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: 1.0,
+        }
+        for k, v in desired.items():
+            try:
+                _autotrade_config_set(k, v)
+            except Exception:
+                pass
+
+        # Keep existing caps configurable. Do not force higher daily/open caps here;
+        # the owner can increase them if he wants more coverage, but safety defaults
+        # should remain under Telegram control.
+        _autotrade_config_set('ver119_audit_match_config_version', target_version)
     except Exception:
         pass
 
@@ -6426,6 +6495,7 @@ try:
     _autotrade_apply_ver107_dynamic_tp_defaults()
     _autotrade_apply_ver117_live_test_alignment_defaults()
     _autotrade_apply_ver118_audit_match_config_defaults()
+    _autotrade_apply_ver119_audit_match_config_defaults()
 except Exception:
     pass
 
