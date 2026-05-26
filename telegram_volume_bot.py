@@ -1,4 +1,5 @@
 # yver116: AutoTrade timeout reconciliation display hardening and longer placement budget.
+# yver117: aligns AutoTrade defaults with setup-audit/live-test goals: fixed 1.5R TP profile, fixed 1.0% risk by default, disables realised-combo self-blocking, and feeds deep side/session/hour lessons into strict WATCH gates for /screen, email and AutoTrade.
 # yver113: fixes Telegram slowdowns from heavy KEEP/WATCH summary and scheduler misfire noise: /setup_audit_keep_watch is cached/fast-cached-result based, autonomous screen/alert jobs get wider misfire grace, and ver112 menu changes are intentionally not included.
 # yver114: fixes runtime AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED/CATCHUP so /autotrade_config can turn the 09:55 Melbourne flat ON while STRICT_TPSL_ONLY remains true; schedules flat guardian jobs unconditionally so runtime toggles work without redeploy.
 # yver115: AutoTrade timeout reconciliation and longer bounded placement timeout; false timeout rows are rechecked against bot journal/live Bybit position before being reported as SKIP.
@@ -2315,6 +2316,47 @@ def _autotrade_apply_ver107_dynamic_tp_defaults() -> None:
         if old_max <= 0 or abs(old_max - 2.0) < 1e-9:
             _autotrade_config_set(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, 4.0)
         _autotrade_config_set('ver107_dynamic_tp_rr_version', target_version)
+    except Exception:
+        pass
+
+
+def _autotrade_apply_ver117_live_test_alignment_defaults() -> None:
+    """yver117: one-time runtime defaults for the next live test.
+
+    Goal: make AutoTrade outcomes easier to compare with setup-audit evidence and
+    improve realised WR consistency. Risk size does not change WR, so default to a
+    simple fixed 1.0% risk. Use a fixed 1.5R live TP profile rather than dynamic RR
+    while the system is still being validated. Disable realised AutoTrade combo self-
+    blocking because it is based on a small, config-dependent live sample and can
+    stop the bot from trading policy-approved KEEP/WATCH lanes. Deep setup context
+    remains ON and is now enforced for WATCH rows.
+    """
+    try:
+        target_version = 'yver117_2026_05_27_live_test_alignment'
+        if str(_autotrade_config_get('ver117_live_test_alignment_version', '') or '').strip().lower() == target_version:
+            return
+        # Fixed, comparable risk profile. Existing daily/open risk caps still apply.
+        _autotrade_config_set(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, 1.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, 1.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.0)
+        # Fixed 1.5R target for live validation. This avoids dynamic RR changing the
+        # hit-rate while preserving positive EV when WR is near 49%.
+        _autotrade_config_set(AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY, 1.5)
+        _autotrade_config_set(AUTOTRADE_CFG_MIN_LIVE_RR_KEY, 1.5)
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, 1.5)
+        # Policy should be the source of setup selection. Deep context remains the
+        # safety layer; small live AutoTrade samples should not independently block.
+        _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY, 1)
+        _autotrade_config_set(USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY, 1)
+        # Keep the 09:55 flat as configured by the owner; it is a risk-control rule.
+        # It means AutoTrade WR will be a live-execution WR, not exactly the 24h
+        # theoretical setup-audit WR.
+        _autotrade_config_set('ver117_live_test_alignment_version', target_version)
     except Exception:
         pass
 
@@ -4753,6 +4795,27 @@ AUTOTRADE_CONTEXT_SESSION_ESCAPE_MIN_DECIDED = int(os.environ.get("AUTOTRADE_CON
 AUTOTRADE_CONTEXT_SESSION_ESCAPE_WR = float(os.environ.get("AUTOTRADE_CONTEXT_SESSION_ESCAPE_WR", "55.0") or 55.0)
 AUTOTRADE_CONTEXT_SESSION_ESCAPE_AVGR = float(os.environ.get("AUTOTRADE_CONTEXT_SESSION_ESCAPE_AVGR", "0.35") or 0.35)
 
+# yver117: Deep-analysis lessons-learned gate for WATCH/probation lanes.
+# KEEP remains the strongest lane and is not killed by broad side/session context,
+# but WATCH rows must not bypass obvious deep-analysis weakness. The same helper is
+# used by /screen, setup emails and AutoTrade, so user-facing setups and real entries
+# stay synced. Exact lane strength can escape broad side/session/hour weakness.
+AUTOTRADE_CONTEXT_WATCH_DEEP_GUARD_ENABLED = env_bool("AUTOTRADE_CONTEXT_WATCH_DEEP_GUARD_ENABLED", True)
+AUTOTRADE_CONTEXT_WATCH_EXACT_ESCAPE_MIN_DECIDED = int(os.environ.get("AUTOTRADE_CONTEXT_WATCH_EXACT_ESCAPE_MIN_DECIDED", "3") or 3)
+AUTOTRADE_CONTEXT_WATCH_EXACT_ESCAPE_WR = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_EXACT_ESCAPE_WR", "55.0") or 55.0)
+AUTOTRADE_CONTEXT_WATCH_EXACT_ESCAPE_AVGR = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_EXACT_ESCAPE_AVGR", "0.25") or 0.25)
+AUTOTRADE_CONTEXT_WATCH_SIDE_MIN_DECIDED = int(os.environ.get("AUTOTRADE_CONTEXT_WATCH_SIDE_MIN_DECIDED", "100") or 100)
+AUTOTRADE_CONTEXT_WATCH_SIDE_WR_MAX = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_SIDE_WR_MAX", "35.0") or 35.0)
+AUTOTRADE_CONTEXT_WATCH_SIDE_AVGR_MAX = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_SIDE_AVGR_MAX", "0.00") or 0.00)
+AUTOTRADE_CONTEXT_WATCH_SESSION_MIN_DECIDED = int(os.environ.get("AUTOTRADE_CONTEXT_WATCH_SESSION_MIN_DECIDED", "100") or 100)
+AUTOTRADE_CONTEXT_WATCH_SESSION_WR_MAX = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_SESSION_WR_MAX", "40.0") or 40.0)
+AUTOTRADE_CONTEXT_WATCH_SESSION_AVGR_MAX = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_SESSION_AVGR_MAX", "0.05") or 0.05)
+AUTOTRADE_CONTEXT_WATCH_HOUR_MIN_DECIDED = int(os.environ.get("AUTOTRADE_CONTEXT_WATCH_HOUR_MIN_DECIDED", "10") or 10)
+AUTOTRADE_CONTEXT_WATCH_HOUR_WR_MAX = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_HOUR_WR_MAX", "35.0") or 35.0)
+AUTOTRADE_CONTEXT_WATCH_HOUR_AVGR_MAX = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_HOUR_AVGR_MAX", "0.00") or 0.00)
+AUTOTRADE_CONTEXT_WATCH_LOW_SAMPLE_MIN_CONF = int(os.environ.get("AUTOTRADE_CONTEXT_WATCH_LOW_SAMPLE_MIN_CONF", "87") or 87)
+AUTOTRADE_CONTEXT_WATCH_LOW_SAMPLE_MIN_DYNAMIC = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_LOW_SAMPLE_MIN_DYNAMIC", "75") or 75)
+
 
 def _autotrade_daily_realized_loss_stop_allows(uid: int) -> tuple[bool, str]:
     """Hard real-money brake: do not open new AutoTrades after a bad Melbourne day."""
@@ -4877,6 +4940,34 @@ def _autotrade_exact_lane_is_strong_from_setup_audit(data: dict, combo: str, *, 
         return False
 
 
+def _autotrade_exact_lane_watch_escape_from_setup_audit(data: dict, combo: str) -> tuple[bool, str]:
+    """Allow a WATCH lane to escape broad side/session/hour weakness when the exact
+    family-session-strategy-side lane already has enough positive setup-audit evidence.
+    This keeps strong niche lanes such as F5-NY-REV-SELL alive while preventing weak
+    broad contexts from leaking into /screen, setup emails or AutoTrade.
+    """
+    try:
+        key = str(combo or '').upper().strip()
+        m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(key) or {})
+        if not m:
+            return False, 'no_exact_lane_metrics'
+        dec = int(m.get('decided') or 0)
+        tp = int(m.get('tp') or 0)
+        sl = int(m.get('sl') or 0)
+        wr = float(m.get('wr') or 0.0)
+        avg = float(m.get('avg_r') or 0.0)
+        min_dec = int(globals().get('AUTOTRADE_CONTEXT_WATCH_EXACT_ESCAPE_MIN_DECIDED', 3) or 3)
+        min_wr = float(globals().get('AUTOTRADE_CONTEXT_WATCH_EXACT_ESCAPE_WR', 55.0) or 55.0)
+        min_avg = float(globals().get('AUTOTRADE_CONTEXT_WATCH_EXACT_ESCAPE_AVGR', 0.25) or 0.25)
+        if dec >= min_dec and wr >= min_wr and avg >= min_avg:
+            return True, f'exact_watch_escape:{key}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
+        # Small perfect samples remain probationary but may escape broad side/session blocks.
+        if dec >= min_dec and sl == 0 and tp >= min_dec and avg > 0:
+            return True, f'exact_watch_escape_perfect_sample:{key}:TP{tp}:SL0:n{dec}'
+        return False, f'exact_watch_not_strong:{key}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
+    except Exception as exc:
+        return False, f'exact_watch_escape_error:{type(exc).__name__}'
+
 def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
     """Final real-money filter: policy KEEP + realised AutoTrade edge + setup-audit context."""
     try:
@@ -4914,6 +5005,42 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
             return False, f'autotrade_symbol_block:{sym}'
         if hour in dict((data or {}).get('hour_watch') or {}):
             return False, f'autotrade_weak_hour_block:{hour}'
+
+        # yver117: Apply Setup Deep Analysis lessons to WATCH rows. KEEP rows are
+        # already proven by exact lane evidence; WATCH rows are probationary and must
+        # survive side/session/hour context. This same function also controls /screen
+        # and setup emails, so subscribers only see the cleaner subset.
+        if pstatus_exec == 'WATCH' and bool(globals().get('AUTOTRADE_CONTEXT_WATCH_DEEP_GUARD_ENABLED', True)):
+            exact_escape, exact_escape_reason = _autotrade_exact_lane_watch_escape_from_setup_audit(data, combo)
+            if not exact_escape:
+                try:
+                    m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
+                    dec = int(m.get('decided') or 0)
+                    conf = float(_autotrade_setup_attr(setup_or_row, 'conf', 0.0) or 0.0)
+                    dyn = float(_autotrade_setup_attr(setup_or_row, 'quality_score', 0.0) or 0.0)
+                    if dyn <= 0:
+                        dyn = float(_autotrade_setup_attr(setup_or_row, 'dynamic_risk_score', 0.0) or 0.0)
+                    if dec < 2 and (conf < int(globals().get('AUTOTRADE_CONTEXT_WATCH_LOW_SAMPLE_MIN_CONF', 87) or 87) or dyn < float(globals().get('AUTOTRADE_CONTEXT_WATCH_LOW_SAMPLE_MIN_DYNAMIC', 75) or 75)):
+                        return False, f'autotrade_watch_low_sample_block:{combo}:Conf{conf:.0f}:Dyn{dyn:.0f}:n{dec}'
+                except Exception:
+                    pass
+                if side in {'BUY', 'SELL'}:
+                    sm = dict(((data or {}).get('side_metrics') or {}).get(side) or {})
+                    if int(sm.get('decided') or 0) >= int(globals().get('AUTOTRADE_CONTEXT_WATCH_SIDE_MIN_DECIDED', 100) or 100):
+                        swr = float(sm.get('wr') or 0.0); savg = float(sm.get('avg_r') or 0.0)
+                        if swr <= float(globals().get('AUTOTRADE_CONTEXT_WATCH_SIDE_WR_MAX', 35.0) or 35.0) and savg <= float(globals().get('AUTOTRADE_CONTEXT_WATCH_SIDE_AVGR_MAX', 0.0) or 0.0):
+                            return False, f'autotrade_watch_side_context_block:{side}:WR{swr:.1f}:AvgR{savg:+.2f}:{exact_escape_reason}'
+                if sess_k in {'ASIA', 'LON', 'NY'}:
+                    ss = dict(((data or {}).get('session_metrics') or {}).get(sess_k) or {})
+                    if int(ss.get('decided') or 0) >= int(globals().get('AUTOTRADE_CONTEXT_WATCH_SESSION_MIN_DECIDED', 100) or 100):
+                        wrs = float(ss.get('wr') or 0.0); avgs = float(ss.get('avg_r') or 0.0)
+                        if wrs <= float(globals().get('AUTOTRADE_CONTEXT_WATCH_SESSION_WR_MAX', 40.0) or 40.0) and avgs <= float(globals().get('AUTOTRADE_CONTEXT_WATCH_SESSION_AVGR_MAX', 0.05) or 0.05):
+                            return False, f'autotrade_watch_session_context_block:{sess_k}:WR{wrs:.1f}:AvgR{avgs:+.2f}:{exact_escape_reason}'
+                hm = dict(((data or {}).get('hour_metrics') or {}).get(hour) or {})
+                if int(hm.get('decided') or 0) >= int(globals().get('AUTOTRADE_CONTEXT_WATCH_HOUR_MIN_DECIDED', 10) or 10):
+                    hwr = float(hm.get('wr') or 0.0); havg = float(hm.get('avg_r') or 0.0)
+                    if hwr <= float(globals().get('AUTOTRADE_CONTEXT_WATCH_HOUR_WR_MAX', 35.0) or 35.0) and havg <= float(globals().get('AUTOTRADE_CONTEXT_WATCH_HOUR_AVGR_MAX', 0.0) or 0.0):
+                        return False, f'autotrade_watch_hour_context_block:{hour}:WR{hwr:.1f}:AvgR{havg:+.2f}:{exact_escape_reason}'
         # 3) Feed broad side/session evidence into AutoTrade. Setup emails can still show them.
         # yver108: broad BUY/SELL weakness is advisory for exact KEEP/WATCH lanes.
         # Exact lane policy + symbol/hour blocks are more precise. Do not let global BUY
@@ -6233,6 +6360,7 @@ try:
     _autotrade_apply_ver43_runtime_defaults_resync()
     _autotrade_apply_ver47_runtime_defaults_resync()
     _autotrade_apply_ver107_dynamic_tp_defaults()
+    _autotrade_apply_ver117_live_test_alignment_defaults()
 except Exception:
     pass
 
