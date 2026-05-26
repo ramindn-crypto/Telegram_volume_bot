@@ -1,4 +1,5 @@
 # yver116: AutoTrade timeout reconciliation display hardening and longer placement budget.
+# yver118: audit-match live-test config defaults are applied through runtime autotrade_config (Telegram-editable): fixed 1.0% risk, dynamic risk OFF, fixed 1.5R TP, realised-combo self-block OFF, daily flat/catchup OFF, max-hold OFF, and context/deep-analysis guard ON.
 # yver117: aligns AutoTrade defaults with setup-audit/live-test goals: fixed 1.5R TP profile, fixed 1.0% risk by default, disables realised-combo self-blocking, and feeds deep side/session/hour lessons into strict WATCH gates for /screen, email and AutoTrade.
 # yver113: fixes Telegram slowdowns from heavy KEEP/WATCH summary and scheduler misfire noise: /setup_audit_keep_watch is cached/fast-cached-result based, autonomous screen/alert jobs get wider misfire grace, and ver112 menu changes are intentionally not included.
 # yver114: fixes runtime AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED/CATCHUP so /autotrade_config can turn the 09:55 Melbourne flat ON while STRICT_TPSL_ONLY remains true; schedules flat guardian jobs unconditionally so runtime toggles work without redeploy.
@@ -2357,6 +2358,69 @@ def _autotrade_apply_ver117_live_test_alignment_defaults() -> None:
         # It means AutoTrade WR will be a live-execution WR, not exactly the 24h
         # theoretical setup-audit WR.
         _autotrade_config_set('ver117_live_test_alignment_version', target_version)
+    except Exception:
+        pass
+
+
+def _autotrade_apply_ver118_audit_match_config_defaults() -> None:
+    """yver118: runtime AutoTrade config profile for audit-matching live test.
+
+    This intentionally writes Telegram-editable values into autotrade_config ONCE.
+    It is not a hard-coded lock: after the migration marker is stored, the owner can
+    change any value with /autotrade_config and future restarts will preserve it.
+
+    Goal: make AutoTrade selection/exit behaviour as close as practical to
+    /setup_audit_keep_watch, which evaluates the setup by its own TP/SL path over the
+    configured result horizon.  Therefore remove live-only distortions that change
+    the measured WR: dynamic risk, dynamic RR, realised-combo self-blocking, daily
+    flat and max-hold.  Keep risk caps and context/deep-analysis guard for safety.
+    """
+    try:
+        target_version = 'yver118_2026_05_27_audit_match_config_defaults'
+        if str(_autotrade_config_get('ver118_audit_match_config_version', '') or '').strip().lower() == target_version:
+            return
+
+        # Fixed risk profile for cleaner WR/PnL analysis.  Risk size does not change
+        # TP/SL hit-rate, but dynamic sizing makes the live PnL harder to reconcile.
+        _autotrade_config_set(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, 1.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, 1.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.0)
+
+        # Fixed 1.5R target so AutoTrade can be compared against the setup-audit TP/SL
+        # model.  Dynamic RR can be turned back ON later from Telegram.
+        _autotrade_config_set(AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY, 1.5)
+        _autotrade_config_set(AUTOTRADE_CFG_MIN_LIVE_RR_KEY, 1.5)
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, 1.5)
+
+        # Policy + deep context should decide what gets traded.  Do not let a tiny
+        # live AutoTrade sample independently block a policy-approved KEEP/WATCH lane.
+        _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY, 1)
+        _autotrade_config_set(USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY, 1)
+
+        # To match /setup_audit_keep_watch more closely, do not force-close before
+        # ASIA or by max-hold.  /setup_audit_keep_watch evaluates the normal TP/SL
+        # path; operational flats create OTHER/NON_TPSL rows and lower WR comparability.
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 0)
+
+        # Keep strict one-TP/one-SL lifecycle and do not market-close on temporary
+        # attach/risk events. Existing exchange safety, duplicate, drift and risk caps remain.
+        _autotrade_config_set(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY, 0)
+        _autotrade_config_set(AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY, 0)
+
+        # A little tighter adverse-entry drift keeps live entries close to the setup
+        # price used by /setup_audit.  This value is still Telegram-editable.
+        _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, 1.0)
+
+        _autotrade_config_set('ver118_audit_match_config_version', target_version)
     except Exception:
         pass
 
@@ -6361,6 +6425,7 @@ try:
     _autotrade_apply_ver47_runtime_defaults_resync()
     _autotrade_apply_ver107_dynamic_tp_defaults()
     _autotrade_apply_ver117_live_test_alignment_defaults()
+    _autotrade_apply_ver118_audit_match_config_defaults()
 except Exception:
     pass
 
@@ -40765,17 +40830,17 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"SETUP_REVERSE_TARGET_RR = {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.20)):.2f}",
             "",
             "Examples:",
-            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.0   (base risk)",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 0.75",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.25",
+            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.0   (base risk; audit-match default)",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED false   (audit-match default)",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 1.0",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.0",
             "• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true",
             "• /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 4",
             "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25",
-            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED true",
+            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_HOUR 9",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE 55",
-            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP true",
+            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP false",
             "• /autotrade_config BLACKOUT_WINDOWS 10:00-10:45   (sets both setup + autotrade blackout)",
             "• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS 10:00-10:45",
             "• /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-10:45",
@@ -40786,16 +40851,16 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK true",
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true",
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
-            "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE true",
+            "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
             "• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY true",
             "• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY true",
             "• /autotrade_config AUTOTRADE_TP_RR_CAP_ENABLED true",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED true",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 2.0",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false   (audit-match default)",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 1.5",
             "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
-            "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 4.0",
-            "• Strict TP/SL lifecycle is ON. Scheduled ASIA flat is configurable above; max-hold is optional and controlled by AUTOTRADE_MAX_POSITION_HOURS_ENABLED.",
+            "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 1.5",
+            "• Strict TP/SL lifecycle is ON. For audit-match testing, scheduled ASIA flat is OFF by default but remains configurable above; max-hold is optional and controlled by AUTOTRADE_MAX_POSITION_HOURS_ENABLED.",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
             "• /autotrade_config AUTOTRADE_MODE live",
@@ -40804,7 +40869,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_ENTRY_ENABLED true",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (default; env can allow 0=unlimited)",
-            "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0",
+            "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0   (audit-match default)",
             "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (recommended; AutoTrade uses executable queue directly)",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
