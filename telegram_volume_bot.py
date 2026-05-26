@@ -1,5 +1,6 @@
 # yver113: fixes Telegram slowdowns from heavy KEEP/WATCH summary and scheduler misfire noise: /setup_audit_keep_watch is cached/fast-cached-result based, autonomous screen/alert jobs get wider misfire grace, and ver112 menu changes are intentionally not included.
 # yver114: fixes runtime AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED/CATCHUP so /autotrade_config can turn the 09:55 Melbourne flat ON while STRICT_TPSL_ONLY remains true; schedules flat guardian jobs unconditionally so runtime toggles work without redeploy.
+# yver115: AutoTrade timeout reconciliation and longer bounded placement timeout; false timeout rows are rechecked against bot journal/live Bybit position before being reported as SKIP.
 # yver111: user-facing /screen/email sync lock: /screen shows only setups that were actually emailed/recent delivery-logged; raw executable queue remains for AutoTrade/audit only.
 # yver107: replaces fixed TP RR cap with dynamic live AutoTrade TP RR targeting (default 1.5R-4.0R) based on policy/quality/conf/volume/momentum; trailing remains off by default to preserve one TP + one SL lifecycle.
 # yver106: caps live AutoTrade TP RR to avoid unrealistic far targets, reports live open Risk$/TP$ from actual Bybit position geometry, and exposes AUTOTRADE_TP_RR_CAP settings in /autotrade_config.
@@ -11931,7 +11932,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v110:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v115:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -12513,6 +12514,115 @@ def _autotrade_should_try_next_after_skip(reason: str) -> bool:
         'not_keep', 'policy_not_keep',
     )
     return any(tok in r for tok in retry_tokens)
+
+
+
+def _autotrade_timeout_reconcile(uid: int, session_label: str, setup, timeout_reason: str = '') -> tuple[bool, str]:
+    """Confirm whether a timed-out placement actually opened a position.
+
+    wait_for() cancels the awaiting coroutine, but the worker thread may still finish
+    the Bybit order + journal write.  Without this reconciliation /autotrade_last can
+    show SKIP timeout even though the position is already open, which then causes
+    confusing duplicate/manual-same-symbol skips on the next tick.
+    """
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    reason_s = str(timeout_reason or 'autotrade_place_trade_timeout')
+    try:
+        sym = _bybit_linear_symbol(str(getattr(setup, 'symbol', '') or '').upper())
+    except Exception:
+        sym = str(getattr(setup, 'symbol', '') or '').upper().strip()
+    side_u = str(getattr(setup, 'side', '') or '').upper().strip()
+    setup_id = str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip()
+    now_ts = float(time.time())
+
+    def _matches_open_trade(t: dict) -> bool:
+        try:
+            if int(t.get('uid') or uid_i) != uid_i:
+                return False
+            ts = float(t.get('opened_ts') or t.get('created_ts') or 0.0)
+            if ts > 0 and now_ts - ts > 20 * 60:
+                return False
+            if setup_id and str(t.get('setup_id') or '') == setup_id:
+                return True
+            tsym = _bybit_linear_symbol(str(t.get('symbol') or '').upper())
+            tside = str(t.get('side') or '').upper().strip()
+            return bool(sym) and tsym == sym and (not side_u or tside == side_u)
+        except Exception:
+            return False
+
+    def _check_journal() -> tuple[bool, str]:
+        try:
+            for t in list(_autotrade_db_open_trades(uid_i) or []):
+                if _matches_open_trade(t):
+                    try:
+                        _LAST_AUTOTRADE_DETAIL.setdefault(uid_i, {})
+                        _LAST_AUTOTRADE_DETAIL[uid_i].update({
+                            'timeout_reconciled': True,
+                            'timeout_reconcile_source': 'journal',
+                            'timeout_original_reason': reason_s,
+                            'trade_id': str(t.get('trade_id') or _LAST_AUTOTRADE_DETAIL.get(uid_i, {}).get('trade_id') or ''),
+                            'setup_id': str(t.get('setup_id') or setup_id or ''),
+                            'symbol_sent': sym,
+                            'side': side_u,
+                        })
+                    except Exception:
+                        pass
+                    return True, 'placed_after_timeout_confirmed_journal'
+        except Exception:
+            pass
+        return False, reason_s
+
+    ok, rr = _check_journal()
+    if ok:
+        return ok, rr
+
+    # Give the worker thread a very short grace period to finish the journal write.
+    try:
+        time.sleep(float(os.environ.get('AUTOTRADE_TIMEOUT_RECONCILE_GRACE_SEC', '2.5') or 2.5))
+    except Exception:
+        pass
+    ok, rr = _check_journal()
+    if ok:
+        return ok, rr
+
+    # Fall back to live Bybit position detection.  This is still safer than showing
+    # a timeout SKIP and immediately retrying the same symbol while the position is open.
+    try:
+        cache_delete('bybit_open_positions_linear')
+    except Exception:
+        pass
+    try:
+        for pos in list(_bybit_get_open_positions_linear() or []):
+            try:
+                if _pos_symbol(pos) != sym:
+                    continue
+                qty = abs(float(_pos_size(pos) or 0.0))
+                if qty <= 0:
+                    continue
+                pos_side = str(_pos_side_text(pos) or '').upper().strip()
+                if side_u and pos_side and pos_side != side_u:
+                    continue
+                try:
+                    _LAST_AUTOTRADE_DETAIL.setdefault(uid_i, {})
+                    _LAST_AUTOTRADE_DETAIL[uid_i].update({
+                        'timeout_reconciled': True,
+                        'timeout_reconcile_source': 'live_position',
+                        'timeout_original_reason': reason_s,
+                        'setup_id': setup_id,
+                        'symbol_sent': sym,
+                        'side': side_u,
+                    })
+                except Exception:
+                    pass
+                return True, 'placed_after_timeout_confirmed_live_position'
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False, reason_s
 
 def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
     if not _autotrade_ready():
@@ -13695,11 +13805,11 @@ ALERT_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
-AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "18") or 18)
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "35") or 35)
 # Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
 # Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
 AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "60") or 60)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "55") or 55)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "75") or 75)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
 AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", True)
@@ -19192,7 +19302,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v110:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v115:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -19220,7 +19330,11 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                 try:
                     ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(35, max(10, int(AUTOTRADE_JOB_TIMEOUT_SEC or 25))))
                 except asyncio.TimeoutError:
-                    ok, reason = False, 'autotrade_place_trade_timeout_after_bigmove_email'
+                    _timeout_reason = 'autotrade_place_trade_timeout_after_bigmove_email'
+                    try:
+                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, owner_uid, sess, cand, _timeout_reason, timeout=8)
+                    except Exception:
+                        ok, reason = False, _timeout_reason
                 except Exception as e:
                     ok, reason = False, f'{type(e).__name__}: {e}'
                 last_reason = '' if ok else str(reason or '')
@@ -40764,9 +40878,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             globals()['AUTOTRADE_ALLOW_WATCH_POLICY'] = bool(val)
             _autotrade_config_set(AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if val else 0)
             try:
-                cache_delete(f"autotrade_db_setups_v110:{int(AUTOTRADE_OWNER_UID or 0)}:ASIA:24:30")
-                cache_delete(f"autotrade_db_setups_v110:{int(AUTOTRADE_OWNER_UID or 0)}:LON:24:30")
-                cache_delete(f"autotrade_db_setups_v110:{int(AUTOTRADE_OWNER_UID or 0)}:NY:24:30")
+                cache_delete(f"autotrade_db_setups_v115:{int(AUTOTRADE_OWNER_UID or 0)}:ASIA:24:30")
+                cache_delete(f"autotrade_db_setups_v115:{int(AUTOTRADE_OWNER_UID or 0)}:LON:24:30")
+                cache_delete(f"autotrade_db_setups_v115:{int(AUTOTRADE_OWNER_UID or 0)}:NY:24:30")
             except Exception:
                 pass
         elif key == 'USER_VISIBLE_ALLOW_WATCH_POLICY':
@@ -59562,7 +59676,11 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                         timeout=per_candidate_timeout,
                     )
                 except asyncio.TimeoutError:
-                    ok, reason = False, f'autotrade_place_trade_timeout>{int(per_candidate_timeout)}s'
+                    _timeout_reason = f'autotrade_place_trade_timeout>{int(per_candidate_timeout)}s'
+                    try:
+                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, uid, sess, cand, _timeout_reason, timeout=8)
+                    except Exception:
+                        ok, reason = False, _timeout_reason
                 try:
                     detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(uid) or {})
                     if 0 <= attempted - 1 < len(attempt_summaries):
@@ -59714,7 +59832,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v110:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v115:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
@@ -59773,7 +59891,11 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 try:
                     ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(35, max(10, int(AUTOTRADE_JOB_TIMEOUT_SEC or 25))))
                 except asyncio.TimeoutError:
-                    ok, reason = False, 'autotrade_place_trade_timeout_after_email'
+                    _timeout_reason = 'autotrade_place_trade_timeout_after_email'
+                    try:
+                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, owner_uid, sess, cand, _timeout_reason, timeout=8)
+                    except Exception:
+                        ok, reason = False, _timeout_reason
                 except Exception as e:
                     ok, reason = False, f'{type(e).__name__}: {e}'
                 try:
