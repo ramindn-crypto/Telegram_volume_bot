@@ -1,4 +1,5 @@
 # yver113: fixes Telegram slowdowns from heavy KEEP/WATCH summary and scheduler misfire noise: /setup_audit_keep_watch is cached/fast-cached-result based, autonomous screen/alert jobs get wider misfire grace, and ver112 menu changes are intentionally not included.
+# yver114: fixes runtime AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED/CATCHUP so /autotrade_config can turn the 09:55 Melbourne flat ON while STRICT_TPSL_ONLY remains true; schedules flat guardian jobs unconditionally so runtime toggles work without redeploy.
 # yver111: user-facing /screen/email sync lock: /screen shows only setups that were actually emailed/recent delivery-logged; raw executable queue remains for AutoTrade/audit only.
 # yver107: replaces fixed TP RR cap with dynamic live AutoTrade TP RR targeting (default 1.5R-4.0R) based on policy/quality/conf/volume/momentum; trailing remains off by default to preserve one TP + one SL lifecycle.
 # yver106: caps live AutoTrade TP RR to avoid unrealistic far targets, reports live open Risk$/TP$ from actual Bybit position geometry, and exposes AUTOTRADE_TP_RR_CAP settings in /autotrade_config.
@@ -1373,24 +1374,46 @@ def _autotrade_candidate_lookback_hours(default_hours: float = 12.0) -> float:
 
 
 def _autotrade_flat_before_asia_enabled() -> bool:
-    # yver84: strict TP/SL-only means positions must finish only by their native
-    # Bybit TP or SL. Scheduled ASIA flat is therefore disabled while strict mode
-    # is ON, unless AUTOTRADE_TPSL_ONLY_DISABLE_TIME_EXITS=0 is explicitly set.
+    """Runtime switch for the scheduled 09:55 Melbourne ASIA handover flat.
+
+    yver114: make /autotrade_config authoritative.  Earlier builds forced this
+    OFF whenever STRICT_TPSL_ONLY was true, so the command accepted the update but
+    the displayed/current value stayed False.  The owner must be able to choose
+    this operational flat independently from the one-TP/one-SL lifecycle rule.
+    """
     try:
-        if bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True)) and env_bool('AUTOTRADE_TPSL_ONLY_DISABLE_TIME_EXITS', True):
+        raw = _autotrade_config_get(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, None)
+        if raw is not None and str(raw).strip() != '':
+            return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        pass
+    # Legacy fallback only when no runtime config row exists.
+    try:
+        if bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True)) and env_bool('AUTOTRADE_TPSL_ONLY_DISABLE_TIME_EXITS', False):
             return False
     except Exception:
         pass
-    return _autotrade_bool_cfg(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
+    return env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True)
 
 
 def _autotrade_flat_before_asia_catchup_enabled() -> bool:
+    """Runtime switch for the repeating catch-up guardian.
+
+    yver114: also follows /autotrade_config directly so enabling the daily flat
+    can be made reliable after Render restarts or missed run_daily ticks.
+    """
     try:
-        if bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True)) and env_bool('AUTOTRADE_TPSL_ONLY_DISABLE_TIME_EXITS', True):
+        raw = _autotrade_config_get(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY, None)
+        if raw is not None and str(raw).strip() != '':
+            return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        pass
+    try:
+        if bool(_autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY, 'AUTOTRADE_STRICT_TPSL_ONLY', True)) and env_bool('AUTOTRADE_TPSL_ONLY_DISABLE_TIME_EXITS', False):
             return False
     except Exception:
         pass
-    return _autotrade_bool_cfg(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY, 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)
+    return env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True)
 
 
 def _autotrade_flat_before_asia_hour() -> int:
@@ -40615,6 +40638,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY, 1 if val else 0)
+            # yver114: if the owner enables the daily flat, enable the catch-up
+            # guardian too so Render/job-queue delays do not miss the ASIA handover.
+            if val:
+                _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY, 1)
         elif key == 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR':
             val = max(0, min(23, int(float(value_raw))))
             _autotrade_config_set(AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY, val)
@@ -60315,39 +60342,41 @@ def main():
                 },
             )
 
-        if bool(_autotrade_flat_before_asia_enabled()):
+        # yver114: schedule the ASIA flat jobs unconditionally; each job checks
+        # /autotrade_config at runtime.  This lets the owner turn
+        # AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED / CATCHUP on or off without needing
+        # a redeploy/restart.
+        try:
+            from datetime import time as _dt_time
+            app.job_queue.run_daily(
+                autotrade_flat_before_asia_job,
+                time=_dt_time(
+                    hour=int(_autotrade_flat_before_asia_hour()),
+                    minute=int(_autotrade_flat_before_asia_minute()),
+                    tzinfo=MEL_TZ,
+                ),
+                name="autotrade_flat_before_asia_job",
+                job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 1800},
+            )
+        except Exception as _flat_sched_exc:
             try:
-                from datetime import time as _dt_time
-                app.job_queue.run_daily(
-                    autotrade_flat_before_asia_job,
-                    time=_dt_time(
-                        hour=int(_autotrade_flat_before_asia_hour()),
-                        minute=int(_autotrade_flat_before_asia_minute()),
-                        tzinfo=MEL_TZ,
-                    ),
-                    name="autotrade_flat_before_asia_job",
-                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 1800},
-                )
-            except Exception as _flat_sched_exc:
-                try:
-                    logger.warning('autotrade flat-before-ASIA schedule failed: %s', _flat_sched_exc)
-                except Exception:
-                    pass
+                logger.warning('autotrade flat-before-ASIA schedule failed: %s', _flat_sched_exc)
+            except Exception:
+                pass
 
-        if bool(_autotrade_flat_before_asia_enabled()) and bool(_autotrade_flat_before_asia_catchup_enabled()):
+        try:
+            app.job_queue.run_repeating(
+                autotrade_flat_before_asia_catchup_job,
+                interval=max(120, int(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_INTERVAL_SEC', 300) or 300)),
+                first=60,
+                name="autotrade_flat_before_asia_catchup_job",
+                job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 900},
+            )
+        except Exception as _flat_catchup_sched_exc:
             try:
-                app.job_queue.run_repeating(
-                    autotrade_flat_before_asia_catchup_job,
-                    interval=max(120, int(globals().get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_INTERVAL_SEC', 300) or 300)),
-                    first=60,
-                    name="autotrade_flat_before_asia_catchup_job",
-                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 900},
-                )
-            except Exception as _flat_catchup_sched_exc:
-                try:
-                    logger.warning('autotrade flat-before-ASIA catch-up schedule failed: %s', _flat_catchup_sched_exc)
-                except Exception:
-                    pass
+                logger.warning('autotrade flat-before-ASIA catch-up schedule failed: %s', _flat_catchup_sched_exc)
+            except Exception:
+                pass
 
         if bool(_autotrade_max_position_hours_enabled()):
             try:
