@@ -1,3 +1,4 @@
+# yver126: fixes /dayrisk_reset so AutoTrade debug uses the reset credit from the same realised-PnL/open-risk basis, and fixes /setup_audit_keep_watch multi-window table to use full historical generated+executable rows rather than the short executable-only slice.
 # yver124: /setup_audit_keep_watch now renders a multi-window table (Last 24h, 7d, 14d, Overall from database) with Keep/Watch combo counts and WR=TP/(TP+SL).
 # yver123: fixes WR methodology (TP/SL only for setup audits; AutoTrade realised WR counts TP or positive OTHER as wins and SL or negative OTHER as losses), tightens compare matching to avoid stale/legacy setup DIFF rows, rounds PnL displays, and clarifies active sessions in /autotrade_debug.
 # yver121: AutoTrade candidate deadline lock. KEEP+WATCH executable setups are tradable only inside AUTOTRADE_ENTRY_WINDOW_MIN (default 60m); the old 24h fallback is capped to that deadline and no longer bypassed by keep-all mode.
@@ -38,6 +39,7 @@
 # yver80: /autotrade_closed now shows Close time and sorts strictly by closed time newest first.
 # yver78: /autotrade_report sorted by Open time; added /autotrade_closed and /autotrade/closed hours for compact closed positions.
 # yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
+# yver127: routes BigMove/F8 candidates through NOR→REV policy before setup-email/autotrade delivery lock, preventing emailed disabled raw-direction setups from being skipped as final_combo_disabled.
 # yver71: end-to-end NOR→REV execution hardening: preserves REV metadata through email/cache/DB fallbacks, locks already-delivered setup lanes so AutoTrade executes the exact emailed/executable side, and keeps routing only in raw setup generation before final gates.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
 # - yver65: fixes remaining report/policy wording and display sanity: /setup_matrix deep now labels exact disabled lanes vs micro-edge tightened lanes, and /autotrade_report prevents impossible Open > Close timestamps while refreshing report caches.
@@ -15455,6 +15457,27 @@ def cache_delete(key: str):
     except Exception:
         pass
 
+def cache_delete_prefix(prefix: str):
+    """Delete all in-memory cache keys beginning with prefix.
+
+    yver126: risk/debug caches include dynamic suffixes such as equity and mode,
+    so deleting only the bare prefix key does not clear the active snapshot.
+    """
+    try:
+        pref = str(prefix or '')
+        for k in list(_CACHE.keys()):
+            if str(k).startswith(pref):
+                _CACHE.pop(k, None)
+    except Exception:
+        pass
+
+def _autotrade_purge_day_risk_caches(uid: int):
+    try:
+        cache_delete_prefix(f'autotrade_day_metrics_fast:{int(uid)}')
+        cache_delete_prefix(f'accounting_snapshot_fast:{int(uid)}')
+    except Exception:
+        pass
+
 def cache_valid(key: str, ttl: int) -> bool:
     v = _CACHE.get(key)
     if not v:
@@ -19642,6 +19665,21 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
             family_name=BIGMOVE_FAMILY_NAME,
             session=str(session_name or '').upper().strip(),
         )
+
+        # yver127: BigMove/F8 candidates must pass through the same NOR→REV
+        # router BEFORE becoming an emailed/executable delivery lane.  Previously
+        # a raw disabled F8-ASIA-NOR-SELL could be emailed and then AutoTrade
+        # correctly skipped it as final_combo_disabled, while /setup_audit showed
+        # the routed F8-ASIA-REV-BUY.  Route first, then lock the delivered lane.
+        try:
+            owner_for_policy = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        except Exception:
+            owner_for_policy = 0
+        try:
+            s = _setup_route_candidate_for_executable_lane(s, session_name=session_name, user_id=owner_for_policy)
+        except Exception:
+            pass
+
         setattr(s, 'atr_pct', float(plan.get('atr_pct') or 0.0))
         setattr(s, 'quality_score', 0.0)
         setattr(s, 'source_kind', 'emailed_setups')
@@ -19659,7 +19697,14 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
         # No separate Big-Move risk setting: F8 must use the same /autotrade_config
         # AUTOTRADE_RISK_PER_TRADE_PCT, open cap, and daily cap as every other family.
         setattr(s, 'risk_source', 'autotrade_config')
-        setattr(s, 'why', f"Confirmed Big-Move alert {str(c.get('direction') or '').upper()} | SL {float(plan.get('sl_pct') or 0.0):.2f}% ({plan.get('sl_model')}) | TP {float(plan.get('tp_pct') or 0.0):.2f}% (~{float(plan.get('rr') or BIGMOVE_AUTOTRADE_RR):.2f}R)")
+        try:
+            routed_side = str(getattr(s, 'side', '') or '').upper().strip()
+            routed_strategy = str(_setup_strategy_label(s) or '').upper().strip()
+            setattr(s, 'bigmove_routed_side', routed_side)
+            setattr(s, 'bigmove_routed_strategy', routed_strategy)
+        except Exception:
+            routed_side, routed_strategy = str(side or '').upper().strip(), ''
+        setattr(s, 'why', f"Confirmed Big-Move alert {str(c.get('direction') or '').upper()} | Routed {routed_strategy or 'NOR'} {routed_side or str(side).upper()} | SL {float(plan.get('sl_pct') or 0.0):.2f}% ({plan.get('sl_model')}) | TP {float(plan.get('tp_pct') or 0.0):.2f}% (~{float(plan.get('rr') or BIGMOVE_AUTOTRADE_RR):.2f}R)")
         return _research_finalize_setup(s, session_name=session_name)
     except Exception:
         return None
@@ -41424,6 +41469,44 @@ async def autotrade_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏸️ AutoTrade entries: OFF. Existing positions, TP/SL guardian, reports and manual flat/fix commands remain available.")
 
 
+
+def _autotrade_dayrisk_reset_raw_used(owner: int, user: dict, snap: dict | None = None) -> tuple[float, float, float]:
+    """Return the exact raw daily-risk usage used by /autotrade_debug.
+
+    yver126: /dayrisk_reset must credit the same number that /autotrade_debug
+    displays as daily risk used.  The quick metrics path can be stale or can miss
+    exchange-closed rows; this function mirrors the debug reconciliation:
+      raw_used = max(0, live_open_risk - realised_net_today)
+    where realised_net_today is sourced from the same closed-report rows that
+    /autotrade_debug uses.
+    """
+    owner_i = int(owner or 0)
+    user_d = dict(user or {})
+    snap_d = dict(snap or {})
+    try:
+        if not snap_d:
+            snap_d = _accounting_snapshot_cached(owner_i, user_d, is_admin=True, ttl=0, force_refresh=True)
+    except Exception:
+        try:
+            snap_d = _accounting_snapshot(owner_i, user_d, is_admin=True)
+        except Exception:
+            snap_d = {}
+    try:
+        start_utc, end_utc = _admin_today_window_utc(uid=owner_i, user=user_d)
+        rows = _autotrade_closed_report_rows(owner_i, float(start_utc.timestamp()), float(end_utc.timestamp()), lookback_h=24, limit=0) or []
+        realised_net = float(sum(float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0) for r in rows))
+    except Exception:
+        try:
+            realised_net = float(snap_d.get('pnl_today') or 0.0)
+        except Exception:
+            realised_net = 0.0
+    try:
+        open_risk = max(0.0, float(snap_d.get('current_total_open_risk') or snap_d.get('live_open_risk_charged_today') or snap_d.get('current_day_open_risk') or 0.0))
+    except Exception:
+        open_risk = 0.0
+    raw_used = max(0.0, float(open_risk) - float(realised_net))
+    return float(raw_used), float(realised_net), float(open_risk)
+
 async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only: baseline-reset current AutoTrade day risk so remaining daily cap is restored."""
     uid = int(update.effective_user.id)
@@ -41442,18 +41525,19 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=0, force_refresh=True)
     except Exception:
         snap = _accounting_snapshot(owner, user, is_admin=True)
-    # yver125: force-refresh the AutoTrade risk metrics directly. The account
-    # snapshot can be fresh while its nested metrics cache is stale; /dayrisk_reset
-    # must credit the same raw-used number that /autotrade_debug displays.
+    # yver126: force-refresh the exact raw daily-used number that /autotrade_debug
+    # displays. The quick metrics path can miss the exchange-closed report rows,
+    # which caused /dayrisk_reset to credit $0 while /autotrade_debug still showed
+    # realised-loss usage.
     try:
-        _eq_for_metrics = float(snap.get('equity') or _effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
-        _m_for_reset = _autotrade_day_risk_metrics_cached(owner, _eq_for_metrics, ttl=0, force_refresh=True)
-        raw_used = float(_m_for_reset.get('used_total_raw', _m_for_reset.get('used_total', snap.get('used_today_raw', snap.get('used_today', 0.0)))) or 0.0)
-        effective_used = float(_m_for_reset.get('used_total', snap.get('used_today', 0.0)) or 0.0)
-        existing_credit = float(_m_for_reset.get('risk_reset_credit', snap.get('risk_reset_credit', 0.0)) or 0.0)
+        raw_used, _reset_realised_net, _reset_open_risk = _autotrade_dayrisk_reset_raw_used(owner, user, snap)
+        existing_credit = float(_risk_day_reset_credit_get(owner, day_local) or 0.0)
+        effective_used = max(0.0, float(raw_used) - float(existing_credit))
         snap['used_today_raw'] = float(raw_used)
         snap['used_today'] = float(effective_used)
         snap['risk_reset_credit'] = float(existing_credit)
+        snap['pnl_today'] = float(_reset_realised_net)
+        snap['current_total_open_risk'] = float(_reset_open_risk)
     except Exception:
         raw_used = float(snap.get('used_today_raw', snap.get('used_today', 0.0)) or 0.0)
         effective_used = float(snap.get('used_today', 0.0) or 0.0)
@@ -41478,8 +41562,7 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action in {"clear", "restore", "undo"}:
         _risk_day_reset_credit_clear(owner, day_local)
         try:
-            cache_delete(f'autotrade_day_metrics_fast:{int(owner)}')
-            cache_delete(f'accounting_snapshot_fast:{int(owner)}')
+            _autotrade_purge_day_risk_caches(int(owner))
         except Exception:
             pass
         try:
@@ -41500,8 +41583,7 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _risk_day_reset_credit_set(owner, day_local, raw_used, note=f"admin_dayrisk_reset_by_{uid}")
     try:
-        cache_delete(f'autotrade_day_metrics_fast:{int(owner)}')
-        cache_delete(f'accounting_snapshot_fast:{int(owner)}')
+        _autotrade_purge_day_risk_caches(int(owner))
     except Exception:
         pass
     try:
@@ -41510,6 +41592,19 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     snap2 = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=0, force_refresh=True)
+    try:
+        _raw2, _realised2, _open2 = _autotrade_dayrisk_reset_raw_used(owner, user, snap2)
+        _credit2 = float(_risk_day_reset_credit_get(owner, day_local) or 0.0)
+        _used2 = max(0.0, float(_raw2) - float(_credit2))
+        snap2['used_today_raw'] = float(_raw2)
+        snap2['used_today'] = float(_used2)
+        snap2['risk_reset_credit'] = float(_credit2)
+        snap2['pnl_today'] = float(_realised2)
+        snap2['current_total_open_risk'] = float(_open2)
+        _cap2 = float(snap2.get('cap') or cap or 0.0)
+        snap2['remaining_today'] = (float('inf') if _cap2 <= 0 else max(0.0, _cap2 - _used2))
+    except Exception:
+        pass
     remaining2 = float(snap2.get('remaining_today', float('inf')))
     remaining2_txt = '∞' if not math.isfinite(remaining2) else f'${float(remaining2 or 0.0):.2f}'
     await update.message.reply_text(
@@ -49203,7 +49298,7 @@ def _setup_audit_keep_watch_fast_result_label(row: dict, horizon_hours: int) -> 
 def _setup_audit_keep_watch_summary_text(uid: int) -> str:
     """Multi-window totals for current KEEP + WATCH policy lanes only.
 
-    yver124: render as a readable table with Last 24h / Last 7d / Last 14d /
+    yver126: render as a readable table with Last 24h / Last 7d / Last 14d /
     Overall-from-database rows.  WR is TP/(TP+SL); NOHIT and OPEN are shown but
     excluded from WR, matching the setup-audit WR basis used elsewhere.
     """
@@ -49214,7 +49309,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         uid_i = int(uid or 0)
 
     try:
-        cache_key = f"keep_watch_summary:v124::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
+        cache_key = f"keep_watch_summary:v126::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -49252,9 +49347,15 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         watch_combos = set()
 
     try:
-        # yver124: "Overall" means from the start of the available setup database,
-        # not only the fixed 15-May management baseline.
-        rows, source_label = _overall_report_source_rows(uid_i, start_ts=0.0, limit=0, dedup=True)
+        # yver126: multi-window summary must use the full available historical
+        # setup database.  _overall_report_source_rows(start_ts=0) can return only
+        # the short executable table, which made Last 24h / 7d / 14d / Overall look
+        # almost identical.  Use the generated+executable source directly, then
+        # filter by the current KEEP/WATCH policy lanes below.
+        rows = _setup_audit_load_rows(int(uid_i), hours=None, limit=0, dedup=True, start_ts=0.0, apply_final_quality_gate=False, source_mode_override='ALL')
+        source_label = 'EXECUTABLE+GENERATED'
+        if not rows:
+            rows, source_label = _overall_report_source_rows(uid_i, start_ts=0.0, limit=0, dedup=True)
     except Exception:
         rows, source_label = [], 'EXECUTABLE'
 
