@@ -39,6 +39,7 @@
 # yver80: /autotrade_closed now shows Close time and sorts strictly by closed time newest first.
 # yver78: /autotrade_report sorted by Open time; added /autotrade_closed and /autotrade/closed hours for compact closed positions.
 # yver72: immutable AutoTrade TP/SL hardening: journal-row TP/SL is now the authority after entry, the guardian only repairs missing native TP/SL by default, and live-position cache is refreshed before/after entry to prevent same-symbol TP/SL overwrites.
+# yver128: improves AutoTrade duplicate-setup diagnostics: a setup already PLACED/consumed by AutoTrade is reported as setup_already_traded instead of duplicate_guard_block:setup, and the selector continues to the next candidate cleanly.
 # yver127: routes BigMove/F8 candidates through NOR→REV policy before setup-email/autotrade delivery lock, preventing emailed disabled raw-direction setups from being skipped as final_combo_disabled.
 # yver71: end-to-end NOR→REV execution hardening: preserves REV metadata through email/cache/DB fallbacks, locks already-delivered setup lanes so AutoTrade executes the exact emailed/executable side, and keeps routing only in raw setup generation before final gates.
 # yver58: Runtime-config authority lock: daily ASIA flat is configurable/ON at 09:55, keep-all no longer suppresses config toggles.
@@ -11422,6 +11423,15 @@ def _autotrade_exec_reserve(uid: int, setup_id: str, symbol: str, side: str, set
                     age = now - updated_ts
                     if status in {'PENDING', 'PLACED'} and age <= ttl:
                         conn.rollback()
+                        # yver128: distinguish a genuine already-consumed setup from
+                        # a short-lived duplicate/inflight lock.  This makes
+                        # /autotrade_last clear: if a setup was already opened and
+                        # later closed, it must not be opened again, but it should
+                        # not look like a broken inflight lock.
+                        if str(gtype or '').upper() == 'SETUP':
+                            if status == 'PLACED':
+                                return (False, reserved, 'setup_already_traded')
+                            return (False, reserved, 'setup_execution_already_pending')
                         return (False, reserved, f'duplicate_guard_block:{gtype.lower()}')
                 c.execute("INSERT OR REPLACE INTO autotrade_exec_guard(guard_key, uid, setup_id, symbol, side, guard_type, status, created_ts, updated_ts, note) VALUES(?,?,?,?,?,?,?,?,?,?)",
                           (guard_key, int(uid), sid, sym, sd, gtype, 'PENDING', now, now, ''))
@@ -12912,6 +12922,7 @@ def _autotrade_should_try_next_after_skip(reason: str) -> bool:
         'sl_not_', 'stop_invalid', 'qty_invalid', 'blocked_duplicate_open_position',
         'blocked_manual_same_symbol_position', 'blocked_duplicate_pending_order',
         'blocked_duplicate_inflight_lock', 'blocked_by_cooldown',
+        'setup_already_traded', 'setup_execution_already_pending',
         'blocked_by_recent_symbol_trade', 'blocked_by_existing_local_trade_state',
         'post_fill_risk_breach', 'exchange_reject', 'no_sltp',
         'leverage_set_failed_for_liq_guard', 'configured_leverage_not_safe',
