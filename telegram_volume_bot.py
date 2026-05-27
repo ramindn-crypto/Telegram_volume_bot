@@ -45072,10 +45072,13 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
     def _setup_match_time_safe(item: dict, tr: dict) -> bool:
         """Reject future/unrelated setup matches for compare.
 
-        A setup can be generated shortly before/at AutoTrade open, and must be before
-        the practical position close. Older metadata fallbacks can accidentally attach
-        a later same-symbol setup_id/nearest setup to an older close; that creates a
-        false DIFF and must be ignored.
+        yver122: /setup_audit_compare must not attach a closed AutoTrade row to an
+        old same-symbol setup just because it is still inside the 24h audit horizon.
+        The 24h horizon is for price-path scoring only; real entry matching should
+        be tied to the AutoTrade entry deadline.  When the journal has an open time,
+        the setup must be generated close to that open.  When only an exchange close
+        time is available, use a short reconciliation window and otherwise show
+        NO_SETUP instead of creating false DIFF/NON_TPSL rows.
         """
         try:
             sts = float((item or {}).get('setup_ts') or 0.0)
@@ -45085,16 +45088,28 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 return False
             if close_ts > 0 and sts > close_ts + 300.0:
                 return False
+
+            try:
+                entry_deadline_sec = float(_autotrade_entry_window_min()) * 60.0
+            except Exception:
+                entry_deadline_sec = 60.0 * 60.0
+            # Allow normal logging/order-fill delay, but do not use the 24h audit
+            # horizon as an entry-matching window.
+            open_match_window = max(20.0 * 60.0, min(4.0 * 3600.0, entry_deadline_sec + 15.0 * 60.0))
+            # If Bybit Closed-PnL lacks a journal open time, allow a small practical
+            # reconciliation window so recently opened/closed trades can still match,
+            # but reject previous-day same-symbol setups.
+            close_only_window = max(4.0 * 3600.0, min(8.0 * 3600.0, entry_deadline_sec + 3.0 * 3600.0))
+
             if open_ts > 0:
                 # Setup should not be after the recorded open time. Allow a small
                 # timestamp/order-fill tolerance only.
                 if sts > open_ts + 300.0:
                     return False
-                # Avoid matching an old same-symbol setup from a previous cycle.
-                if open_ts - sts > float(max(3 * 3600.0, horizon_hours * 3600.0 + 1800.0)):
+                if open_ts - sts > open_match_window:
                     return False
             elif close_ts > 0:
-                if close_ts - sts > float(max(3 * 3600.0, horizon_hours * 3600.0 + 1800.0)):
+                if close_ts - sts > close_only_window:
                     return False
             return True
         except Exception:
@@ -45235,6 +45250,8 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         f"Window: <b>last {hours}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
         "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
         "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
+        "AT = actual realised AutoTrade close from Bybit/journal. Audit = independent matched setup price-path result.",
+        "yver122 matching: setup_id/open-time must fit the AutoTrade entry deadline; stale previous-day setup matches are shown as NO_SETUP instead of false DIFF.",
         "Precision: mismatched TP/SL rows are rechecked with targeted 1m candles before DIFF is shown.",
         f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
     ]
