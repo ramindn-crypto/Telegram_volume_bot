@@ -1,3 +1,4 @@
+# yver120: AutoTrade now prioritises fresh current-session executable rows (same lane as /setup_audit) before stale 24h fallback candidates, so every fresh setup is either placed or gets a visible skip reason.
 # yver116: AutoTrade timeout reconciliation display hardening and longer placement budget.
 # yver119: forces the audit-match AutoTrade runtime profile with a new one-time DB migration marker so deployed databases that already skipped/marked yver118 are corrected; values remain Telegram-editable after migration.
 # yver118: audit-match live-test config defaults are applied through runtime autotrade_config (Telegram-editable): fixed 1.0% risk, dynamic risk OFF, fixed 1.5R TP, realised-combo self-block OFF, daily flat/catchup OFF, max-hold OFF, and context/deep-analysis guard ON.
@@ -6544,6 +6545,13 @@ except Exception:
     _autotrade_entry_window_default_min = '45'
 AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", _autotrade_entry_window_default_min) or _autotrade_entry_window_default_min)
 
+# yver120: AutoTrade must prioritise the fresh current-session executable lane.
+# This keeps AutoTrade aligned with /setup_audit rows generated after the session starts,
+# instead of spending attempts on stale 24h lookback rows from the previous day/session.
+AUTOTRADE_FRESH_SESSION_QUEUE_ENABLED = env_bool("AUTOTRADE_FRESH_SESSION_QUEUE_ENABLED", True)
+AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN = int(os.environ.get("AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN", "150") or 150)
+AUTOTRADE_FRESH_SESSION_QUEUE_LIMIT = int(os.environ.get("AUTOTRADE_FRESH_SESSION_QUEUE_LIMIT", "60") or 60)
+
 # Email
 EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "false").lower() == "true"
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
@@ -12194,9 +12202,124 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
 
 
 
+def _autotrade_candidate_dedupe_key(setup) -> tuple:
+    """Practical candidate identity for AutoTrade queue merging."""
+    try:
+        return (
+            str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip(),
+            str(getattr(setup, 'symbol', '') or '').upper().strip(),
+            str(getattr(setup, 'side', '') or '').upper().strip(),
+            round(float(getattr(setup, 'entry', 0.0) or 0.0), 10),
+            round(float(getattr(setup, 'sl', 0.0) or 0.0), 10),
+        )
+    except Exception:
+        return (str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or ''), str(getattr(setup, 'symbol', '') or ''), str(getattr(setup, 'side', '') or ''))
+
+
+def _autotrade_merge_candidate_lists_fresh_first(*lists, limit: int = 60) -> list:
+    """Merge candidate lists, preserving order and avoiding duplicate setup/price rows."""
+    out = []
+    seen_exact = set()
+    seen_setup_id = set()
+    for items in lists:
+        for item in list(items or []):
+            try:
+                sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+                key = _autotrade_candidate_dedupe_key(item)
+                if sid and sid in seen_setup_id:
+                    continue
+                if key in seen_exact:
+                    continue
+                seen_exact.add(key)
+                if sid:
+                    seen_setup_id.add(sid)
+                out.append(item)
+                if int(limit or 0) > 0 and len(out) >= int(limit):
+                    return out
+            except Exception:
+                continue
+    return out
+
+
+def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: str, window_min: int | None = None, limit: int | None = None) -> list:
+    """Return fresh current-session executable rows and keep all live safety checks downstream."""
+    try:
+        owner_uid = int(uid or 0)
+    except Exception:
+        owner_uid = 0
+    sess = str(session_label or '').upper().strip()
+    if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
+        return []
+    if not bool(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_ENABLED', True)):
+        return []
+    try:
+        win_min = int(window_min if window_min is not None else globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN', 150))
+    except Exception:
+        win_min = 150
+    win_min = max(20, min(480, int(win_min or 150)))
+    try:
+        lim = int(limit if limit is not None else globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_LIMIT', 60))
+    except Exception:
+        lim = 60
+    lim = max(10, min(120, int(lim or 60)))
+    cutoff = float(time.time()) - float(win_min) * 60.0
+    rows = []
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute(
+            """
+            SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts
+            FROM executable_setups x
+            LEFT JOIN emailed_setups e
+                   ON e.user_id = x.user_id
+                  AND e.setup_id = x.setup_id
+            LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
+            WHERE x.user_id = ?
+              AND x.executable_ts >= ?
+              AND UPPER(COALESCE(x.session, '')) = ?
+              AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+            ORDER BY x.executable_ts DESC, x.setup_id DESC
+            LIMIT ?
+            """,
+            (int(owner_uid), float(cutoff), sess, int(lim * 2)),
+        )
+        rows = [dict(r) for r in (cur.fetchall() or [])]
+        con.close()
+    except Exception as e:
+        try:
+            db_log_setup_pipeline_event(owner_uid, stage='autotrade_fresh_queue', status='error', session=sess, mode='autotrade', details={'error': f'{type(e).__name__}: {e}'})
+        except Exception:
+            pass
+        return []
+
+    out = []
+    rejects = Counter()
+    for row in rows:
+        try:
+            objs = _executable_rows_to_setup_objects([row], session_name=sess)
+            if not objs:
+                continue
+            obj = objs[0]
+            ok, why = _autotrade_db_signal_structurally_valid(obj, session_name=sess)
+            if ok:
+                out.append(obj)
+            else:
+                rejects[str(why or 'blocked')] += 1
+        except Exception as e:
+            rejects[f'exception:{type(e).__name__}'] += 1
+            continue
+    try:
+        db_log_setup_pipeline_event(owner_uid, stage='autotrade_fresh_queue', status='ok' if out else 'empty', session=sess, mode='autotrade', details={'window_min': int(win_min), 'scanned': len(rows or []), 'selected': len(out or []), 'top_rejects': _pipeline_top_reasons(rejects, 6)})
+    except Exception:
+        pass
+    return _autotrade_merge_candidate_lists_fresh_first(out, limit=lim)
+
+
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v115:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v120:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -19566,7 +19689,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v115:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v120:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -59954,6 +60077,22 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     db_log_setup_pipeline_event(uid, stage='autotrade_exec_select', status='error', session=str(sess or ''), mode='autotrade', details={'error': f'{type(e).__name__}: {e}'})
                 except Exception:
                     pass
+            # yver120: put fresh current-session executable rows ahead of the broad 24h queue.
+            # This is what makes AutoTrade coverage match /setup_audit for the current session.
+            try:
+                fresh_db_setups = await to_thread_autotrade(
+                    _autotrade_select_fresh_session_executable_setups,
+                    uid,
+                    sess,
+                    int(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN', 150) or 150),
+                    int(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_LIMIT', 60) or 60),
+                    timeout=8,
+                )
+            except Exception:
+                fresh_db_setups = []
+            if fresh_db_setups:
+                db_setups = _autotrade_merge_candidate_lists_fresh_first(fresh_db_setups, db_setups, limit=60)
+
             tf_cooling = _ohlcv_timeframe_cooling('15m', '1h', '4h')
             if not db_setups and tf_cooling:
                 reason = 'autotrade_refresh_deferred_rate_limit_cooldown'
@@ -60197,7 +60336,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v115:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v120:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
@@ -60224,6 +60363,19 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             reason = 'no_setups_after_email'
             max_batch_places = max(0, int(globals().get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', 0) or 0))  # 0 = unlimited/all eligible
             _email_batch_candidates = list(db_setups or [])
+            # yver120: after an email, also try the fresh current-session executable queue
+            # before the broad 24h fallback, so all fresh /setup_audit rows get either
+            # traded or a visible skip reason in /autotrade_last.
+            try:
+                _fresh_current_session = _autotrade_select_fresh_session_executable_setups(
+                    owner_uid,
+                    sess,
+                    int(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN', 150) or 150),
+                    int(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_LIMIT', 60) or 60),
+                ) or []
+                _email_batch_candidates = _autotrade_merge_candidate_lists_fresh_first(_email_batch_candidates, _fresh_current_session, limit=60)
+            except Exception:
+                pass
             # yver100: if the emailed batch is DISABLE/WATCH or otherwise not tradable,
             # immediately look through the owner's current executable queue for KEEP
             # lanes in the same session. This keeps AutoTrade aligned with best-lane
