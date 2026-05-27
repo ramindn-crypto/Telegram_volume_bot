@@ -1,3 +1,4 @@
+# yver123: fixes WR methodology (TP/SL only for setup audits; AutoTrade realised WR counts TP or positive OTHER as wins and SL or negative OTHER as losses), tightens compare matching to avoid stale/legacy setup DIFF rows, rounds PnL displays, and clarifies active sessions in /autotrade_debug.
 # yver121: AutoTrade candidate deadline lock. KEEP+WATCH executable setups are tradable only inside AUTOTRADE_ENTRY_WINDOW_MIN (default 60m); the old 24h fallback is capped to that deadline and no longer bypassed by keep-all mode.
 # yver116: AutoTrade timeout reconciliation display hardening and longer placement budget.
 # yver119: forces the audit-match AutoTrade runtime profile with a new one-time DB migration marker so deployed databases that already skipped/marked yver118 are corrected; values remain Telegram-editable after migration.
@@ -44783,7 +44784,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
         table_rows.append([ttxt, sym, side, combo_key, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
-    decided = tp_n + sl_n + nohit_n
+    decided = tp_n + sl_n
+    # yver123: WR excludes NOHIT and OPEN.
     wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
     try:
         now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
@@ -44808,7 +44810,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position).",
+        "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
@@ -45088,6 +45090,15 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 return False
             if close_ts > 0 and sts > close_ts + 300.0:
                 return False
+            # yver123: /setup_audit_compare is a live reconciliation view for the
+            # selected window. Do not attach a close in this window to an old
+            # previous-day setup row; that creates false DIFF rows when legacy
+            # positions or stale metadata survive across version/config changes.
+            try:
+                if float(sts) < float(start_ts) - 300.0:
+                    return False
+            except Exception:
+                pass
 
             try:
                 entry_deadline_sec = float(_autotrade_entry_window_min()) * 60.0
@@ -45236,7 +45247,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 mismatch += 1
             else:
                 unresolved += 1
-            rows.append([_fmt_ts(close_ts), sym, side, f"{pnl:.2f}".rstrip('0').rstrip('.'), actual, setup_time, audit_res, verdict])
+            rows.append([_fmt_ts(close_ts), sym, side, f"{pnl:.2f}", actual, setup_time, audit_res, verdict])
         except Exception:
             continue
 
@@ -45251,7 +45262,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
         "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
         "AT = actual realised AutoTrade close from Bybit/journal. Audit = independent matched setup price-path result.",
-        "yver122 matching: setup_id/open-time must fit the AutoTrade entry deadline; stale previous-day setup matches are shown as NO_SETUP instead of false DIFF.",
+        "yver123 matching: setup_id/open-time must fit the AutoTrade entry deadline and selected compare window; stale previous-day/legacy setup matches are shown as NO_SETUP instead of false DIFF.",
         "Precision: mismatched TP/SL rows are rechecked with targeted 1m candles before DIFF is shown.",
         f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
     ]
@@ -47061,7 +47072,8 @@ def _setup_edge_bucket_metrics(bucket: dict | None) -> dict:
         sl = int(b.get('sl') or 0)
         nh = int(b.get('nohit') or 0)
         op = int(b.get('open') or 0)
-        decided = tp + sl + nh
+        decided = tp + sl
+        # yver123: no-hit is not a loss for WR/AvgR; open/no-hit are shown separately.
         wr = (tp / max(1, decided) * 100.0) if decided else 0.0
         avg_r = (float(b.get('r_sum') or 0.0) / max(1, decided)) if decided else 0.0
         score = (wr - 50.0) + avg_r * 25.0 + min(20, decided) * 0.35 - (op / max(1, setups) * 2.0)
@@ -47846,7 +47858,7 @@ def _setup_combo_matrix_build(uid: int, hours: int = 168, persist: bool = True, 
         _strat = _setup_strategy_suffix(value=str(st.get('strategy') or 'NOR'))
         _side = _setup_side_suffix(value=str(st.get('side') or 'BOTH'))
         total = int(st.get('setups') or 0)
-        decided = int(st.get('tp') or 0) + int(st.get('sl') or 0) + int(st.get('nohit') or 0)
+        decided = int(st.get('tp') or 0) + int(st.get('sl') or 0)
         tp = int(st.get('tp') or 0)
         sl = int(st.get('sl') or 0)
         nohit = int(st.get('nohit') or 0)
@@ -48100,7 +48112,8 @@ def _setup_edge_stats_rows(stats: dict, *, min_setups: int = 1, sort_mode: str =
         sl = int(b.get('sl') or 0)
         nh = int(b.get('nohit') or 0)
         op = int(b.get('open') or 0)
-        decided = tp + sl + nh
+        decided = tp + sl
+        # yver123: no-hit is not a loss for WR/AvgR; open/no-hit are shown separately.
         wr = (tp / max(1, decided) * 100.0) if decided else 0.0
         avg_r = (float(b.get('r_sum') or 0.0) / max(1, decided)) if decided else 0.0
         avg_conf = float(b.get('conf_sum') or 0.0) / max(1, setups)
@@ -48230,7 +48243,8 @@ def _setup_edge_deep_text(uid: int, hours: int = 168, start_ts: float | None = N
             except Exception:
                 continue
 
-        decided = tp_n + sl_n + nohit_n
+        decided = tp_n + sl_n
+        # yver123: deep-analysis WR excludes NOHIT and OPEN.
         wr = (tp_n / max(1, decided) * 100.0) if decided else 0.0
         try:
             start_txt = datetime.fromtimestamp(first_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M') if first_ts else '-'
@@ -48255,7 +48269,7 @@ def _setup_edge_deep_text(uid: int, hours: int = 168, start_ts: float | None = N
         rec_tighten = []
         for lane, b in by_lane.items():
             tp = int(b.get('tp') or 0); sl = int(b.get('sl') or 0); nh = int(b.get('nohit') or 0)
-            dec = tp + sl + nh
+            dec = tp + sl
             if dec < max(1, min_dec_weekly):
                 continue
             wr_i = tp / max(1, dec) * 100.0
@@ -48995,7 +49009,8 @@ def _setup_audit_overall_text(uid: int) -> str:
         sl = int(st.get('sl') or 0)
         nohit = int(st.get('nohit') or 0)
         op = int(st.get('open') or 0)
-        decided = tp + sl + nohit
+        decided = tp + sl
+        # yver123: setup WR excludes NOHIT and OPEN.
         wr = (tp / decided * 100.0) if decided > 0 else 0.0
         total_setups += total
         total_tp += tp
@@ -49004,14 +49019,15 @@ def _setup_audit_overall_text(uid: int) -> str:
         total_open += op
         combo_key = _setup_combo_strategy_side_key(fam, sess_row, strat_row, side_row)
         table_rows.append([combo_key, total, tp, sl, nohit, op, f"{wr:.1f}%"])
-    decided_total = total_tp + total_sl + total_nohit
+    decided_total = total_tp + total_sl
+    # yver123: WR is TP/(TP+SL). NOHIT and OPEN are informational, not losses.
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
     win = _setup_audit_window_summary(rows)
     dur_days = float(win.get('duration_days') or 0.0)
     avg_daily = float(win.get('avg_daily') or 0.0)
     try:
-        keep_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) >= SETUP_COMBO_POLICY_KEEP_WR and int(r[2]) + int(r[3]) + int(r[4]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
-        weak_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) < SETUP_COMBO_POLICY_DISABLE_WR and int(r[2]) + int(r[3]) + int(r[4]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
+        keep_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) >= SETUP_COMBO_POLICY_KEEP_WR and int(r[2]) + int(r[3]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
+        weak_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) < SETUP_COMBO_POLICY_DISABLE_WR and int(r[2]) + int(r[3]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
         keep_txt = ', '.join([str(r[0]) for r in keep_candidates[:5]]) or '-'
         weak_txt = ', '.join([str(r[0]) for r in weak_candidates[:5]]) or '-'
     except Exception:
@@ -49034,7 +49050,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         f"Current live disabled policy combos: <b>{html.escape(pol_txt)}</b>.",
         html.escape(_setup_edge_guard_snapshot_text(int(uid))),
         "For the weekly DB edge review, use <code>/setup_matrix 168</code>. <code>/setup_matrix 24</code> is diagnostic only. Live policy is officially updated by the scheduled Sunday 23:00 Melbourne review; daily 10:00 safety can add temporary severe-disable rows only.",
-        "NOHIT = horizon expired with no TP/SL; OPEN = still inside the result horizon.",
+        "NOHIT = horizon expired with no TP/SL; OPEN = still inside the result horizon. WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     table = tabulate(
         table_rows,
@@ -49096,7 +49112,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         uid_i = int(uid or 0)
 
     try:
-        cache_key = f"keep_watch_summary::{uid_i}::{int(float(_overall_report_start_ts() or 0.0))}"
+        cache_key = f"keep_watch_summary:v123::{uid_i}::{int(float(_overall_report_start_ts() or 0.0))}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -49166,7 +49182,8 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         except Exception:
             continue
 
-    decided_total = total_tp + total_sl + total_nohit
+    decided_total = total_tp + total_sl
+    # yver123: WR is TP/(TP+SL). NOHIT and OPEN are informational, not losses.
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
     win = _setup_audit_window_summary(rows)
 
@@ -51246,7 +51263,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v108_live_geometry_no_stale_override:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v123_realised_wr:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -51708,7 +51725,7 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_closed_positions:v106:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v123:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -51888,11 +51905,8 @@ def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> 
     def _pnl_text(value) -> str:
         try:
             x = float(value or 0.0)
-            # Match Bybit-style precision for small/normal values without adding a
-            # plus sign, so visual comparison against Bybit P&L is straightforward.
-            if abs(x) >= 100:
-                return f"{x:.2f}".rstrip('0').rstrip('.')
-            return f"{x:.4f}".rstrip('0').rstrip('.')
+            # yver123: keep all PnL display rounded and readable.
+            return f"{x:.2f}"
         except Exception:
             return '-'
 
@@ -52249,7 +52263,7 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v106:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_closed_positions:v123:{owner_uid}:{lookback_h}"
     stale_cached = ''
     try:
         raw_cached = cache_get(cache_key)
@@ -52819,6 +52833,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         HDR,
         f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Entries: {'ON' if _autotrade_entry_enabled() else 'OFF'} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
         f"Trading day: {snap.get('today_window_label')}",
+        "Configured sessions: ASIA/LON/NY active by default; current Session line only shows the active session/time block right now.",
         (f"Keep-all test: ON | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(_autotrade_entry_window_min())}m" if _autotrade_keep_all_test_mode() else None),
         (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry blackout: {'ON' if _autotrade_entry_blackout_enabled() else 'OFF'} | Setup blackout: {'ON' if _setup_generation_blackout_enabled() else 'OFF'}" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
         SEP,
@@ -53114,6 +53129,28 @@ def _autotrade_closed_report_rows_for_fixed_overall(owner_uid: int, start_ts: fl
         pass
     return out
 
+def _autotrade_realised_wr_kind(row: dict) -> str:
+    """Return WIN/LOSS/FLAT/OPEN for realised AutoTrade WR.
+
+    yver123: AutoTrade WR should be based on closed practical outcomes, excluding
+    open rows. TP is a win and SL is a loss. OTHER rows are classified by realised
+    PnL sign so daily flat/profit-close/exchange-authority closes still contribute
+    to real trading WR instead of disappearing from the denominator.
+    """
+    try:
+        if str((row or {}).get('state') or '').upper().strip() == 'OPEN':
+            return 'OPEN'
+        kind = str((row or {}).get('closed_kind') or _autotrade_report_closed_kind(row) or '').upper().strip()
+        pnl = float((row or {}).get('pnl_usdt') if (row or {}).get('pnl_usdt') is not None else (row or {}).get('pnl') or 0.0)
+        eps = float(globals().get('AUTOTRADE_REPORT_TPSL_SIGN_EPS_USD', 0.50) or 0.50)
+        if kind == 'TP' or pnl > eps:
+            return 'WIN'
+        if kind == 'SL' or pnl < -eps:
+            return 'LOSS'
+        return 'FLAT'
+    except Exception:
+        return 'FLAT'
+
 def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24) -> str:
     """Family/session AutoTrade matrix based on actual AutoTrade positions and PnL."""
     owner_uid = int(owner_uid)
@@ -53121,7 +53158,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     _now_for_key = float(time.time())
     _fixed_overall = bool(lookback_h >= max(1, int(_overall_report_hours_since_start(_now_for_key)) - 1))
     _fixed_start_ts = float(_overall_report_start_ts() or 0.0) if _fixed_overall else 0.0
-    cache_key = f"autoytrade_report_overall:v75_fixed_start:{owner_uid}:{lookback_h}:{int(_fixed_start_ts or 0)}"
+    cache_key = f"autoytrade_report_overall:v123_realised_wr:{owner_uid}:{lookback_h}:{int(_fixed_start_ts or 0)}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -53222,7 +53259,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         })
 
     merged = _autotrade_merge_position_report_rows(rows)
-    buckets = defaultdict(lambda: {'trades': 0, 'tp': 0, 'sl': 0, 'open': 0, 'other': 0, 'pnl': 0.0, 'parts': 0, 'loss_reasons': defaultdict(int)})
+    buckets = defaultdict(lambda: {'trades': 0, 'tp': 0, 'sl': 0, 'open': 0, 'other': 0, 'wins': 0, 'losses': 0, 'flat': 0, 'pnl': 0.0, 'parts': 0, 'loss_reasons': defaultdict(int)})
     for r in merged:
         fam = str(r.get('family') or 'F0').upper().strip() or 'F0'
         sess = str(r.get('session') or _autotrade_report_row_session(r) or 'UNK').upper().strip() or 'UNK'
@@ -53237,6 +53274,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
             b['open'] += 1
         else:
             kind = str(r.get('closed_kind') or _autotrade_report_closed_kind(r)).upper().strip()
+            realised_kind = _autotrade_realised_wr_kind(r)
             if kind == 'TP':
                 b['tp'] += 1
             elif kind == 'SL':
@@ -53247,6 +53285,17 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
                     b['loss_reasons']['LOSS_CLOSE'] += 1
             else:
                 b['other'] += 1
+            if realised_kind == 'WIN':
+                b['wins'] += 1
+            elif realised_kind == 'LOSS':
+                b['losses'] += 1
+                if kind != 'SL':
+                    try:
+                        b['loss_reasons'][_autotrade_report_loss_reason(r)] += 1
+                    except Exception:
+                        b['loss_reasons']['LOSS_CLOSE'] += 1
+            elif realised_kind == 'FLAT':
+                b['flat'] += 1
 
     total_tp = sum(int(v.get('tp') or 0) for v in buckets.values())
     total_sl = sum(int(v.get('sl') or 0) for v in buckets.values())
@@ -53254,9 +53303,12 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
     total_open = sum(int(v.get('open') or 0) for v in buckets.values())
     total_pnl = sum(float(v.get('pnl') or 0.0) for v in buckets.values())
     total_trades = sum(int(v.get('trades') or 0) for v in buckets.values())
+    total_wins = sum(int(v.get('wins') or 0) for v in buckets.values())
+    total_losses = sum(int(v.get('losses') or 0) for v in buckets.values())
+    total_flat = sum(int(v.get('flat') or 0) for v in buckets.values())
     raw_fragments = int(len(rows or []))
-    decided = total_tp + total_sl
-    wr = (total_tp / decided * 100.0) if decided > 0 else 0.0
+    decided = total_wins + total_losses
+    wr = (total_wins / decided * 100.0) if decided > 0 else 0.0
     try:
         now_txt = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
     except Exception:
@@ -53267,7 +53319,7 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
         HDR,
         (f'Window: from {_overall_report_start_txt()} Melbourne' if _fixed_overall else f'Window: last {lookback_h}h (Melbourne)') + (f' | Now: {now_txt}' if now_txt else ''),
         f'Position rows: {total_trades} | Raw fragments merged: {raw_fragments} | TP: {total_tp} | SL: {total_sl} | Other: {total_other} | Open: {total_open} | WR: {wr:.1f}% | PnL: {total_pnl:+.2f} USDT',
-        'TP/SL counts are realised outcomes and use the same classifier as /autotrade_report. Other should only be near-zero/unknown rows; time exits and inferred loss reasons are tracked in the detailed report.',
+        f'Realised WR basis: wins={total_wins} / losses={total_losses}; OPEN excluded; near-zero FLAT excluded; OTHER uses PnL sign (positive=win, negative=loss).',
     ]
     if external_positions:
         lines.append(f'Ignored unmatched manual/external live positions: {len(external_positions)}')
@@ -53280,8 +53332,8 @@ def _autoytrade_report_overall_text_cached(owner_uid: int, lookback_h: int = 24)
 
     table_rows = []
     for (fam, sess, strat, side), v in sorted(buckets.items(), key=lambda kv: (float(kv[1].get('pnl') or 0.0), int(kv[1].get('tp') or 0), -int(kv[1].get('sl') or 0)), reverse=True):
-        d = int(v.get('tp') or 0) + int(v.get('sl') or 0)
-        wr_i = (int(v.get('tp') or 0) / d * 100.0) if d > 0 else 0.0
+        d = int(v.get('wins') or 0) + int(v.get('losses') or 0)
+        wr_i = (int(v.get('wins') or 0) / d * 100.0) if d > 0 else 0.0
         try:
             loss_reasons = dict(v.get('loss_reasons') or {})
             top_loss = max(loss_reasons.items(), key=lambda kv: kv[1])[0] if loss_reasons else '-'
