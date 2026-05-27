@@ -1,3 +1,4 @@
+# yver131: KEEP-only live/investor mode: /setup_audit_keep X command, AutoTrade + /screen + setup emails default to KEEP-only with email match, and /setup_matrix policy uses fast DB policy view to avoid Telegram timeouts.
 # yver130: startup fix for yver129: imports typing.Any before the early AutoTrade email-gate helper so Render does not crash on NameError.
 from typing import Any  # yver130 early import required before early helper annotations
 # yver129: locks AutoTrade to the same delivered KEEP+WATCH lane as subscribers: future AutoTrade entries require an actual recent setup email/delivery within AUTOTRADE_ENTRY_WINDOW_MIN, remove broad executable/fresh-queue fallbacks from email-triggered AutoTrade, and keep the setting Telegram-configurable.
@@ -837,8 +838,8 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: float(os.environ.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', '3.0') or 3.0),
         AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True) else 0,
         AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1 if env_bool('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True) else 0,
-        AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('AUTOTRADE_ALLOW_WATCH_POLICY', True) else 0,
-        USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('USER_VISIBLE_ALLOW_WATCH_POLICY', True) else 0,
+        AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('AUTOTRADE_ALLOW_WATCH_POLICY', False) else 0,
+        USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('USER_VISIBLE_ALLOW_WATCH_POLICY', False) else 0,
         AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_TP_RR_CAP_ENABLED', True) else 0,
         AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_TP_RR_ENABLED', True) else 0,
         AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', '2.0') or 2.0),
@@ -2561,7 +2562,7 @@ def _autotrade_apply_ver119_audit_match_config_defaults() -> None:
     change any value from Telegram and restarts will preserve those changes.
     """
     try:
-        target_version = 'yver129_2026_05_27_email_matched_autotrade_runtime_config'
+        target_version = 'yver131_2026_05_28_keep_only_email_matched_live_config'
         if str(_autotrade_config_get('ver119_audit_match_config_version', '') or '').strip().lower() == target_version:
             return
 
@@ -2584,8 +2585,8 @@ def _autotrade_apply_ver119_audit_match_config_defaults() -> None:
             # live-only AutoTrade sample to block policy-approved KEEP/WATCH lanes.
             AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 0,
             AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
-            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 1,
-            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 1,
+            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
             AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1,
 
             # Match setup-audit TP/SL horizon better: no operational daily flat or
@@ -4870,7 +4871,7 @@ DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H = float(os.environ.get("DIRECTIONAL_CONTEXT
 #   guards pass.
 # - DISABLE/OFF/BLOCK/PAUSE: never shown, emailed or AutoTraded.
 AUTOTRADE_REQUIRE_KEEP_POLICY = env_bool("AUTOTRADE_REQUIRE_KEEP_POLICY", True)
-AUTOTRADE_ALLOW_WATCH_POLICY = env_bool("AUTOTRADE_ALLOW_WATCH_POLICY", True)
+AUTOTRADE_ALLOW_WATCH_POLICY = env_bool("AUTOTRADE_ALLOW_WATCH_POLICY", False)
 
 def _autotrade_require_keep_policy() -> bool:
     try:
@@ -4880,10 +4881,10 @@ def _autotrade_require_keep_policy() -> bool:
 
 def _autotrade_allow_watch_policy() -> bool:
     try:
-        raw = _autotrade_config_get(AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if bool(globals().get('AUTOTRADE_ALLOW_WATCH_POLICY', True)) else 0)
+        raw = _autotrade_config_get(AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if bool(globals().get('AUTOTRADE_ALLOW_WATCH_POLICY', False)) else 0)
         return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
     except Exception:
-        return True
+        return False
 
 def _autotrade_allowed_policy_statuses() -> set:
     try:
@@ -4898,9 +4899,9 @@ def _autotrade_allowed_policy_statuses() -> set:
 USER_VISIBLE_REQUIRE_KEEP_POLICY = env_bool("USER_VISIBLE_REQUIRE_KEEP_POLICY", True)
 SCREEN_REQUIRE_KEEP_POLICY = env_bool("SCREEN_REQUIRE_KEEP_POLICY", True)
 EMAIL_REQUIRE_KEEP_POLICY = env_bool("EMAIL_REQUIRE_KEEP_POLICY", True)
-USER_VISIBLE_ALLOW_WATCH_POLICY = env_bool("USER_VISIBLE_ALLOW_WATCH_POLICY", True)
-SCREEN_ALLOW_WATCH_POLICY = env_bool("SCREEN_ALLOW_WATCH_POLICY", True)
-EMAIL_ALLOW_WATCH_POLICY = env_bool("EMAIL_ALLOW_WATCH_POLICY", True)
+USER_VISIBLE_ALLOW_WATCH_POLICY = env_bool("USER_VISIBLE_ALLOW_WATCH_POLICY", False)
+SCREEN_ALLOW_WATCH_POLICY = env_bool("SCREEN_ALLOW_WATCH_POLICY", False)
+EMAIL_ALLOW_WATCH_POLICY = env_bool("EMAIL_ALLOW_WATCH_POLICY", False)
 
 def _user_visible_require_keep_policy(lane: str = '') -> bool:
     try:
@@ -4920,15 +4921,15 @@ def _user_visible_allow_watch_policy(lane: str = '') -> bool:
         l = str(lane or '').lower().strip()
         fallback = True
         if l in {'screen', '/screen'}:
-            fallback = bool(globals().get('SCREEN_ALLOW_WATCH_POLICY', True))
+            fallback = bool(globals().get('SCREEN_ALLOW_WATCH_POLICY', False))
         elif l in {'email', 'setup_email', 'bigmove', 'f8', 'screen_sync'}:
-            fallback = bool(globals().get('EMAIL_ALLOW_WATCH_POLICY', True))
+            fallback = bool(globals().get('EMAIL_ALLOW_WATCH_POLICY', False))
         else:
-            fallback = bool(globals().get('USER_VISIBLE_ALLOW_WATCH_POLICY', True))
+            fallback = bool(globals().get('USER_VISIBLE_ALLOW_WATCH_POLICY', False))
         raw = _autotrade_config_get(USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if fallback else 0)
         return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
     except Exception:
-        return True
+        return False
 
 def _user_visible_allowed_policy_statuses(lane: str = '') -> set:
     try:
@@ -39629,7 +39630,7 @@ KNOWN_COMMANDS = sorted(set([
 
     # Admin diagnostics / optimization
     "why", "edge_status", "learning_status", "optimizer_status", "winrate", "ny_winrate", "lessons_learned",
-    "setup_audit_overall", "setup_audit_keep_watch", "setup_keep_watch_summary", "setup_audit_compare", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis", "email_decision", "adaptive_status",
+    "setup_audit_overall", "setup_audit_keep_watch", "setup_audit_keep", "setup_keep_watch_summary", "setup_audit_compare", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis", "email_decision", "adaptive_status",
     "params_show", "params_set", "params_reset", "backtest", "universe_backtest", "optimize", "optimize_report", "self_optimize", "self_optimize_stop", "self_optimize_report",
 
     # Timezone
@@ -40171,6 +40172,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall Family-Session-Strategy-Side summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR",
     "setup_audit_keep_watch": "Multi-window KEEP + WATCH setup summary table: Last 24h, 7d, 14d, Overall; Keep/Watch combo counts, Set, TP, SL, NH, Open, WR",
+    "setup_audit_keep": "Setup Audit filtered to current KEEP policy lanes only; usage: /setup_audit_keep 24",
     "setup_keep_watch_summary": "Alias of /setup_audit_keep_watch",
     "setup_audit_compare": "Reconcile bot-created AutoTrade closes against /setup_audit price-path results; exchange-only rows are marked BYBIT_ONLY: /setup_audit_compare 24",
     "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
@@ -40229,7 +40231,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_audit_keep_watch", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
+    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_audit_keep_watch", "setup_audit_keep", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autotrade_closed", "autotrade_report_overall", "autotrade_report_matrix", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_test_data", "admin_reset_signal_reports", "reset", "restore"]),
@@ -41330,8 +41332,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
             "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
-            "• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY true",
-            "• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY true",
+            "• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY false   (KEEP-only live mode)",
+            "• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY false   (/screen + emails KEEP-only)",
             "• /autotrade_config AUTOTRADE_TP_RR_CAP_ENABLED true",
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 1.5",
@@ -45176,6 +45178,115 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
 
 
 
+def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
+    """Setup audit filtered to current KEEP policy lanes only."""
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    try:
+        hours = max(1, min(8760, int(float(hours or 24))))
+    except Exception:
+        hours = 24
+    try:
+        limit = max(0, int(limit or 0))
+    except Exception:
+        limit = 0
+    result_horizon = _setup_audit_result_horizon_hours()
+    min_vol_m = _setup_min_volume_floor_usd() / 1e6
+    try:
+        rows_all = _setup_audit_load_rows(uid_i, hours=hours, limit=0, dedup=True)
+    except Exception:
+        rows_all = []
+
+    def _row_is_keep(r: dict) -> bool:
+        try:
+            sess_row = str((r or {}).get('session') or (r or {}).get('source_session') or '').upper().strip()
+            pinfo = _setup_combo_policy_lookup_for_setup(r, session_name=sess_row, user_id=uid_i) or {}
+            pfound = bool((pinfo or {}).get('found'))
+            pstatus = _setup_policy_effective_status(str((pinfo or {}).get('status') or '').upper().strip(), found=pfound)
+            return str(pstatus or '').upper().strip() == 'KEEP'
+        except Exception:
+            return False
+
+    rows = [dict(r or {}) for r in (rows_all or []) if _row_is_keep(dict(r or {}))]
+    if limit > 0:
+        rows = rows[:limit]
+    if not rows:
+        return (
+            f"🧪 <b>Setup Audit — KEEP Only</b>\n{HDR}\n"
+            f"No KEEP-policy setup rows above ${min_vol_m:.0f}M volume in the last {hours}h.\n"
+            f"This means the current KEEP-only live lane has no audited setup rows in this window. "
+            f"Use <code>/setup_audit_keep_watch</code> to compare KEEP vs WATCH coverage."
+        )
+
+    audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
+    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
+    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(uid_i, start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+    table_rows = []
+    tp_n = sl_n = nohit_n = open_n = 0
+    for r in rows:
+        try:
+            sid = str(r.get('setup_id') or '').strip()
+            side = str(r.get('side') or '').upper().strip()
+            sym = str(r.get('symbol') or '').upper().strip()
+            if sym.endswith('USDT'):
+                sym = sym[:-4]
+            family_code = _setup_audit_family_code(r)
+            actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
+            ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=uid_i, candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
+            result = _setup_audit_result_label(ev.get('result'))
+            if result == 'TP':
+                tp_n += 1
+            elif result == 'SL':
+                sl_n += 1
+            elif result == 'NOHIT':
+                nohit_n += 1
+            else:
+                open_n += 1
+            sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+            ts = _setup_audit_row_ts(r)
+            try:
+                ttxt = datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if ts > 0 else '-'
+            except Exception:
+                ttxt = '-'
+            try:
+                volm = float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0) / 1e6
+            except Exception:
+                volm = 0.0
+            combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
+            entry_f = float(r.get('entry') or 0.0)
+            sl_f = float(r.get('sl') or 0.0)
+            tp_f = float(_resolve_single_tp(entry_f, sl_f, r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)
+            table_rows.append([ttxt, sym, side, combo_key, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(entry_f) if entry_f > 0 else '-', fmt_price(sl_f) if sl_f > 0 else '-', fmt_price(tp_f) if tp_f > 0 else '-', result])
+        except Exception:
+            continue
+    decided = tp_n + sl_n
+    wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
+    try:
+        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        now_txt = ''
+    win = _setup_audit_window_summary(rows)
+    table = tabulate(
+        table_rows,
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        tablefmt='plain',
+        colalign=('left', 'left', 'center', 'left', 'right', 'right', 'right', 'right', 'right', 'center'),
+    )
+    return "\n".join([
+        "🧪 <b>Setup Audit — KEEP Only</b>",
+        HDR,
+        f"Window: <b>last {hours}h</b> | KEEP setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
+        f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
+        "Source: post-setup price path; AutoTrade-independent. Rows: <b>current KEEP policy lanes only</b>.",
+        "WR = TP/(TP+SL), excluding NOHIT and OPEN.",
+        f"Rows shown: <b>{len(table_rows)}</b> / <b>{len(table_rows)}</b> (full list).",
+        "<pre>" + html.escape(table) + "</pre>",
+    ])
+
+
 # ================= SETUP AUDIT ↔ AUTOTRADE RECONCILIATION =================
 def _setup_audit_compare_prepare_closed_positions(trade_rows: list[dict]) -> list[dict]:
     """Return practical merged closed AutoTrade positions for audit comparison.
@@ -48698,22 +48809,23 @@ def _setup_combo_policy_text(uid: int) -> str:
         if owner_uid <= 0:
             owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
 
-        # yver76: /setup_matrix policy must be based on the same fixed historical
-        # evidence window as /setup_audit_overall, not a stale last-24h/168h score run.
-        # This refresh writes the enforceable lane policy and optimizer bridge from
-        # 2026-05-15 00:00 Melbourne before rendering the policy table.
-        baseline_res = {}
-        try:
-            baseline_res = _setup_combo_matrix_build(
-                int(owner_uid),
-                _overall_report_effective_hours(SETUP_COMBO_REVIEW_WINDOW_HOURS),
-                True,
-                True,
-                'scheduled',
-                start_ts=_overall_report_start_ts(),
-            )
-        except Exception as _baseline_exc:
-            baseline_res = {'ok': False, 'reason': f'{type(_baseline_exc).__name__}: {_baseline_exc}'}
+        # yver131: /setup_matrix policy is an admin view and must not block/timeout
+        # Telegram while rebuilding the full 15-May matrix. Scheduled/intraday safety
+        # jobs remain responsible for refreshing policy. Use the DB policy view fast by
+        # default; set SETUP_MATRIX_POLICY_REFRESH_ON_VIEW=1 only for manual heavy refresh.
+        baseline_res = {'ok': True, 'reason': 'view_fast_db_policy_no_refresh'}
+        if env_bool('SETUP_MATRIX_POLICY_REFRESH_ON_VIEW', False):
+            try:
+                baseline_res = _setup_combo_matrix_build(
+                    int(owner_uid),
+                    _overall_report_effective_hours(SETUP_COMBO_REVIEW_WINDOW_HOURS),
+                    True,
+                    True,
+                    'scheduled',
+                    start_ts=_overall_report_start_ts(),
+                )
+            except Exception as _baseline_exc:
+                baseline_res = {'ok': False, 'reason': f'{type(_baseline_exc).__name__}: {_baseline_exc}'}
 
         _setup_combo_policy_migrate()
         with sqlite3.connect(DB_PATH) as conn:
@@ -49654,6 +49766,25 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
         text = await to_thread_fast(_setup_audit_keep_watch_summary_text, int(AUTOTRADE_OWNER_UID or uid), timeout=45)
     except Exception as e:
         text = f"❌ setup_audit_keep_watch failed: {type(e).__name__}: {html.escape(str(e))}"
+    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    hours = 24
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and re.fullmatch(r'\d+(\.\d+)?', args[0]):
+            hours = int(float(args[0]))
+    except Exception:
+        hours = 24
+    try:
+        text = await to_thread_heavy(_setup_audit_keep_text, int(AUTOTRADE_OWNER_UID or uid), int(hours), 0, timeout=120)
+    except Exception as e:
+        text = f"❌ setup_audit_keep failed: {type(e).__name__}: {html.escape(str(e))}"
     await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
@@ -61290,6 +61421,7 @@ def main():
     app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_keep_watch", setup_audit_keep_watch_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_keep", setup_audit_keep_cmd, block=False))
     app.add_handler(CommandHandler("setup_keep_watch_summary", setup_audit_keep_watch_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_compare", setup_audit_compare_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_reconcile", setup_audit_compare_cmd, block=False))
