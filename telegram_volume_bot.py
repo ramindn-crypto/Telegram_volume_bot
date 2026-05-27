@@ -1,4 +1,4 @@
-# yver120: AutoTrade now prioritises fresh current-session executable rows (same lane as /setup_audit) before stale 24h fallback candidates, so every fresh setup is either placed or gets a visible skip reason.
+# yver121: AutoTrade candidate deadline lock. KEEP+WATCH executable setups are tradable only inside AUTOTRADE_ENTRY_WINDOW_MIN (default 60m); the old 24h fallback is capped to that deadline and no longer bypassed by keep-all mode.
 # yver116: AutoTrade timeout reconciliation display hardening and longer placement budget.
 # yver119: forces the audit-match AutoTrade runtime profile with a new one-time DB migration marker so deployed databases that already skipped/marked yver118 are corrected; values remain Telegram-editable after migration.
 # yver118: audit-match live-test config defaults are applied through runtime autotrade_config (Telegram-editable): fixed 1.0% risk, dynamic risk OFF, fixed 1.5R TP, realised-combo self-block OFF, daily flat/catchup OFF, max-hold OFF, and context/deep-analysis guard ON.
@@ -529,6 +529,7 @@ AUTOTRADE_CFG_ENTRY_ENABLED_KEY = 'entry_enabled'  # yver60: runtime AutoTrade n
 AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY = 'max_open_trades'
 AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY = 'max_trades_per_day'  # AutoTrade-only daily count cap; independent from /limits maxtrades
 AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY = 'max_entry_drift_pct'
+AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY = 'entry_window_min'  # yver121: setup must be attempted/opened before this age deadline
 AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY = 'liq_buffer_pct'
 # Ver03: Dynamic AutoTrade risk scaling. The configured risk remains the base
 # from /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT, then the bot may size
@@ -647,8 +648,8 @@ SETUP_GENERATION_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get(
 # SL/TP attachment, risk caps, duplicate guards, drift checks and exchange safety checks remain active.
 AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN = env_bool('AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN', True)
 AUTOTRADE_KEEP_ALL_TEST_DISABLE_TIME_EXITS = env_bool('AUTOTRADE_KEEP_ALL_TEST_DISABLE_TIME_EXITS', False)
-AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN = int(os.environ.get('AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN', '1440') or 1440)
-AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS = float(os.environ.get('AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS', '24') or 24)
+AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN = int(os.environ.get('AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN', '60') or 60)
+AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS = float(os.environ.get('AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS', '1') or 1)
 # yver55: forward-test mode should not stop after N candidates. 0 means unlimited/all eligible.
 AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE = env_bool('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', True)
 AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS = env_bool('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)
@@ -796,6 +797,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(_autotrade_runtime_max_open_trades()),
         AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: int(_autotrade_runtime_max_trades_per_day()),
         AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT),
+        AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY: int(os.environ.get('AUTOTRADE_ENTRY_WINDOW_MIN', '60') or 60),
         AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY: float(AUTOTRADE_LIQ_BUFFER_PCT),
         AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_RISK_ENABLED', True) else 0,
         AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '0.75') or 0.75),
@@ -1366,17 +1368,33 @@ def _autotrade_keep_all_test_disables_time_exits() -> bool:
         return False
 
 
+def _autotrade_entry_window_min() -> int:
+    """Maximum age of a setup before AutoTrade must stop trying to open it.
+
+    This is intentionally an execution deadline, not the setup-audit horizon.
+    /setup_audit_keep_watch still evaluates the 24h TP/SL path, but AutoTrade
+    should not open stale positions many hours later.
+    """
+    try:
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY, os.environ.get('AUTOTRADE_ENTRY_WINDOW_MIN', '60')) or 60))
+    except Exception:
+        val = 60
+    return max(5, min(240, int(val)))
+
+
 def _autotrade_candidate_lookback_hours(default_hours: float = 12.0) -> float:
     try:
         base = float(default_hours or 12.0)
     except Exception:
         base = 12.0
-    if _autotrade_keep_all_test_mode():
-        try:
-            return max(base, float(globals().get('AUTOTRADE_KEEP_ALL_TEST_LOOKBACK_HOURS', 24.0) or 24.0))
-        except Exception:
-            return max(base, 24.0)
-    return base
+    # yver121: selection lookback is capped by the entry deadline. 24h remains
+    # only the audit/result horizon, not an AutoTrade opening window. Add a tiny
+    # 1-minute tolerance for timestamp/logging jitter, but never re-open old rows.
+    try:
+        deadline_h = (float(_autotrade_entry_window_min()) + 1.0) / 60.0
+    except Exception:
+        deadline_h = 61.0 / 60.0
+    return max(0.10, min(float(base), float(deadline_h)))
 
 
 def _autotrade_flat_before_asia_enabled() -> bool:
@@ -1555,6 +1573,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_MAX_OPEN_TRADES': int(_autotrade_runtime_max_open_trades()),
         'AUTOTRADE_MAX_TRADES_PER_DAY': int(_autotrade_runtime_max_trades_per_day()),
         'AUTOTRADE_MAX_ENTRY_DRIFT_PCT': float(_autotrade_runtime_max_entry_drift_pct()),
+        'AUTOTRADE_ENTRY_WINDOW_MIN': int(_autotrade_entry_window_min()),
         'AUTOTRADE_LEVERAGE': int(_autotrade_runtime_leverage()),
         'AUTOTRADE_LIQ_BUFFER_PCT': float(_autotrade_runtime_liq_buffer_pct()),
         'AUTOTRADE_DYNAMIC_RISK_ENABLED': bool(_autotrade_dynamic_risk_enabled()),
@@ -6539,17 +6558,18 @@ BYBIT_API_KEY = str(os.environ.get("BYBIT_API_KEY", "") or "").strip()
 BYBIT_API_SECRET = str(os.environ.get("BYBIT_API_SECRET", "") or "").strip()
 BYBIT_RECV_WINDOW = str(os.environ.get("BYBIT_RECV_WINDOW", "5000") or "5000").strip()
 BYBIT_TESTNET = str(os.environ.get("BYBIT_TESTNET", "0")).strip() in ("1", "true", "TRUE", "yes", "YES")
+# yver121: setup entry deadline. Default is 60 minutes and is Telegram-editable
+# through /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60. This is separate from
+# the 24h setup-audit result horizon.
 try:
-    _autotrade_entry_window_default_min = str(int(globals().get('AUTOTRADE_KEEP_ALL_TEST_ENTRY_WINDOW_MIN', 1440) or 1440)) if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_SETUPS_OPEN', False)) else '45'
+    AUTOTRADE_ENTRY_WINDOW_MIN = _autotrade_entry_window_min()
 except Exception:
-    _autotrade_entry_window_default_min = '45'
-AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", _autotrade_entry_window_default_min) or _autotrade_entry_window_default_min)
+    AUTOTRADE_ENTRY_WINDOW_MIN = int(os.environ.get("AUTOTRADE_ENTRY_WINDOW_MIN", "60") or 60)
 
-# yver120: AutoTrade must prioritise the fresh current-session executable lane.
-# This keeps AutoTrade aligned with /setup_audit rows generated after the session starts,
-# instead of spending attempts on stale 24h lookback rows from the previous day/session.
+# AutoTrade must prioritise the fresh current-session executable lane. The fresh
+# queue window is capped by the same entry deadline; it is not a 24h fallback.
 AUTOTRADE_FRESH_SESSION_QUEUE_ENABLED = env_bool("AUTOTRADE_FRESH_SESSION_QUEUE_ENABLED", True)
-AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN = int(os.environ.get("AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN", "150") or 150)
+AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN = int(os.environ.get("AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN", str(AUTOTRADE_ENTRY_WINDOW_MIN)) or AUTOTRADE_ENTRY_WINDOW_MIN)
 AUTOTRADE_FRESH_SESSION_QUEUE_LIMIT = int(os.environ.get("AUTOTRADE_FRESH_SESSION_QUEUE_LIMIT", "60") or 60)
 
 # Email
@@ -12082,8 +12102,8 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                         setattr(obj, 'created_ts', now_ts)
                     except Exception:
                         pass
-                expiry_grace_sec = float(max(300, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 300))
-                if (canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec) and not _autotrade_keep_all_test_mode():
+                expiry_grace_sec = float(max(60, int(_autotrade_entry_window_min()) * 60))
+                if (canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec):
                     try:
                         _admin_setup_lifecycle_merge(int(uid), str(getattr(obj, 'setup_id', '') or ''), session=src_session_u or req_session_u, symbol=str(getattr(obj, 'symbol', '') or ''), side=str(getattr(obj, 'side', '') or ''), state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
                     except Exception:
@@ -12105,7 +12125,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         if not out:
             fallback_items = []
             try:
-                fallback_items = _recent_delivery_lane_setup_objects(int(uid), session_name=req_session_u, max_age_min=max(20, int(AUTOTRADE_ENTRY_WINDOW_MIN) + 15), limit=max(1, int(limit * 4))) or []
+                fallback_items = _recent_delivery_lane_setup_objects(int(uid), session_name=req_session_u, max_age_min=max(20, int(_autotrade_entry_window_min()) + 15), limit=max(1, int(limit * 4))) or []
             except Exception:
                 fallback_items = []
             for obj in (fallback_items or []):
@@ -12121,8 +12141,8 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                             setattr(obj, 'created_ts', now_ts)
                         except Exception:
                             pass
-                    expiry_grace_sec = float(max(300, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 300))
-                    if (canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec) and not _autotrade_keep_all_test_mode():
+                    expiry_grace_sec = float(max(60, int(_autotrade_entry_window_min()) * 60))
+                    if (canonical_ts <= 0 or (now_ts - canonical_ts) > expiry_grace_sec):
                         continue
                     exec_ok, exec_why = _autotrade_db_signal_structurally_valid(obj, session_name=req_session_u or src_session_u or session_label)
                     if not exec_ok:
@@ -12319,7 +12339,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v120:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v121:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -13099,7 +13119,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         _cts = float(getattr(s, 'created_ts', 0.0) or 0.0)
         _canonical_ts = max(_cts, _email_ts, _generated_ts, _signal_ts)
         _setup_dt = datetime.fromtimestamp(_canonical_ts, tz=timezone.utc) if _canonical_ts > 0 else datetime.now(timezone.utc)
-        _deadline_dt = _setup_dt + timedelta(minutes=AUTOTRADE_ENTRY_WINDOW_MIN)
+        _deadline_dt = _setup_dt + timedelta(minutes=_autotrade_entry_window_min())
         _LAST_AUTOTRADE_DETAIL[int(uid)].update({
             'setup_time': _setup_dt.isoformat(timespec='seconds'),
             'entry_deadline': _deadline_dt.isoformat(timespec='seconds'),
@@ -13110,17 +13130,11 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             'source_session': str(getattr(s, 'source_session', '') or ''),
         })
         if datetime.now(timezone.utc) > _deadline_dt:
-            if _autotrade_keep_all_test_mode():
-                try:
-                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({'entry_deadline_bypassed_by_keep_all_test_mode': True})
-                except Exception:
-                    pass
-            else:
-                try:
-                    _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
-                except Exception:
-                    pass
-                return (False, 'setup_expired')
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('stale_deadline'), last_reason='stale_deadline')
+            except Exception:
+                pass
+            return (False, 'setup_expired')
     except Exception:
         pass
 
@@ -19689,7 +19703,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v120:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v121:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -23501,7 +23515,7 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
     except Exception:
         pass
     try:
-        cutoff_ts = float(time.time()) - float(max(86400, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 21600))
+        cutoff_ts = float(time.time()) - float(max(86400, int(_autotrade_entry_window_min()) * 60 + 21600))
         cur.execute(
             """DELETE FROM executable_setups
                    WHERE user_id=?
@@ -23843,7 +23857,7 @@ _RECENT_EMAILED_SETUP_CACHE: Dict[int, List[dict]] = {}
 
 def _recent_emailed_cache_ttl_sec() -> int:
     try:
-        return int(max(1800, int(AUTOTRADE_ENTRY_WINDOW_MIN) * 60 + 900))
+        return int(max(1800, int(_autotrade_entry_window_min()) * 60 + 900))
     except Exception:
         return 1800
 
@@ -41015,6 +41029,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
             f"AUTOTRADE_MAX_TRADES_PER_DAY = {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0))} (default 50; env can allow 0=unlimited)",
             f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
+            f"AUTOTRADE_ENTRY_WINDOW_MIN = {int(summary.get('AUTOTRADE_ENTRY_WINDOW_MIN', 60))} minutes",
             f"AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False)) else 'false'} (queue-direct; false recommended)",
             f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
@@ -41063,6 +41078,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (default; env can allow 0=unlimited)",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0   (audit-match default)",
+            "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60   (deadline to open a setup)",
             "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (recommended; AutoTrade uses executable queue directly)",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
@@ -41084,7 +41100,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     value_raw = " ".join(context.args[1:]).strip()
     if key not in {
         'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT',
-        'AUTOTRADE_MODE', 'AUTOTRADE_ENTRY_ENABLED', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED',
+        'AUTOTRADE_MODE', 'AUTOTRADE_ENTRY_ENABLED', 'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_ENTRY_WINDOW_MIN', 'AUTOTRADE_LEVERAGE', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ISOLATED',
         'AUTOTRADE_DYNAMIC_RISK_ENABLED', 'AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 'AUTOTRADE_DYNAMIC_RISK_MAX_MULT',
         'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE',
         'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', 'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT',
@@ -41214,6 +41230,12 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT':
             val = max(0.0, float(value_raw))
             _autotrade_config_set(AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY, val)
+        elif key == 'AUTOTRADE_ENTRY_WINDOW_MIN':
+            val = max(5, min(240, int(float(value_raw))))
+            globals()['AUTOTRADE_ENTRY_WINDOW_MIN'] = int(val)
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY, int(val))
+            # Keep the fresh-queue window in sync unless explicitly overridden later.
+            globals()['AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN'] = int(val)
         elif key == 'AUTOTRADE_LEVERAGE':
             val = max(1, int(float(value_raw)))
             _autotrade_config_set(AUTOTRADE_CFG_LEVERAGE_KEY, val)
@@ -52780,7 +52802,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         HDR,
         f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Entries: {'ON' if _autotrade_entry_enabled() else 'OFF'} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
         f"Trading day: {snap.get('today_window_label')}",
-        (f"Keep-all test: ON | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(AUTOTRADE_ENTRY_WINDOW_MIN)}m" if _autotrade_keep_all_test_mode() else None),
+        (f"Keep-all test: ON | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(_autotrade_entry_window_min())}m" if _autotrade_keep_all_test_mode() else None),
         (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry blackout: {'ON' if _autotrade_entry_blackout_enabled() else 'OFF'} | Setup blackout: {'ON' if _setup_generation_blackout_enabled() else 'OFF'}" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
         SEP,
         f"EquityAT: ${equity:.2f}",
@@ -60336,7 +60358,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v120:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v121:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
