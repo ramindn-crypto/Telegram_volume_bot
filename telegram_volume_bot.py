@@ -1,3 +1,4 @@
+# yver124: /setup_audit_keep_watch now renders a multi-window table (Last 24h, 7d, 14d, Overall from database) with Keep/Watch combo counts and WR=TP/(TP+SL).
 # yver123: fixes WR methodology (TP/SL only for setup audits; AutoTrade realised WR counts TP or positive OTHER as wins and SL or negative OTHER as losses), tightens compare matching to avoid stale/legacy setup DIFF rows, rounds PnL displays, and clarifies active sessions in /autotrade_debug.
 # yver121: AutoTrade candidate deadline lock. KEEP+WATCH executable setups are tradable only inside AUTOTRADE_ENTRY_WINDOW_MIN (default 60m); the old 24h fallback is capped to that deadline and no longer bypassed by keep-all mode.
 # yver116: AutoTrade timeout reconciliation display hardening and longer placement budget.
@@ -13658,6 +13659,13 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(reserve_reason), last_reason=str(reserve_reason or 'guard_reserve_failed'))
         except Exception:
             pass
+        # yver125: release the short in-memory symbol lock when DB reservation
+        # fails. Otherwise the next valid email/setup can be blocked for the
+        # whole guard TTL as blocked_duplicate_inflight_lock.
+        try:
+            _autotrade_runtime_symbol_lock_release(uid, sym)
+        except Exception:
+            pass
         return (False, str(reserve_reason or 'guard_reserve_failed'))
 
     # Authoritative exit targets: use the exact setup TP/SL, tick-rounded once.
@@ -13671,10 +13679,26 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'tp_not_above_live_entry', 'fixed_setup_tp': float(live_final_tp), 'live_entry': float(price_ref)})
         except Exception:
             pass
+        try:
+            _autotrade_exec_mark(reserved_keys, 'FAILED', 'tp_not_above_live_entry')
+        except Exception:
+            pass
+        try:
+            _autotrade_runtime_symbol_lock_release(uid, sym)
+        except Exception:
+            pass
         return (False, 'tp_not_above_live_entry')
     if side == 'SELL' and live_final_tp >= price_ref:
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'tp_not_below_live_entry', 'fixed_setup_tp': float(live_final_tp), 'live_entry': float(price_ref)})
+        except Exception:
+            pass
+        try:
+            _autotrade_exec_mark(reserved_keys, 'FAILED', 'tp_not_below_live_entry')
+        except Exception:
+            pass
+        try:
+            _autotrade_runtime_symbol_lock_release(uid, sym)
         except Exception:
             pass
         return (False, 'tp_not_below_live_entry')
@@ -13707,12 +13731,50 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             pass
     min_live_rr = max(0.50, float(_autotrade_min_live_rr() or 1.0))
     if live_rr < min_live_rr:
+        # yver125: a BUY TP rounded down (or SELL TP rounded up) can land a few
+        # ticks below the configured RR floor even though the setup is valid.
+        # Repair once by rounding the minimum-floor TP away from entry before
+        # rejecting, so BigMove/fixed-RR setups are not skipped incorrectly.
+        try:
+            _dist = abs(float(price_ref) - float(sl_for_order))
+            if _dist > 0:
+                if side == 'BUY':
+                    _floor_tp = float(price_ref) + float(min_live_rr) * float(_dist)
+                    _floor_tp = _round_price_to_tick(sym, _floor_tp, rounding=ROUND_UP)
+                else:
+                    _floor_tp = float(price_ref) - float(min_live_rr) * float(_dist)
+                    _floor_tp = _round_price_to_tick(sym, _floor_tp, rounding=ROUND_DOWN)
+                _floor_rr = _autotrade_rr_value(price_ref, sl_for_order, _floor_tp, side)
+                if _floor_rr >= (float(min_live_rr) - 0.005):
+                    live_final_tp = float(_floor_tp)
+                    live_rr = float(_floor_rr)
+                    _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+                    _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                        'tp_rr_floor_repair_applied': True,
+                        'tp_rr_after_floor_repair': float(live_rr),
+                        'tp_after_rr_floor_repair': float(live_final_tp),
+                    })
+        except Exception as _rr_floor_exc:
+            try:
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'tp_rr_floor_repair_error': f'{type(_rr_floor_exc).__name__}: {_rr_floor_exc}'})
+            except Exception:
+                pass
+    if live_rr < (min_live_rr - 0.005):
         try:
             _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'live_rr_below_floor', 'live_rr': float(live_rr), 'min_live_rr': float(min_live_rr), 'fixed_setup_tp': float(live_final_tp), 'fixed_setup_sl': float(sl_for_order), 'live_entry': float(price_ref)})
         except Exception:
             pass
         try:
             _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('below_min_rr'), last_reason=f'live_rr_below_floor {live_rr:.2f}<{min_live_rr:.2f}')
+        except Exception:
+            pass
+        try:
+            _autotrade_exec_mark(reserved_keys, 'FAILED', f'live_rr_below_floor {live_rr:.2f}<{min_live_rr:.2f}')
+        except Exception:
+            pass
+        try:
+            _autotrade_runtime_symbol_lock_release(uid, sym)
         except Exception:
             pass
         return (False, 'live_rr_below_floor')
@@ -39902,7 +39964,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; /setup_audit compare 24 reconciles real AutoTrade rows vs setup path",
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall Family-Session-Strategy-Side summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR",
-    "setup_audit_keep_watch": "Compact total summary for current KEEP + WATCH policy lanes only: Combo count, Set, TP, SL, NH, Open, WR",
+    "setup_audit_keep_watch": "Multi-window KEEP + WATCH setup summary table: Last 24h, 7d, 14d, Overall; Keep/Watch combo counts, Set, TP, SL, NH, Open, WR",
     "setup_keep_watch_summary": "Alias of /setup_audit_keep_watch",
     "setup_audit_compare": "Reconcile bot-created AutoTrade closes against /setup_audit price-path results; exchange-only rows are marked BYBIT_ONLY: /setup_audit_compare 24",
     "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
@@ -41363,18 +41425,39 @@ async def autotrade_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin-only: baseline-reset current day risk so remaining daily cap is restored."""
+    """Admin-only: baseline-reset current AutoTrade day risk so remaining daily cap is restored."""
     uid = int(update.effective_user.id)
     if not is_admin_user(uid):
         await update.message.reply_text("⛔ Admin only.")
         return
-    user = reset_daily_if_needed(get_user(uid) or {})
+    # yver125: /dayrisk_reset is an AutoTrade risk command. Always reset the
+    # AutoTrade owner ledger, not the Telegram admin user's manual ledger. This
+    # fixes the case where the reset reply showed $334 remaining while
+    # /autotrade_debug still showed the owner account with $271 remaining.
+    owner = int(AUTOTRADE_OWNER_UID or uid)
+    user = reset_daily_if_needed(get_user(owner) or {})
     day_local = _user_day_local(user)
-    cap = float(_autotrade_daily_cap_usd(uid, float(_effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)) or 0.0)
-    snap = _accounting_snapshot(uid, user, is_admin=True)
-    raw_used = float(snap.get('used_today_raw', snap.get('used_today', 0.0)) or 0.0)
-    effective_used = float(snap.get('used_today', 0.0) or 0.0)
-    existing_credit = float(snap.get('risk_reset_credit', 0.0) or 0.0)
+    cap = float(_autotrade_daily_cap_usd(owner, float(_effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)) or 0.0)
+    try:
+        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=0, force_refresh=True)
+    except Exception:
+        snap = _accounting_snapshot(owner, user, is_admin=True)
+    # yver125: force-refresh the AutoTrade risk metrics directly. The account
+    # snapshot can be fresh while its nested metrics cache is stale; /dayrisk_reset
+    # must credit the same raw-used number that /autotrade_debug displays.
+    try:
+        _eq_for_metrics = float(snap.get('equity') or _effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
+        _m_for_reset = _autotrade_day_risk_metrics_cached(owner, _eq_for_metrics, ttl=0, force_refresh=True)
+        raw_used = float(_m_for_reset.get('used_total_raw', _m_for_reset.get('used_total', snap.get('used_today_raw', snap.get('used_today', 0.0)))) or 0.0)
+        effective_used = float(_m_for_reset.get('used_total', snap.get('used_today', 0.0)) or 0.0)
+        existing_credit = float(_m_for_reset.get('risk_reset_credit', snap.get('risk_reset_credit', 0.0)) or 0.0)
+        snap['used_today_raw'] = float(raw_used)
+        snap['used_today'] = float(effective_used)
+        snap['risk_reset_credit'] = float(existing_credit)
+    except Exception:
+        raw_used = float(snap.get('used_today_raw', snap.get('used_today', 0.0)) or 0.0)
+        effective_used = float(snap.get('used_today', 0.0) or 0.0)
+        existing_credit = float(snap.get('risk_reset_credit', 0.0) or 0.0)
 
     action = str((context.args[0] if context.args else "reset") or "reset").strip().lower()
     if action in {"show", "status"}:
@@ -41393,8 +41476,18 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action in {"clear", "restore", "undo"}:
-        _risk_day_reset_credit_clear(uid, day_local)
-        snap2 = _accounting_snapshot(uid, user, is_admin=True)
+        _risk_day_reset_credit_clear(owner, day_local)
+        try:
+            cache_delete(f'autotrade_day_metrics_fast:{int(owner)}')
+            cache_delete(f'accounting_snapshot_fast:{int(owner)}')
+        except Exception:
+            pass
+        try:
+            _eq_for_metrics = float(snap.get('equity') or _effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
+            _autotrade_day_risk_metrics_cached(owner, _eq_for_metrics, ttl=0, force_refresh=True)
+        except Exception:
+            pass
+        snap2 = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=0, force_refresh=True)
         remaining2 = float(snap2.get('remaining_today', float('inf')))
         remaining2_txt = '∞' if not math.isfinite(remaining2) else f'${float(remaining2 or 0.0):.2f}'
         await update.message.reply_text(
@@ -41405,8 +41498,18 @@ async def dayrisk_reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    _risk_day_reset_credit_set(uid, day_local, raw_used, note="admin_dayrisk_reset")
-    snap2 = _accounting_snapshot(uid, user, is_admin=True)
+    _risk_day_reset_credit_set(owner, day_local, raw_used, note=f"admin_dayrisk_reset_by_{uid}")
+    try:
+        cache_delete(f'autotrade_day_metrics_fast:{int(owner)}')
+        cache_delete(f'accounting_snapshot_fast:{int(owner)}')
+    except Exception:
+        pass
+    try:
+        _eq_for_metrics = float(snap.get('equity') or _effective_equity_for_risk(user, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live')) or 0.0)
+        _autotrade_day_risk_metrics_cached(owner, _eq_for_metrics, ttl=0, force_refresh=True)
+    except Exception:
+        pass
+    snap2 = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=0, force_refresh=True)
     remaining2 = float(snap2.get('remaining_today', float('inf')))
     remaining2_txt = '∞' if not math.isfinite(remaining2) else f'${float(remaining2 or 0.0):.2f}'
     await update.message.reply_text(
@@ -49098,12 +49201,11 @@ def _setup_audit_keep_watch_fast_result_label(row: dict, horizon_hours: int) -> 
 
 
 def _setup_audit_keep_watch_summary_text(uid: int) -> str:
-    """Compact totals for current KEEP + WATCH policy lanes only.
+    """Multi-window totals for current KEEP + WATCH policy lanes only.
 
-    yver113: fast/cached admin summary. It deliberately avoids live OHLCV
-    preloading so Telegram commands stay responsive while Render background jobs
-    are running. Deep/full candle recomputation remains in /setup_audit_overall
-    and /setup_matrix policy.
+    yver124: render as a readable table with Last 24h / Last 7d / Last 14d /
+    Overall-from-database rows.  WR is TP/(TP+SL); NOHIT and OPEN are shown but
+    excluded from WR, matching the setup-audit WR basis used elsewhere.
     """
     try:
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
@@ -49112,7 +49214,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         uid_i = int(uid or 0)
 
     try:
-        cache_key = f"keep_watch_summary:v123::{uid_i}::{int(float(_overall_report_start_ts() or 0.0))}"
+        cache_key = f"keep_watch_summary:v124::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -49123,8 +49225,8 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
     allowed_statuses = {'KEEP', 'WATCH'}
     watch_like_statuses = {'WATCH', 'TIGHTEN', 'PART'}
     allowed_combos: set[str] = set()
-    keep_count = 0
-    watch_count = 0
+    keep_combos: set[str] = set()
+    watch_combos: set[str] = set()
     try:
         pol_lookup = _setup_combo_enforceable_policy_lookup(uid_i)
         for combo, pol in (pol_lookup or {}).items():
@@ -49138,77 +49240,141 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
                     continue
                 if st == 'KEEP':
                     allowed_combos.add(combo_u)
-                    keep_count += 1
+                    keep_combos.add(combo_u)
                 elif st in allowed_statuses or st in watch_like_statuses:
                     allowed_combos.add(combo_u)
-                    watch_count += 1
+                    watch_combos.add(combo_u)
             except Exception:
                 continue
     except Exception:
         allowed_combos = set()
-        keep_count = watch_count = 0
+        keep_combos = set()
+        watch_combos = set()
 
     try:
-        rows, source_label = _overall_report_source_rows(uid_i, start_ts=float(_overall_report_start_ts() or 0.0), limit=0, dedup=True)
+        # yver124: "Overall" means from the start of the available setup database,
+        # not only the fixed 15-May management baseline.
+        rows, source_label = _overall_report_source_rows(uid_i, start_ts=0.0, limit=0, dedup=True)
     except Exception:
         rows, source_label = [], 'EXECUTABLE'
 
     result_horizon = _setup_audit_result_horizon_hours()
     audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
+    now_ts = float(time.time())
 
-    total_setups = total_tp = total_sl = total_nohit = total_open = 0
-    matched_combos: set[str] = set()
-    for r in list(rows or []):
+    def _row_combo_u(r: dict) -> str:
         try:
             fam = _setup_audit_family_code(r)
             sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
             strat = _setup_strategy_short_label(r)
             side_row = _setup_side_suffix(value=str(r.get('side') or ''))
-            combo_key = _setup_combo_strategy_side_key(fam, sess_row, strat, side_row)
-            combo_u = str(combo_key or '').upper().strip()
+            return str(_setup_combo_strategy_side_key(fam, sess_row, strat, side_row) or '').upper().strip()
+        except Exception:
+            return ''
+
+    # Precompute just once so every window uses exactly the same policy/result logic.
+    enriched_rows: list[tuple[float, str, str]] = []
+    matched_all_for_dates: list[dict] = []
+    for r in list(rows or []):
+        try:
+            combo_u = _row_combo_u(r)
             if combo_u not in allowed_combos:
                 continue
-            matched_combos.add(combo_u)
-            result = _setup_audit_keep_watch_fast_result_label(r, result_horizon)
-            total_setups += 1
-            if result == 'TP':
-                total_tp += 1
-            elif result == 'SL':
-                total_sl += 1
-            elif result == 'NOHIT':
-                total_nohit += 1
-            else:
-                total_open += 1
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            res = _setup_audit_keep_watch_fast_result_label(r, result_horizon)
+            enriched_rows.append((ts, combo_u, res))
+            matched_all_for_dates.append(r)
         except Exception:
             continue
 
-    decided_total = total_tp + total_sl
-    # yver123: WR is TP/(TP+SL). NOHIT and OPEN are informational, not losses.
-    wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
-    win = _setup_audit_window_summary(rows)
+    def _stats_for_window(start_ts: float | None = None) -> dict:
+        keep_hit: set[str] = set()
+        watch_hit: set[str] = set()
+        set_n = tp = sl = nh = op = 0
+        for ts, combo_u, res in enriched_rows:
+            try:
+                if start_ts is not None and float(ts or 0.0) > 0 and float(ts) < float(start_ts):
+                    continue
+                if start_ts is not None and float(ts or 0.0) <= 0:
+                    continue
+                if combo_u in keep_combos:
+                    keep_hit.add(combo_u)
+                elif combo_u in watch_combos:
+                    watch_hit.add(combo_u)
+                set_n += 1
+                if res == 'TP':
+                    tp += 1
+                elif res == 'SL':
+                    sl += 1
+                elif res == 'NOHIT':
+                    nh += 1
+                else:
+                    op += 1
+            except Exception:
+                continue
+        dec = tp + sl
+        wr = (tp / dec * 100.0) if dec > 0 else 0.0
+        return {
+            'keep': len(keep_hit),
+            'watch': len(watch_hit),
+            'set': set_n,
+            'tp': tp,
+            'sl': sl,
+            'nh': nh,
+            'open': op,
+            'wr': wr,
+        }
 
+    windows = [
+        ('Last 24h', now_ts - 24 * 3600),
+        ('Last 7d', now_ts - 7 * 86400),
+        ('Last 14d', now_ts - 14 * 86400),
+        ('Overall', None),
+    ]
+    table_rows = []
+    for label, start_ts in windows:
+        st = _stats_for_window(start_ts)
+        table_rows.append([
+            label,
+            st['keep'],
+            st['watch'],
+            st['set'],
+            st['tp'],
+            st['sl'],
+            st['nh'],
+            st['open'],
+            f"{st['wr']:.1f}%",
+        ])
+
+    try:
+        win = _setup_audit_window_summary(matched_all_for_dates)
+        data_start_txt = str(win.get('start_txt') or '-')
+        data_end_txt = str(win.get('end_txt') or '-')
+    except Exception:
+        data_start_txt = data_end_txt = '-'
+
+    table = tabulate(
+        table_rows,
+        headers=['Window', 'Keep', 'Watch', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
+        tablefmt='plain',
+        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
+    )
     lines = [
         "📊 <b>Setup KEEP + WATCH Summary</b>",
         HDR,
-        f"Window: <b>from {_overall_report_start_txt()} Melbourne</b>",
-        f"Policy source: <b>current enforceable KEEP + WATCH lanes</b>",
-        f"Data start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b>",
-        f"Data end: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        "Policy source: <b>current enforceable KEEP + WATCH lanes</b>",
+        f"Current policy combos: <b>{len(allowed_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>{len(watch_combos)}</b>)",
+        f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
         f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
-        "Mode: <b>fast cached audit</b> (deep candle recompute remains in /setup_audit_overall)",
+        "WR basis: <b>TP/(TP+SL)</b>; NH and Open are shown but excluded from WR.",
+        "Overall row: <b>from start of available setup database</b>.",
         HDR,
-        f"Total number of Combo: <b>{len(allowed_combos)}</b> (KEEP: <b>{keep_count}</b> | WATCH: <b>{watch_count}</b>)",
-        f"Set: <b>{total_setups}</b>",
-        f"TP: <b>{total_tp}</b>",
-        f"SL: <b>{total_sl}</b>",
-        f"NH: <b>{total_nohit}</b>",
-        f"Open: <b>{total_open}</b>",
-        f"WR: <b>{wr_total:.1f}%</b>",
+        "<pre>" + html.escape(table) + "</pre>",
     ]
     if not allowed_combos:
         lines.append("No active KEEP/WATCH policy lanes found. Run <code>/setup_matrix policy</code> to refresh policy first.")
-    elif total_setups == 0:
-        lines.append("No historical setup rows matched the current KEEP/WATCH lanes in this baseline window yet.")
+    elif not enriched_rows:
+        lines.append("No historical setup rows matched the current KEEP/WATCH lanes yet.")
     txt = "\n".join(lines)
     try:
         if cache_key:
@@ -52852,7 +53018,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         'Email / AutoTrade entry gate',
         f"AutoTrade lane filter: {('KEEP+WATCH policy ON' if _autotrade_allow_watch_policy() else 'KEEP-only policy ON') if _autotrade_require_keep_policy() else 'policy filter OFF'}",
         f"AutoTrade capital guard: daily loss stop {'ON' if _autotrade_daily_realized_loss_stop_enabled() else 'OFF'} {_autotrade_daily_realized_loss_stop_pct():.1f}% | realised-combo {'ON' if _autotrade_require_realized_combo_edge() else 'OFF'} | context feed {'ON' if _autotrade_context_feed_guard_enabled() else 'OFF'}",
-        f"AutoTrade capital gate: {'OPEN' if _autotrade_daily_realized_loss_stop_allows(int(uid))[0] else 'BLOCKED'} | {_autotrade_daily_realized_loss_stop_allows(int(uid))[1]}",
+        f"AutoTrade capital gate: {'OPEN' if _autotrade_daily_realized_loss_stop_allows(int(owner))[0] else 'BLOCKED'} | {_autotrade_daily_realized_loss_stop_allows(int(owner))[1]}",
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
         f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
         f"Session email cap: {session_cap_txt} (configured)",
