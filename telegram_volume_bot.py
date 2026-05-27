@@ -1,3 +1,4 @@
+# yver129: locks AutoTrade to the same delivered KEEP+WATCH lane as subscribers: future AutoTrade entries require an actual recent setup email/delivery within AUTOTRADE_ENTRY_WINDOW_MIN, remove broad executable/fresh-queue fallbacks from email-triggered AutoTrade, and keep the setting Telegram-configurable.
 # yver126: fixes /dayrisk_reset so AutoTrade debug uses the reset credit from the same realised-PnL/open-risk basis, and fixes /setup_audit_keep_watch multi-window table to use full historical generated+executable rows rather than the short executable-only slice.
 # yver124: /setup_audit_keep_watch now renders a multi-window table (Last 24h, 7d, 14d, Overall from database) with Keep/Watch combo counts and WR=TP/(TP+SL).
 # yver123: fixes WR methodology (TP/SL only for setup audits; AutoTrade realised WR counts TP or positive OTHER as wins and SL or negative OTHER as losses), tightens compare matching to avoid stale/legacy setup DIFF rows, rounds PnL displays, and clarifies active sessions in /autotrade_debug.
@@ -823,7 +824,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
         AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18),
-        AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False) else 0,
+        AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True) else 0,
         AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY: 1 if env_bool('AUTOTRADE_STRICT_TPSL_ONLY', True) else 0,
         AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY: 1 if env_bool('AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', True) else 0,
         AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY: 1 if env_bool('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False) else 0,
@@ -849,12 +850,12 @@ def _autotrade_bootstrap_runtime_config() -> None:
                 _autotrade_config_set(k, v)
         except Exception:
             pass
-    # Ver110: AutoTrade is queue-direct. Do not let an old persisted
-    # require-email flag silently block executable KEEP/WATCH setups or confuse
-    # /autotrade_config. Only an explicit environment override may keep it on.
+    # yver129: AutoTrade must match the subscriber/email delivery lane by default.
+    # Do not override the Telegram-configured value on each restart unless an
+    # explicit environment variable is supplied.
     try:
-        if 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY' not in os.environ:
-            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 0)
+        if 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY' in os.environ:
+            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True) else 0)
     except Exception:
         pass
 
@@ -1546,9 +1547,105 @@ def _setup_generation_blackout_windows() -> str:
 
 def _autotrade_require_setup_email_for_entry() -> bool:
     try:
-        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False)
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
     except Exception:
-        return bool(globals().get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False))
+        return bool(globals().get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True))
+
+
+
+def _autotrade_recent_email_gate_allows_setup(uid: int, s: Any, session_label: str = '') -> tuple[bool, str]:
+    """yver129: final AutoTrade/email sync gate.
+
+    AutoTrade entries must match the subscriber delivery lane: the exact setup_id
+    must have a recent emailed_setups row (or in-memory email cache row) within
+    AUTOTRADE_ENTRY_WINDOW_MIN.  This prevents the scheduled AutoTrade job or any
+    fallback queue from opening raw executable setups that subscribers never saw.
+    """
+    try:
+        if not _autotrade_require_setup_email_for_entry():
+            return (True, 'email_gate_disabled')
+    except Exception:
+        return (False, 'email_gate_config_error')
+    try:
+        uid_i = int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid_i = 0
+    sid = ''
+    try:
+        sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+    except Exception:
+        sid = ''
+    if uid_i <= 0 or not sid:
+        return (False, 'missing_recent_setup_email')
+    sess = str(session_label or getattr(s, 'source_session', '') or getattr(s, 'session', '') or '').upper().strip()
+    try:
+        max_age_sec = float(max(60, int(_autotrade_entry_window_min()) * 60))
+    except Exception:
+        max_age_sec = 3600.0
+    now_ts = float(time.time())
+    cutoff = now_ts - max_age_sec
+
+    # First trust an explicit timestamp carried by a just-emailed setup object.
+    for attr in ('email_logged_ts', 'emailed_ts'):
+        try:
+            ts = float(getattr(s, attr, 0.0) or 0.0)
+            if ts >= cutoff:
+                return (True, 'recent_setup_email')
+        except Exception:
+            pass
+
+    # In-memory email cache, used immediately after a successful email in this process.
+    try:
+        _recent_emailed_cache_prune(uid_i)
+        for row in list(_RECENT_EMAILED_SETUP_CACHE.get(uid_i, []) or []):
+            try:
+                if str(row.get('setup_id') or '').strip() != sid:
+                    continue
+                src = str(row.get('source_session') or row.get('session') or '').upper().strip()
+                if sess and src and src not in {'', sess}:
+                    continue
+                ts = float(row.get('emailed_ts') or row.get('email_logged_ts') or 0.0)
+                if ts >= cutoff:
+                    try:
+                        setattr(s, 'email_logged_ts', ts)
+                    except Exception:
+                        pass
+                    return (True, 'recent_setup_email')
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # DB authority: exact setup_id must have been emailed recently.
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            if sess:
+                row = cur.execute(
+                    """
+                    SELECT MAX(emailed_ts)
+                    FROM emailed_setups
+                    WHERE user_id=? AND setup_id=? AND emailed_ts>=?
+                      AND (UPPER(COALESCE(session,''))=? OR COALESCE(session,'')='')
+                    """,
+                    (uid_i, sid, float(cutoff), sess),
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND setup_id=? AND emailed_ts>=?",
+                    (uid_i, sid, float(cutoff)),
+                ).fetchone()
+        ts = float((row[0] if row else 0.0) or 0.0)
+        if ts >= cutoff:
+            try:
+                setattr(s, 'email_logged_ts', ts)
+            except Exception:
+                pass
+            return (True, 'recent_setup_email')
+    except Exception:
+        return (False, 'setup_email_gate_db_error')
+
+    return (False, 'missing_recent_setup_email')
 
 def _autotrade_hard_risk_cap_usd(equity: float, multiplier: float | None = None) -> float:
     '''Hard per-position risk cap from base risk and dynamic max multiplier.'''
@@ -1623,7 +1720,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)),
         'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)),
         'SETUP_REVERSE_TARGET_RR': float(globals().get('SETUP_REVERSE_TARGET_RR', 1.20) or 1.20),
-        'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY': _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False),
+        'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY': _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True),
     }
 
 
@@ -2462,7 +2559,7 @@ def _autotrade_apply_ver119_audit_match_config_defaults() -> None:
     change any value from Telegram and restarts will preserve those changes.
     """
     try:
-        target_version = 'yver119_2026_05_27_force_audit_match_runtime_config'
+        target_version = 'yver129_2026_05_27_email_matched_autotrade_runtime_config'
         if str(_autotrade_config_get('ver119_audit_match_config_version', '') or '').strip().lower() == target_version:
             return
 
@@ -2487,7 +2584,7 @@ def _autotrade_apply_ver119_audit_match_config_defaults() -> None:
             AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
             AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 1,
             USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 1,
-            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 0,
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1,
 
             # Match setup-audit TP/SL horizon better: no operational daily flat or
             # max-hold market exit unless the owner turns them back on from Telegram.
@@ -3139,7 +3236,7 @@ SETUP_ADAPTIVE_STRONG_MIN_DECIDED = max(2, int(globals().get('SETUP_ADAPTIVE_STR
 AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH = int(os.environ.get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', '0') or 0)
 # Ver57: AutoTrade must not open from a hidden executable row before the setup email is sent.
 # The scheduled job can still catch up emailed rows, but email is the authorising/sync point.
-AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False)
+AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
@@ -11957,6 +12054,15 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
+        # yver129: AutoTrade must only consume the exact recent setup-email lane.
+        # This keeps AutoTrade, /screen and subscriber emails synchronised.
+        try:
+            policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+            email_ok, email_why = _autotrade_recent_email_gate_allows_setup(policy_uid, s, session_label=sess)
+            if not email_ok:
+                return (False, str(email_why or 'missing_recent_setup_email'))
+        except Exception:
+            return (False, 'setup_email_gate_exception')
         # Ver53: setup-generation blackout only stops creating new setups.
         # It must not invalidate already persisted/emailed executable rows that
         # AutoTrade is trying to consume before their entry window expires.
@@ -12048,11 +12154,12 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
-        # yver108: AutoTrade must consume the authoritative executable queue directly.
-        # Email delivery is still aligned to the same KEEP+WATCH gate, but it must not be
-        # a hard prerequisite for live execution because SMTP delays/timeouts or a quiet
-        # email tick can otherwise leave valid KEEP/WATCH executable setups untraded.
-        require_email_entry = False
+        # yver129: AutoTrade is now email-matched by default.  The exact setup_id
+        # must have a recent emailed_setups row inside AUTOTRADE_ENTRY_WINDOW_MIN.
+        # This prevents AutoTrade from opening raw/fallback executable rows that
+        # were never delivered to the subscriber/admin.
+        require_email_entry = bool(_autotrade_require_setup_email_for_entry())
+        email_cutoff = float(time.time()) - float(max(60, int(_autotrade_entry_window_min()) * 60))
         cur.execute(
             """
             SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts
@@ -12065,11 +12172,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
               AND x.executable_ts >= ?
               AND (? = '' OR UPPER(COALESCE(x.session, '')) = ?)
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-              AND (? = 0 OR COALESCE(e.emailed_ts, 0) > 0 OR LOWER(COALESCE(x.source_kind, '')) IN ('emailed_setups','setup_email','email_autotrade_immediate'))
-            ORDER BY x.executable_ts DESC, x.setup_id DESC
+              AND (? = 0 OR COALESCE(e.emailed_ts, 0) >= ?)
+            ORDER BY COALESCE(e.emailed_ts, x.executable_ts) DESC, x.executable_ts DESC, x.setup_id DESC
             LIMIT ?
             """,
-            (int(uid), float(cutoff), req_session_u, req_session_u, 1 if require_email_entry else 0, int(max(limit * 20, 80))),
+            (int(uid), float(cutoff), req_session_u, req_session_u, 1 if require_email_entry else 0, float(email_cutoff), int(max(limit * 20, 80))),
         )
         rows = [dict(r) for r in (cur.fetchall() or [])]
         con.close()
@@ -12110,7 +12217,13 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     continue
                 now_ts = float(time.time())
                 canonical_ts = float(getattr(obj, 'created_ts', 0.0) or 0.0)
-                if canonical_ts <= 0 and _autotrade_keep_all_test_mode():
+                if _autotrade_require_setup_email_for_entry():
+                    email_ok, email_why = _autotrade_recent_email_gate_allows_setup(int(uid), obj, session_label=req_session_u or src_session_u or session_label)
+                    if not email_ok:
+                        _selector_reject(obj, str(email_why or 'missing_recent_setup_email'))
+                        continue
+                    canonical_ts = float(getattr(obj, 'email_logged_ts', 0.0) or getattr(obj, 'emailed_ts', 0.0) or canonical_ts or 0.0)
+                if canonical_ts <= 0 and _autotrade_keep_all_test_mode() and not _autotrade_require_setup_email_for_entry():
                     canonical_ts = now_ts
                     try:
                         setattr(obj, 'created_ts', now_ts)
@@ -12139,7 +12252,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         if not out:
             fallback_items = []
             try:
-                fallback_items = _recent_delivery_lane_setup_objects(int(uid), session_name=req_session_u, max_age_min=max(20, int(_autotrade_entry_window_min()) + 15), limit=max(1, int(limit * 4))) or []
+                fallback_items = _recent_delivery_lane_setup_objects(int(uid), session_name=req_session_u, max_age_min=max(20, int(_autotrade_entry_window_min())), limit=max(1, int(limit * 4))) or []
             except Exception:
                 fallback_items = []
             for obj in (fallback_items or []):
@@ -12148,8 +12261,14 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                         continue
                     now_ts = float(time.time())
-                    canonical_ts = float(getattr(obj, 'created_ts', 0.0) or getattr(obj, 'email_logged_ts', 0.0) or 0.0)
-                    if canonical_ts <= 0 and _autotrade_keep_all_test_mode():
+                    canonical_ts = float(getattr(obj, 'email_logged_ts', 0.0) or getattr(obj, 'emailed_ts', 0.0) or getattr(obj, 'created_ts', 0.0) or 0.0)
+                    if _autotrade_require_setup_email_for_entry():
+                        email_ok, email_why = _autotrade_recent_email_gate_allows_setup(int(uid), obj, session_label=req_session_u or src_session_u or session_label)
+                        if not email_ok:
+                            _selector_reject(obj, str(email_why or 'missing_recent_setup_email'))
+                            continue
+                        canonical_ts = float(getattr(obj, 'email_logged_ts', 0.0) or getattr(obj, 'emailed_ts', 0.0) or canonical_ts or 0.0)
+                    if canonical_ts <= 0 and _autotrade_keep_all_test_mode() and not _autotrade_require_setup_email_for_entry():
                         canonical_ts = now_ts
                         try:
                             setattr(obj, 'created_ts', now_ts)
@@ -12284,6 +12403,14 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
     sess = str(session_label or '').upper().strip()
     if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
         return []
+    # yver129: when AutoTrade is synced to subscriber delivery, the broad fresh
+    # executable queue is not an entry source. The normal DB selector already
+    # returns recent emailed setup_ids only.
+    try:
+        if _autotrade_require_setup_email_for_entry():
+            return []
+    except Exception:
+        return []
     if not bool(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_ENABLED', True)):
         return []
     try:
@@ -12353,7 +12480,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v121:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v129:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -12380,6 +12507,13 @@ def _autotrade_refresh_owner_executable_pool(uid: int, session_label: str, lookb
         owner_uid = 0
     sess = str(session_label or '').upper().strip()
     if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
+        return []
+    # yver129: AutoTrade entries are email-matched. Do not self-refresh and
+    # open raw executable rows that were not sent to subscribers.
+    try:
+        if _autotrade_require_setup_email_for_entry():
+            return []
+    except Exception:
         return []
     now_ts = float(time.time())
     try:
@@ -12918,7 +13052,7 @@ def _autotrade_should_try_next_after_skip(reason: str) -> bool:
     if any(tok in r for tok in hard_stop_tokens):
         return False
     retry_tokens = (
-        'entry_drift_too_wide', 'setup_expired', 'bad_prices', 'missing_tp',
+        'entry_drift_too_wide', 'setup_expired', 'missing_recent_setup_email', 'setup_email_gate_db_error', 'bad_prices', 'missing_tp',
         'sl_not_', 'stop_invalid', 'qty_invalid', 'blocked_duplicate_open_position',
         'blocked_manual_same_symbol_position', 'blocked_duplicate_pending_order',
         'blocked_duplicate_inflight_lock', 'blocked_by_cooldown',
@@ -13152,6 +13286,20 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return (False, 'setup_expired')
     except Exception:
         pass
+
+    # yver129: final hard gate before any Bybit placement. Even if an upstream
+    # selector accidentally passes a raw executable object, do not open it unless
+    # the exact setup was emailed/delivered recently.
+    try:
+        _email_ok, _email_why = _autotrade_recent_email_gate_allows_setup(int(uid), s, session_label=session_label)
+        if not _email_ok:
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(_email_why), last_reason=str(_email_why))
+            except Exception:
+                pass
+            return (False, str(_email_why or 'missing_recent_setup_email'))
+    except Exception:
+        return (False, 'setup_email_gate_exception')
 
     try:
         _source_kind_u = str(getattr(s, 'source_kind', '') or '').lower().strip()
@@ -19822,7 +19970,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v121:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v129:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -41149,7 +41297,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_MAX_TRADES_PER_DAY = {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0))} (default 50; env can allow 0=unlimited)",
             f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
             f"AUTOTRADE_ENTRY_WINDOW_MIN = {int(summary.get('AUTOTRADE_ENTRY_WINDOW_MIN', 60))} minutes",
-            f"AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False)) else 'false'} (queue-direct; false recommended)",
+            f"AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)) else 'false'} (email-matched; true recommended)",
             f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
             f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
             f"SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED = {'true' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'false'}",
@@ -41198,7 +41346,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (default; env can allow 0=unlimited)",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0   (audit-match default)",
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60   (deadline to open a setup)",
-            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (recommended; AutoTrade uses executable queue directly)",
+            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY true   (recommended; AutoTrade only opens recently emailed setups)",
             "• /autotrade_config AUTOTRADE_LEVERAGE 10",
             "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
             "• /autotrade_config AUTOTRADE_ISOLATED true",
@@ -60705,7 +60853,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v121:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v129:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
@@ -60732,35 +60880,10 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             reason = 'no_setups_after_email'
             max_batch_places = max(0, int(globals().get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', 0) or 0))  # 0 = unlimited/all eligible
             _email_batch_candidates = list(db_setups or [])
-            # yver120: after an email, also try the fresh current-session executable queue
-            # before the broad 24h fallback, so all fresh /setup_audit rows get either
-            # traded or a visible skip reason in /autotrade_last.
-            try:
-                _fresh_current_session = _autotrade_select_fresh_session_executable_setups(
-                    owner_uid,
-                    sess,
-                    int(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN', 150) or 150),
-                    int(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_LIMIT', 60) or 60),
-                ) or []
-                _email_batch_candidates = _autotrade_merge_candidate_lists_fresh_first(_email_batch_candidates, _fresh_current_session, limit=60)
-            except Exception:
-                pass
-            # yver100: if the emailed batch is DISABLE/WATCH or otherwise not tradable,
-            # immediately look through the owner's current executable queue for KEEP
-            # lanes in the same session. This keeps AutoTrade aligned with best-lane
-            # selection without forcing trades from non-KEEP emails.
-            try:
-                existing_ids = {str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or '') for x in _email_batch_candidates}
-                fallback_keep = _autotrade_select_db_setups_cached(owner_uid, sess, lookback_hours=24, limit=30, ttl=3, force_refresh=True) or []
-                for _fb in list(fallback_keep or []):
-                    _sid = str(getattr(_fb, 'setup_id', '') or getattr(_fb, 'id', '') or '')
-                    if _sid and _sid in existing_ids:
-                        continue
-                    _email_batch_candidates.append(_fb)
-                    if _sid:
-                        existing_ids.add(_sid)
-            except Exception:
-                pass
+            # yver129: do NOT append generic fresh-session or fallback executable
+            # queues here. Immediate AutoTrade after email must attempt only the
+            # exact just-emailed batch, otherwise AutoTrade can open PLAYSOUT/TAO/NEAR
+            # style rows that were never emailed to the subscriber/admin.
             if max_batch_places > 0:
                 _email_batch_candidates = _email_batch_candidates[:max_batch_places]
             for cand in _email_batch_candidates:
