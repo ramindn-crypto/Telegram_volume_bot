@@ -1,3 +1,4 @@
+# yver135: fixes setup-audit/email/autotrade sync gap by letting setup emails consume executable rows for the full AUTOTRADE_ENTRY_WINDOW_MIN instead of only MAX_STALE_SCAN_SEC; /screen fallback age now follows the same entry window.
 # yver134: adds Policy column to /setup_audit detailed table, showing current enforceable KEEP/WATCH/OFF lane for each setup.
 # yver132: explains KEEP selection in /setup_matrix policy (KEEP requires more than 50% WR: sample + AvgR/payoff + no safety disable); no trading-policy loosening.
 # yver130: startup fix for yver129: imports typing.Any before the early AutoTrade email-gate helper so Render does not crash on NameError.
@@ -4839,6 +4840,45 @@ SCAN_SYMBOL_LIMIT = int(os.environ.get("SCAN_SYMBOL_LIMIT", "40") or 40)
 BIGMOVE_SYMBOL_LIMIT = int(os.environ.get("BIGMOVE_SYMBOL_LIMIT", "30") or 30)
 MAX_OHLCV_LIMIT = int(os.environ.get("MAX_OHLCV_LIMIT", "50") or 50)
 MAX_STALE_SCAN_SEC = int(os.environ.get("MAX_STALE_SCAN_SEC", "120") or 120)
+
+
+def _setup_email_actionable_queue_window_sec() -> float:
+    """How far back setup-email should read the executable queue.
+
+    yver135: /setup_audit and AutoTrade consider a setup actionable until
+    AUTOTRADE_ENTRY_WINDOW_MIN expires (default 60m).  The email loop was only
+    re-reading executable_setups for MAX_STALE_SCAN_SEC (default 120s), so a
+    valid KEEP setup could appear in /setup_audit but be missed by setup email,
+    which then also blocked /screen and AutoTrade because both are delivery-locked.
+    """
+    try:
+        entry_sec = (float(_autotrade_entry_window_min()) + 1.0) * 60.0
+    except Exception:
+        entry_sec = 61.0 * 60.0
+    try:
+        stale_sec = float(MAX_STALE_SCAN_SEC or 0.0)
+    except Exception:
+        stale_sec = 120.0
+    return float(max(120.0, stale_sec, entry_sec))
+
+
+def _setup_email_actionable_queue_window_min() -> int:
+    try:
+        return max(2, int(math.ceil(_setup_email_actionable_queue_window_sec() / 60.0)))
+    except Exception:
+        return 61
+
+
+def _screen_actionable_fallback_max_age_min() -> int:
+    """Keep /screen's delivery/executable fallback age aligned with entry window."""
+    try:
+        return max(int(SCREEN_FALLBACK_MAX_AGE_MIN or 45), int(_autotrade_entry_window_min()))
+    except Exception:
+        try:
+            return max(int(SCREEN_FALLBACK_MAX_AGE_MIN or 45), 60)
+        except Exception:
+            return 60
+
 SCREEN_UNIVERSE_N = int(os.environ.get("SCREEN_UNIVERSE_N", str(SCAN_SYMBOL_LIMIT)) or SCAN_SYMBOL_LIMIT)
 SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
 SCREEN_WAITING_NEAR_PCT = 0.75  # near-miss threshold for "Waiting for Trigger"
@@ -55235,8 +55275,8 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
             # If a setup email was delivered recently, keep /screen locked to that exact
             # email/autotrade lane instead of overwriting it with a different background scan.
             try:
-                if int(uid or 0) > 0 and _screen_user_can_see_email_source(int(uid or 0)) and _latest_recent_delivery_ts(int(uid or 0), sess, max_age_min=45) > 0:
-                    body_e, kb_e, _shown_e = _screen_recent_db_body_and_kb(int(uid or 0), sess, best_fut or {}, max_age_min=45, include_email_source=True)
+                if int(uid or 0) > 0 and _screen_user_can_see_email_source(int(uid or 0)) and _latest_recent_delivery_ts(int(uid or 0), sess, max_age_min=_screen_actionable_fallback_max_age_min()) > 0:
+                    body_e, kb_e, _shown_e = _screen_recent_db_body_and_kb(int(uid or 0), sess, best_fut or {}, max_age_min=_screen_actionable_fallback_max_age_min(), include_email_source=True)
                     if body_e:
                         body, kb = body_e, list(kb_e or [])
             except Exception:
@@ -55943,7 +55983,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         _exec_ready = []
 
     try:
-        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=max(45, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)), limit=max(1, int(SETUPS_N))))
+        setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=_screen_actionable_fallback_max_age_min(), limit=max(1, int(SETUPS_N))))
     except Exception:
         setups = []
 
@@ -55952,7 +55992,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         setups = list(_screen_keep_ready[:max(1, int(SETUPS_N))])
     elif not setups and _exec_ready and _screen_requires_emailed_delivery_for_setup():
         _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=str(session or ''), user_id=int(uid), lane='screen')
-        _screen_emailed_ready = [s for s in list(_screen_keep_ready or []) if _screen_attach_email_delivery_or_skip(int(uid), s, lookback_hours=max(1.0, float(SCREEN_FALLBACK_MAX_AGE_MIN or 45) / 60.0))]
+        _screen_emailed_ready = [s for s in list(_screen_keep_ready or []) if _screen_attach_email_delivery_or_skip(int(uid), s, lookback_hours=max(1.0, float(_screen_actionable_fallback_max_age_min()) / 60.0))]
         setups = list(_screen_emailed_ready[:max(1, int(SETUPS_N))])
 
     # Keep /screen readable. The executable queue can still hold more for email/autotrade;
@@ -58553,7 +58593,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # This prevents transient rebuild droughts from suppressing email/autotrade when
             # executable setups were already produced in a recent prior cycle.
             try:
-                exec_rows_cached = db_list_executable_setups(0, session_name=str(sess_name or ''), ts_from=float(time.time() - float(MAX_STALE_SCAN_SEC)), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
+                exec_rows_cached = db_list_executable_setups(0, session_name=str(sess_name or ''), ts_from=float(time.time() - _setup_email_actionable_queue_window_sec()), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
             except Exception:
                 exec_rows_cached = []
             try:
@@ -58563,7 +58603,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             persisted_setups = [s for s in (persisted_setups or []) if s is not None]
             if persisted_setups:
                 try:
-                    db_log_setup_pipeline_event(0, stage='email_pool_session_db', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(persisted_setups or []), 'source': f'exec_db_{int(MAX_STALE_SCAN_SEC)}s'})
+                    db_log_setup_pipeline_event(0, stage='email_pool_session_db', status='ok', session=str(sess_name or ''), mode='email', details={'setups': len(persisted_setups or []), 'source': f'exec_db_{int(_setup_email_actionable_queue_window_sec())}s'})
                 except Exception:
                     pass
                 _email_pool_cache_set(sess_name, persisted_setups)
@@ -58638,7 +58678,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                                 pass
                 if setups:
                     _email_pool_cache_set(sess_name, setups)
-                elif cached_setups and cache_age <= float(MAX_STALE_SCAN_SEC):
+                elif cached_setups and cache_age <= float(_setup_email_actionable_queue_window_sec()):
                     setups = list(cached_setups)
                     try:
                         db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='stale_fallback', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cache_age_sec': round(cache_age, 1)})
@@ -58826,7 +58866,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}', 'eligible': len(eligible or []), 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
 
             try:
-                exec_rows = db_list_executable_setups(int(uid), session_name=str(sess_name or ''), ts_from=float(time.time() - float(MAX_STALE_SCAN_SEC)), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
+                exec_rows = db_list_executable_setups(int(uid), session_name=str(sess_name or ''), ts_from=float(time.time() - _setup_email_actionable_queue_window_sec()), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
             except Exception:
                 exec_rows = []
             try:
@@ -58840,7 +58880,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     recent_candidates = _db_recent_candidate_setup_objects(
                         int(uid),
                         session_name=str(sess_name or ''),
-                        max_age_min=max(2, int(math.ceil(float(MAX_STALE_SCAN_SEC) / 60.0))),
+                        max_age_min=_setup_email_actionable_queue_window_min(),
                         limit=max(int(EMAIL_SETUPS_N) * 4, 12),
                     )
                 except Exception:
@@ -58857,7 +58897,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             continue
                     try:
-                        db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_fallback', status='ok' if eligible else 'empty', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'source': f'recent_candidates_{int(MAX_STALE_SCAN_SEC)}s'})
+                        db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_fallback', status='ok' if eligible else 'empty', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'source': f'recent_candidates_{int(_setup_email_actionable_queue_window_sec())}s'})
                     except Exception:
                         pass
 
