@@ -1,3 +1,7 @@
+# yver143: adds setup-audit AutoTrade lifecycle visibility and final live-entry user-visible gate so already-open trades (e.g. INJ) are not confused with fresh actionable setups.
+# yver142: fixes /setup_audit_keep and /setup_audit_keep_watch summary semantics: Keep/Watch now show current policy lane totals, with UsedK/UsedW showing lanes that actually had setups in each window; setup counts/TP/SL/WR remain window-specific.
+# yver141: final autonomous-screen-sync owner delivery hardening: AUTOTRADE_OWNER_UID is now pinned to the front of the autonomous /screen-sync email queue too, so AUTONOMOUS_SCREEN_SYNC_MAX_USERS slicing cannot cut the owner before setup email/autotrade sync. No trading/risk/policy changes.
+# yver140: final owner-delivery hardening: AUTOTRADE_OWNER_UID is pinned at the front of the setup-email notify queue and preserved after ALERT_JOB_NOTIFY_MAX_USERS slicing, screen recent-delivery helpers now use the runtime entry-window helper when no max_age is supplied, and setup_audit Policy fails closed to OFF on unexpected gate errors.
 # yver139: final 0-100 pipeline sync hardening: email selection no longer drops in-memory/shared executable candidates when the per-user DB fan-out is skipped, setup-email candidate picking now applies the same user-visible KEEP/context presend gate before choosing a candidate, /screen cache/actionability windows now use AUTOTRADE_ENTRY_WINDOW_MIN instead of hidden 45m windows, and alert_job always includes AUTOTRADE_OWNER_UID when email is configured.
 # yver138: final delivery-window sync hardening: /setup_audit Policy now returns KEEP/WATCH only when the row is still inside the live entry window, belongs to the active session, passes user-visible email/screen/context gates, and is not blocked by email flip/symbol cooldown; otherwise it is OFF.
 # yver137: final pipeline sync audit: /setup_audit Policy now uses the same user-visible KEEP/WATCH/context gate as setup email + /screen, and /screen DB fallback windows now use AUTOTRADE_ENTRY_WINDOW_MIN instead of a fixed 45m window.
@@ -13390,6 +13394,20 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         return (False, 'setup_email_gate_exception')
 
+    # yver143: final live entry must still pass the same user-visible KEEP/context
+    # delivery gate used by setup email and /screen.  This prevents any fallback or
+    # stale-delivery object from opening after the live gate would now label it OFF.
+    try:
+        _uv_ok, _uv_why, _uv_meta = _setup_user_visible_keep_policy_allows(s, session_name=session_label, user_id=int(uid), lane='email')
+        if not _uv_ok:
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_user_visible_gate_block'), last_reason=str(_uv_why or 'autotrade_user_visible_gate_block'))
+            except Exception:
+                pass
+            return (False, str(_uv_why or 'autotrade_user_visible_gate_block'))
+    except Exception:
+        return (False, 'autotrade_user_visible_gate_exception')
+
     try:
         _source_kind_u = str(getattr(s, 'source_kind', '') or '').lower().strip()
     except Exception:
@@ -24303,7 +24321,7 @@ def _cache_recent_emailed_setup(user_id: int, setup: Any, session: str = '', ema
     _RECENT_EMAILED_SETUP_CACHE[uid] = bucket[:50]
     _recent_emailed_cache_prune(uid)
 
-def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3) -> list:
+def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_min: int | None = None, limit: int = 3) -> list:
     from types import SimpleNamespace
     try:
         uid = int(user_id or 0)
@@ -24311,6 +24329,12 @@ def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_
         uid = 0
     if uid <= 0:
         return []
+    try:
+        if max_age_min is None:
+            max_age_min = _screen_actionable_fallback_max_age_min()
+        max_age_min = max(1, int(max_age_min or _screen_actionable_fallback_max_age_min()))
+    except Exception:
+        max_age_min = _screen_actionable_fallback_max_age_min()
     cutoff = float(time.time()) - float(max_age_min) * 60.0
     req_session_u = str(session_name or '').upper().strip()
     _recent_emailed_cache_prune(uid)
@@ -24339,7 +24363,7 @@ def _recent_cached_emailed_setups(user_id: int, session_name: str = '', max_age_
             continue
     return out[:int(limit)]
 
-def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3) -> list:
+def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_age_min: int | None = None, limit: int = 3) -> list:
     """Hydrate recently emailed setups from DB for screen/autotrade recovery.
 
     This is the durable fallback when the in-memory recent-email cache is empty
@@ -24485,8 +24509,14 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
     return out[:int(limit)]
 
 
-def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3) -> list:
+def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int | None = None, limit: int = 3) -> list:
     """Return recent emailed/executable setups with cache -> DB fallback order."""
+    try:
+        if max_age_min is None:
+            max_age_min = _screen_actionable_fallback_max_age_min()
+        max_age_min = max(1, int(max_age_min or _screen_actionable_fallback_max_age_min()))
+    except Exception:
+        max_age_min = _screen_actionable_fallback_max_age_min()
     out = []
     seen = set()
     for getter in (
@@ -45181,6 +45211,92 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
 
 
 
+
+def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: str = '') -> str:
+    """Return setup lifecycle state for /setup_audit display.
+
+    yver143: A row can be OFF for *new delivery now* after the 60-minute entry
+    window, while the same setup has already been emailed and opened by
+    AutoTrade.  That is not an invalid trade; it is an already-consumed setup.
+    This helper makes that visible so /setup_audit is not mistaken for the live
+    /screen candidate list.
+    """
+    try:
+        rr = dict(row or {})
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        if owner_uid <= 0:
+            return '-'
+        sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
+        sym_raw = str(rr.get('symbol') or rr.get('market_symbol') or '').upper().strip()
+        sym_lin = _bybit_linear_symbol(sym_raw) if sym_raw else ''
+        sym_base = _symbol_base(sym_raw) if sym_raw else ''
+        side_u = str(rr.get('side') or '').upper().strip()
+        setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
+        entry_win_sec = float(max(60, int(_autotrade_entry_window_min()) * 60))
+        # Generous linkage window for fallback symbol/side matching where older DBs
+        # may not have preserved setup_id exactly.
+        match_start = max(0.0, setup_ts - 300.0) if setup_ts > 0 else 0.0
+        match_end = (setup_ts + entry_win_sec + 900.0) if setup_ts > 0 else float(time.time()) + 3600.0
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                rows = []
+                if sid:
+                    rows = [dict(r) for r in (cur.execute(
+                        """
+                        SELECT setup_id, symbol, side, status, opened_ts, closed_ts, outcome
+                        FROM autotrade_trades
+                        WHERE uid=? AND setup_id=?
+                        ORDER BY COALESCE(opened_ts,0) DESC
+                        LIMIT 3
+                        """,
+                        (int(owner_uid), sid),
+                    ).fetchall() or [])]
+                if not rows and (sym_base or sym_lin) and side_u in {'BUY', 'SELL'}:
+                    q = """
+                        SELECT setup_id, symbol, side, status, opened_ts, closed_ts, outcome
+                        FROM autotrade_trades
+                        WHERE uid=? AND UPPER(COALESCE(side,''))=?
+                          AND COALESCE(opened_ts,0)>=? AND COALESCE(opened_ts,0)<=?
+                        ORDER BY COALESCE(opened_ts,0) DESC
+                        LIMIT 20
+                    """
+                    cand = [dict(r) for r in (cur.execute(q, (int(owner_uid), side_u, float(match_start), float(match_end))).fetchall() or [])]
+                    rows = []
+                    for r in cand:
+                        rsym = str(r.get('symbol') or '').upper().strip()
+                        if _symbol_base(rsym) == sym_base or _bybit_linear_symbol(rsym) == sym_lin:
+                            rows.append(r)
+                            break
+                if rows:
+                    r0 = dict(rows[0] or {})
+                    st = str(r0.get('status') or '').upper().strip()
+                    if st == 'OPEN' and not r0.get('closed_ts'):
+                        return 'AT_OPEN'
+                    out = str(r0.get('outcome') or st or '').upper().strip()
+                    if out in {'TP', 'SL'}:
+                        return f'AT_{out}'
+                    return 'AT_CLOSED' if r0.get('closed_ts') else 'AT'
+                if sid:
+                    er = cur.execute(
+                        "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND setup_id=?",
+                        (int(owner_uid), sid),
+                    ).fetchone()
+                    ets = float((er[0] if er else 0.0) or 0.0)
+                    if ets > 0:
+                        try:
+                            if (float(time.time()) - ets) <= entry_win_sec:
+                                return 'SENT'
+                        except Exception:
+                            return 'SENT'
+                        return 'SENT_OLD'
+        except Exception:
+            return '-'
+        return '-'
+    except Exception:
+        return '-'
+
 def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
     """Final actionable policy label for one /setup_audit row.
 
@@ -45300,7 +45416,7 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
             return 'WATCH'
         return 'OFF'
     except Exception:
-        return '-'
+        return 'OFF'
 
 def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     """Compact setup audit with current Policy lane per setup."""
@@ -45354,7 +45470,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
             volm = 0.0
         combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
         policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
-        table_rows.append([ttxt, sym, side, combo_key, policy_label, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
+        at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -45371,9 +45488,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
@@ -45382,7 +45499,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "Policy = current delivery/actionability gate: KEEP/WATCH only if the row is still inside the active session + entry window and passes /screen + setup-email + AutoTrade gates; OFF = audit-only/not deliverable now.",
+        "Policy = fresh-current delivery/actionability gate only. AT = lifecycle: SENT/AT_OPEN/AT_TP/AT_SL; an AT_OPEN row can be Policy OFF after the entry window because it was already consumed earlier.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
@@ -45413,7 +45530,7 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
 
     try:
         cache_bucket = int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))
-        cache_key = f"keep_only_summary:v133::{uid_i}::{cache_bucket}"
+        cache_key = f"keep_only_summary:v142::{uid_i}::{cache_bucket}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -45499,8 +45616,15 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
         dec = tp + sl
         wr = (tp / dec * 100.0) if dec > 0 else 0.0
         return {
-            'keep': len(keep_hit),
+            # yver142: Keep/Watch are policy-lane totals, not just lanes touched
+            # inside this specific result window.  The old display made Last 24h
+            # look like only 2 KEEP lanes existed even when the current policy had
+            # 7 KEEP lanes.  UsedK/UsedW preserves the old useful "touched in
+            # window" count separately.
+            'keep': len(keep_combos),
             'watch': 0,
+            'used_keep': len(keep_hit),
+            'used_watch': 0,
             'set': set_n,
             'tp': tp,
             'sl': sl,
@@ -45522,6 +45646,8 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
             label,
             st['keep'],
             st['watch'],
+            st['used_keep'],
+            st['used_watch'],
             st['set'],
             st['tp'],
             st['sl'],
@@ -45539,9 +45665,9 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
 
     table = tabulate(
         table_rows,
-        headers=['Window', 'Keep', 'Watch', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
+        headers=['Window', 'Keep', 'Watch', 'UsedK', 'UsedW', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
         tablefmt='plain',
-        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
+        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     lines = [
         "📊 <b>Setup KEEP Summary</b>",
@@ -45550,6 +45676,7 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
         f"Current policy combos: <b>{len(keep_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>0</b>)",
         f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
         f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        "Keep/Watch columns = <b>current policy lane totals</b>; UsedK/UsedW = policy lanes that actually had setup rows in that window.",
         "WR basis: <b>TP/(TP+SL)</b>; NH and Open are shown but excluded from WR.",
         "Overall row: <b>from start of available setup database</b>.",
         HDR,
@@ -49865,7 +49992,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         uid_i = int(uid or 0)
 
     try:
-        cache_key = f"keep_watch_summary:v126::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
+        cache_key = f"keep_watch_summary:v142::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -49972,8 +50099,14 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         dec = tp + sl
         wr = (tp / dec * 100.0) if dec > 0 else 0.0
         return {
-            'keep': len(keep_hit),
-            'watch': len(watch_hit),
+            # yver142: Keep/Watch are policy-lane totals, not just lanes touched
+            # inside this specific result window.  UsedK/UsedW preserves the old
+            # "touched in window" count separately, so the policy counts match the
+            # header and the setup/result metrics remain window-specific.
+            'keep': len(keep_combos),
+            'watch': len(watch_combos),
+            'used_keep': len(keep_hit),
+            'used_watch': len(watch_hit),
             'set': set_n,
             'tp': tp,
             'sl': sl,
@@ -49995,6 +50128,8 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
             label,
             st['keep'],
             st['watch'],
+            st['used_keep'],
+            st['used_watch'],
             st['set'],
             st['tp'],
             st['sl'],
@@ -50012,9 +50147,9 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
 
     table = tabulate(
         table_rows,
-        headers=['Window', 'Keep', 'Watch', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
+        headers=['Window', 'Keep', 'Watch', 'UsedK', 'UsedW', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
         tablefmt='plain',
-        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
+        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     lines = [
         "📊 <b>Setup KEEP + WATCH Summary</b>",
@@ -50023,6 +50158,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         f"Current policy combos: <b>{len(allowed_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>{len(watch_combos)}</b>)",
         f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
         f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        "Keep/Watch columns = <b>current policy lane totals</b>; UsedK/UsedW = policy lanes that actually had setup rows in that window.",
         "WR basis: <b>TP/(TP+SL)</b>; NH and Open are shown but excluded from WR.",
         "Overall row: <b>from start of available setup database</b>.",
         HDR,
@@ -58095,16 +58231,19 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             logger.exception("list_users_with_email failed: %s", e)
             users_bigmove = []
 
-        # yver139: do not let a stale notify list silently remove the live owner from
-        # the autonomous setup-email pool. /autotrade_debug can show Alerts ON while
-        # list_users_notify_on() still misses AUTOTRADE_OWNER_UID; include it explicitly
-        # when an email address exists.
+        # yver140: do not let a stale/long notify list silently remove the live owner
+        # from the autonomous setup-email pool. Keep AUTOTRADE_OWNER_UID pinned first
+        # so ALERT_JOB_NOTIFY_MAX_USERS slicing cannot cut it off.
         try:
             owner_uid_for_email = int(AUTOTRADE_OWNER_UID or 0)
-            if owner_uid_for_email > 0 and not any(int((u or {}).get('user_id') or (u or {}).get('id') or 0) == owner_uid_for_email for u in list(users_notify or [])):
+        except Exception:
+            owner_uid_for_email = 0
+        try:
+            if owner_uid_for_email > 0:
                 ou = get_user(owner_uid_for_email) or {}
                 if ou and str(ou.get('email_to') or ou.get('email') or '').strip():
-                    users_notify.append(ou)
+                    users_notify = [u for u in list(users_notify or []) if int((u or {}).get('user_id') or (u or {}).get('id') or 0) != owner_uid_for_email]
+                    users_notify.insert(0, ou)
         except Exception:
             pass
 
@@ -58891,7 +59030,31 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # -----------------------------------------------------
         # Per-user send / skip logic
         # -----------------------------------------------------
-        notify_runtime = list(notify_runtime or [])[:_alert_job_limit('ALERT_JOB_NOTIFY_MAX_USERS', 6)]
+        try:
+            _notify_max = int(_alert_job_limit('ALERT_JOB_NOTIFY_MAX_USERS', 6) or 6)
+        except Exception:
+            _notify_max = 6
+        notify_runtime = list(notify_runtime or [])
+        # yver140: owner must not be lost when the notify list is longer than the
+        # runtime cap. This is the setup-email source of truth for AutoTrade.
+        try:
+            if owner_uid_for_email > 0:
+                owner_meta = None
+                rest_meta = []
+                for _m in notify_runtime:
+                    try:
+                        if int((_m or {}).get('uid') or 0) == int(owner_uid_for_email):
+                            owner_meta = _m
+                        else:
+                            rest_meta.append(_m)
+                    except Exception:
+                        rest_meta.append(_m)
+                if owner_meta is not None:
+                    notify_runtime = [owner_meta] + rest_meta
+        except Exception:
+            pass
+        if _notify_max > 0:
+            notify_runtime = notify_runtime[:_notify_max]
         for meta in notify_runtime:
             if _job_budget_exhausted():
                 logger.warning("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
@@ -61473,14 +61636,31 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
                 users = []
             users = list(users or [])
 
-            # Always include the AutoTrade owner/admin if an email is configured, even if a
-            # stale notify flag prevents list_users_notify_on from returning it.
+            # yver141: keep the AutoTrade owner/admin pinned first in the autonomous
+            # /screen-sync email queue as well. ver140 fixed alert_job, but this
+            # separate autonomous path could still append the owner at the end and then
+            # cut it off with AUTONOMOUS_SCREEN_SYNC_MAX_USERS slicing.
             try:
                 owner_uid = int(AUTOTRADE_OWNER_UID or 0)
-                if owner_uid > 0 and not any(int((u or {}).get('user_id') or 0) == owner_uid for u in users):
-                    ou = get_user(owner_uid) or {}
-                    if ou and (str(ou.get('email_to') or ou.get('email') or '').strip()):
-                        users.append(ou)
+            except Exception:
+                owner_uid = 0
+            try:
+                if owner_uid > 0:
+                    owner_user = None
+                    rest_users = []
+                    for _u in list(users or []):
+                        try:
+                            if int((_u or {}).get('user_id') or (_u or {}).get('id') or 0) == int(owner_uid):
+                                owner_user = _u
+                            else:
+                                rest_users.append(_u)
+                        except Exception:
+                            rest_users.append(_u)
+                    if owner_user is None:
+                        ou = get_user(owner_uid) or {}
+                        if ou and str(ou.get('email_to') or ou.get('email') or '').strip():
+                            owner_user = ou
+                    users = ([owner_user] if owner_user is not None else []) + rest_users
             except Exception:
                 pass
             if not users:
