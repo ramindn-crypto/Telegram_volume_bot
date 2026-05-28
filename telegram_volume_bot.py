@@ -40172,7 +40172,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_quality": "Alias of /setup_audit",
     "setup_audit_overall": "Overall Family-Session-Strategy-Side summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR",
     "setup_audit_keep_watch": "Multi-window KEEP + WATCH setup summary table: Last 24h, 7d, 14d, Overall; Keep/Watch combo counts, Set, TP, SL, NH, Open, WR",
-    "setup_audit_keep": "Setup Audit filtered to current KEEP policy lanes only; usage: /setup_audit_keep 24",
+    "setup_audit_keep": "Multi-window KEEP-only setup summary table: Last 24h, 7d, 14d, Overall; same columns as /setup_audit_keep_watch",
     "setup_keep_watch_summary": "Alias of /setup_audit_keep_watch",
     "setup_audit_compare": "Reconcile bot-created AutoTrade closes against /setup_audit price-path results; exchange-only rows are marked BYBIT_ONLY: /setup_audit_compare 24",
     "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
@@ -45179,112 +45179,181 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
 
 
 def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
-    """Setup audit filtered to current KEEP policy lanes only."""
+    """Multi-window summary for current KEEP policy lanes only.
+
+    yver133: /setup_audit_keep now mirrors /setup_audit_keep_watch format so the
+    owner can compare Last 24h, Last 7d, Last 14d, and Overall with the same
+    columns.  It intentionally does not list every setup row; use /setup_audit X
+    for the detailed setup list.
+    """
     try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(owner_uid or uid or 0)
+    except Exception:
         uid_i = int(uid or 0)
-    except Exception:
-        uid_i = 0
+
+    # Keep the old optional argument accepted for backwards compatibility, but
+    # the command now always prints the standard four-window table.
     try:
-        hours = max(1, min(8760, int(float(hours or 24))))
+        _ = max(1, min(8760, int(float(hours or 24))))
     except Exception:
-        hours = 24
+        pass
+
     try:
-        limit = max(0, int(limit or 0))
+        cache_bucket = int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))
+        cache_key = f"keep_only_summary:v133::{uid_i}::{cache_bucket}"
+        cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
+        cached = cache.get(cache_key) if isinstance(cache, dict) else None
+        if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
+            return str(cached.get('text') or '')
     except Exception:
-        limit = 0
+        cache_key = ''
+
+    keep_combos: set[str] = set()
+    try:
+        pol_lookup = _setup_combo_enforceable_policy_lookup(uid_i)
+        for combo, pol in (pol_lookup or {}).items():
+            try:
+                combo_u = str(combo or '').upper().strip()
+                if not combo_u:
+                    continue
+                st = str((pol or {}).get('status') or '').upper().strip()
+                enabled = int((pol or {}).get('enabled') if (pol or {}).get('enabled') is not None else 1) == 1
+                pstatus = _setup_policy_effective_status(st, found=True)
+                if enabled and str(pstatus or '').upper().strip() == 'KEEP':
+                    keep_combos.add(combo_u)
+            except Exception:
+                continue
+    except Exception:
+        keep_combos = set()
+
+    try:
+        rows = _setup_audit_load_rows(int(uid_i), hours=None, limit=0, dedup=True, start_ts=0.0, apply_final_quality_gate=False, source_mode_override='ALL')
+        source_label = 'EXECUTABLE+GENERATED'
+        if not rows:
+            rows, source_label = _overall_report_source_rows(uid_i, start_ts=0.0, limit=0, dedup=True)
+    except Exception:
+        rows, source_label = [], 'EXECUTABLE'
+
     result_horizon = _setup_audit_result_horizon_hours()
-    min_vol_m = _setup_min_volume_floor_usd() / 1e6
-    try:
-        rows_all = _setup_audit_load_rows(uid_i, hours=hours, limit=0, dedup=True)
-    except Exception:
-        rows_all = []
+    audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
+    now_ts = float(time.time())
 
-    def _row_is_keep(r: dict) -> bool:
+    def _row_combo_u(r: dict) -> str:
         try:
-            sess_row = str((r or {}).get('session') or (r or {}).get('source_session') or '').upper().strip()
-            pinfo = _setup_combo_policy_lookup_for_setup(r, session_name=sess_row, user_id=uid_i) or {}
-            pfound = bool((pinfo or {}).get('found'))
-            pstatus = _setup_policy_effective_status(str((pinfo or {}).get('status') or '').upper().strip(), found=pfound)
-            return str(pstatus or '').upper().strip() == 'KEEP'
-        except Exception:
-            return False
-
-    rows = [dict(r or {}) for r in (rows_all or []) if _row_is_keep(dict(r or {}))]
-    if limit > 0:
-        rows = rows[:limit]
-    if not rows:
-        return (
-            f"🧪 <b>Setup Audit — KEEP Only</b>\n{HDR}\n"
-            f"No KEEP-policy setup rows above ${min_vol_m:.0f}M volume in the last {hours}h.\n"
-            f"This means the current KEEP-only live lane has no audited setup rows in this window. "
-            f"Use <code>/setup_audit_keep_watch</code> to compare KEEP vs WATCH coverage."
-        )
-
-    audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
-    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
-    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(uid_i, start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
-    table_rows = []
-    tp_n = sl_n = nohit_n = open_n = 0
-    for r in rows:
-        try:
-            sid = str(r.get('setup_id') or '').strip()
-            side = str(r.get('side') or '').upper().strip()
-            sym = str(r.get('symbol') or '').upper().strip()
-            if sym.endswith('USDT'):
-                sym = sym[:-4]
-            family_code = _setup_audit_family_code(r)
-            actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
-            ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=uid_i, candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
-            result = _setup_audit_result_label(ev.get('result'))
-            if result == 'TP':
-                tp_n += 1
-            elif result == 'SL':
-                sl_n += 1
-            elif result == 'NOHIT':
-                nohit_n += 1
-            else:
-                open_n += 1
+            fam = _setup_audit_family_code(r)
             sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
-            ts = _setup_audit_row_ts(r)
-            try:
-                ttxt = datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if ts > 0 else '-'
-            except Exception:
-                ttxt = '-'
-            try:
-                volm = float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0) / 1e6
-            except Exception:
-                volm = 0.0
-            combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
-            entry_f = float(r.get('entry') or 0.0)
-            sl_f = float(r.get('sl') or 0.0)
-            tp_f = float(_resolve_single_tp(entry_f, sl_f, r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)
-            table_rows.append([ttxt, sym, side, combo_key, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(entry_f) if entry_f > 0 else '-', fmt_price(sl_f) if sl_f > 0 else '-', fmt_price(tp_f) if tp_f > 0 else '-', result])
+            strat = _setup_strategy_short_label(r)
+            side_row = _setup_side_suffix(value=str(r.get('side') or ''))
+            return str(_setup_combo_strategy_side_key(fam, sess_row, strat, side_row) or '').upper().strip()
+        except Exception:
+            return ''
+
+    enriched_rows: list[tuple[float, str, str]] = []
+    matched_all_for_dates: list[dict] = []
+    for r in list(rows or []):
+        try:
+            combo_u = _row_combo_u(r)
+            if combo_u not in keep_combos:
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            res = _setup_audit_keep_watch_fast_result_label(r, result_horizon)
+            enriched_rows.append((ts, combo_u, res))
+            matched_all_for_dates.append(r)
         except Exception:
             continue
-    decided = tp_n + sl_n
-    wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
+
+    def _stats_for_window(start_ts: float | None = None) -> dict:
+        keep_hit: set[str] = set()
+        set_n = tp = sl = nh = op = 0
+        for ts, combo_u, res in enriched_rows:
+            try:
+                if start_ts is not None and float(ts or 0.0) > 0 and float(ts) < float(start_ts):
+                    continue
+                if start_ts is not None and float(ts or 0.0) <= 0:
+                    continue
+                keep_hit.add(combo_u)
+                set_n += 1
+                if res == 'TP':
+                    tp += 1
+                elif res == 'SL':
+                    sl += 1
+                elif res == 'NOHIT':
+                    nh += 1
+                else:
+                    op += 1
+            except Exception:
+                continue
+        dec = tp + sl
+        wr = (tp / dec * 100.0) if dec > 0 else 0.0
+        return {
+            'keep': len(keep_hit),
+            'watch': 0,
+            'set': set_n,
+            'tp': tp,
+            'sl': sl,
+            'nh': nh,
+            'open': op,
+            'wr': wr,
+        }
+
+    windows = [
+        ('Last 24h', now_ts - 24 * 3600),
+        ('Last 7d', now_ts - 7 * 86400),
+        ('Last 14d', now_ts - 14 * 86400),
+        ('Overall', None),
+    ]
+    table_rows = []
+    for label, start_ts in windows:
+        st = _stats_for_window(start_ts)
+        table_rows.append([
+            label,
+            st['keep'],
+            st['watch'],
+            st['set'],
+            st['tp'],
+            st['sl'],
+            st['nh'],
+            st['open'],
+            f"{st['wr']:.1f}%",
+        ])
+
     try:
-        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        win = _setup_audit_window_summary(matched_all_for_dates)
+        data_start_txt = str(win.get('start_txt') or '-')
+        data_end_txt = str(win.get('end_txt') or '-')
     except Exception:
-        now_txt = ''
-    win = _setup_audit_window_summary(rows)
+        data_start_txt = data_end_txt = '-'
+
     table = tabulate(
         table_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Window', 'Keep', 'Watch', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
-    return "\n".join([
-        "🧪 <b>Setup Audit — KEEP Only</b>",
+    lines = [
+        "📊 <b>Setup KEEP Summary</b>",
         HDR,
-        f"Window: <b>last {hours}h</b> | KEEP setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
-        f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
-        "Source: post-setup price path; AutoTrade-independent. Rows: <b>current KEEP policy lanes only</b>.",
-        "WR = TP/(TP+SL), excluding NOHIT and OPEN.",
-        f"Rows shown: <b>{len(table_rows)}</b> / <b>{len(table_rows)}</b> (full list).",
+        "Policy source: <b>current enforceable KEEP lanes only</b>",
+        f"Current policy combos: <b>{len(keep_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>0</b>)",
+        f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
+        f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        "WR basis: <b>TP/(TP+SL)</b>; NH and Open are shown but excluded from WR.",
+        "Overall row: <b>from start of available setup database</b>.",
+        HDR,
         "<pre>" + html.escape(table) + "</pre>",
-    ])
+    ]
+    if not keep_combos:
+        lines.append("No active KEEP policy lanes found. Run <code>/setup_matrix policy</code> to refresh policy first.")
+    elif not enriched_rows:
+        lines.append("No historical setup rows matched the current KEEP lanes yet.")
+    txt = "\n".join(lines)
+    try:
+        if cache_key:
+            _SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE[cache_key] = {'ts': float(time.time()), 'text': txt}
+    except Exception:
+        pass
+    return txt
 
 
 # ================= SETUP AUDIT ↔ AUTOTRADE RECONCILIATION =================
