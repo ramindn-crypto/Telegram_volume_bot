@@ -1,3 +1,4 @@
+# yver134: adds Policy column to /setup_audit detailed table, showing current enforceable KEEP/WATCH/OFF lane for each setup.
 # yver132: explains KEEP selection in /setup_matrix policy (KEEP requires more than 50% WR: sample + AvgR/payoff + no safety disable); no trading-policy loosening.
 # yver130: startup fix for yver129: imports typing.Any before the early AutoTrade email-gate helper so Render does not crash on NameError.
 from typing import Any  # yver130 early import required before early helper annotations
@@ -45092,8 +45093,40 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
     return final
 
 
+
+def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
+    """Current enforceable policy label for one /setup_audit row.
+
+    yver134: /setup_audit now shows whether the row's exact
+    Family-Session-Strategy-Side lane is currently KEEP, WATCH, or OFF.
+    Missing/new policy lanes are intentionally displayed as WATCH because the
+    executable gate treats unknown/new lanes as WATCH probation, not as a block.
+    """
+    try:
+        rr = dict(row or {})
+        sess = str(session_name or rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
+        side_u = str(side or rr.get('side') or '').upper().strip()
+        if side_u in {'BUY', 'SELL'}:
+            rr['side'] = side_u
+        policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        info = _setup_combo_policy_lookup_for_setup(rr, session_name=sess, user_id=policy_uid) or {}
+        found = bool(info.get('found'))
+        raw_status = str(info.get('status') or '').upper().strip()
+        status = _setup_policy_effective_status(raw_status, found=found)
+        try:
+            enabled = int(info.get('enabled') if info.get('enabled') is not None else (1 if not found else 0)) == 1
+        except Exception:
+            enabled = True if not found else False
+        if (not enabled) or status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}:
+            return 'OFF'
+        if status == 'KEEP':
+            return 'KEEP'
+        return 'WATCH'
+    except Exception:
+        return '-'
+
 def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
-    """Compact setup audit: Symbol / Type / Conf / Family / Result only."""
+    """Compact setup audit with current Policy lane per setup."""
     limit = max(0, int(limit or 0))
     hours = max(1, min(8760, int(hours or 24)))
     result_horizon = _setup_audit_result_horizon_hours()
@@ -45143,7 +45176,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         except Exception:
             volm = 0.0
         combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
-        table_rows.append([ttxt, sym, side, combo_key, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
+        policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -45160,9 +45194,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
@@ -45171,6 +45205,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
+        "Policy = current enforceable lane status for that setup: KEEP, WATCH, or OFF.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
