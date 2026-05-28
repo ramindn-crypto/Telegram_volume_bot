@@ -1,3 +1,4 @@
+# yver137: final pipeline sync audit: /setup_audit Policy now uses the same user-visible KEEP/WATCH/context gate as setup email + /screen, and /screen DB fallback windows now use AUTOTRADE_ENTRY_WINDOW_MIN instead of a fixed 45m window.
 # yver136: aligns /setup_audit Policy with the real delivery/execution gate: it now shows KEEP only when the same final gate used by /screen/setup-email/AutoTrade allows the row; WATCH only when WATCH exposure/execution is enabled; otherwise OFF.
 # yver135: fixes setup-audit/email/autotrade sync gap by letting setup emails consume executable rows for the full AUTOTRADE_ENTRY_WINDOW_MIN instead of only MAX_STALE_SCAN_SEC; /screen fallback age now follows the same entry window.
 # yver134: adds Policy column to /setup_audit detailed table, showing current enforceable KEEP/WATCH/OFF lane for each setup.
@@ -24311,7 +24312,7 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
     try:
         cutoff = float(time.time()) - float(max_age_min) * 60.0
     except Exception:
-        cutoff = float(time.time()) - float(SCREEN_FALLBACK_MAX_AGE_MIN) * 60.0
+        cutoff = float(time.time()) - float(_screen_actionable_fallback_max_age_min()) * 60.0
     req_session_u = str(session_name or '').upper().strip()
     try:
         try:
@@ -45174,21 +45175,32 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
             enabled = True if not found else False
         if (not enabled) or status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}:
             return 'OFF'
+
+        # yver137: final gate alone is not enough.  The real delivery path also
+        # applies the user-visible KEEP/WATCH policy and the context feed guard via
+        # _setup_user_visible_keep_policy_allows().  Without this, /setup_audit can
+        # still label a raw KEEP row as tradable while email, /screen and AutoTrade
+        # correctly skip it for context/symbol/hour/side reasons.
+        try:
+            visible_ok, _visible_why, _visible_meta = _setup_user_visible_keep_policy_allows(
+                rr, session_name=sess, user_id=policy_uid, lane='email'
+            )
+            if not visible_ok:
+                return 'OFF'
+        except Exception:
+            return 'OFF'
+        try:
+            at_allowed = (not _autotrade_require_keep_policy()) or (status in _autotrade_allowed_policy_statuses())
+        except Exception:
+            at_allowed = False
+        if not at_allowed:
+            return 'OFF'
         if status == 'KEEP':
             return 'KEEP'
         if status == 'WATCH':
-            # Keep /setup_audit aligned with the currently configured user-facing
-            # email/screen lane and the AutoTrade lane. In the current KEEP-only
-            # mode, raw WATCH rows stay visible for audit, but are not actionable.
-            try:
-                email_allowed = status in _user_visible_allowed_policy_statuses('email')
-            except Exception:
-                email_allowed = False
-            try:
-                at_allowed = (not _autotrade_require_keep_policy()) or (status in _autotrade_allowed_policy_statuses())
-            except Exception:
-                at_allowed = False
-            return 'WATCH' if (email_allowed and at_allowed) else 'OFF'
+            # WATCH is only actionable when both subscriber-facing exposure and
+            # AutoTrade WATCH policy are explicitly enabled.
+            return 'WATCH'
         return 'OFF'
     except Exception:
         return '-'
@@ -55620,7 +55632,7 @@ def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: flo
     if uid <= 0:
         return 0.0
     try:
-        hours = float(lookback_hours if lookback_hours is not None else max(1.0, float(SCREEN_FALLBACK_MAX_AGE_MIN or 45) / 60.0))
+        hours = float(lookback_hours if lookback_hours is not None else max(1.0, float(_screen_actionable_fallback_max_age_min()) / 60.0))
     except Exception:
         hours = 1.0
     cutoff = float(time.time()) - max(1.0, hours) * 3600.0
@@ -56454,7 +56466,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _schedule_screen_cache_refresh(int(uid), scan_session)
         can_show_email_source = _screen_user_can_see_email_source(int(uid), user)
         try:
-            latest_delivery_ts = _latest_recent_delivery_ts(int(uid), str(scan_session or '').upper(), max_age_min=max(45, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8))) if can_show_email_source else 0.0
+            screen_fallback_min = int(_screen_actionable_fallback_max_age_min())
+        except Exception:
+            screen_fallback_min = 60
+        try:
+            latest_delivery_ts = _latest_recent_delivery_ts(int(uid), str(scan_session or '').upper(), max_age_min=screen_fallback_min) if can_show_email_source else 0.0
         except Exception:
             latest_delivery_ts = 0.0
         cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
@@ -56467,7 +56483,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if quick_best_email:
                     body_e, kb_e, shown_e = _screen_recent_db_body_and_kb(
                         int(uid), str(scan_session or '').upper(), quick_best_email,
-                        max_age_min=max(45, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)),
+                        max_age_min=screen_fallback_min,
                         include_email_source=True,
                     )
                     if body_e:
@@ -56544,7 +56560,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     int(uid),
                     str(scan_session or '').upper(),
                     quick_best,
-                    max_age_min=max(10, int(SCREEN_FALLBACK_MAX_AGE_MIN or 8)),
+                    max_age_min=screen_fallback_min,
                     include_email_source=bool(can_show_email_source),
                 )
                 if body:
