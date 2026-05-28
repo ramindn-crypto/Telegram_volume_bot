@@ -1,3 +1,4 @@
+# yver139: final 0-100 pipeline sync hardening: email selection no longer drops in-memory/shared executable candidates when the per-user DB fan-out is skipped, setup-email candidate picking now applies the same user-visible KEEP/context presend gate before choosing a candidate, /screen cache/actionability windows now use AUTOTRADE_ENTRY_WINDOW_MIN instead of hidden 45m windows, and alert_job always includes AUTOTRADE_OWNER_UID when email is configured.
 # yver138: final delivery-window sync hardening: /setup_audit Policy now returns KEEP/WATCH only when the row is still inside the live entry window, belongs to the active session, passes user-visible email/screen/context gates, and is not blocked by email flip/symbol cooldown; otherwise it is OFF.
 # yver137: final pipeline sync audit: /setup_audit Policy now uses the same user-visible KEEP/WATCH/context gate as setup email + /screen, and /screen DB fallback windows now use AUTOTRADE_ENTRY_WINDOW_MIN instead of a fixed 45m window.
 # yver136: aligns /setup_audit Policy with the real delivery/execution gate: it now shows KEEP only when the same final gate used by /screen/setup-email/AutoTrade allows the row; WATCH only when WATCH exposure/execution is enabled; otherwise OFF.
@@ -669,7 +670,7 @@ AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE = env_bool('AUTOTRADE_KEEP_ALL_TEST_UNLIM
 AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS = env_bool('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)
 AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK = int(os.environ.get('AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK', '0') or 0)
 AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS = 3.0
-SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "45") or 55)
+SCREEN_FALLBACK_MAX_AGE_MIN = int(os.environ.get("SCREEN_FALLBACK_MAX_AGE_MIN", "60") or 60)
 
 # Setup audit defaults: report actionable/executable setups, not every raw scanner candidate.
 # This prevents /setup_audit and /setup_audit_overall from being inflated by repeated
@@ -24515,7 +24516,7 @@ def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', ma
 
 
 
-def _latest_recent_delivery_ts(user_id: int, session_name: str = '', max_age_min: int = 45) -> float:
+def _latest_recent_delivery_ts(user_id: int, session_name: str = '', max_age_min: int | None = None) -> float:
     """Latest setup-email delivery timestamp for /screen cache invalidation.
 
     /screen can have a valid but older executable snapshot while a newer setup email has
@@ -24529,7 +24530,9 @@ def _latest_recent_delivery_ts(user_id: int, session_name: str = '', max_age_min
     if uid <= 0:
         return 0.0
     req_session_u = str(session_name or '').upper().strip()
-    cutoff = float(time.time()) - float(max(2, int(max_age_min or 55))) * 60.0
+    if max_age_min is None:
+        max_age_min = _screen_actionable_fallback_max_age_min()
+    cutoff = float(time.time()) - float(max(2, int(max_age_min or _screen_actionable_fallback_max_age_min()))) * 60.0
     latest = 0.0
     try:
         _recent_emailed_cache_prune(uid)
@@ -45209,6 +45212,18 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
         if not _setup_audit_row_matches_active_session(rr, session_name=sess):
             return 'OFF'
 
+        # yver139: /setup_audit Policy must match the email candidate lane, not just
+        # the lower-level final quality gate. Re-run the executable eligibility wrapper
+        # on the hydrated row before labelling it KEEP/WATCH.
+        try:
+            from types import SimpleNamespace
+            _exec_obj = SimpleNamespace(**rr)
+            _exec_ok, _exec_why = is_executable_setup_eligible(_exec_obj, session_name=sess)
+            if not _exec_ok:
+                return 'OFF'
+        except Exception:
+            return 'OFF'
+
         # First apply the real shared gate. This catches blocks that are not visible
         # from the raw policy row alone, such as directional leader/loser conflict,
         # final quality/risk/TP-SL validation, weak context, or exact disable state.
@@ -55610,7 +55625,10 @@ def _screen_cache_put(cache_key: str, body: str, kb: list | None = None, ts: flo
         old_body = str(old.get('body') or '')
         old_has = _screen_body_has_trade_setups(old_body)
         old_age = now_ts - float(old.get('ts', 0.0) or 0.0)
-        keep_window = max(float(SCREEN_STALE_CACHE_MAX_SEC or 0), 45.0 * 60.0)
+        try:
+            keep_window = max(float(SCREEN_STALE_CACHE_MAX_SEC or 0), float(_setup_delivery_actionable_window_sec()))
+        except Exception:
+            keep_window = max(float(SCREEN_STALE_CACHE_MAX_SEC or 0), 60.0 * 60.0)
 
         # Keep the exact setup-email batch visible while it is still actionable.
         # A background /screen rebuild can legitimately find a different pool one
@@ -55667,7 +55685,11 @@ def _screen_choose_best_cache(cache_keys: list[str]) -> tuple[dict, float]:
             candidates.append((_is_email, _has, _age, _ce))
         if not candidates:
             return {}, 999999.0
-        recent_email = [c for c in candidates if c[0] and c[1] and c[2] <= max(45.0 * 60.0, float(SCREEN_STALE_CACHE_MAX_SEC or 0))]
+        try:
+            _email_screen_window_sec = max(float(_setup_delivery_actionable_window_sec()), float(SCREEN_STALE_CACHE_MAX_SEC or 0))
+        except Exception:
+            _email_screen_window_sec = max(60.0 * 60.0, float(SCREEN_STALE_CACHE_MAX_SEC or 0))
+        recent_email = [c for c in candidates if c[0] and c[1] and c[2] <= _email_screen_window_sec]
         with_setups = [c for c in candidates if c[1]]
         pool = recent_email if recent_email else (with_setups if with_setups else candidates)
         pool.sort(key=lambda x: x[2])
@@ -55851,7 +55873,7 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
     return ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
 
 
-def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int = 30, include_email_source: bool = True):
+def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int | None = None, include_email_source: bool = True):
     """Lightweight no-OHLCV /screen fallback from the latest delivery/executable DB.
 
     Priority is deliberate:
@@ -55861,6 +55883,9 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
     This keeps /screen, email and autotrade showing the same setups after a deploy or cache refresh.
     """
     try:
+        if max_age_min is None:
+            max_age_min = _screen_actionable_fallback_max_age_min()
+        max_age_min = max(1, int(max_age_min or _screen_actionable_fallback_max_age_min()))
         sess = str(session or '').upper().strip()
         out = []
         seen = set()
@@ -55977,7 +56002,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     """
     from types import SimpleNamespace
 
-    def _recent_email_lane_screen_setups(_uid: int, _session: str, max_age_min: int = SCREEN_FALLBACK_MAX_AGE_MIN, limit: int = 3):
+    def _recent_email_lane_screen_setups(_uid: int, _session: str, max_age_min: int | None = None, limit: int = 3):
         """Return the newest visible setup lane for /screen.
 
         Priority: latest emailed setups first, then executable DB queue, then recent generated
@@ -55985,6 +56010,9 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         just went out.
         """
         try:
+            if max_age_min is None:
+                max_age_min = _screen_actionable_fallback_max_age_min()
+            max_age_min = max(1, int(max_age_min or _screen_actionable_fallback_max_age_min()))
             req_session_u = str(_session or '').upper().strip()
             out = []
             seen = set()
@@ -58067,6 +58095,19 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             logger.exception("list_users_with_email failed: %s", e)
             users_bigmove = []
 
+        # yver139: do not let a stale notify list silently remove the live owner from
+        # the autonomous setup-email pool. /autotrade_debug can show Alerts ON while
+        # list_users_notify_on() still misses AUTOTRADE_OWNER_UID; include it explicitly
+        # when an email address exists.
+        try:
+            owner_uid_for_email = int(AUTOTRADE_OWNER_UID or 0)
+            if owner_uid_for_email > 0 and not any(int((u or {}).get('user_id') or (u or {}).get('id') or 0) == owner_uid_for_email for u in list(users_notify or [])):
+                ou = get_user(owner_uid_for_email) or {}
+                if ou and str(ou.get('email_to') or ou.get('email') or '').strip():
+                    users_notify.append(ou)
+        except Exception:
+            pass
+
         if not users_notify and not users_bigmove:
             return
         if _job_budget_exhausted():
@@ -58991,6 +59032,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}', 'eligible': len(eligible or []), 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
 
+            # yver139: keep the in-memory/shared executable candidates as a safety net.
+            # A per-user executable_setups fan-out can be skipped by generation cooldown or
+            # a transient SQLite write, but the exact candidate can still be emailed and
+            # then stamped into emailed_setups/executable_setups by send_email_alert_multi().
+            eligible_from_pool = list(eligible or [])
             try:
                 exec_rows = db_list_executable_setups(int(uid), session_name=str(sess_name or ''), ts_from=float(time.time() - _setup_email_actionable_queue_window_sec()), limit=max(int(EMAIL_SETUPS_N) * 12, 36))
             except Exception:
@@ -58999,7 +59045,17 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 hydrated = _executable_rows_to_setup_objects(list(exec_rows or []), session_name=str(sess_name or ''))
             except Exception:
                 hydrated = []
-            eligible = [s for s in (hydrated or []) if s is not None]
+            eligible_db = [s for s in (hydrated or []) if s is not None]
+            if eligible_db:
+                eligible = list(eligible_db)
+            elif eligible_from_pool:
+                eligible = list(eligible_from_pool)
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_db_fallback', status='using_in_memory_pool', session=str(sess_name or ''), mode='email', details={'eligible_from_pool': len(eligible_from_pool or []), 'db_rows': len(exec_rows or [])})
+                except Exception:
+                    pass
+            else:
+                eligible = []
 
             if (not eligible) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
                 try:
@@ -59117,6 +59173,23 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     if not _setup_combo_policy_allows_setup(s, sess_name, user_id=int(uid)):
                         combo_policy_blocked += 1
+                        continue
+                except Exception:
+                    combo_policy_blocked += 1
+                    continue
+
+                # yver139: apply the same subscriber/email KEEP + context gate before
+                # choosing the candidate, not only inside send_email_alert_multi().
+                # Otherwise the top candidate can be chosen then removed by presend,
+                # causing the whole email batch to fail instead of trying the next valid setup.
+                try:
+                    _vis_ok, _vis_why, _vis_meta = _setup_user_visible_keep_policy_allows(s, session_name=sess_name, user_id=int(uid), lane='email')
+                    if not _vis_ok:
+                        combo_policy_blocked += 1
+                        try:
+                            db_log_setup_pipeline_event(int(uid), stage='email_user_visible_policy_gate', status='skip', session=str(sess_name or ''), mode='email', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=sym, side=side, details={'reason': str(_vis_why or 'email_policy_not_allowed'), 'policy': dict(_vis_meta or {})})
+                        except Exception:
+                            pass
                         continue
                 except Exception:
                     combo_policy_blocked += 1
