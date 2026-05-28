@@ -1,3 +1,4 @@
+# yver138: final delivery-window sync hardening: /setup_audit Policy now returns KEEP/WATCH only when the row is still inside the live entry window, belongs to the active session, passes user-visible email/screen/context gates, and is not blocked by email flip/symbol cooldown; otherwise it is OFF.
 # yver137: final pipeline sync audit: /setup_audit Policy now uses the same user-visible KEEP/WATCH/context gate as setup email + /screen, and /screen DB fallback windows now use AUTOTRADE_ENTRY_WINDOW_MIN instead of a fixed 45m window.
 # yver136: aligns /setup_audit Policy with the real delivery/execution gate: it now shows KEEP only when the same final gate used by /screen/setup-email/AutoTrade allows the row; WATCH only when WATCH exposure/execution is enabled; otherwise OFF.
 # yver135: fixes setup-audit/email/autotrade sync gap by letting setup emails consume executable rows for the full AUTOTRADE_ENTRY_WINDOW_MIN instead of only MAX_STALE_SCAN_SEC; /screen fallback age now follows the same entry window.
@@ -4880,6 +4881,47 @@ def _screen_actionable_fallback_max_age_min() -> int:
             return max(int(SCREEN_FALLBACK_MAX_AGE_MIN or 45), 60)
         except Exception:
             return 60
+
+
+def _setup_delivery_actionable_window_sec() -> float:
+    """Single delivery/actionability window for setup email, /screen and AutoTrade."""
+    try:
+        return float(max(float(_setup_email_actionable_queue_window_sec()), float(_autotrade_entry_window_min()) * 60.0, 120.0))
+    except Exception:
+        return 3600.0
+
+
+def _setup_audit_row_inside_delivery_window(row: dict) -> bool:
+    """True only while this audit row can still be consumed by email/AutoTrade.
+
+    /setup_audit can show a 10h/24h history, but email and AutoTrade only consume
+    recent executable rows.  Without this guard, an old KEEP lane looked actionable
+    even though it was already expired for setup email and AutoTrade.
+    """
+    try:
+        ts = float(_setup_audit_row_ts(dict(row or {})) or 0.0)
+        if ts <= 0:
+            return False
+        return (float(time.time()) - ts) <= float(_setup_delivery_actionable_window_sec())
+    except Exception:
+        return False
+
+
+def _setup_audit_row_matches_active_session(row: dict, session_name: str = '') -> bool:
+    """Keep Policy=current/actionable, not historical policy.
+
+    A setup from a previous session can remain visible for audit/learning, but it
+    should not be labelled KEEP/WATCH if the live email/autotrade loop is already
+    operating in another market session.
+    """
+    try:
+        sess = str(session_name or (row or {}).get('session') or (row or {}).get('source_session') or '').upper().strip()
+        live = str(current_session_utc(datetime.now(timezone.utc)) or '').upper().strip()
+        if live in {'ASIA', 'LON', 'NY'} and sess in {'ASIA', 'LON', 'NY'}:
+            return sess == live
+        return True
+    except Exception:
+        return True
 
 SCREEN_UNIVERSE_N = int(os.environ.get("SCREEN_UNIVERSE_N", str(SCAN_SYMBOL_LIMIT)) or SCAN_SYMBOL_LIMIT)
 SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
@@ -45154,6 +45196,18 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
         if side_u in {'BUY', 'SELL'}:
             rr['side'] = side_u
         policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
+        sym_u = str(rr.get('symbol') or rr.get('market_symbol') or '').upper().strip()
+        if sym_u.endswith('USDT'):
+            sym_u = sym_u[:-4]
+
+        # Final check: Policy is CURRENT actionability, not raw historical policy.
+        # A setup row outside the active session or outside AUTOTRADE_ENTRY_WINDOW_MIN
+        # can be audited, but it cannot still be emailed or opened by AutoTrade.
+        if not _setup_audit_row_inside_delivery_window(rr):
+            return 'OFF'
+        if not _setup_audit_row_matches_active_session(rr, session_name=sess):
+            return 'OFF'
 
         # First apply the real shared gate. This catches blocks that are not visible
         # from the raw policy row alone, such as directional leader/loser conflict,
@@ -45189,6 +45243,34 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
                 return 'OFF'
         except Exception:
             return 'OFF'
+        # Match the setup-email delivery loop as closely as possible: if the exact
+        # setup has already been emailed recently, it is still actionable for /screen
+        # and AutoTrade. If it has not, then current blackout/flip/symbol cooldown
+        # means it will not be delivered now, so show OFF instead of KEEP.
+        exact_email_recent = False
+        try:
+            from types import SimpleNamespace
+            _obj = SimpleNamespace(**rr)
+            exact_email_recent = bool(_autotrade_recent_email_gate_allows_setup(policy_uid, _obj, sess)[0])
+        except Exception:
+            exact_email_recent = False
+        if not exact_email_recent:
+            try:
+                _blk, _blk_reason = _setup_generation_blackout_now()
+                if _blk:
+                    return 'OFF'
+            except Exception:
+                pass
+            try:
+                if symbol_flip_guard_active(int(policy_uid), sym_u, side_u, sess):
+                    return 'OFF'
+            except Exception:
+                pass
+            try:
+                if _email_symbol_recently_sent(int(policy_uid), sym_u, side_u, sess, setup_id=sid):
+                    return 'OFF'
+            except Exception:
+                pass
         try:
             at_allowed = (not _autotrade_require_keep_policy()) or (status in _autotrade_allowed_policy_statuses())
         except Exception:
@@ -45285,7 +45367,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "Policy = final shared /screen + setup-email + AutoTrade gate: KEEP means actionable now; WATCH appears only if WATCH mode is enabled; OFF means audit-only/not deliverable.",
+        "Policy = current delivery/actionability gate: KEEP/WATCH only if the row is still inside the active session + entry window and passes /screen + setup-email + AutoTrade gates; OFF = audit-only/not deliverable now.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
