@@ -1,3 +1,4 @@
+# yver136: aligns /setup_audit Policy with the real delivery/execution gate: it now shows KEEP only when the same final gate used by /screen/setup-email/AutoTrade allows the row; WATCH only when WATCH exposure/execution is enabled; otherwise OFF.
 # yver135: fixes setup-audit/email/autotrade sync gap by letting setup emails consume executable rows for the full AUTOTRADE_ENTRY_WINDOW_MIN instead of only MAX_STALE_SCAN_SEC; /screen fallback age now follows the same entry window.
 # yver134: adds Policy column to /setup_audit detailed table, showing current enforceable KEEP/WATCH/OFF lane for each setup.
 # yver132: explains KEEP selection in /setup_matrix policy (KEEP requires more than 50% WR: sample + AvgR/payoff + no safety disable); no trading-policy loosening.
@@ -45135,12 +45136,15 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
 
 
 def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
-    """Current enforceable policy label for one /setup_audit row.
+    """Final actionable policy label for one /setup_audit row.
 
-    yver134: /setup_audit now shows whether the row's exact
-    Family-Session-Strategy-Side lane is currently KEEP, WATCH, or OFF.
-    Missing/new policy lanes are intentionally displayed as WATCH because the
-    executable gate treats unknown/new lanes as WATCH probation, not as a block.
+    yver136: this column must not show a raw KEEP/WATCH matrix state that the
+    live delivery/execution lane would still block.  A row is displayed as KEEP
+    only if the same shared final quality/context/directional gate used by
+    executable queue, setup-email, /screen and AutoTrade currently allows it.
+    WATCH is shown only when WATCH exposure/execution is enabled. Otherwise the
+    audit row remains visible for learning, but Policy is OFF so the owner does
+    not expect an email, /screen card, or AutoTrade entry.
     """
     try:
         rr = dict(row or {})
@@ -45149,6 +45153,17 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
         if side_u in {'BUY', 'SELL'}:
             rr['side'] = side_u
         policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+
+        # First apply the real shared gate. This catches blocks that are not visible
+        # from the raw policy row alone, such as directional leader/loser conflict,
+        # final quality/risk/TP-SL validation, weak context, or exact disable state.
+        try:
+            final_ok, final_why, final_meta = _setup_final_quality_gate_allows_setup(rr, session_name=sess, user_id=policy_uid)
+            if not final_ok:
+                return 'OFF'
+        except Exception:
+            return 'OFF'
+
         info = _setup_combo_policy_lookup_for_setup(rr, session_name=sess, user_id=policy_uid) or {}
         found = bool(info.get('found'))
         raw_status = str(info.get('status') or '').upper().strip()
@@ -45161,7 +45176,20 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
             return 'OFF'
         if status == 'KEEP':
             return 'KEEP'
-        return 'WATCH'
+        if status == 'WATCH':
+            # Keep /setup_audit aligned with the currently configured user-facing
+            # email/screen lane and the AutoTrade lane. In the current KEEP-only
+            # mode, raw WATCH rows stay visible for audit, but are not actionable.
+            try:
+                email_allowed = status in _user_visible_allowed_policy_statuses('email')
+            except Exception:
+                email_allowed = False
+            try:
+                at_allowed = (not _autotrade_require_keep_policy()) or (status in _autotrade_allowed_policy_statuses())
+            except Exception:
+                at_allowed = False
+            return 'WATCH' if (email_allowed and at_allowed) else 'OFF'
+        return 'OFF'
     except Exception:
         return '-'
 
@@ -45245,7 +45273,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "Policy = current enforceable lane status for that setup: KEEP, WATCH, or OFF.",
+        "Policy = final shared /screen + setup-email + AutoTrade gate: KEEP means actionable now; WATCH appears only if WATCH mode is enabled; OFF means audit-only/not deliverable.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
