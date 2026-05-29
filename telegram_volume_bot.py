@@ -1,3 +1,4 @@
+# yver144: fixes final audit/report sync: /setup_audit AT no longer shows stale AT_OPEN after a position is no longer live, and /setup_audit_compare recovers setup matches from the AutoTrade journal when Bybit Closed-PnL rows lose setup_id/open-time metadata.
 # yver143: adds setup-audit AutoTrade lifecycle visibility and final live-entry user-visible gate so already-open trades (e.g. INJ) are not confused with fresh actionable setups.
 # yver142: fixes /setup_audit_keep and /setup_audit_keep_watch summary semantics: Keep/Watch now show current policy lane totals, with UsedK/UsedW showing lanes that actually had setups in each window; setup counts/TP/SL/WR remain window-specific.
 # yver141: final autonomous-screen-sync owner delivery hardening: AUTOTRADE_OWNER_UID is now pinned to the front of the autonomous /screen-sync email queue too, so AUTONOMOUS_SCREEN_SYNC_MAX_USERS slicing cannot cut the owner before setup email/autotrade sync. No trading/risk/policy changes.
@@ -45212,6 +45213,47 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
 
 
 
+_SETUP_AUDIT_LIVE_POS_CACHE = {'ts': 0.0, 'rows': []}
+
+def _setup_audit_live_position_present(symbol: str, side: str) -> bool:
+    """Return whether a matching live Bybit position currently exists.
+
+    yver144: /setup_audit AT should not keep showing AT_OPEN just because the
+    local journal row has not yet been closed/synced. Use the short cached live
+    Bybit position list as the source of truth for whether an already-executed
+    setup is still open.
+    """
+    try:
+        sym_lin = _bybit_linear_symbol(str(symbol or '')).upper().strip()
+        sym_base = _symbol_base(sym_lin)
+        side_u = str(side or '').upper().strip()
+        if not sym_base or side_u not in {'BUY', 'SELL'}:
+            return False
+        cache = globals().setdefault('_SETUP_AUDIT_LIVE_POS_CACHE', {'ts': 0.0, 'rows': []})
+        now = float(time.time())
+        rows = []
+        try:
+            if isinstance(cache, dict) and (now - float(cache.get('ts') or 0.0)) <= 8.0:
+                rows = list(cache.get('rows') or [])
+            else:
+                rows = list(_bybit_get_open_positions_linear() or [])
+                cache['ts'] = now
+                cache['rows'] = list(rows or [])
+        except Exception:
+            rows = list(cache.get('rows') or []) if isinstance(cache, dict) else []
+        for p in rows or []:
+            try:
+                psym = _symbol_base(str(_pos_symbol(p) or p.get('symbol') or ''))
+                pside = str(_pos_side_text(p) or p.get('side') or '').upper().strip()
+                if psym == sym_base and pside == side_u:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: str = '') -> str:
     """Return setup lifecycle state for /setup_audit display.
 
@@ -45272,11 +45314,17 @@ def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: st
                 if rows:
                     r0 = dict(rows[0] or {})
                     st = str(r0.get('status') or '').upper().strip()
-                    if st == 'OPEN' and not r0.get('closed_ts'):
-                        return 'AT_OPEN'
                     out = str(r0.get('outcome') or st or '').upper().strip()
                     if out in {'TP', 'SL'}:
                         return f'AT_{out}'
+                    if st == 'OPEN' and not r0.get('closed_ts'):
+                        # yver144: the local journal can lag Bybit close sync.
+                        # Only show AT_OPEN if the symbol/side is still live now;
+                        # otherwise mark it as already consumed/closed instead of
+                        # making /setup_audit disagree with /autotrade_debug.
+                        if _setup_audit_live_position_present(sym_lin or sym_raw, side_u):
+                            return 'AT_OPEN'
+                        return 'AT_CLOSED'
                     return 'AT_CLOSED' if r0.get('closed_ts') else 'AT'
                 if sid:
                     er = cur.execute(
@@ -45499,7 +45547,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "Policy = fresh-current delivery/actionability gate only. AT = lifecycle: SENT/AT_OPEN/AT_TP/AT_SL; an AT_OPEN row can be Policy OFF after the entry window because it was already consumed earlier.",
+        "Policy = fresh-current delivery/actionability gate only. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions, so stale open journal rows no longer look live after closure.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
@@ -45721,10 +45769,23 @@ def _setup_audit_compare_prepare_closed_positions(trade_rows: list[dict]) -> lis
                 cts = float(row.get('closed_ts') or row.get('last_ts') or row.get('ts') or base.get('closed_ts') or base.get('ts') or 0.0)
             except Exception:
                 cts = 0.0
+            opened_ts_source = ''
             try:
-                opened_ts = float(row.get('opened_ts') or row.get('first_ts') or base.get('opened_ts') or 0.0)
+                if row.get('opened_ts') or base.get('opened_ts'):
+                    opened_ts = float(row.get('opened_ts') or base.get('opened_ts') or 0.0)
+                    opened_ts_source = 'opened_ts'
+                elif row.get('first_ts') or base.get('first_ts'):
+                    # first_ts on merged closed-PnL rows is usually the first close
+                    # fragment, not the real entry time. Keep it only as a weak
+                    # timestamp and let compare matching fall back to close-time
+                    # reconciliation or journal recovery.
+                    opened_ts = float(row.get('first_ts') or base.get('first_ts') or 0.0)
+                    opened_ts_source = 'first_close_fragment'
+                else:
+                    opened_ts = 0.0
             except Exception:
                 opened_ts = 0.0
+                opened_ts_source = ''
             try:
                 pnl = float(row.get('pnl_usdt') if row.get('pnl_usdt') is not None else row.get('pnl') if row.get('pnl') is not None else base.get('pnl_usdt') if base.get('pnl_usdt') is not None else base.get('pnl') or 0.0)
             except Exception:
@@ -45748,6 +45809,8 @@ def _setup_audit_compare_prepare_closed_positions(trade_rows: list[dict]) -> lis
             if opened_ts > 0:
                 row['opened_ts'] = float(opened_ts)
                 row.setdefault('first_ts', float(opened_ts))
+            if opened_ts_source:
+                row['_compare_opened_ts_source'] = opened_ts_source
             row['pnl'] = float(pnl)
             row['pnl_usdt'] = float(pnl)
             try:
@@ -45949,6 +46012,90 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         except Exception:
             return False
 
+    def _compare_open_ts_is_reliable(tr: dict, open_ts: float, close_ts: float) -> bool:
+        try:
+            if float(open_ts or 0.0) <= 0:
+                return False
+            src = str((tr or {}).get('_compare_opened_ts_source') or '').lower().strip()
+            if src in {'first_close_fragment', 'first_ts', 'closed_pnl_first_ts'}:
+                return False
+            # Bybit Closed-PnL enrichment can sometimes place the first close
+            # fragment into opened_ts. If open and close are effectively the same
+            # event and no exact setup_id is available, treat it as close-only.
+            if float(close_ts or 0.0) > 0 and abs(float(close_ts) - float(open_ts)) <= 30.0 * 60.0 and not str((tr or {}).get('setup_id') or '').strip():
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _recover_setup_from_autotrade_journal(tr: dict) -> dict | None:
+        """Recover setup match when Bybit Closed-PnL row lost setup_id/open time.
+
+        yver144: /setup_audit could show lifecycle for HYPE/NEAR/TON but
+        /setup_audit_compare showed NO_SETUP because the canonical Closed-PnL row
+        had only close-fragment timestamps. Use the local AutoTrade journal as a
+        safe bridge, then validate against the same time window before accepting.
+        """
+        try:
+            sym = str(_bybit_linear_symbol((tr or {}).get('symbol') or '')).upper().strip()
+            sym_base = _symbol_base(sym)
+            side = _trade_side_for_compare(tr)
+            close_ts = float((tr or {}).get('closed_ts') or (tr or {}).get('last_ts') or (tr or {}).get('ts') or 0.0)
+            if not sym_base or side not in {'BUY', 'SELL'} or close_ts <= 0:
+                return None
+            try:
+                entry_deadline_sec = float(_autotrade_entry_window_min()) * 60.0
+            except Exception:
+                entry_deadline_sec = 60.0 * 60.0
+            q_start = max(0.0, min(float(compare_setup_start_ts or 0.0), close_ts - float(horizon_hours + 6) * 3600.0))
+            q_end = close_ts + 10.0 * 60.0
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cand = [dict(r) for r in (cur.execute(
+                    """
+                    SELECT setup_id, symbol, side, opened_ts, closed_ts, trade_id, status, outcome
+                    FROM autotrade_trades
+                    WHERE uid=? AND UPPER(COALESCE(side,''))=?
+                      AND COALESCE(opened_ts,0)>=? AND COALESCE(opened_ts,0)<=?
+                      AND COALESCE(setup_id,'')<>''
+                    ORDER BY ABS(COALESCE(opened_ts,0)-?) ASC
+                    LIMIT 30
+                    """,
+                    (int(owner_uid), side, float(q_start), float(q_end), float(close_ts)),
+                ).fetchall() or [])]
+            best = None
+            best_score = 10**18
+            for jr in cand:
+                try:
+                    if _symbol_base(str(jr.get('symbol') or '')) != sym_base:
+                        continue
+                    sid_j = str(jr.get('setup_id') or '').strip()
+                    item = setup_by_id.get(sid_j)
+                    if not item:
+                        continue
+                    synthetic = dict(tr or {})
+                    synthetic['setup_id'] = sid_j
+                    synthetic['opened_ts'] = float(jr.get('opened_ts') or 0.0)
+                    synthetic['_compare_opened_ts_source'] = 'opened_ts'
+                    if jr.get('closed_ts'):
+                        synthetic.setdefault('journal_closed_ts', float(jr.get('closed_ts') or 0.0))
+                    if not _setup_match_time_safe(item, synthetic):
+                        continue
+                    sts = float(item.get('setup_ts') or 0.0)
+                    ots = float(jr.get('opened_ts') or 0.0)
+                    score = abs((ots or close_ts) - sts)
+                    if ots > 0 and sts > 0 and 0 <= (ots - sts) <= max(20*60.0, entry_deadline_sec + 15*60.0):
+                        score -= 300.0
+                    if score < best_score:
+                        best = item
+                        best_score = score
+                except Exception:
+                    continue
+            return best
+        except Exception:
+            return None
+
     def _setup_match_time_safe(item: dict, tr: dict) -> bool:
         """Reject future/unrelated setup matches for compare.
 
@@ -45990,7 +46137,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
             # but reject previous-day same-symbol setups.
             close_only_window = max(4.0 * 3600.0, min(8.0 * 3600.0, entry_deadline_sec + 3.0 * 3600.0))
 
-            if open_ts > 0:
+            if open_ts > 0 and _compare_open_ts_is_reliable(tr, open_ts, close_ts):
                 # Setup should not be after the recorded open time. Allow a small
                 # timestamp/order-fill tolerance only.
                 if sts > open_ts + 300.0:
@@ -46011,6 +46158,9 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 item = setup_by_id.get(sid)
                 if item and _setup_match_time_safe(item, tr):
                     return item
+            recovered = _recover_setup_from_autotrade_journal(tr)
+            if recovered:
+                return recovered
             sym = str(_bybit_linear_symbol((tr or {}).get('symbol') or '')).upper().strip()
             side = _trade_side_for_compare(tr)
             close_ts = float((tr or {}).get('closed_ts') or (tr or {}).get('last_ts') or (tr or {}).get('ts') or 0.0)
@@ -46140,7 +46290,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
         "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
         "AT = actual realised AutoTrade close from Bybit/journal. Audit = independent matched setup price-path result.",
-        "yver123 matching: setup_id/open-time must fit the AutoTrade entry deadline and selected compare window; stale previous-day/legacy setup matches are shown as NO_SETUP instead of false DIFF.",
+        "yver144 matching: setup_id/open-time must fit the AutoTrade entry deadline; when Bybit Closed-PnL loses setup_id/open-time metadata, compare recovers the safe match from the AutoTrade journal before showing NO_SETUP.",
         "Precision: mismatched TP/SL rows are rechecked with targeted 1m candles before DIFF is shown.",
         f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
     ]
