@@ -1,3 +1,4 @@
+# yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
 # yver144: fixes final audit/report sync: /setup_audit AT no longer shows stale AT_OPEN after a position is no longer live, and /setup_audit_compare recovers setup matches from the AutoTrade journal when Bybit Closed-PnL rows lose setup_id/open-time metadata.
 # yver143: adds setup-audit AutoTrade lifecycle visibility and final live-entry user-visible gate so already-open trades (e.g. INJ) are not confused with fresh actionable setups.
 # yver142: fixes /setup_audit_keep and /setup_audit_keep_watch summary semantics: Keep/Watch now show current policy lane totals, with UsedK/UsedW showing lanes that actually had setups in each window; setup counts/TP/SL/WR remain window-specific.
@@ -49586,14 +49587,17 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
     if args and args[0].lower() in {'policy', 'rules', 'status'}:
-        try:
-            # yver77: policy refresh uses the fixed 15 May baseline and can be heavier
-            # than the old rolling 168h view. Keep it guarded but do not let a timeout
-            # bubble up as a Telegram handler/job crash in Render logs.
-            text = await to_thread_heavy(_setup_combo_policy_text, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
-        except Exception as e:
-            text = f"❌ setup_matrix policy failed: {type(e).__name__}: {html.escape(str(e))}"
-        await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await _send_cached_or_queue_admin_report(
+            update,
+            "/setup_matrix policy",
+            f"admin:bg:v145:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            _setup_combo_policy_text,
+            args=(int(AUTOTRADE_OWNER_UID or uid),),
+            parse_mode=ParseMode.HTML,
+            fresh_ttl=120,
+            stale_ttl=12 * 3600,
+            background_timeout=900,
+        )
         return
     if args and args[0].lower() in {'deep', 'analysis', 'analytics', 'timing', 'times'}:
         hours_deep = SETUP_COMBO_REVIEW_WINDOW_HOURS
@@ -49602,8 +49606,17 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 hours_deep = int(float(args[1]))
         except Exception:
             hours_deep = SETUP_COMBO_REVIEW_WINDOW_HOURS
-        text = await to_thread_heavy(_setup_edge_deep_text, int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts(), timeout=240)
-        await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await _send_cached_or_queue_admin_report(
+            update,
+            f"/setup_matrix deep {int(hours_deep)}",
+            f"admin:bg:v145:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            _setup_edge_deep_text,
+            args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
+            parse_mode=ParseMode.HTML,
+            fresh_ttl=90,
+            stale_ttl=12 * 3600,
+            background_timeout=900,
+        )
         return
     if args and args[0].lower() in {'safety', 'daily_safety', 'run_safety'}:
         res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(AUTOTRADE_OWNER_UID or uid), _overall_report_start_ts(), timeout=240)
@@ -49645,11 +49658,17 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             hours = int(float(args[0]))
     except Exception:
         hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
-    try:
-        text = await to_thread_heavy(_setup_combo_matrix_text, int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts(), timeout=240)
-    except Exception as e:
-        text = f"❌ setup_matrix failed: {type(e).__name__}: {html.escape(str(e))}"
-    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_matrix {int(hours)}",
+        f"admin:bg:v145:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        _setup_combo_matrix_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=120,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
 
 
 async def setup_combo_review_job(context: ContextTypes.DEFAULT_TYPE):
@@ -49799,6 +49818,165 @@ async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+
+# ================= NON-BLOCKING ADMIN REPORT RUNNER (yver145) =================
+_ADMIN_REPORT_BG_RUNNING: set[str] = set()
+_ADMIN_REPORT_BG_LOCK = threading.Lock()
+
+
+def _admin_report_cache_get_with_age(cache_key: str, ttl_sec: float | None = None) -> tuple[str, float | None]:
+    """Return cached report text and age seconds. TTL=None returns any cached value."""
+    try:
+        rec = _CACHE.get(str(cache_key or ''))
+        if not rec:
+            return '', None
+        ts, obj = rec
+        age = max(0.0, float(time.time()) - float(ts or 0.0))
+        if ttl_sec is not None and float(ttl_sec) > 0 and age > float(ttl_sec):
+            return '', age
+        txt = str(obj or '')
+        return (txt if txt.strip() else ''), age
+    except Exception:
+        return '', None
+
+
+def _admin_report_age_text(age: float | None) -> str:
+    try:
+        if age is None:
+            return '-'
+        age_f = max(0.0, float(age))
+        if age_f < 90:
+            return f"{int(age_f)}s"
+        if age_f < 7200:
+            return f"{age_f/60.0:.0f}m"
+        return f"{age_f/3600.0:.1f}h"
+    except Exception:
+        return '-'
+
+
+def _admin_report_bg_try_start(cache_key: str) -> bool:
+    try:
+        key = str(cache_key or '')
+        with _ADMIN_REPORT_BG_LOCK:
+            if key in _ADMIN_REPORT_BG_RUNNING:
+                return False
+            _ADMIN_REPORT_BG_RUNNING.add(key)
+            return True
+    except Exception:
+        return False
+
+
+def _admin_report_bg_done(cache_key: str) -> None:
+    try:
+        with _ADMIN_REPORT_BG_LOCK:
+            _ADMIN_REPORT_BG_RUNNING.discard(str(cache_key or ''))
+    except Exception:
+        pass
+
+
+async def _admin_report_background_refresh(
+    update: Update,
+    title: str,
+    cache_key: str,
+    fn,
+    args: tuple = (),
+    kwargs: dict | None = None,
+    parse_mode=None,
+    background_timeout: int | None = 600,
+    post_result: bool = True,
+):
+    """Build a heavy admin report outside the Telegram command timeout and post it when ready."""
+    kwargs = dict(kwargs or {})
+    try:
+        text = await to_thread_bg(fn, *(args or ()), timeout=background_timeout, **kwargs)
+        text = str(text or '').strip() or 'No data found.'
+        try:
+            cache_set(str(cache_key or ''), text)
+        except Exception:
+            pass
+        if post_result:
+            header = f"✅ <b>Fresh result ready:</b> {html.escape(str(title or 'report'))}\n{SEP}\n"
+            await send_long_message(update, header + text, parse_mode=(parse_mode or ParseMode.HTML), disable_web_page_preview=True)
+    except Exception as e:
+        try:
+            await update.message.reply_text(
+                f"⚠️ {str(title or 'Report')} background refresh failed: {type(e).__name__}: {html.escape(str(e))}",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+    finally:
+        _admin_report_bg_done(str(cache_key or ''))
+
+
+async def _send_cached_or_queue_admin_report(
+    update: Update,
+    title: str,
+    cache_key: str,
+    fn,
+    args: tuple = (),
+    kwargs: dict | None = None,
+    parse_mode=None,
+    fresh_ttl: int = 60,
+    stale_ttl: int = 12 * 3600,
+    background_timeout: int | None = 600,
+    force_refresh: bool = True,
+) -> None:
+    """Instant response for heavy admin commands.
+
+    Behaviour:
+    - fresh cache -> send immediately, no Telegram timeout;
+    - stale cache -> send immediately and queue a background rebuild;
+    - no cache -> acknowledge immediately and post the fresh result later.
+    """
+    cache_key = str(cache_key or '')
+    title_s = str(title or 'report').strip() or 'report'
+    pm = parse_mode or ParseMode.HTML
+
+    fresh, age = _admin_report_cache_get_with_age(cache_key, fresh_ttl)
+    if fresh:
+        await send_long_message(update, fresh, parse_mode=pm, disable_web_page_preview=True)
+        return
+
+    stale, stale_age = _admin_report_cache_get_with_age(cache_key, stale_ttl)
+    started = False
+    if force_refresh:
+        started = _admin_report_bg_try_start(cache_key)
+        if started:
+            _safe_create_task(
+                _admin_report_background_refresh(
+                    update,
+                    title_s,
+                    cache_key,
+                    fn,
+                    args=tuple(args or ()),
+                    kwargs=dict(kwargs or {}),
+                    parse_mode=pm,
+                    background_timeout=background_timeout,
+                    post_result=True,
+                ),
+                label=f"admin-report-refresh:{cache_key}",
+            )
+
+    if stale:
+        note = (
+            f"⚡ <b>Latest cached result:</b> {html.escape(title_s)} "
+            f"(age {html.escape(_admin_report_age_text(stale_age))}). "
+            f"Fresh rebuild {'started in background' if started else 'already running in background'}.\n{SEP}\n"
+        )
+        await send_long_message(update, note + stale, parse_mode=pm, disable_web_page_preview=True)
+        return
+
+    await update.message.reply_text(
+        f"⏳ {title_s} is heavy. No cached result yet. Fresh rebuild "
+        f"{'started in background' if started else 'is already running in background'}; I will post it here when ready.",
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
+
+# ============================================================================
+
 async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(update.effective_user.id)
     if not is_admin_user(uid):
@@ -49811,11 +49989,17 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
             hours = int(float(args[0]))
     except Exception:
         hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
-    try:
-        text = await to_thread_heavy(_setup_edge_deep_text, int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts(), timeout=240)
-    except Exception as e:
-        text = f"❌ setup_deep_analysis failed: {type(e).__name__}: {html.escape(str(e))}"
-    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_deep_analysis {int(hours)}",
+        f"admin:bg:v145:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        _setup_edge_deep_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=90,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
 
 
 async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -49831,8 +50015,17 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_long_message(update, _setup_audit_help_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
             return
         if args and args[0].lower() in {'overall', 'alltime', 'all-time'}:
-            text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=180)
-            await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await _send_cached_or_queue_admin_report(
+                update,
+                "/setup_audit overall",
+                f"admin:bg:v145:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                _setup_audit_overall_text,
+                args=(int(AUTOTRADE_OWNER_UID or uid),),
+                parse_mode=ParseMode.HTML,
+                fresh_ttl=120,
+                stale_ttl=12 * 3600,
+                background_timeout=900,
+            )
             return
         if args and args[0].lower() in {'compare', 'reconcile', 'traded', 'autotrade'}:
             cmp_hours = 24
@@ -49841,8 +50034,17 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cmp_hours = int(float(args[1]))
             except Exception:
                 cmp_hours = 24
-            text = await to_thread_heavy(_setup_audit_compare_text, int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours), timeout=180)
-            await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await _send_cached_or_queue_admin_report(
+                update,
+                f"/setup_audit compare {int(cmp_hours)}",
+                f"admin:bg:v145:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                _setup_audit_compare_text,
+                args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
+                parse_mode=ParseMode.HTML,
+                fresh_ttl=60,
+                stale_ttl=12 * 3600,
+                background_timeout=900,
+            )
             return
         # Primary/simple usage: /setup_audit 1 means last 1 hour, not 1 row.
         # Optional advanced usage: /setup_audit rows 20 24 OR /setup_audit limit 20 24.
@@ -49863,11 +50065,17 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         limit = 0
         hours = 24
-    try:
-        text = await to_thread_heavy(_setup_audit_text, int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours), timeout=120)
-    except Exception as e:
-        text = f"❌ setup_audit failed: {type(e).__name__}: {html.escape(str(e))}"
-    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_audit {int(hours)}",
+        f"admin:bg:v145:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        _setup_audit_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=45,
+        stale_ttl=6 * 3600,
+        background_timeout=600,
+    )
 
 
 
@@ -50331,11 +50539,17 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     if not is_admin_user(uid):
         await update.message.reply_text("⛔ Admin only.")
         return
-    try:
-        text = await to_thread_fast(_setup_audit_keep_watch_summary_text, int(AUTOTRADE_OWNER_UID or uid), timeout=45)
-    except Exception as e:
-        text = f"❌ setup_audit_keep_watch failed: {type(e).__name__}: {html.escape(str(e))}"
-    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await _send_cached_or_queue_admin_report(
+        update,
+        "/setup_audit_keep_watch",
+        f"admin:bg:v145:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        _setup_audit_keep_watch_summary_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid),),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=90,
+        stale_ttl=12 * 3600,
+        background_timeout=600,
+    )
 
 
 async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50350,11 +50564,17 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             hours = int(float(args[0]))
     except Exception:
         hours = 24
-    try:
-        text = await to_thread_heavy(_setup_audit_keep_text, int(AUTOTRADE_OWNER_UID or uid), int(hours), 0, timeout=120)
-    except Exception as e:
-        text = f"❌ setup_audit_keep failed: {type(e).__name__}: {html.escape(str(e))}"
-    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_audit_keep {int(hours)}",
+        f"admin:bg:v145:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        _setup_audit_keep_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=90,
+        stale_ttl=12 * 3600,
+        background_timeout=600,
+    )
 
 
 async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50362,11 +50582,17 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     if not is_admin_user(uid):
         await update.message.reply_text("⛔ Admin only.")
         return
-    try:
-        text = await to_thread_heavy(_setup_audit_overall_text, int(AUTOTRADE_OWNER_UID or uid), timeout=240)
-    except Exception as e:
-        text = f"❌ setup_audit_overall failed: {type(e).__name__}: {html.escape(str(e))}"
-    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await _send_cached_or_queue_admin_report(
+        update,
+        "/setup_audit_overall",
+        f"admin:bg:v145:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        _setup_audit_overall_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid),),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=120,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
 
 
 async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -50381,11 +50607,17 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
             hours = int(float(args[0]))
     except Exception:
         hours = 24
-    try:
-        text = await to_thread_heavy(_setup_audit_compare_text, int(AUTOTRADE_OWNER_UID or uid), int(hours), timeout=180)
-    except Exception as e:
-        text = f"❌ setup_audit_compare failed: {type(e).__name__}: {html.escape(str(e))}"
-    await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_audit_compare {int(hours)}",
+        f"admin:bg:v145:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        _setup_audit_compare_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=60,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
 
 
 async def setups_log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -53391,30 +53623,18 @@ async def autotrade_closed_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-    cache_key = f"autotrade_closed_positions:v123:{owner_uid}:{lookback_h}"
-    stale_cached = ''
-    try:
-        raw_cached = cache_get(cache_key)
-        stale_cached = raw_cached if isinstance(raw_cached, str) else ''
-    except Exception:
-        stale_cached = ''
-
-    try:
-        text_out = await to_thread_heavy(_autotrade_closed_positions_text_cached, owner_uid, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
-    except asyncio.TimeoutError:
-        if stale_cached:
-            text_out = stale_cached + "\n" + SEP + "Showing cached snapshot while a fresh closed-position report rebuild is still busy."
-        else:
-            await update.message.reply_text(f"⚠️ /autotrade_closed timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
-            return
-    except Exception as e:
-        if stale_cached:
-            text_out = stale_cached + "\n" + SEP + f"Showing cached snapshot after refresh failure ({type(e).__name__})."
-        else:
-            await update.message.reply_text(f"❌ /autotrade_closed failed: {type(e).__name__}: {e}")
-            return
-
-    await send_long_message(update, text_out, parse_mode=ParseMode.HTML)
+    cache_key = f"autotrade_closed_positions:v145:{owner_uid}:{lookback_h}"
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/autotrade_closed {lookback_h}",
+        cache_key,
+        _autotrade_closed_positions_text_cached,
+        args=(owner_uid, lookback_h),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=45,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
 
 
 async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -53432,31 +53652,17 @@ async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
     owner_uid = int(AUTOTRADE_OWNER_UID or uid)
-
-    cache_key = f"autotrade_report_text_cmd:v108_live_geometry_no_stale_override:{owner_uid}:{lookback_h}"
-    stale_cached = ''
-    try:
-        raw_cached = cache_get(cache_key)
-        stale_cached = raw_cached if isinstance(raw_cached, str) else ''
-    except Exception:
-        stale_cached = ''
-
-    try:
-        text_out = await to_thread_heavy(_autotrade_report_text_cached, owner_uid, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
-    except asyncio.TimeoutError:
-        if stale_cached:
-            text_out = stale_cached + "\n" + SEP + "Showing cached snapshot while a fresh report rebuild is still busy."
-        else:
-            await update.message.reply_text(f"⚠️ /autotrade_report timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
-            return
-    except Exception as e:
-        if stale_cached:
-            text_out = stale_cached + "\n" + SEP + f"Showing cached snapshot after refresh failure ({type(e).__name__})."
-        else:
-            await update.message.reply_text(f"❌ /autotrade_report failed: {type(e).__name__}: {e}")
-            return
-
-    await send_long_message(update, text_out, parse_mode=ParseMode.HTML)
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/autotrade_report {lookback_h}",
+        f"autotrade_report_text_cmd:v145:{owner_uid}:{lookback_h}",
+        _autotrade_report_text_cached,
+        args=(owner_uid, lookback_h),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=45,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
 
 def _autotrade_reconciliation_snapshot(uid: int, days: int = 7) -> dict:
     """Journal-first reconciliation stats for performance reporting."""
@@ -54498,23 +54704,22 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
-    # yver90: the typo commands /autoytrade_report_overall and /autoytrade_report_overal
-    # used to show a misleading rolling 24h report with the same title as /autotrade_report_overall.
-    # Keep the typo aliases for compatibility, but make them use the fixed 15-May overall window.
     msg_txt = str(getattr(update.message, 'text', '') or '').lower()
     is_matrix_cmd = msg_txt.startswith('/autotrade_report_matrix')
+    owner = int(AUTOTRADE_OWNER_UID or uid)
     if not is_matrix_cmd:
-        owner = int(AUTOTRADE_OWNER_UID or uid)
         lookback_h = int(_overall_report_hours_since_start())
-        try:
-            text_out = await to_thread_heavy(_autotrade_report_overall_text_cached, owner, lookback_h, timeout=PERFORMANCE_REPORT_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            await update.message.reply_text(f"⚠️ /autotrade_report_overall timed out after {int(PERFORMANCE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
-            return
-        except Exception as e:
-            await update.message.reply_text(f"❌ /autotrade_report_overall failed: {type(e).__name__}: {e}")
-            return
-        await send_long_message(update, str(text_out or 'No AutoTrade data found yet.'), parse_mode=ParseMode.HTML)
+        await _send_cached_or_queue_admin_report(
+            update,
+            "/autotrade_report_overall",
+            f"admin:bg:v145:autotrade_report_overall:{owner}:{lookback_h}",
+            _autotrade_report_overall_text_cached,
+            args=(owner, lookback_h),
+            parse_mode=ParseMode.HTML,
+            fresh_ttl=90,
+            stale_ttl=12 * 3600,
+            background_timeout=900,
+        )
         return
 
     lookback_h = 24
@@ -54524,16 +54729,17 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     except Exception:
         lookback_h = 24
     lookback_h = int(clamp(lookback_h, 1, 168))
-    owner = int(AUTOTRADE_OWNER_UID or uid)
-    try:
-        text_out = await to_thread_heavy(_autoytrade_report_overall_text_cached, owner, lookback_h, timeout=max(12, min(25, int(AUTOTRADE_REPORT_TIMEOUT_SEC))))
-    except asyncio.TimeoutError:
-        await update.message.reply_text(f"⚠️ /autotrade_report_overall timed out after {int(AUTOTRADE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
-        return
-    except Exception as e:
-        await update.message.reply_text(f"❌ /autotrade_report_overall failed: {type(e).__name__}: {e}")
-        return
-    await send_long_message(update, str(text_out or 'No AutoTrade data found yet.'), parse_mode=ParseMode.HTML)
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/autotrade_report_matrix {lookback_h}",
+        f"admin:bg:v145:autotrade_report_matrix:{owner}:{lookback_h}",
+        _autoytrade_report_overall_text_cached,
+        args=(owner, lookback_h),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=45,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
 
 async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/autotrade_report_overall — Overall performance summary for bot-opened trades."""
@@ -54542,24 +54748,19 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("⛔️ Owner/admin only.")
         return
 
-    # yver75: fixed owner decision window from 2026-05-15 Melbourne.
-    # Do not change /autotrade_report or any execution/risk logic.
     lookback_h = int(_overall_report_hours_since_start())
     owner = int(AUTOTRADE_OWNER_UID or uid)
-    try:
-        text_out = await to_thread_heavy(_autotrade_report_overall_text_cached, owner, lookback_h, timeout=PERFORMANCE_REPORT_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        await update.message.reply_text(f"⚠️ /autotrade_report_overall timed out after {int(PERFORMANCE_REPORT_TIMEOUT_SEC)}s. Try again in a few seconds.")
-        return
-    except Exception as e:
-        await update.message.reply_text(f"❌ /autotrade_report_overall failed: {type(e).__name__}: {e}")
-        return
-
-    if not str(text_out or '').strip():
-        await update.message.reply_text("No autotrade lifecycle data found yet.")
-        return
-
-    await send_long_message(update, str(text_out), parse_mode=ParseMode.HTML)
+    await _send_cached_or_queue_admin_report(
+        update,
+        "/autotrade_report_overall",
+        f"admin:bg:v145:autotrade_report_overall:{owner}:{lookback_h}",
+        _autotrade_report_overall_text_cached,
+        args=(owner, lookback_h),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=90,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
 
 def _leader_base_override_ok(side: str, ch24: float, ch4: float, ch15: float, fut_vol_usd: float, pullback_ready: bool, pb_dist_pct: float, session_name: str) -> bool:
     """Allow post-expansion continuation entries after a clean 15m base/reclaim.
