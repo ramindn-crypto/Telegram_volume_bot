@@ -1,4 +1,4 @@
-# yver147: fixes /setup_matrix safety TimeoutError to background-cache, blocks non-crypto/terms-required symbols like CL, and adds strict AutoTrade KEEP edge gate (default: exact KEEP lane WR>=60%, Dec>=5, AvgR>=+0.25) to improve live WR.
+# yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
 # yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
 # yver144: fixes final audit/report sync: /setup_audit AT no longer shows stale AT_OPEN after a position is no longer live, and /setup_audit_compare recovers setup matches from the AutoTrade journal when Bybit Closed-PnL rows lose setup_id/open-time metadata.
 # yver143: adds setup-audit AutoTrade lifecycle visibility and final live-entry user-visible gate so already-open trades (e.g. INJ) are not confused with fresh actionable setups.
@@ -597,6 +597,13 @@ AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY = 'daily_realized_loss_stop_e
 AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY = 'daily_realized_loss_stop_pct'
 AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY = 'require_realized_combo_edge'
 AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY = 'context_feed_guard_enabled'
+# yver148: runtime-visible strict AutoTrade edge gate. This same context gate is
+# also called by /screen and setup emails, so user-visible setups remain synced
+# with AutoTrade eligibility while background audit generation still learns all rows.
+AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY = 'strict_keep_edge_enabled'
+AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY = 'strict_keep_edge_min_decided'
+AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY = 'strict_keep_edge_min_wr'
+AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY = 'strict_keep_edge_min_avgr'
 # yver110: runtime-switchable policy exposure for final live testing.
 # Defaults remain KEEP+strict WATCH for /screen, setup emails and AutoTrade.
 AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY = 'allow_watch_policy'
@@ -852,6 +859,10 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: float(os.environ.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', '3.0') or 3.0),
         AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True) else 0,
         AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1 if env_bool('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True) else 0,
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1 if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True) else 0,
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5') or 5),
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0') or 60.0),
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25') or 0.25),
         AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('AUTOTRADE_ALLOW_WATCH_POLICY', False) else 0,
         USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('USER_VISIBLE_ALLOW_WATCH_POLICY', False) else 0,
         AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_TP_RR_CAP_ENABLED', True) else 0,
@@ -1154,6 +1165,37 @@ def _autotrade_context_feed_guard_enabled() -> bool:
         return _autotrade_bool_cfg(AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY, 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)
     except Exception:
         return bool(globals().get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True))
+
+
+def _autotrade_strict_keep_edge_enabled() -> bool:
+    try:
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)
+    except Exception:
+        return env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)
+
+
+def _autotrade_strict_keep_edge_min_decided() -> int:
+    try:
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY, os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5')) or 5))
+    except Exception:
+        val = 5
+    return max(1, min(200, int(val)))
+
+
+def _autotrade_strict_keep_edge_min_wr() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY, os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0')) or 60.0)
+    except Exception:
+        val = 60.0
+    return max(0.0, min(100.0, float(val)))
+
+
+def _autotrade_strict_keep_edge_min_avgr() -> float:
+    try:
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY, os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25')) or 0.25)
+    except Exception:
+        val = 0.25
+    return max(-5.0, min(10.0, float(val)))
 
 
 def _autotrade_tp_rr_cap_enabled() -> bool:
@@ -1726,6 +1768,10 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT': float(_autotrade_daily_realized_loss_stop_pct()),
         'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE': bool(_autotrade_require_realized_combo_edge()),
         'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED': bool(_autotrade_context_feed_guard_enabled()),
+        'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED': bool(_autotrade_strict_keep_edge_enabled()),
+        'AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED': int(_autotrade_strict_keep_edge_min_decided()),
+        'AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR': float(_autotrade_strict_keep_edge_min_wr()),
+        'AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR': float(_autotrade_strict_keep_edge_min_avgr()),
         'AUTOTRADE_ALLOW_WATCH_POLICY': bool(_autotrade_allow_watch_policy()),
         'USER_VISIBLE_ALLOW_WATCH_POLICY': bool(_user_visible_allow_watch_policy()),
         'AUTOTRADE_TP_RR_CAP_ENABLED': bool(_autotrade_tp_rr_cap_enabled()),
@@ -5383,14 +5429,14 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         # lanes such as F1-LON-NOR-BUY/F2-NY-NOR-BUY while keeping stronger lanes
         # like F2-ASIA-NOR-BUY and F1-LON-REV-BUY.
         try:
-            if pstatus_exec == 'KEEP' and env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True):
+            if pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
                 m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
                 dec = int(m.get('decided') or 0)
                 wr = float(m.get('wr') or 0.0)
                 avg = float(m.get('avg_r') or 0.0)
-                min_dec = int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5') or 5)
-                min_wr = float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0') or 60.0)
-                min_avg = float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25') or 0.25)
+                min_dec = int(_autotrade_strict_keep_edge_min_decided())
+                min_wr = float(_autotrade_strict_keep_edge_min_wr())
+                min_avg = float(_autotrade_strict_keep_edge_min_avgr())
                 if dec < min_dec or wr < min_wr or avg < min_avg:
                     return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
         except Exception as _strict_exc:
@@ -41458,7 +41504,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT = {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)):.2f}",
             f"AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) else 'false'}",
             f"AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED = {'true' if bool(summary.get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_STRICT_KEEP_EDGE = {'true' if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True) else 'false'} | min WR {float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0') or 60.0):.1f}% | min Dec {int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5') or 5)} | min AvgR {float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25') or 0.25):+.2f}",
+            f"AUTOTRADE_STRICT_KEEP_EDGE_ENABLED = {'true' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED = {int(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 5))}",
+            f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 60.0)):.1f}",
+            f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', 0.25)):+.2f}",
             f"AUTOTRADE_BLOCKED_SYMBOLS = {','.join(AUTOTRADE_BLOCKED_SYMBOLS) if AUTOTRADE_BLOCKED_SYMBOLS else '-'}",
             f"AUTOTRADE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('AUTOTRADE_ALLOW_WATCH_POLICY', True)) else 'false'}",
             f"USER_VISIBLE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('USER_VISIBLE_ALLOW_WATCH_POLICY', True)) else 'false'}",
@@ -41506,6 +41555,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
             "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
+            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true   (syncs /screen + email + AutoTrade to high-edge KEEP lanes)",
+            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 60",
+            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 5",
+            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.25",
             "• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY false   (KEEP-only live mode)",
             "• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY false   (/screen + emails KEEP-only)",
             "• /autotrade_config AUTOTRADE_TP_RR_CAP_ENABLED true",
@@ -41727,6 +41780,18 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED'] = bool(val)
             _autotrade_config_set(AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED':
+            val = max(1, min(200, int(float(value_raw))))
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY, int(val))
+        elif key == 'AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR':
+            val = max(0.0, min(100.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY, float(val))
+        elif key == 'AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR':
+            val = max(-5.0, min(10.0, float(value_raw)))
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY, float(val))
         elif key == 'AUTOTRADE_ALLOW_WATCH_POLICY':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_ALLOW_WATCH_POLICY'] = bool(val)
