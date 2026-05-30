@@ -13,6 +13,7 @@
 # yver135: fixes setup-audit/email/autotrade sync gap by letting setup emails consume executable rows for the full AUTOTRADE_ENTRY_WINDOW_MIN instead of only MAX_STALE_SCAN_SEC; /screen fallback age now follows the same entry window.
 # yver134: adds Policy column to /setup_audit detailed table, showing current enforceable KEEP/WATCH/OFF lane for each setup.
 # yver146: hardens AutoTrade closed/report metadata sync: canonical Bybit Closed-PnL enrichment now rejects future-open candidates, syncs /setup_matrix WR basis with setup-audit, shares v146 cache namespace, and keeps strategy recommendations as guidance only (no trading config auto-change).
+# yver150: separates user-visible setup delivery from AutoTrade strict KEEP-edge risk gate; background/executable setup generation stays visible while AutoTrade remains stricter.
 # yver132: explains KEEP selection in /setup_matrix policy (KEEP requires more than 50% WR: sample + AvgR/payoff + no safety disable); no trading-policy loosening.
 # yver130: startup fix for yver129: imports typing.Any before the early AutoTrade email-gate helper so Render does not crash on NameError.
 from typing import Any  # yver130 early import required before early helper annotations
@@ -5148,10 +5149,12 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
                         return False, f'{l}_watch_final_gate:{final_why or "blocked"}', meta
                 except Exception as _final_exc:
                     return False, f'{l}_watch_final_gate_exception:{type(_final_exc).__name__}', meta
-            # Subscriber-facing setup exposure must also match the real AutoTrade
-            # context layer: weak symbol/hour/session/side blocks hide the setup.
+            # Subscriber-facing setup exposure must match the shared context layer
+            # for symbol/hour/session/side blocks, but yver150 keeps the extra
+            # strict KEEP-edge risk filter AutoTrade-only so setup emails/screen do
+            # not disappear while background evidence is still being collected.
             try:
-                ctx_ok, ctx_why = _autotrade_policy_context_execution_allows(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0))
+                ctx_ok, ctx_why = _autotrade_policy_context_execution_allows(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0), apply_strict_keep_edge=False)
                 meta['context_gate_reason'] = str(ctx_why or '')
                 if not ctx_ok:
                     return False, f'{l}_{ctx_why or "context_guard_block"}', meta
@@ -5390,7 +5393,7 @@ def _autotrade_exact_lane_watch_escape_from_setup_audit(data: dict, combo: str) 
     except Exception as exc:
         return False, f'exact_watch_escape_error:{type(exc).__name__}'
 
-def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
+def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0, *, apply_strict_keep_edge: bool = True) -> tuple[bool, str]:
     """Final real-money filter: policy KEEP + realised AutoTrade edge + setup-audit context."""
     try:
         if not _autotrade_context_feed_guard_enabled() and not _autotrade_require_realized_combo_edge():
@@ -5430,7 +5433,7 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         # lanes such as F1-LON-NOR-BUY/F2-NY-NOR-BUY while keeping stronger lanes
         # like F2-ASIA-NOR-BUY and F1-LON-REV-BUY.
         try:
-            if pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
+            if bool(apply_strict_keep_edge) and pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
                 m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
                 dec = int(m.get('decided') or 0)
                 wr = float(m.get('wr') or 0.0)
