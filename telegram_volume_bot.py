@@ -1,3 +1,4 @@
+# yver147: fixes /setup_matrix safety TimeoutError to background-cache, blocks non-crypto/terms-required symbols like CL, and adds strict AutoTrade KEEP edge gate (default: exact KEEP lane WR>=60%, Dec>=5, AvgR>=+0.25) to improve live WR.
 # yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
 # yver144: fixes final audit/report sync: /setup_audit AT no longer shows stale AT_OPEN after a position is no longer live, and /setup_audit_compare recovers setup matches from the AutoTrade journal when Bybit Closed-PnL rows lose setup_id/open-time metadata.
 # yver143: adds setup-audit AutoTrade lifecycle visibility and final live-entry user-visible gate so already-open trades (e.g. INJ) are not confused with fresh actionable setups.
@@ -4966,6 +4967,23 @@ DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H = float(os.environ.get("DIRECTIONAL_CONTEXT
 AUTOTRADE_REQUIRE_KEEP_POLICY = env_bool("AUTOTRADE_REQUIRE_KEEP_POLICY", True)
 AUTOTRADE_ALLOW_WATCH_POLICY = env_bool("AUTOTRADE_ALLOW_WATCH_POLICY", False)
 
+# yver147: hard live-block for symbols/contracts that are not suitable for the
+# current Bybit futures account or repeatedly fail exchange terms (e.g. CL crude oil).
+# This is only for setup delivery/autotrade; audit can still retain historical rows.
+AUTOTRADE_BLOCKED_SYMBOLS = tuple(
+    x.strip().upper() for x in str(os.environ.get("AUTOTRADE_BLOCKED_SYMBOLS", "CL") or "").split(",") if x.strip()
+)
+
+def _autotrade_symbol_blocked(sym: str) -> tuple[bool, str]:
+    try:
+        base = _symbol_base(str(sym or '')).upper().strip()
+        blocked = {str(x or '').upper().strip() for x in AUTOTRADE_BLOCKED_SYMBOLS if str(x or '').strip()}
+        if base and base in blocked:
+            return True, f'autotrade_symbol_hard_block:{base}'
+    except Exception:
+        pass
+    return False, ''
+
 def _autotrade_require_keep_policy() -> bool:
     try:
         return bool(globals().get('AUTOTRADE_REQUIRE_KEEP_POLICY', True))
@@ -5044,6 +5062,12 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
         sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
         if sess not in {'ASIA', 'LON', 'NY'}:
             return False, 'user_visible_missing_session', meta
+        try:
+            _sym_blocked, _sym_block_reason = _autotrade_symbol_blocked(str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or _autotrade_setup_attr(setup_or_row, 'market_symbol', '') or ''))
+            if _sym_blocked:
+                return False, _sym_block_reason, meta
+        except Exception:
+            pass
         try:
             owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
         except Exception:
@@ -5351,6 +5375,27 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
             return True, 'autotrade_realized_combo_ok'
         hours = _overall_report_effective_hours(int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
         data = _setup_edge_guard_build(owner_uid, hours=hours, force=False) or {}
+
+        # yver147: real-money AutoTrade should not use every KEEP lane while the
+        # target WR is >50%.  A lane can be KEEP because of broader/older policy,
+        # but live entries now require the exact lane evidence to remain strong.
+        # Default: decided>=5, WR>=60%, AvgR>=+0.25. This blocks recent weak KEEP
+        # lanes such as F1-LON-NOR-BUY/F2-NY-NOR-BUY while keeping stronger lanes
+        # like F2-ASIA-NOR-BUY and F1-LON-REV-BUY.
+        try:
+            if pstatus_exec == 'KEEP' and env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True):
+                m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
+                dec = int(m.get('decided') or 0)
+                wr = float(m.get('wr') or 0.0)
+                avg = float(m.get('avg_r') or 0.0)
+                min_dec = int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5') or 5)
+                min_wr = float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0') or 60.0)
+                min_avg = float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25') or 0.25)
+                if dec < min_dec or wr < min_wr or avg < min_avg:
+                    return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
+        except Exception as _strict_exc:
+            return False, f'autotrade_strict_keep_edge_error:{type(_strict_exc).__name__}'
+
         # 2) Existing micro-edge symbols/hours are hard execution blockers.
         if sym and sym in dict((data or {}).get('symbol_block') or {}):
             return False, f'autotrade_symbol_block:{sym}'
@@ -36494,6 +36539,12 @@ def is_executable_setup_eligible(
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
+        try:
+            _sym_blocked, _sym_block_reason = _autotrade_symbol_blocked(str(getattr(s, 'symbol', '') or getattr(s, 'market_symbol', '') or ''))
+            if _sym_blocked:
+                return (False, _sym_block_reason)
+        except Exception:
+            pass
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
         try:
@@ -41407,6 +41458,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT = {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)):.2f}",
             f"AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) else 'false'}",
             f"AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED = {'true' if bool(summary.get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_STRICT_KEEP_EDGE = {'true' if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True) else 'false'} | min WR {float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0') or 60.0):.1f}% | min Dec {int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5') or 5)} | min AvgR {float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25') or 0.25):+.2f}",
+            f"AUTOTRADE_BLOCKED_SYMBOLS = {','.join(AUTOTRADE_BLOCKED_SYMBOLS) if AUTOTRADE_BLOCKED_SYMBOLS else '-'}",
             f"AUTOTRADE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('AUTOTRADE_ALLOW_WATCH_POLICY', True)) else 'false'}",
             f"USER_VISIBLE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('USER_VISIBLE_ALLOW_WATCH_POLICY', True)) else 'false'}",
             f"AUTOTRADE_TP_RR_CAP_ENABLED = {'true' if bool(summary.get('AUTOTRADE_TP_RR_CAP_ENABLED', True)) else 'false'}",
@@ -45320,6 +45373,17 @@ def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: st
                     if out in {'TP', 'SL'}:
                         return f'AT_{out}'
                     if st == 'OPEN' and not r0.get('closed_ts'):
+                        # yver147: if the independent audit path has already hit
+                        # TP/SL for this setup, do not label it AT_OPEN just
+                        # because a newer same-symbol/same-side position exists.
+                        # This avoids stale rows like old ZEC BUY showing AT_OPEN
+                        # while /autotrade_report has already closed that trade.
+                        try:
+                            audit_res = str(rr.get('result') or rr.get('res') or rr.get('outcome') or '').upper().strip()
+                            if audit_res in {'TP', 'SL'}:
+                                return 'AT_CLOSED'
+                        except Exception:
+                            pass
                         # yver144: the local journal can lag Bybit close sync.
                         # Only show AT_OPEN if the symbol/side is still live now;
                         # otherwise mark it as already consumed/closed instead of
@@ -49593,7 +49657,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v146:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v147:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -49612,7 +49676,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v146:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v147:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -49622,38 +49686,54 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if args and args[0].lower() in {'safety', 'daily_safety', 'run_safety'}:
-        res = await to_thread_heavy(_setup_combo_run_daily_safety_policy, int(AUTOTRADE_OWNER_UID or uid), _overall_report_start_ts(), timeout=240)
-        disabled = ', '.join(list((res or {}).get('disabled') or [])) or '-'
-        expires = _setup_combo_format_policy_ts((res or {}).get('expires_ts'))
-        try:
-            guard_data = _setup_edge_guard_build(int(AUTOTRADE_OWNER_UID or uid), hours=_overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168)), force=False)
-            exact_disabled = sorted([str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_strategy_side_block') or (guard_data or {}).get('combo_side_block') or {}).keys() if str(x or '').strip()])
-        except Exception:
-            exact_disabled = []
-        try:
-            active_policy = _setup_combo_enforceable_policy_lookup(int(AUTOTRADE_OWNER_UID or uid))
-            coarse_disabled = sorted([
-                k for k, v in (active_policy or {}).items()
-                if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') if (v or {}).get('enabled') is not None else 1) == 0
-            ])
-        except Exception:
-            coarse_disabled = []
-        # Show the union of exact daily-safety disabled lanes and micro-edge tightened lanes.
-        # Do not collapse exact F1-ASIA-NOR-SELL back to legacy/coarse F1-ASIA.
-        try:
-            _active_lanes = sorted(set([x for x in (coarse_disabled or []) if str(x or '').strip()]) | set([x for x in (exact_disabled or []) if str(x or '').strip()]))
-        except Exception:
-            _active_lanes = list(exact_disabled or coarse_disabled or [])
-        active_disabled_txt = ', '.join(_active_lanes) if _active_lanes else '-'
-        text = (
-            f"🛡️ <b>Setup Combo Daily Safety</b>\n{HDR}\n"
-            f"Status: <b>{'OK' if (res or {}).get('ok') else 'SKIP/ERROR'}</b> | Run: <b>{html.escape(str((res or {}).get('run_id') or '-'))}</b>\n"
-            f"Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Source: <b>{html.escape(str((res or {}).get('source_label') or 'EXECUTABLE'))}</b>\n"
-            f"Rows reviewed: <b>{int((res or {}).get('rows') or 0)}</b> | Newly disabled by this run: <b>{html.escape(disabled)}</b> | Expires: <b>{html.escape(expires)}</b>\n"
-            f"Currently active disabled/tightened lanes: <b>{html.escape(active_disabled_txt)}</b>\n"
-            f"Reason: <b>{html.escape(str((res or {}).get('reason') or '-'))}</b>"
+        # yver147: daily safety can exceed Telegram's 60s handler budget when
+        # several heavy reports are pressed together.  Use the same cache/background
+        # path as other heavy admin reports so Render logs do not fill with
+        # TimeoutError and Telegram gets an immediate response.
+        def _daily_safety_text(owner_uid: int) -> str:
+            try:
+                res = _setup_combo_run_daily_safety_policy(int(owner_uid), _overall_report_start_ts())
+                disabled = ', '.join(list((res or {}).get('disabled') or [])) or '-'
+                expires = _setup_combo_format_policy_ts((res or {}).get('expires_ts'))
+                try:
+                    guard_data = _setup_edge_guard_build(int(owner_uid), hours=_overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168)), force=False)
+                    exact_disabled = sorted([str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_strategy_side_block') or (guard_data or {}).get('combo_side_block') or {}).keys() if str(x or '').strip()])
+                except Exception:
+                    exact_disabled = []
+                try:
+                    active_policy = _setup_combo_enforceable_policy_lookup(int(owner_uid))
+                    coarse_disabled = sorted([
+                        k for k, v in (active_policy or {}).items()
+                        if str((v or {}).get('status') or '').upper() in {'DISABLE','BLOCK','PAUSE','OFF'} or int((v or {}).get('enabled') if (v or {}).get('enabled') is not None else 1) == 0
+                    ])
+                except Exception:
+                    coarse_disabled = []
+                try:
+                    _active_lanes = sorted(set([x for x in (coarse_disabled or []) if str(x or '').strip()]) | set([x for x in (exact_disabled or []) if str(x or '').strip()]))
+                except Exception:
+                    _active_lanes = list(exact_disabled or coarse_disabled or [])
+                active_disabled_txt = ', '.join(_active_lanes) if _active_lanes else '-'
+                return (
+                    f"🛡️ <b>Setup Combo Daily Safety</b>\n{HDR}\n"
+                    f"Status: <b>{'OK' if (res or {}).get('ok') else 'SKIP/ERROR'}</b> | Run: <b>{html.escape(str((res or {}).get('run_id') or '-'))}</b>\n"
+                    f"Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Source: <b>{html.escape(str((res or {}).get('source_label') or 'EXECUTABLE'))}</b>\n"
+                    f"Rows reviewed: <b>{int((res or {}).get('rows') or 0)}</b> | Newly disabled by this run: <b>{html.escape(disabled)}</b> | Expires: <b>{html.escape(expires)}</b>\n"
+                    f"Currently active disabled/tightened lanes: <b>{html.escape(active_disabled_txt)}</b>\n"
+                    f"Reason: <b>{html.escape(str((res or {}).get('reason') or '-'))}</b>"
+                )
+            except Exception as exc:
+                return f"❌ setup_matrix safety failed: {type(exc).__name__}: {html.escape(str(exc))}"
+        await _send_cached_or_queue_admin_report(
+            update,
+            "/setup_matrix safety",
+            f"admin:bg:v147:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            _daily_safety_text,
+            args=(int(AUTOTRADE_OWNER_UID or uid),),
+            parse_mode=ParseMode.HTML,
+            fresh_ttl=120,
+            stale_ttl=12 * 3600,
+            background_timeout=900,
         )
-        await send_long_message(update, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         return
     hours = SETUP_COMBO_REVIEW_WINDOW_HOURS
     try:
@@ -49664,7 +49744,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v146:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v147:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -49995,7 +50075,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v146:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v147:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50021,7 +50101,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v146:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v147:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -50040,7 +50120,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v146:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v147:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -50071,7 +50151,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v146:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v147:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -50545,7 +50625,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v146:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v147:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -50570,7 +50650,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v146:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v147:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -50588,7 +50668,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v146:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v147:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -50613,7 +50693,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v146:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v147:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -54722,7 +54802,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v146:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v147:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -54742,7 +54822,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v146:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v147:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -54763,7 +54843,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v146:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v147:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
