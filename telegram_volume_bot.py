@@ -1,3 +1,4 @@
+# yver152: user-requested experimental fast-KEEP promotion for very small perfect lanes (1-3 decided, 100% WR, strong AvgR) and strong 75%+ lanes, including active WATCH-to-KEEP overlay; no risk/SL/TP changes.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
 # yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
@@ -3076,6 +3077,16 @@ SETUP_COMBO_POLICY_DISABLE_WR = min(float(os.environ.get("SETUP_COMBO_POLICY_DIS
 SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "0.00") or 0.00)
 SETUP_COMBO_POLICY_WATCH_WR = float(os.environ.get("SETUP_COMBO_POLICY_WATCH_WR", "50") or 50)
 SETUP_COMBO_POLICY_PROMOTE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_PROMOTE_AVG_R", "0.35") or 0.35)
+# yver152: Experimental fast-KEEP promotion requested by owner.
+# Purpose: allow very strong small-sample lanes to become KEEP sooner for live testing,
+# while keeping the rule explicit/configurable and preserving DISABLE safety rows.
+SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_ENABLED = env_bool("SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_ENABLED", True)
+SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MAX_DECIDED = int(os.environ.get("SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MAX_DECIDED", "3") or 3)
+SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_WR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_WR", "100.0") or 100.0)
+SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR", "0.50") or 0.50)
+SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED", "4") or 4)
+SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR", "75.0") or 75.0)
+SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR", "0.60") or 0.60)
 
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
 # matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
@@ -5441,6 +5452,18 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
                 min_dec = int(_autotrade_strict_keep_edge_min_decided())
                 min_wr = float(_autotrade_strict_keep_edge_min_wr())
                 min_avg = float(_autotrade_strict_keep_edge_min_avgr())
+                # yver152: if a lane was intentionally promoted by the experimental
+                # fast-KEEP rule, do not let the older strict edge min_decided=5
+                # immediately block it from AutoTrade. DISABLE/OFF policy rows are
+                # still blocked before this point.
+                try:
+                    tp_e = int(m.get('tp') or 0)
+                    sl_e = int(m.get('sl') or 0)
+                    exp_keep, exp_reason = _setup_combo_experimental_keep_override(dec, tp_e, sl_e, wr, avg)
+                    if exp_keep:
+                        return True, f'autotrade_experimental_keep_edge_allowed:{combo}:{exp_reason}'
+                except Exception:
+                    pass
                 if dec < min_dec or wr < min_wr or avg < min_avg:
                     return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
         except Exception as _strict_exc:
@@ -48630,9 +48653,29 @@ def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
                     combo = _setup_combo_strategy_key(str(fam), str(sess), strat)
                 else:
                     combo = f"{str(fam).upper().strip()}-{str(sess).upper().strip()}"
+                pol_out = dict(pol or {})
+                # yver152: user-requested experimental fast-KEEP overlay. This only
+                # upgrades active WATCH rows to KEEP when the stored exact-lane metrics
+                # are already very strong. It never overrides DISABLE/OFF safety rows.
+                try:
+                    st_pol = str(pol_out.get('status') or '').upper().strip()
+                    en_pol = int(pol_out.get('enabled') if pol_out.get('enabled') is not None else 1) == 1
+                    if st_pol == 'WATCH' and en_pol:
+                        dec_pol = int(pol_out.get('last_decided') or 0)
+                        wr_pol = float(pol_out.get('last_win_rate') or 0.0)
+                        avg_pol = float(pol_out.get('last_avg_r') or 0.0)
+                        tp_pol = int(round((wr_pol / 100.0) * dec_pol)) if dec_pol > 0 else 0
+                        sl_pol = max(0, dec_pol - tp_pol)
+                        exp_keep, exp_reason = _setup_combo_experimental_keep_override(dec_pol, tp_pol, sl_pol, wr_pol, avg_pol)
+                        if exp_keep:
+                            pol_out['status'] = 'KEEP'
+                            pol_out['enabled'] = 1
+                            pol_out['notes'] = (str(pol_out.get('notes') or '') + ' | yver152 ' + exp_reason)[:500]
+                except Exception:
+                    pass
                 old = out.get(combo)
                 if old is None or (int(_uid or 0) != 0 and int(old.get('user_id') or 0) == 0):
-                    out[combo] = dict(pol or {})
+                    out[combo] = pol_out
             except Exception:
                 continue
         return out
@@ -48775,6 +48818,37 @@ def _setup_combo_sync_active_policy_bridge(uid: int, matrix_rows: list[dict] | N
             pass
         return rep
 
+def _setup_combo_experimental_keep_override(decided: int, tp: int, sl: int, wr: float, avg_r: float) -> tuple[bool, str]:
+    """Owner-requested fast promotion for very strong lanes.
+
+    This promotes selected high-edge lanes to KEEP earlier than the normal
+    minimum sample rule so they can be tested live. It never overrides an
+    explicit DISABLE/daily-safety row; callers must only apply it to advisory
+    or WATCH policy states.
+    """
+    try:
+        if not bool(globals().get('SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_ENABLED', True)):
+            return False, 'experimental_fast_keep_disabled'
+        dec = int(decided or 0)
+        tp_i = int(tp or 0)
+        sl_i = int(sl or 0)
+        wr_f = float(wr or 0.0)
+        avg_f = float(avg_r or 0.0)
+        max_dec = max(1, int(globals().get('SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MAX_DECIDED', 3) or 3))
+        min_wr = float(globals().get('SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_WR', 100.0) or 100.0)
+        min_avg = float(globals().get('SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR', 0.50) or 0.50)
+        if 1 <= dec <= max_dec and tp_i == dec and sl_i == 0 and wr_f >= (min_wr - 1e-9) and avg_f >= min_avg:
+            return True, f'experimental_fast_keep:perfect_small_sample:n{dec}:WR{wr_f:.1f}:AvgR{avg_f:+.2f}'
+        strong_dec = max(1, int(globals().get('SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED', 4) or 4))
+        strong_wr = float(globals().get('SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR', 75.0) or 75.0)
+        strong_avg = float(globals().get('SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR', 0.60) or 0.60)
+        if dec >= strong_dec and wr_f >= strong_wr and avg_f >= strong_avg and tp_i > sl_i:
+            return True, f'experimental_strong_keep:n{dec}:WR{wr_f:.1f}:AvgR{avg_f:+.2f}'
+        return False, 'no_experimental_keep_override'
+    except Exception as exc:
+        return False, f'experimental_keep_error:{type(exc).__name__}'
+
+
 def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int, str, float]:
     """Convert lane evidence into KEEP / WATCH / DISABLE.
 
@@ -48798,14 +48872,25 @@ def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int
 
         score = (wr - 50.0) * 1.20 + avg_r * 22.0 + min(20, decided) * 0.45 - ((op / max(1, total)) * 4.0)
 
-        # No/low decided evidence is probation, not a hard block. This is why 100% WR
-        # from 1-3 decided rows should show WATCH, not DISABLE.
+        # No/low decided evidence is usually probation, not a hard block.
+        # yver152: owner-requested experimental fast KEEP lets a very small, perfect
+        # lane with strong AvgR move to KEEP now instead of waiting for the normal
+        # minimum sample count. If future results degrade, the thresholds can be
+        # tightened or disabled.
         if decided < min_decided:
+            exp_keep, exp_reason = _setup_combo_experimental_keep_override(decided, tp, sl, wr, avg_r)
+            if exp_keep:
+                return 'KEEP', 1, 'Experimental KEEP: ' + exp_reason, float(score)
             if decided <= 0:
                 return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'No decided results yet ({decided}/{min_decided}); probation/watch', float(score)
             if wr >= float(SETUP_COMBO_POLICY_WATCH_WR) or avg_r > float(SETUP_COMBO_POLICY_DISABLE_AVG_R) or tp > 0:
                 return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'Promising but not enough decided results ({decided}/{min_decided}); keep collecting data', float(score)
             return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'Insufficient decided results ({decided}/{min_decided}); keep collecting data', float(score)
+
+        # yver152: strong experimental promotion for lanes such as F6-NY-REV-SELL.
+        exp_keep, exp_reason = _setup_combo_experimental_keep_override(decided, tp, sl, wr, avg_r)
+        if exp_keep:
+            return 'KEEP', 1, 'Experimental KEEP: ' + exp_reason, float(score)
 
         # Strong normal promotion.
         if wr >= float(SETUP_COMBO_POLICY_KEEP_WR) and avg_r >= float(SETUP_COMBO_POLICY_KEEP_AVG_R) and tp >= max(1, sl):
@@ -49717,8 +49802,8 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
-            f"KEEP rule: <b>Decided ≥ {int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY)}</b> and either <b>WR ≥ {float(SETUP_COMBO_POLICY_KEEP_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_POLICY_KEEP_AVG_R):+.2f} + TP≥SL</b>, or <b>WR ≥ {float(SETUP_COMBO_POLICY_WATCH_WR):.0f}% + strong AvgR ≥ {float(SETUP_COMBO_POLICY_PROMOTE_AVG_R):+.2f} + TP&gt;SL</b>. 50% WR alone remains WATCH for real-money safety.\n"
-            f"Why a 50% row can be WATCH: sample/Dec is too small, AvgR/payoff is not strong enough, or a daily/intraday safety row temporarily disabled/tightened it. Policy=the enforced state; Reco=this window's recommendation only.\n"
+            f"KEEP rule: <b>Decided ≥ {int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY)}</b> and either <b>WR ≥ {float(SETUP_COMBO_POLICY_KEEP_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_POLICY_KEEP_AVG_R):+.2f} + TP≥SL</b>, or <b>WR ≥ {float(SETUP_COMBO_POLICY_WATCH_WR):.0f}% + strong AvgR ≥ {float(SETUP_COMBO_POLICY_PROMOTE_AVG_R):+.2f} + TP&gt;SL</b>. Experimental fast-KEEP is ON: <b>1–{int(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MAX_DECIDED)} decided with 100% WR + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR):+.2f}</b>, or <b>decided ≥ {int(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED)} + WR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR):+.2f}</b>, can be KEEP for live testing. 50% WR alone remains WATCH.\n"
+            f"Why a row can still be WATCH: sample/Dec is too small, AvgR/payoff is not strong enough, or a daily/intraday safety row temporarily disabled/tightened it. Policy=the enforced state; Reco=this window's recommendation only.\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
             f"{guard_txt}\n{html.escape(_setup_nor_rev_router_note(int(owner_uid), []))}\n{note}\n"
@@ -49739,7 +49824,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v149:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v152:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -49758,7 +49843,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v149:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v152:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -49808,7 +49893,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v149:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v152:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -49826,7 +49911,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v149:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v152:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50157,7 +50242,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v149:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v152:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50183,7 +50268,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v149:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v152:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -50202,7 +50287,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v149:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v152:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -50233,7 +50318,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v149:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v152:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -50707,7 +50792,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v149:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v152:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -50732,7 +50817,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v149:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v152:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -50750,7 +50835,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v149:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v152:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -50775,7 +50860,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v149:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v152:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -54884,7 +54969,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v149:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v152:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -54904,7 +54989,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v149:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v152:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -54925,7 +55010,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v149:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v152:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
