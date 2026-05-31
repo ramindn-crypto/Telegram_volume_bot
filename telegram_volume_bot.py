@@ -56897,6 +56897,10 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
             if out:
                 break
 
+        try:
+            out = _resolve_same_symbol_setup_conflicts(list(out or []), session_name=sess, user_id=int(uid), lane='screen')
+        except Exception:
+            pass
         if not out:
             return '', [], []
         try:
@@ -58325,6 +58329,156 @@ def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, s
         return 0
 
 
+
+
+def _setup_exact_lane_rank_for_sync(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple:
+    """Deterministic same-symbol conflict rank for setup email, /screen and AutoTrade sync.
+
+    When normal setup generation and Big-Move/F8 produce the same symbol at the
+    same time, only one symbol-side should be exposed as the active tradable lane.
+    Rank by enforced policy first, then exact-lane evidence (WR, AvgR, decided),
+    then confidence/recency. This keeps LAB-style conflicts aligned: e.g. an
+    F8-LON-NOR-SELL with 60% WR/+0.80 AvgR beats a weaker F1-LON-NOR-BUY.
+    """
+    try:
+        uid = int(user_id or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid = 0
+    sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+    combo = ''
+    status = ''
+    found = False
+    try:
+        info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(uid or 0)) or {}
+        combo = str(info.get('combo') or '').upper().strip()
+        found = bool(info.get('found'))
+        status = _setup_policy_effective_status(str(info.get('status') or '').upper().strip(), found=found)
+    except Exception:
+        pass
+    if not combo:
+        try:
+            combo = str(_autotrade_setup_exact_combo_key(setup_or_row, sess) or '').upper().strip()
+        except Exception:
+            combo = ''
+    # Effective policy priority. GATE is treated like WATCH/probation for conflict ranking.
+    pol_score = {'KEEP': 4, 'GATE': 3, 'WATCH': 2, 'PART': 1, 'OFF': 0, 'DISABLE': 0, 'BLOCK': 0}.get(str(status or '').upper(), 0)
+    dec = tp = sl = 0
+    wr = avg = score = 0.0
+    try:
+        hours = _overall_report_effective_hours(int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
+        data = _setup_edge_guard_build(int(uid or 0), hours=hours, force=False) or {}
+        m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
+        dec = int(m.get('decided') or 0)
+        tp = int(m.get('tp') or 0)
+        sl = int(m.get('sl') or 0)
+        wr = float(m.get('wr') or 0.0)
+        avg = float(m.get('avg_r') or 0.0)
+        score = float(m.get('score') or 0.0)
+    except Exception:
+        pass
+    try:
+        conf = float(_autotrade_setup_attr(setup_or_row, 'conf', 0.0) or 0.0)
+    except Exception:
+        conf = 0.0
+    try:
+        recency = float(_autotrade_setup_attr(setup_or_row, 'emailed_ts', 0.0) or _autotrade_setup_attr(setup_or_row, 'email_logged_ts', 0.0) or _autotrade_setup_attr(setup_or_row, 'created_ts', 0.0) or time.time())
+    except Exception:
+        recency = 0.0
+    # BigMove/F8 gets no artificial KEEP override. Its advantage must come from its exact-lane evidence.
+    return (int(pol_score), float(wr), float(avg), int(dec), float(score), float(conf), float(recency), str(combo or ''))
+
+
+def _resolve_same_symbol_setup_conflicts(setups: list, session_name: str = '', user_id: int = 0, lane: str = 'setup_email') -> list:
+    """Keep the best setup per symbol before user-visible email/screen delivery.
+
+    This prevents normal setup email, Big-Move/F8 setup email and /screen from
+    presenting opposite directions for the same symbol at the same time. AutoTrade
+    still has duplicate/same-symbol live-position protection, but this resolver
+    keeps the user-facing setup lane cleaner and better aligned with the lane WR.
+    """
+    try:
+        items = list(setups or [])
+        if len(items) <= 1:
+            return items
+        best_by_symbol = {}
+        order = []
+        for item in items:
+            try:
+                sym = str(_autotrade_setup_attr(item, 'symbol', '') or '').upper().strip()
+                if not sym:
+                    continue
+                rank = _setup_exact_lane_rank_for_sync(item, session_name=session_name, user_id=user_id)
+                old = best_by_symbol.get(sym)
+                if old is None:
+                    best_by_symbol[sym] = (rank, item)
+                    order.append(sym)
+                elif tuple(rank) > tuple(old[0]):
+                    best_by_symbol[sym] = (rank, item)
+            except Exception:
+                continue
+        resolved = []
+        for sym in order:
+            try:
+                resolved.append(best_by_symbol[sym][1])
+            except Exception:
+                pass
+        # Preserve any rows that had no symbol rather than silently dropping them.
+        for item in items:
+            try:
+                sym = str(_autotrade_setup_attr(item, 'symbol', '') or '').upper().strip()
+                if not sym:
+                    resolved.append(item)
+            except Exception:
+                resolved.append(item)
+        try:
+            if len(resolved) != len(items):
+                db_log_setup_pipeline_event(int(user_id or 0), stage='same_symbol_conflict_resolver', status='applied', session=str(session_name or ''), mode=str(lane or ''), details={'input': len(items), 'output': len(resolved)})
+        except Exception:
+            pass
+        return list(resolved or [])
+    except Exception:
+        return list(setups or [])
+
+
+def _recent_stronger_same_symbol_delivery_exists(user_id: int, setup, session_name: str = '', max_age_min: int | None = None) -> tuple[bool, str]:
+    """Return True when a recent emailed setup for the same symbol has stronger exact-lane evidence.
+
+    Used before sending a new setup email, so a fresh normal F1 setup does not hide
+    a stronger Big-Move/F8 setup for the same symbol, and vice versa.
+    """
+    try:
+        uid = int(user_id or 0)
+        if uid <= 0:
+            return False, ''
+        sess = str(session_name or '').upper().strip()
+        sym = str(_autotrade_setup_attr(setup, 'symbol', '') or '').upper().strip()
+        sid = str(_autotrade_setup_attr(setup, 'setup_id', '') or _autotrade_setup_attr(setup, 'id', '') or '').strip()
+        if not sym:
+            return False, ''
+        if max_age_min is None:
+            max_age_min = max(10, int(_autotrade_entry_window_min() or 60))
+        cur_rank = _setup_exact_lane_rank_for_sync(setup, session_name=sess, user_id=uid)
+        recent = _recent_delivery_lane_setup_objects(uid, session_name=sess, max_age_min=int(max_age_min), limit=30) or []
+        for old in list(recent or []):
+            try:
+                old_sym = str(_autotrade_setup_attr(old, 'symbol', '') or '').upper().strip()
+                old_sid = str(_autotrade_setup_attr(old, 'setup_id', '') or _autotrade_setup_attr(old, 'id', '') or '').strip()
+                if old_sym != sym or (sid and old_sid == sid):
+                    continue
+                old_rank = _setup_exact_lane_rank_for_sync(old, session_name=sess, user_id=uid)
+                if tuple(old_rank) >= tuple(cur_rank):
+                    try:
+                        old_combo = str(old_rank[-1] or '')
+                        cur_combo = str(cur_rank[-1] or '')
+                        return True, f'recent_stronger_same_symbol_setup:{sym}:{old_combo or old_sid}>={cur_combo or sid}'
+                    except Exception:
+                        return True, f'recent_stronger_same_symbol_setup:{sym}'
+            except Exception:
+                continue
+        return False, ''
+    except Exception:
+        return False, ''
+
 def _setup_email_presend_executable_filter(user_id: int, session_name: str, setups: list, lane: str = 'email') -> tuple[list, Counter]:
     """Return only setup rows that can be both emailed and autotrade-consumed.
 
@@ -58389,10 +58543,29 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
                 except Exception:
                     pass
                 continue
+            # yver159: keep setup email /screen /AutoTrade aligned when normal and
+            # Big-Move/F8 create the same symbol at the same time.  Do not send a
+            # weaker same-symbol setup if a stronger exact-lane setup was already
+            # emailed recently.
+            try:
+                stronger_exists, stronger_reason = _recent_stronger_same_symbol_delivery_exists(int(uid or gate_uid or 0), eff, session_name=sess)
+            except Exception:
+                stronger_exists, stronger_reason = False, ''
+            if stronger_exists:
+                reasons[str(stronger_reason or 'recent_stronger_same_symbol_setup')] += 1
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_same_symbol_conflict', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(stronger_reason or ''), 'gate_uid': int(gate_uid or 0)})
+                except Exception:
+                    pass
+                continue
             out.append(eff)
         except Exception as exc:
             reasons[f'presend_gate_exception:{type(exc).__name__}'] += 1
             continue
+    try:
+        out = _resolve_same_symbol_setup_conflicts(list(out or []), session_name=sess, user_id=int(gate_uid or uid or 0), lane=str(lane or 'email'))
+    except Exception:
+        pass
     try:
         db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_presend_gate', status='ok' if out else 'empty', session=sess, mode=str(lane or 'email'), details={'input': len(list(setups or [])), 'eligible': len(out), 'top_reasons': _pipeline_top_reasons(reasons, 8), 'gate_uid': int(gate_uid or 0)})
     except Exception:
@@ -59558,10 +59731,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
                         if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                            # yver158: BigMove alert email is only a market-event notification.
-                            # AutoTrade must only consume the paired normal setup email rows
-                            # that /screen can also show.  Do not execute a separately rebuilt
-                            # BMAT candidate when the setup email failed/was filtered out.
+                            # yver159: BigMove alert email is only a market-event notification.
+                            # AutoTrade may consume only the paired F8 setup-email row that /screen
+                            # also shows, and that row must pass its own exact-lane KEEP evidence
+                            # (e.g. F8-LON-NOR-SELL) independently from normal F1 setups.
                             if setup_email_sent and setup_email_setups:
                                 _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
                                     "status": "QUEUED",
@@ -59579,7 +59752,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                                 _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
                                     "status": "SKIP",
                                     "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                    "reason": "bigmove_autotrade_blocked_until_paired_setup_email_sent",
+                                    "reason": "bigmove_autotrade_blocked_until_paired_f8_setup_email_sent",
                                     "session": str(bm_sess or ""),
                                     "mode": str(_autotrade_runtime_mode()).lower(),
                                     "trigger": "bigmove_setup_email_required",
@@ -60429,7 +60602,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                                 _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
                                     "status": "SKIP",
                                     "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                    "reason": "bigmove_autotrade_blocked_until_paired_setup_email_sent",
+                                    "reason": "bigmove_autotrade_blocked_until_paired_f8_setup_email_sent",
                                     "session": str(bm_sess or ""),
                                     "mode": str(_autotrade_runtime_mode()).lower(),
                                     "trigger": "bigmove_setup_email_required",
