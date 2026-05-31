@@ -80,6 +80,7 @@ from typing import Any  # yver130 early import required before early helper anno
 # - yver61: AutoTrade risk caps are controlled only by /autotrade_config; /dailycap is manual-only; AutoTrade reports use one clear Reason column with pre-ASIA closes renamed.
 # yver157: responsiveness hardening: alert_job now schedules its heavy work as a background task so APScheduler/job queue returns immediately, heavy admin commands send instant cached previews instead of long cached reports blocking Telegram, and alert interval/runtime defaults are calmer to reduce Render max_instances warnings.
 # yver158: BigMove sync hardening: BigMove AutoTrade now requires the paired normal setup email/screen row to be sent first and executes that exact setup-email batch, not a separately rebuilt BigMove candidate; background scheduler intervals are calmer to reduce Render max_instances pressure.
+# yver160: major speed mode: scheduler jobs are budget-capped and cache/DB-first; BigMove runs fire-and-forget after alert tick instead of blocking session setup pools; non-critical warmup is off by default; AutoTrade fallback loop is DB/email-only by default; aggressive pool fallback is disabled unless explicitly enabled.
 # - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
 # - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
@@ -14673,11 +14674,11 @@ AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and 
 AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "55") or 55)
 # Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
 # Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
-AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "60") or 60)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "115") or 115)
+AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "300") or 300)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "30") or 30)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
-AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", True)
+AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", False)
 AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "15") or 15)
 AUTOTRADE_GUARDIAN_INTERVAL_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_INTERVAL_SEC", "150") or 150)
 AUTOTRADE_GUARDIAN_MIN_GAP_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_MIN_GAP_SEC", "20") or 20)
@@ -56171,8 +56172,8 @@ def user_location_and_time(user: dict):
 # =========================================================
 SCREEN_CACHE_TTL_SEC = int(os.environ.get("SCREEN_CACHE_TTL_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)  # seconds
 SCREEN_STALE_CACHE_MAX_SEC = int(os.environ.get("SCREEN_STALE_CACHE_MAX_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)  # force fresh rebuild when stale
-SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)
-SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)
+SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", "900") or 900)
+SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", "900") or 900)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE: dict[str, dict] = {}
 _SCREEN_LOCK = asyncio.Lock()
@@ -59012,18 +59013,18 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
-EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
-EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "75"))
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "8"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "12"))
+EMAIL_SEND_TIMEOUT_SEC = max(8, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "12") or 12))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "35"))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
-AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "180") or 180)
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "300") or 300)
 AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "2"))
-ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "2"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
+ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "1"))
 ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC", "12"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
 ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", False)
@@ -59031,10 +59032,15 @@ ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_B
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
 BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "60") or 60)
+# yver160 speed mode: keep scheduler jobs short and user commands responsive.
+ALERT_JOB_FAST_SCHEDULER_MODE = env_bool("ALERT_JOB_FAST_SCHEDULER_MODE", True)
+EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED = env_bool("EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED", False)
+SCREEN_CACHE_WARMUP_ENABLED = env_bool("SCREEN_CACHE_WARMUP_ENABLED", False)
+BIGMOVE_FIRE_AND_FORGET_ENABLED = env_bool("BIGMOVE_FIRE_AND_FORGET_ENABLED", True)
 # Ver22: autonomous setup discovery must stay hot. A 10-minute rebuild floor made /screen
 # look like the trigger because manual /screen used the dedicated screen lane while the
 # email lane waited on stale/empty pools. Keep it short by default.
-EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "60"))
+EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "240"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
 PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "300"))
@@ -59792,7 +59798,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             users_bigmove = [u for u in users_bigmove if int((u or {}).get('bigmove_alert_on', 1) or 0) == 1]
         except Exception:
             users_bigmove = list(users_bigmove or [])
-        _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)
+        _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 1)
         if int(_bigmove_user_limit or 0) > 0:
             users_bigmove = users_bigmove[:int(_bigmove_user_limit)]
         for u in users_bigmove:
@@ -59828,7 +59834,26 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     "reasons": ["pre_session_bigmove_budget_exhausted"],
                 }
                 continue
-            await _send_bigmove_payload_for_user(int(uid), tz, tag='pre_session')
+            # yver160: do not let Big-Move processing hold ALERT_LOCK or consume the
+            # session setup/email budget. It can send its own alert/setup email in the
+            # background; the normal session pool must continue immediately so Telegram
+            # commands and setup emails remain responsive.
+            if bool(globals().get('BIGMOVE_FIRE_AND_FORGET_ENABLED', True)):
+                try:
+                    _safe_create_task(_send_bigmove_payload_for_user(int(uid), tz, tag='pre_session_bg'), 'bigmove_payload_bg')
+                    _LAST_BIGMOVE_DECISION[int(uid)] = {
+                        "status": "QUEUED",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": ["queued_background_bigmove_payload"],
+                    }
+                except Exception as _bm_sched_exc:
+                    _LAST_BIGMOVE_DECISION[int(uid)] = {
+                        "status": "ERROR",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": [f"bigmove_background_schedule_failed:{type(_bm_sched_exc).__name__}"],
+                    }
+            else:
+                await _send_bigmove_payload_for_user(int(uid), tz, tag='pre_session')
 
 
         # -----------------------------------------------------
@@ -59906,7 +59931,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # authoritative session pool already exists. Under runtime pressure, prefer
             # reusing cache over starting another expensive scan.
             busy_runtime = SCAN_LOCK.locked() or _SCREEN_LOCK.locked() or _backtest_runtime_busy()
-            cache_ttl_for_email = float(max(20, min(float(MAX_STALE_SCAN_SEC), float(_alert_job_limit('EMAIL_POOL_REBUILD_MIN_SEC', 60)))))
+            cache_ttl_for_email = float(max(120, min(float(_setup_email_actionable_queue_window_sec()), float(_alert_job_limit('EMAIL_POOL_REBUILD_MIN_SEC', 240)))))
             if cached_setups and cache_age <= cache_ttl_for_email:
                 setups = list(cached_setups)
                 try:
@@ -59947,7 +59972,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         pool = {"setups": []}
 
                     setups = list(pool.get("setups", []) or [])
-                    if (not setups) and (not busy_runtime) and (not tf_cooling) and ((time.time() - job_started_ts) < max(10.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 70) - 20.0)) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
+                    if bool(globals().get('EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED', False)) and (not setups) and (not busy_runtime) and (not tf_cooling) and ((time.time() - job_started_ts) < max(10.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 35) - 12.0)) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
                         try:
                             fallback_pool = await to_thread_email(
                                 _run_async_in_new_loop,
@@ -63061,7 +63086,7 @@ def main():
         # the pipeline alive.
         # Ver110: schedule interval must be longer than the allowed runtime to avoid
         # APScheduler max_instances skipped-run warnings on Render.
-        interval_sec = max(240, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 240), int(ALERT_JOB_MAX_RUNTIME_SEC or 75) + 150)
+        interval_sec = max(300, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 300), int(ALERT_JOB_MAX_RUNTIME_SEC or 35) + 120)
     
         app.job_queue.run_repeating(
             alert_job,
@@ -63069,7 +63094,7 @@ def main():
             first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
             name="alert_job",
             job_kwargs={
-                "max_instances": 2,
+                "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 300,
             },
@@ -63204,21 +63229,21 @@ def main():
                 except Exception:
                     pass
 
-        app.job_queue.run_repeating(
-            screen_cache_warmup_job,
-            interval=max(420, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC)),
-            first=max(45, min(120, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
-            name="screen_cache_warmup_job",
-            job_kwargs={
-                "max_instances": 1,
-                "coalesce": True,
-                # Ver22: Render can pause the event loop for >60s during deploy/cold-start
-                # pressure. A short grace produced noisy APScheduler missed-run warnings
-                # even though the next cache warmup runs normally. Give this non-critical
-                # cache job a wider grace window and coalesce missed runs.
-                "misfire_grace_time": 300,
-            },
-        )
+        # yver160: non-critical cache warmup is disabled by default on small Render
+        # instances. /screen already returns an instant ticker/cached preview and queues
+        # a focused refresh; scheduled warmup was competing with alert/autotrade jobs.
+        if bool(globals().get('SCREEN_CACHE_WARMUP_ENABLED', False)):
+            app.job_queue.run_repeating(
+                screen_cache_warmup_job,
+                interval=max(900, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC)),
+                first=max(120, min(300, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
+                name="screen_cache_warmup_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 300,
+                },
+            )
 
         # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
         app.job_queue.run_repeating(
@@ -63236,7 +63261,7 @@ def main():
         # AutoTrade loop (owner-only)
         app.job_queue.run_repeating(
             autotrade_job,
-            interval=max(180, int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 90),
+            interval=max(300, int(AUTOTRADE_JOB_INTERVAL_SEC or 300), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 30) + 180),
             first=45,
             name="autotrade_job",
             job_kwargs={
