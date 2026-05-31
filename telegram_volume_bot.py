@@ -27302,6 +27302,46 @@ from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
 
 SAFE_CHUNK = 3800
 
+
+# ver155: fast per-message Telegram send timeouts.
+# The global Bot read timeout is intentionally longer for polling stability, but
+# user-facing replies should fail fast and retry/fallback instead of making the
+# bot feel frozen when Telegram/network is slow.
+async def _telegram_reply_text_fast(message, text, **kwargs):
+    try:
+        connect_timeout = float(os.getenv('TELEGRAM_REPLY_CONNECT_TIMEOUT_SEC', '2.5') or 2.5)
+    except Exception:
+        connect_timeout = 2.5
+    try:
+        read_timeout = float(os.getenv('TELEGRAM_REPLY_READ_TIMEOUT_SEC', '8.0') or 8.0)
+    except Exception:
+        read_timeout = 8.0
+    try:
+        write_timeout = float(os.getenv('TELEGRAM_REPLY_WRITE_TIMEOUT_SEC', '8.0') or 8.0)
+    except Exception:
+        write_timeout = 8.0
+    try:
+        pool_timeout = float(os.getenv('TELEGRAM_REPLY_POOL_TIMEOUT_SEC', '0.75') or 0.75)
+    except Exception:
+        pool_timeout = 0.75
+
+    send_kwargs = dict(kwargs)
+    send_kwargs.setdefault('connect_timeout', connect_timeout)
+    send_kwargs.setdefault('read_timeout', read_timeout)
+    send_kwargs.setdefault('write_timeout', write_timeout)
+    send_kwargs.setdefault('pool_timeout', pool_timeout)
+    try:
+        return await message.reply_text(text, **send_kwargs)
+    except TypeError as exc:
+        # Older python-telegram-bot builds may not accept per-call timeout kwargs.
+        # Fall back without them rather than breaking replies.
+        msg = str(exc).lower()
+        if ('timeout' in msg) or ('unexpected keyword' in msg):
+            for k in ('connect_timeout', 'read_timeout', 'write_timeout', 'pool_timeout'):
+                send_kwargs.pop(k, None)
+            return await message.reply_text(text, **send_kwargs)
+        raise
+
 def _telegram_html_to_plain_for_fallback(value: str) -> str:
     """Best-effort HTML-to-plain conversion for long Telegram admin reports.
 
@@ -27368,7 +27408,7 @@ async def send_long_message(
 
             async def _send_chunk_safe(body: str, pm=ParseMode.HTML, markup=None):
                 try:
-                    await update.message.reply_text(
+                    await _telegram_reply_text_fast(update.message,
                         body,
                         parse_mode=pm,
                         disable_web_page_preview=disable_web_page_preview,
@@ -27381,7 +27421,7 @@ async def send_long_message(
                     except Exception:
                         pass
                     try:
-                        await update.message.reply_text(
+                        await _telegram_reply_text_fast(update.message,
                             _telegram_html_to_plain_for_fallback(body),
                             parse_mode=None,
                             disable_web_page_preview=disable_web_page_preview,
@@ -27395,10 +27435,10 @@ async def send_long_message(
                 except RetryAfter as e:
                     await asyncio.sleep(int(getattr(e, 'retry_after', 1)) + 1)
                     try:
-                        await update.message.reply_text(body, parse_mode=pm, disable_web_page_preview=disable_web_page_preview, reply_markup=markup)
+                        await _telegram_reply_text_fast(update.message,body, parse_mode=pm, disable_web_page_preview=disable_web_page_preview, reply_markup=markup)
                     except Exception:
                         try:
-                            await update.message.reply_text(_telegram_html_to_plain_for_fallback(body), parse_mode=None, disable_web_page_preview=disable_web_page_preview, reply_markup=markup)
+                            await _telegram_reply_text_fast(update.message,_telegram_html_to_plain_for_fallback(body), parse_mode=None, disable_web_page_preview=disable_web_page_preview, reply_markup=markup)
                         except Exception:
                             pass
                 except (TimedOut, NetworkError) as e:
@@ -27408,7 +27448,7 @@ async def send_long_message(
                         pass
                     await asyncio.sleep(1)
                     try:
-                        await update.message.reply_text(body, parse_mode=pm, disable_web_page_preview=disable_web_page_preview, reply_markup=markup)
+                        await _telegram_reply_text_fast(update.message,body, parse_mode=pm, disable_web_page_preview=disable_web_page_preview, reply_markup=markup)
                     except Exception:
                         pass
 
@@ -27504,7 +27544,7 @@ async def send_long_message(
     for ch in chunks:
 
         async def _send(pm: Optional[str], body: Optional[str] = None):
-            await update.message.reply_text(
+            await _telegram_reply_text_fast(update.message,
                 ch if body is None else body,
                 parse_mode=pm,
                 disable_web_page_preview=disable_web_page_preview,
