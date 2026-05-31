@@ -1,3 +1,4 @@
+# yver161: final sync hardening for Monday audit: delivered/AutoTraded setup IDs are preserved in /setup_audit instead of daily de-duping them away; BigMove/F8 setup-email rows hydrate /screen from executable_setups even when signals metadata is missing; Bybit-verified AutoTrade TP/SL can override candle-audit for traded rows; weekly policy catch-up window/retry hardened; admin cache namespace bumped.
 # yver153: broaden experimental strong-KEEP promotion for high payoff lanes (>=4 decided, WR>=60%, AvgR>=+0.60), so lanes such as F8-LON-NOR-SELL and F6-NY-REV-SELL can be live-tested as KEEP; no risk/SL/TP changes.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
@@ -2915,7 +2916,7 @@ SETUP_COMBO_PROFIT_TARGET_WR = float(os.environ.get("SETUP_COMBO_PROFIT_TARGET_W
 # for the next cycle and a bad combo can stay live for another day/week.
 SETUP_COMBO_POLICY_CATCHUP_ENABLED = env_bool("SETUP_COMBO_POLICY_CATCHUP_ENABLED", True)
 SETUP_COMBO_DAILY_SAFETY_CATCHUP_MAX_HOURS = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_CATCHUP_MAX_HOURS", "2.5") or 2.5)
-SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS = float(os.environ.get("SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS", "8") or 8)
+SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS = float(os.environ.get("SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS", "36") or 36)
 # Ver13: link Setup Edge Matrix policy decisions into the optimizer/adaptive runtime config.
 # Scheduled weekly review can promote/tighten/relax family-session runtime gates.
 # Daily safety can only tighten severe losers until the next weekly review.
@@ -24533,21 +24534,21 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
                 f"""
                 SELECT
                     e.setup_id, e.session, e.emailed_ts,
-                    COALESCE(s.market_symbol, '') AS market_symbol,
-                    COALESCE(s.symbol, '') AS symbol,
-                    COALESCE(s.side, '') AS side,
-                    COALESCE(s.conf, 0) AS conf,
-                    COALESCE(s.entry, 0) AS entry,
-                    COALESCE(s.sl, 0) AS sl,
-                    COALESCE(s.tp, 0) AS tp,
-                    COALESCE(s.alt_target_a, 0) AS alt_target_a,
-                    COALESCE(s.alt_target_b, 0) AS alt_target_b,
-                    COALESCE(s.fut_vol_usd, 0) AS fut_vol_usd,
-                    COALESCE(s.ch24, 0) AS ch24,
-                    COALESCE(s.ch4, 0) AS ch4,
-                    COALESCE(s.ch1, 0) AS ch1,
-                    COALESCE(s.ch15, 0) AS ch15,
-                    COALESCE(s.created_ts, e.emailed_ts) AS signal_created_ts,
+                    COALESCE(NULLIF(s.market_symbol,''), NULLIF(x.market_symbol,''), '') AS market_symbol,
+                    COALESCE(NULLIF(s.symbol,''), NULLIF(x.symbol,''), '') AS symbol,
+                    COALESCE(NULLIF(s.side,''), NULLIF(x.side,''), '') AS side,
+                    COALESCE(NULLIF(s.conf,0), NULLIF(x.conf,0), 0) AS conf,
+                    COALESCE(NULLIF(s.entry,0), NULLIF(x.entry,0), 0) AS entry,
+                    COALESCE(NULLIF(s.sl,0), NULLIF(x.sl,0), 0) AS sl,
+                    COALESCE(NULLIF(s.tp,0), NULLIF(x.tp,0), 0) AS tp,
+                    COALESCE(NULLIF(s.alt_target_a,0), NULLIF(x.alt_target_a,0), 0) AS alt_target_a,
+                    COALESCE(NULLIF(s.alt_target_b,0), NULLIF(x.alt_target_b,0), 0) AS alt_target_b,
+                    COALESCE(NULLIF(s.fut_vol_usd,0), NULLIF(x.fut_vol_usd,0), 0) AS fut_vol_usd,
+                    COALESCE(NULLIF(s.ch24,0), NULLIF(x.ch24,0), 0) AS ch24,
+                    COALESCE(NULLIF(s.ch4,0), NULLIF(x.ch4,0), 0) AS ch4,
+                    COALESCE(NULLIF(s.ch1,0), NULLIF(x.ch1,0), 0) AS ch1,
+                    COALESCE(NULLIF(s.ch15,0), NULLIF(x.ch15,0), 0) AS ch15,
+                    COALESCE(NULLIF(x.signal_created_ts,0), NULLIF(s.created_ts,0), e.emailed_ts) AS signal_created_ts,
                     COALESCE(x.quality_score, 0) AS quality_score,
                     COALESCE(x.atr_pct, 0) AS atr_pct,
                     COALESCE(x.engine, '') AS engine,
@@ -45138,6 +45139,62 @@ def _setup_audit_payload_result_from_candles(row: dict, candles: list, horizon_h
         return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'candles_eval_error:{type(exc).__name__}'}
 
 
+
+def _setup_audit_bybit_verified_result_for_setup(user_id: int, setup_id: str) -> dict:
+    """Return verified TP/SL from local AutoTrade journal for an exact setup_id.
+
+    yver161: Candle OHLCV can occasionally disagree with the exchange TP/SL trigger
+    source (mark/last/index price, reduce-only lifecycle, partial close repair).  For
+    rows that were actually AutoTraded and closed, the Bybit/journal realised TP/SL is
+    the practical source of truth used to keep /setup_audit, /setup_audit_compare and
+    /autotrade_report aligned. Non-traded rows remain price-path independent.
+    """
+    try:
+        if not env_bool('SETUP_AUDIT_USE_BYBIT_RESULT_FOR_TRADED_ROWS', True):
+            return {}
+        uid = int(user_id or 0)
+        sid = str(setup_id or '').strip()
+        if uid <= 0 or not sid:
+            return {}
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = [dict(r) for r in (cur.execute(
+                """
+                SELECT * FROM autotrade_trades
+                WHERE uid=? AND setup_id=? AND COALESCE(closed_ts,0)>0
+                ORDER BY COALESCE(closed_ts,0) DESC, COALESCE(opened_ts,0) DESC
+                LIMIT 5
+                """,
+                (uid, sid),
+            ).fetchall() or [])]
+        for r in rows:
+            try:
+                kind = str(_autotrade_report_closed_kind(r) or '').upper().strip()
+            except Exception:
+                kind = ''
+            if kind not in {'TP', 'SL'}:
+                try:
+                    pnl = float(r.get('pnl_usdt') if r.get('pnl_usdt') is not None else r.get('pnl') or 0.0)
+                    reason = str(r.get('close_reason') or r.get('reason') or r.get('outcome') or r.get('status') or '').upper()
+                    if pnl > 0 and 'TP' in reason:
+                        kind = 'TP'
+                    elif pnl < 0 and 'SL' in reason:
+                        kind = 'SL'
+                except Exception:
+                    kind = ''
+            if kind in {'TP', 'SL'}:
+                return {
+                    'result': kind,
+                    'hit_level': kind,
+                    'hit_ts': float(r.get('closed_ts') or 0.0) or None,
+                    'note': 'bybit_verified_autotrade_result',
+                    'actual_pnl_usdt': float(r.get('pnl_usdt') if r.get('pnl_usdt') is not None else r.get('pnl') or 0.0),
+                }
+    except Exception:
+        pass
+    return {}
+
 def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, candles_by_symbol: dict | None = None, audit_timeframe: str = '5m', actual_pnl_usdt: float = 0.0) -> dict:
     """Authoritative result resolver for /setup_audit.
 
@@ -45151,6 +45208,18 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
     try:
         rr = _setup_audit_payload_from_row(row)
         sid = str(rr.get('setup_id') or '').strip()
+        try:
+            at_ev = _setup_audit_bybit_verified_result_for_setup(int(user_id or 0), sid)
+            at_canon = _setup_audit_result_label((at_ev or {}).get('result'))
+            if at_canon in {'TP', 'SL'}:
+                at_ev['result'] = at_canon
+                try:
+                    _setup_audit_upsert_result(int(user_id or 0), rr, at_ev, int(horizon_hours), actual_pnl_usdt=float((at_ev or {}).get('actual_pnl_usdt') or actual_pnl_usdt or 0.0))
+                except Exception:
+                    pass
+                return at_ev
+        except Exception:
+            pass
         ms = _setup_audit_market_symbol_for_row(rr)
         candles = (candles_by_symbol or {}).get(ms) or []
         last_ev = {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'no_grouped_candles'}
@@ -45388,11 +45457,40 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
 
     cleaned = sorted(cleaned, key=lambda x: _setup_audit_row_ts(x), reverse=True)
     if bool(dedup):
+        delivered_setup_ids: set[str] = set()
+        if bool(globals().get('SETUP_AUDIT_DEDUP_PRESERVE_DELIVERED_ROWS', True)):
+            try:
+                since_for_delivery = float(cutoff or 0.0) - 6.0 * 3600.0 if float(cutoff or 0.0) > 0 else 0.0
+                with sqlite3.connect(DB_PATH) as con:
+                    cur = con.cursor()
+                    try:
+                        for (sid_d,) in cur.execute(
+                            "SELECT setup_id FROM emailed_setups WHERE user_id=? AND COALESCE(emailed_ts,0)>=? AND COALESCE(setup_id,'')<>''",
+                            (int(uid), float(since_for_delivery)),
+                        ).fetchall() or []:
+                            delivered_setup_ids.add(str(sid_d or '').strip())
+                    except Exception:
+                        pass
+                    try:
+                        for (sid_d,) in cur.execute(
+                            "SELECT setup_id FROM autotrade_trades WHERE uid=? AND COALESCE(opened_ts,0)>=? AND COALESCE(setup_id,'')<>''",
+                            (int(uid), float(since_for_delivery)),
+                        ).fetchall() or []:
+                            delivered_setup_ids.add(str(sid_d or '').strip())
+                    except Exception:
+                        pass
+            except Exception:
+                delivered_setup_ids = set()
         deduped: dict[str, dict] = {}
-        # Keep the earliest actionable row within the practical setup key. Keeping
-        # the newest row turns repeated snapshots into fake OPENs and inflates counts.
+        # Keep the earliest raw scanner row per practical key, but never de-dupe away
+        # a setup that was actually emailed or AutoTraded. Those rows are the sync
+        # bridge between /screen, setup emails, /setup_audit and /autotrade_report.
         for r in sorted(cleaned, key=lambda x: _setup_audit_row_ts(x)):
-            key = _setup_audit_unique_key(r)
+            sid_r = str((r or {}).get('setup_id') or '').strip()
+            if sid_r and sid_r in delivered_setup_ids:
+                key = f"DELIVERED|{sid_r}"
+            else:
+                key = _setup_audit_unique_key(r)
             if key not in deduped:
                 deduped[key] = r
         final = sorted(list(deduped.values()), key=lambda x: _setup_audit_row_ts(x), reverse=True)
@@ -45762,7 +45860,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
-        f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
+        f"Source: post-setup price path; Bybit-verified AutoTrade TP/SL overrides traded rows. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
         "Policy = fresh-current delivery/actionability gate only. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions, so stale open journal rows no longer look live after closure.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
@@ -46509,7 +46607,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         HDR,
         f"Window: <b>last {hours}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
         "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
-        "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
+        "Important: /setup_audit is price-path based for non-traded rows; for actual AutoTrade rows, Bybit-verified TP/SL is the practical source of truth. This compare view is the reconciliation layer.",
         "AT = actual realised AutoTrade close from Bybit/journal. Audit = independent matched setup price-path result.",
         "yver149 matching: setup_id/open-time must fit the AutoTrade entry deadline. Trades opened before the selected compare window but closed inside it can still match their original setup when journal/open-time evidence is reliable; close-only legacy rows remain guarded.",
         "Precision: mismatched TP/SL rows are rechecked with targeted 1m candles before DIFF is shown.",
@@ -49967,7 +50065,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v157:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v161:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -49986,7 +50084,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v157:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v161:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -50036,7 +50134,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v157:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v161:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50054,7 +50152,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v157:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v161:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50156,7 +50254,7 @@ async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
             prev_weekly = _setup_combo_previous_policy_review_dt(now_ts)
             prev_weekly_ts = float(prev_weekly.astimezone(timezone.utc).timestamp())
             age_h = (now_ts - prev_weekly_ts) / 3600.0
-            if bool(SETUP_COMBO_REVIEW_ENABLED) and 0.0 <= age_h <= float(SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS or 8):
+            if bool(SETUP_COMBO_REVIEW_ENABLED) and 0.0 <= age_h <= float(SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS or 36):
                 if not _setup_combo_policy_kind_updated_since(int(uid), 'scheduled', prev_weekly_ts - 300.0):
                     res = await to_thread_heavy(
                         _setup_combo_matrix_build,
@@ -50431,7 +50529,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v157:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v161:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50457,7 +50555,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v157:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v161:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -50476,7 +50574,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v157:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v161:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -50507,7 +50605,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v157:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v161:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -50981,7 +51079,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v157:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v161:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51006,7 +51104,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v157:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v161:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -51024,7 +51122,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v157:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v161:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51049,7 +51147,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v157:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v161:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55158,7 +55256,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v157:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v161:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55178,7 +55276,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v157:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v161:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55199,7 +55297,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v157:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v161:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -63169,12 +63267,18 @@ def main():
                     pass
 
         if SETUP_COMBO_POLICY_CATCHUP_ENABLED and (SETUP_COMBO_REVIEW_ENABLED or SETUP_COMBO_DAILY_SAFETY_ENABLED):
-            app.job_queue.run_once(
+            # yver161: retry catch-up hourly. A Sunday 23:00 weekly review can be missed
+            # during Render deploy/restart/scheduler pressure; the old one-shot 8h catch-up
+            # could miss it by Monday morning. The job is cheap when nothing is due.
+            app.job_queue.run_repeating(
                 setup_combo_policy_catchup_job,
-                when=90,
+                interval=3600,
+                first=90,
                 name="setup_combo_policy_catchup_job",
                 job_kwargs={
-                    "misfire_grace_time": 900,
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 3600,
                 },
             )
 
