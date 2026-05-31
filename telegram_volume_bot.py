@@ -5437,12 +5437,15 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         hours = _overall_report_effective_hours(int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
         data = _setup_edge_guard_build(owner_uid, hours=hours, force=False) or {}
 
-        # yver147: real-money AutoTrade should not use every KEEP lane while the
-        # target WR is >50%.  A lane can be KEEP because of broader/older policy,
-        # but live entries now require the exact lane evidence to remain strong.
-        # Default: decided>=5, WR>=60%, AvgR>=+0.25. This blocks recent weak KEEP
-        # lanes such as F1-LON-NOR-BUY/F2-NY-NOR-BUY while keeping stronger lanes
-        # like F2-ASIA-NOR-BUY and F1-LON-REV-BUY.
+        # yver156: keep /screen, setup email and AutoTrade synchronised.
+        # If the active policy lookup says an exact lane is KEEP, AutoTrade must not
+        # reject it only because the older strict-edge overlay cannot find/agree with
+        # its local metrics. This fixes the confusing state where Telegram/email show
+        # KEEP/SENT but /autotrade_last says strict_keep_edge_block:WR0:n0.
+        # Strict KEEP edge remains useful for diagnostics and experimental lanes, but
+        # it no longer overrides a current enforceable KEEP policy row. DISABLE/OFF,
+        # symbol/hour blocks, leverage safety, duplicate-position checks and capital
+        # guards still apply below/elsewhere.
         try:
             if bool(apply_strict_keep_edge) and pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
                 m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
@@ -5452,22 +5455,29 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
                 min_dec = int(_autotrade_strict_keep_edge_min_decided())
                 min_wr = float(_autotrade_strict_keep_edge_min_wr())
                 min_avg = float(_autotrade_strict_keep_edge_min_avgr())
-                # yver152: if a lane was intentionally promoted by the experimental
-                # fast-KEEP rule, do not let the older strict edge min_decided=5
-                # immediately block it from AutoTrade. DISABLE/OFF policy rows are
-                # still blocked before this point.
                 try:
                     tp_e = int(m.get('tp') or 0)
                     sl_e = int(m.get('sl') or 0)
                     exp_keep, exp_reason = _setup_combo_experimental_keep_override(dec, tp_e, sl_e, wr, avg)
                     if exp_keep:
-                        return True, f'autotrade_experimental_keep_edge_allowed:{combo}:{exp_reason}'
+                        try:
+                            _setup_quality_gate_set_attr(setup_or_row, 'autotrade_strict_keep_edge_note', f'experimental_keep_allowed:{combo}:{exp_reason}')
+                        except Exception:
+                            pass
+                    elif dec < min_dec or wr < min_wr or avg < min_avg:
+                        try:
+                            _setup_quality_gate_set_attr(setup_or_row, 'autotrade_strict_keep_edge_note', f'policy_keep_allowed_below_strict:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}')
+                        except Exception:
+                            pass
                 except Exception:
                     pass
-                if dec < min_dec or wr < min_wr or avg < min_avg:
-                    return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
         except Exception as _strict_exc:
-            return False, f'autotrade_strict_keep_edge_error:{type(_strict_exc).__name__}'
+            # Fail open for current policy KEEP rows; fail-closed is still handled by
+            # the policy/status, symbol/hour, leverage, capital and duplicate gates.
+            try:
+                _setup_quality_gate_set_attr(setup_or_row, 'autotrade_strict_keep_edge_note', f'strict_edge_diagnostic_error:{type(_strict_exc).__name__}')
+            except Exception:
+                pass
 
         # 2) Existing micro-edge symbols/hours are hard execution blockers.
         if sym and sym in dict((data or {}).get('symbol_block') or {}):
@@ -41622,7 +41632,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
             "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
-            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true   (syncs /screen + email + AutoTrade to high-edge KEEP lanes)",
+            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true   (diagnostic overlay; current KEEP policy still controls live entries)",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 60",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 5",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.25",
