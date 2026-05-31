@@ -78,6 +78,8 @@ from typing import Any  # yver130 early import required before early helper anno
 # - Ver54 yver54: forward-test keep-all mode for NORMAL/REVERSE comparison: disables automatic flat/max-hold/carryover closes by default, extends setup entry life for test observation, and lets scheduled AutoTrade continue placing multiple eligible queued setups per tick while retaining SL/TP, risk caps, duplicate guards and exchange safety checks.
 # - Ver53 yver53: fixes post-unblock execution gaps: removes MON from combo identity (NOR/REV only), routes weak combos to REV earlier, lets AutoTrade execute already queued/emailed setups during setup-generation blackout, retries Bybit leverage at exchange max, and continues candidate attempts after leverage/setup-specific skips.
 # - yver61: AutoTrade risk caps are controlled only by /autotrade_config; /dailycap is manual-only; AutoTrade reports use one clear Reason column with pre-ASIA closes renamed.
+# yver157: responsiveness hardening: alert_job now schedules its heavy work as a background task so APScheduler/job queue returns immediately, heavy admin commands send instant cached previews instead of long cached reports blocking Telegram, and alert interval/runtime defaults are calmer to reduce Render max_instances warnings.
+# yver158: BigMove sync hardening: BigMove AutoTrade now requires the paired normal setup email/screen row to be sent first and executes that exact setup-email batch, not a separately rebuilt BigMove candidate; background scheduler intervals are calmer to reduce Render max_instances pressure.
 # - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
 # - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
@@ -49964,7 +49966,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v154:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v157:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -49983,7 +49985,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v154:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v157:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -50033,7 +50035,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v154:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v157:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50051,7 +50053,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v154:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v157:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50209,6 +50211,28 @@ async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# yver157: admin reports can be huge. Sending a full cached /setup_matrix or
+# /setup_audit table immediately can make the bot feel frozen, even when the
+# calculation itself is already cached. Default to an instant preview and let the
+# full fresh report post from the background task. Set ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE=1
+# if full cached reports should be sent immediately again.
+ADMIN_REPORT_FAST_CACHE_MAX_CHARS = int(os.environ.get("ADMIN_REPORT_FAST_CACHE_MAX_CHARS", "3200") or 3200)
+ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE = env_bool("ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE", False)
+ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE = env_bool("ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE", True)
+
+
+def _admin_report_cached_preview(title: str, text: str, age: float | None, *, fresh: bool, started: bool) -> str:
+    try:
+        limit = max(800, int(globals().get("ADMIN_REPORT_FAST_CACHE_MAX_CHARS", 3200) or 3200))
+    except Exception:
+        limit = 3200
+    plain = _telegram_html_to_plain_for_fallback(str(text or ''))
+    if len(plain) > limit:
+        plain = plain[:limit].rstrip() + "\n… preview truncated. Full fresh result will be posted in background."
+    status = "Fresh cached preview" if fresh else "Latest cached preview"
+    bg = "Fresh rebuild started in background." if started else "Fresh rebuild already running in background."
+    return f"⚡ {status}: {title} (age {_admin_report_age_text(age)}). {bg}\n{SEP}\n{plain}"
+
 # ================= NON-BLOCKING ADMIN REPORT RUNNER (yver145) =================
 _ADMIN_REPORT_BG_RUNNING: set[str] = set()
 _ADMIN_REPORT_BG_LOCK = threading.Lock()
@@ -50324,41 +50348,65 @@ async def _send_cached_or_queue_admin_report(
     title_s = str(title or 'report').strip() or 'report'
     pm = parse_mode or ParseMode.HTML
 
+    def _start_refresh_if_needed() -> bool:
+        started_local = False
+        if force_refresh:
+            started_local = _admin_report_bg_try_start(cache_key)
+            if started_local:
+                _safe_create_task(
+                    _admin_report_background_refresh(
+                        update,
+                        title_s,
+                        cache_key,
+                        fn,
+                        args=tuple(args or ()),
+                        kwargs=dict(kwargs or {}),
+                        parse_mode=pm,
+                        background_timeout=background_timeout,
+                        post_result=True,
+                    ),
+                    label=f"admin-report-refresh:{cache_key}",
+                )
+        return started_local
+
     fresh, age = _admin_report_cache_get_with_age(cache_key, fresh_ttl)
     if fresh:
-        await send_long_message(update, fresh, parse_mode=pm, disable_web_page_preview=True)
+        is_long = len(str(fresh or '')) > int(globals().get('ADMIN_REPORT_FAST_CACHE_MAX_CHARS', 3200) or 3200)
+        if is_long and not bool(globals().get('ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE', False)):
+            started = _start_refresh_if_needed() if bool(globals().get('ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE', True)) else False
+            await _telegram_reply_text_fast(
+                update.message,
+                _admin_report_cached_preview(title_s, fresh, age, fresh=True, started=started),
+                parse_mode=None,
+                disable_web_page_preview=True,
+            )
+        else:
+            await send_long_message(update, fresh, parse_mode=pm, disable_web_page_preview=True)
         return
 
     stale, stale_age = _admin_report_cache_get_with_age(cache_key, stale_ttl)
-    started = False
-    if force_refresh:
-        started = _admin_report_bg_try_start(cache_key)
-        if started:
-            _safe_create_task(
-                _admin_report_background_refresh(
-                    update,
-                    title_s,
-                    cache_key,
-                    fn,
-                    args=tuple(args or ()),
-                    kwargs=dict(kwargs or {}),
-                    parse_mode=pm,
-                    background_timeout=background_timeout,
-                    post_result=True,
-                ),
-                label=f"admin-report-refresh:{cache_key}",
-            )
+    started = _start_refresh_if_needed()
 
     if stale:
-        note = (
-            f"⚡ <b>Latest cached result:</b> {html.escape(title_s)} "
-            f"(age {html.escape(_admin_report_age_text(stale_age))}). "
-            f"Fresh rebuild {'started in background' if started else 'already running in background'}.\n{SEP}\n"
-        )
-        await send_long_message(update, note + stale, parse_mode=pm, disable_web_page_preview=True)
+        is_long = len(str(stale or '')) > int(globals().get('ADMIN_REPORT_FAST_CACHE_MAX_CHARS', 3200) or 3200)
+        if is_long and not bool(globals().get('ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE', False)):
+            await _telegram_reply_text_fast(
+                update.message,
+                _admin_report_cached_preview(title_s, stale, stale_age, fresh=False, started=started),
+                parse_mode=None,
+                disable_web_page_preview=True,
+            )
+        else:
+            note = (
+                f"⚡ <b>Latest cached result:</b> {html.escape(title_s)} "
+                f"(age {html.escape(_admin_report_age_text(stale_age))}). "
+                f"Fresh rebuild {'started in background' if started else 'already running in background'}.\n{SEP}\n"
+            )
+            await send_long_message(update, note + stale, parse_mode=pm, disable_web_page_preview=True)
         return
 
-    await update.message.reply_text(
+    await _telegram_reply_text_fast(
+        update.message,
         f"⏳ {title_s} is heavy. No cached result yet. Fresh rebuild "
         f"{'started in background' if started else 'is already running in background'}; I will post it here when ready.",
         parse_mode=None,
@@ -50382,7 +50430,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v154:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v157:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50408,7 +50456,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v154:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v157:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -50427,7 +50475,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v154:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v157:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -50458,7 +50506,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v154:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v157:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -50932,7 +50980,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v154:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v157:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -50957,7 +51005,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v154:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v157:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -50975,7 +51023,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v154:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v157:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51000,7 +51048,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v154:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v157:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55109,7 +55157,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v154:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v157:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55129,7 +55177,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v154:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v157:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55150,7 +55198,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v154:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v157:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -58794,11 +58842,11 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "75"))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
-AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "60") or 60)
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "180") or 180)
 AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "2"))
@@ -59510,18 +59558,36 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
                         if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                                "status": "QUEUED",
-                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
-                                "session": str(bm_sess or ""),
-                                "mode": str(_autotrade_runtime_mode()).lower(),
-                                "trigger": "bigmove_setup_email_immediate",
-                            }
-                            _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
-                                "autotrade_after_bigmove_setup_email",
-                            )
+                            # yver158: BigMove alert email is only a market-event notification.
+                            # AutoTrade must only consume the paired normal setup email rows
+                            # that /screen can also show.  Do not execute a separately rebuilt
+                            # BMAT candidate when the setup email failed/was filtered out.
+                            if setup_email_sent and setup_email_setups:
+                                _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                                    "status": "QUEUED",
+                                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                    "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade",
+                                    "session": str(bm_sess or ""),
+                                    "mode": str(_autotrade_runtime_mode()).lower(),
+                                    "trigger": "bigmove_setup_email_immediate",
+                                }
+                                _safe_create_task(
+                                    _trigger_autotrade_after_email_async(int(uid), str(bm_sess or ""), list(setup_email_setups or [])),
+                                    "autotrade_after_bigmove_setup_email",
+                                )
+                            else:
+                                _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                                    "status": "SKIP",
+                                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                    "reason": "bigmove_autotrade_blocked_until_paired_setup_email_sent",
+                                    "session": str(bm_sess or ""),
+                                    "mode": str(_autotrade_runtime_mode()).lower(),
+                                    "trigger": "bigmove_setup_email_required",
+                                }
+                                try:
+                                    db_log_setup_pipeline_event(owner_uid_for_bm_at, stage='bigmove_autotrade_sync_gate', status='skip', session=str(bm_sess or ''), mode='autotrade', details={'reason': 'paired_setup_email_not_sent', 'tag': str(tag or 'pre_session'), 'filtered': len(list(filtered or []))})
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
             except Exception as e:
@@ -60343,18 +60409,35 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
                         if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                                "status": "QUEUED",
-                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
-                                "session": str(bm_sess or ""),
-                                "mode": str(_autotrade_runtime_mode()).lower(),
-                                "trigger": "bigmove_setup_email_immediate",
-                            }
-                            _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred"),
-                                "autotrade_after_bigmove_setup_email_deferred",
-                            )
+                            # yver158: deferred BigMove path uses the same strict sync rule
+                            # as the pre-session path: only the paired setup-email rows can
+                            # trigger AutoTrade, so BigMove alert-only rows never bypass /screen.
+                            if setup_email_sent and setup_email_setups:
+                                _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                                    "status": "QUEUED",
+                                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                    "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade",
+                                    "session": str(bm_sess or ""),
+                                    "mode": str(_autotrade_runtime_mode()).lower(),
+                                    "trigger": "bigmove_setup_email_immediate",
+                                }
+                                _safe_create_task(
+                                    _trigger_autotrade_after_email_async(int(uid), str(bm_sess or ""), list(setup_email_setups or [])),
+                                    "autotrade_after_bigmove_setup_email_deferred",
+                                )
+                            else:
+                                _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                                    "status": "SKIP",
+                                    "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                    "reason": "bigmove_autotrade_blocked_until_paired_setup_email_sent",
+                                    "session": str(bm_sess or ""),
+                                    "mode": str(_autotrade_runtime_mode()).lower(),
+                                    "trigger": "bigmove_setup_email_required",
+                                }
+                                try:
+                                    db_log_setup_pipeline_event(owner_uid_for_bm_at, stage='bigmove_autotrade_sync_gate', status='skip', session=str(bm_sess or ''), mode='autotrade', details={'reason': 'paired_setup_email_not_sent', 'tag': 'deferred', 'filtered': len(list(filtered or []))})
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
             except Exception as e:
@@ -62495,19 +62578,34 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
+    # yver157: run the autonomous email/setup/autotrade pipeline as a detached task.
+    # The JobQueue callback returns immediately; _alert_job_async_internal still owns
+    # ALERT_LOCK so overlapping ticks quietly skip instead of blocking commands or
+    # producing APScheduler max_instances warnings.
+    try:
+        await _alert_job_async_internal(context)
+        _hb_touch('email', ok=True, details='alert_job_ok')
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"{type(e).__name__}: {e}"
+        except Exception:
+            pass
+        _hb_touch('email', ok=False, error=f"{type(e).__name__}: {e}", details='alert_job_error')
+        try:
+            logger.warning("Alert job background failure: %s: %s", type(e).__name__, e)
+        except Exception:
+            pass
+
+
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
-    """Background email engine (trade setups + big-move alerts).
-
-    IMPORTANT:
-    - Do NOT take ALERT_LOCK here.
-    - _alert_job_async_internal() already owns ALERT_LOCK to prevent overlap.
-
-    The previous version double-locked (wrapper + internal), which caused the
-    internal job to exit immediately every time, so no emails were ever sent
-    (while /email_test still worked).
-    """
-
-    # Heartbeat (so /email_decision can prove the loop is alive)
+    """Fast scheduler wrapper for the background email engine."""
     try:
         _EMAIL_LOOP_HEARTBEAT["alive"] = True
         now_ts = time.time()
@@ -62518,21 +62616,23 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             _EMAIL_LOOP_HEARTBEAT["next_tick_ts"] = now_ts + interval
     except Exception:
         pass
-
     try:
-        await _alert_job_async_internal(context)
-        _hb_touch('email', ok=True, details='alert_job_ok')
-        try:
-            _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
-        except Exception:
-            pass
+        if ALERT_LOCK.locked():
+            return
+    except Exception:
+        pass
+    try:
+        _safe_create_task(_alert_job_background_runner(context), label="alert_job_bg")
     except Exception as e:
         try:
-            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"{type(e).__name__}: {e}"
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"schedule_{type(e).__name__}: {e}"
         except Exception:
             pass
-        _hb_touch('email', ok=False, error=f"{type(e).__name__}: {e}", details='alert_job_error')
-        logger.exception("Alert job failure: %s", e)
+        _hb_touch('email', ok=False, error=f"{type(e).__name__}: {e}", details='alert_job_schedule_error')
+        try:
+            logger.warning("Alert job schedule failure: %s: %s", type(e).__name__, e)
+        except Exception:
+            pass
 
 
 
@@ -62788,7 +62888,7 @@ def main():
         # the pipeline alive.
         # Ver110: schedule interval must be longer than the allowed runtime to avoid
         # APScheduler max_instances skipped-run warnings on Render.
-        interval_sec = max(90, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 30)
+        interval_sec = max(240, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 240), int(ALERT_JOB_MAX_RUNTIME_SEC or 75) + 150)
     
         app.job_queue.run_repeating(
             alert_job,
@@ -62796,7 +62896,7 @@ def main():
             first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
             name="alert_job",
             job_kwargs={
-                "max_instances": 1,
+                "max_instances": 2,
                 "coalesce": True,
                 "misfire_grace_time": 300,
             },
@@ -62933,8 +63033,8 @@ def main():
 
         app.job_queue.run_repeating(
             screen_cache_warmup_job,
-            interval=int(SCREEN_CACHE_WARMUP_INTERVAL_SEC),
-            first=max(20, min(60, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
+            interval=max(420, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC)),
+            first=max(45, min(120, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
             name="screen_cache_warmup_job",
             job_kwargs={
                 "max_instances": 1,
@@ -62963,7 +63063,7 @@ def main():
         # AutoTrade loop (owner-only)
         app.job_queue.run_repeating(
             autotrade_job,
-            interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 10),
+            interval=max(180, int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 90),
             first=45,
             name="autotrade_job",
             job_kwargs={
