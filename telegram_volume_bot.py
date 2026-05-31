@@ -13,7 +13,7 @@
 # yver135: fixes setup-audit/email/autotrade sync gap by letting setup emails consume executable rows for the full AUTOTRADE_ENTRY_WINDOW_MIN instead of only MAX_STALE_SCAN_SEC; /screen fallback age now follows the same entry window.
 # yver134: adds Policy column to /setup_audit detailed table, showing current enforceable KEEP/WATCH/OFF lane for each setup.
 # yver146: hardens AutoTrade closed/report metadata sync: canonical Bybit Closed-PnL enrichment now rejects future-open candidates, syncs /setup_matrix WR basis with setup-audit, shares v146 cache namespace, and keeps strategy recommendations as guidance only (no trading config auto-change).
-# yver150: separates user-visible setup delivery from AutoTrade strict KEEP-edge risk gate; background/executable setup generation stays visible while AutoTrade remains stricter.
+# yver151: sorts setup audit/policy tables by Policy priority (KEEP, WATCH, then disabled/OFF) without changing trading logic.
 # yver132: explains KEEP selection in /setup_matrix policy (KEEP requires more than 50% WR: sample + AvgR/payoff + no safety disable); no trading-policy loosening.
 # yver130: startup fix for yver129: imports typing.Any before the early AutoTrade email-gate helper so Render does not crash on NameError.
 from typing import Any  # yver130 early import required before early helper annotations
@@ -45667,7 +45667,12 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
 
     # Ver16: show all rows. send_long_message now chunks <pre> tables safely,
     # so there is no need to hide audit rows for Telegram length limits.
-    display_rows = list(table_rows)
+    # yver151: Sort by Policy priority for readability: KEEP, WATCH, then OFF/disabled.
+    policy_rank = {'KEEP': 0, 'WATCH': 1, 'OFF': 2, 'DISABLE': 2, 'BLOCK': 2, 'PAUSE': 2}
+    display_rows = [row for _i, row in sorted(
+        enumerate(table_rows),
+        key=lambda kv: (policy_rank.get(str(kv[1][4]).upper().strip(), 9), kv[0])
+    )]
     hidden_rows = 0
     table = tabulate(
         display_rows,
@@ -49681,7 +49686,10 @@ def _setup_combo_policy_text(uid: int) -> str:
             avg_txt = f'{avg_v:+.2f}' if dec_v > 0 else '-'
             table_rows.append([full_combo, exec_state, live_state, set_v, dec_v, wr_txt, avg_txt, adv])
 
-        order_rank = {'OFF': 0, 'PART': 1, 'GATE': 2, 'KEEP': 3, 'ON': 4}
+        # yver151: Sort the policy output by enforced Policy first:
+        # KEEP, then WATCH, then disabled/tightened rows. ExecNow remains shown as a column.
+        policy_order_rank = {'KEEP': 0, 'WATCH': 1, 'TIGHTEN': 2, 'DISABLE': 3, 'OFF': 3, 'BLOCK': 3, 'PAUSE': 3}
+        exec_order_rank = {'KEEP': 0, 'ON': 1, 'GATE': 2, 'PART': 3, 'OFF': 4}
         def _row_key(row):
             combo = str(row[0])
             parts = combo.split('-')
@@ -49693,7 +49701,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             sess_n = sess_order.index(sess) if sess in sess_order else 99
             strat_n = 0 if strat == 'NOR' else 1
             side_n = 0 if side == 'BUY' else 1
-            return (order_rank.get(str(row[1]), 9), fam_n, sess_n, strat_n, side_n, combo)
+            return (policy_order_rank.get(str(row[2]).upper().strip(), 9), exec_order_rank.get(str(row[1]).upper().strip(), 9), fam_n, sess_n, strat_n, side_n, combo)
         table_rows = sorted(table_rows, key=_row_key)
         table = tabulate(table_rows, headers=['Combo','ExecNow','Policy','Set','Dec','WR','AvgR','Reco'], tablefmt='plain')
 
