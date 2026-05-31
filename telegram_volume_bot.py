@@ -1,4 +1,4 @@
-# yver152: user-requested experimental fast-KEEP promotion for very small perfect lanes (1-3 decided, 100% WR, strong AvgR) and strong 75%+ lanes, including active WATCH-to-KEEP overlay; no risk/SL/TP changes.
+# yver153: broaden experimental strong-KEEP promotion for high payoff lanes (>=4 decided, WR>=60%, AvgR>=+0.60), so lanes such as F8-LON-NOR-SELL and F6-NY-REV-SELL can be live-tested as KEEP; no risk/SL/TP changes.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
 # yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
@@ -3085,7 +3085,7 @@ SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MAX_DECIDED = int(os.environ.get("SETUP_COMBO
 SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_WR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_WR", "100.0") or 100.0)
 SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR", "0.50") or 0.50)
 SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED", "4") or 4)
-SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR", "75.0") or 75.0)
+SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR", "60.0") or 60.0)
 SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR", "0.60") or 0.60)
 
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
@@ -47455,6 +47455,20 @@ def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', u
                     continue
                 status = str(pol.get('status') or 'WATCH').upper().strip()
                 enabled = 1 if int(pol.get('enabled') if pol.get('enabled') is not None else 1) == 1 else 0
+                # yver153: let current exact-lane evidence promote active WATCH rows
+                # to KEEP for the owner's experimental live trial. Never override
+                # explicit DISABLE/OFF/BLOCK/PAUSE rows.
+                try:
+                    if enabled and status == 'WATCH' and side in {'BUY', 'SELL'}:
+                        exp_keep, exp_reason = _setup_combo_experimental_keep_from_live_metrics(full_combo, uid or owner_uid)
+                        if exp_keep:
+                            status = 'KEEP'
+                            pol = dict(pol or {})
+                            pol['status'] = 'KEEP'
+                            pol['enabled'] = 1
+                            pol['notes'] = (str(pol.get('notes') or '') + ' | yver153 live ' + str(exp_reason))[:500]
+                except Exception:
+                    pass
                 out.update({'found': True, 'policy': dict(pol or {}), 'status': status, 'enabled': enabled,
                             'strategy': k_strat if k_strat != 'ALL' else strat, 'side': k_side if k_side != 'BOTH' else side})
                 return out
@@ -48719,6 +48733,26 @@ def _setup_combo_enrich_rows_with_active_policy(uid: int, rows: list[dict]) -> l
                 r['active_policy_status'] = st
             else:
                 r['active_policy_status'] = 'ADVISORY'
+            # yver153: show the same experimental promotion in /setup_matrix policy
+            # when the current row's own evidence qualifies. This covers strong
+            # WATCH rows such as F8-LON-NOR-SELL (60% WR, +0.80 AvgR) and
+            # F6-NY-REV-SELL (75% WR, +0.65 AvgR) without touching disabled rows.
+            try:
+                if str(r.get('effective_action') or '').upper().strip() in {'WATCH', 'GATE'} and int(r.get('active_policy_enabled') or 1) == 1:
+                    dec_e = int(r.get('decided') or 0)
+                    tp_e = int(r.get('tp') or 0)
+                    sl_e = int(r.get('sl') or 0)
+                    wr_e = float(r.get('win_rate') if r.get('win_rate') is not None else r.get('wr') or 0.0)
+                    avg_e = float(r.get('avg_r') or 0.0)
+                    exp_keep, exp_reason = _setup_combo_experimental_keep_override(dec_e, tp_e, sl_e, wr_e, avg_e)
+                    if exp_keep:
+                        r['effective_action'] = 'KEEP'
+                        r['active_policy_status'] = 'KEEP'
+                        r['active_policy_enabled'] = 1
+                        r['active_policy_kind'] = str(r.get('active_policy_kind') or '-') + '+EXP'
+                        r['notes'] = (str(r.get('notes') or '') + ' | yver153 ' + str(exp_reason))[:500]
+            except Exception:
+                pass
             enriched.append(r)
         return enriched
     except Exception:
@@ -48758,6 +48792,14 @@ def _setup_combo_policy_rows_for_bridge(uid: int, matrix_rows: list[dict] | None
                 sl = int(base.get('sl') or 0)
                 wr = float(base.get('win_rate') if base.get('win_rate') is not None else (pol.get('last_win_rate') or 0.0))
                 avg_r = float(base.get('avg_r') if base.get('avg_r') is not None else (pol.get('last_avg_r') or 0.0))
+                try:
+                    if action == 'WATCH' and enabled:
+                        exp_keep, exp_reason = _setup_combo_experimental_keep_override(decided, tp, sl, wr, avg_r)
+                        if exp_keep:
+                            action = 'KEEP'
+                            status = 'KEEP'
+                except Exception:
+                    pass
                 score = float(base.get('score') if base.get('score') is not None else (pol.get('last_score') or 0.0))
                 setups = int(base.get('setups') or pol.get('last_setups') or decided)
                 # Interim overrides may be seeded with no stored stats. For bridge purposes
@@ -48848,6 +48890,34 @@ def _setup_combo_experimental_keep_override(decided: int, tp: int, sl: int, wr: 
     except Exception as exc:
         return False, f'experimental_keep_error:{type(exc).__name__}'
 
+
+def _setup_combo_experimental_keep_from_live_metrics(combo: str, uid: int = 0) -> tuple[bool, str]:
+    """Return True when the latest setup-audit edge metrics justify experimental KEEP.
+
+    yver153: active daily-safety policy may still have a lane as WATCH until the
+    weekly cycle, even when the current exact-lane evidence is strong enough for
+    the owner's experimental KEEP trial. This helper lets /setup_matrix policy,
+    /screen, setup email, and AutoTrade see the same current promotion without
+    overriding explicit DISABLE/OFF policy rows.
+    """
+    try:
+        key = str(combo or '').upper().strip()
+        if not key:
+            return False, 'no_combo'
+        owner_uid = int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        hours = _overall_report_effective_hours(int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
+        data = _setup_edge_guard_build(owner_uid, hours=hours, force=False) or {}
+        m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(key) or {})
+        if not m:
+            return False, f'no_live_metrics:{key}'
+        dec = int(m.get('decided') or 0)
+        tp = int(m.get('tp') or 0)
+        sl = int(m.get('sl') or 0)
+        wr = float(m.get('wr') or 0.0)
+        avg = float(m.get('avg_r') or 0.0)
+        return _setup_combo_experimental_keep_override(dec, tp, sl, wr, avg)
+    except Exception as exc:
+        return False, f'experimental_keep_live_metrics_error:{type(exc).__name__}'
 
 def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int, str, float]:
     """Convert lane evidence into KEEP / WATCH / DISABLE.
