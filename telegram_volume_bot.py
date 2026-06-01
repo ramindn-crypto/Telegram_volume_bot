@@ -1,5 +1,5 @@
 # yver165: final deployment hardening for yver164; bumps heavy admin cache namespace to avoid stale v161 results and disables fixed day/time prior flags by default; no trading/risk changes.
-# yver164: data-driven day/time/session guard from setup_deep_analysis/edge metrics; promotes WATCH rows to KEEP when current Reco/metrics qualify (e.g. F8-NY-NOR-BUY); adds /assumptions admin command; no risk changes.
+# yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
 # yver163: day-time-session live guard from ver161 baseline; ignores ver162 liquidity/soft-stop changes; synced /screen setup-email AutoTrade context gate; Monday pre-ASIA, Monday ASIA market-tone, and Saturday pre-ASIA directional filters.
 # yver161: final sync hardening for Monday audit: delivered/AutoTraded setup IDs are preserved in /setup_audit instead of daily de-duping them away; BigMove/F8 setup-email rows hydrate /screen from executable_setups even when signals metadata is missing; Bybit-verified AutoTrade TP/SL can override candle-audit for traded rows; weekly policy catch-up window/retry hardened; admin cache namespace bumped.
 # yver153: broaden experimental strong-KEEP promotion for high payoff lanes (>=4 decided, WR>=60%, AvgR>=+0.60), so lanes such as F8-LON-NOR-SELL and F6-NY-REV-SELL can be live-tested as KEEP; no risk/SL/TP changes.
@@ -5037,7 +5037,10 @@ AUTOTRADE_ALLOW_WATCH_POLICY = env_bool("AUTOTRADE_ALLOW_WATCH_POLICY", False)
 # current Bybit futures account or repeatedly fail exchange terms (e.g. CL crude oil).
 # This is only for setup delivery/autotrade; audit can still retain historical rows.
 AUTOTRADE_BLOCKED_SYMBOLS = tuple(
-    x.strip().upper() for x in str(os.environ.get("AUTOTRADE_BLOCKED_SYMBOLS", "CL") or "").split(",") if x.strip()
+    # yver166: no permanent hard-blocked symbol by default.  Symbols that misbehave
+    # are handled by rolling micro-edge evidence (max 24h by default) rather than
+    # forever blocks.  Operators can still set AUTOTRADE_BLOCKED_SYMBOLS env if needed.
+    x.strip().upper() for x in str(os.environ.get("AUTOTRADE_BLOCKED_SYMBOLS", "") or "").split(",") if x.strip()
 )
 
 def _autotrade_symbol_blocked(sym: str) -> tuple[bool, str]:
@@ -5622,15 +5625,15 @@ def _autotrade_day_time_session_guard_allows(setup_or_row, *, data: dict, combo:
         if bool(globals().get('AUTOTRADE_DTS_FALLBACK_PRIOR_ENABLED', False)):
             wd = int(dt_local.weekday())
             hh = int(dt_local.hour)
-            if bool(globals().get('AUTOTRADE_DTS_MONDAY_PRE_ASIA_STRICT', True)) and wd == 0 and 2 <= hh < 10:
+            if bool(globals().get('AUTOTRADE_DTS_MONDAY_PRE_ASIA_STRICT', False)) and wd == 0 and 2 <= hh < 10:
                 if exact_ok:
                     return True, f'dts_prior_monday_pre_asia_exact_escape:{exact_reason}'
                 return False, f'dts_prior_monday_pre_asia_block:{dt_local.strftime("%a %H:%M")}:{exact_reason}'
-            if bool(globals().get('AUTOTRADE_DTS_SATURDAY_PRE_ASIA_BUY_STRICT', True)) and wd == 5 and 2 <= hh < 10 and side == 'BUY':
+            if bool(globals().get('AUTOTRADE_DTS_SATURDAY_PRE_ASIA_BUY_STRICT', False)) and wd == 5 and 2 <= hh < 10 and side == 'BUY':
                 if exact_ok:
                     return True, f'dts_prior_saturday_pre_asia_buy_exact_escape:{exact_reason}'
                 return False, f'dts_prior_saturday_pre_asia_buy_block:{dt_local.strftime("%a %H:%M")}:{exact_reason}'
-            if bool(globals().get('AUTOTRADE_DTS_MONDAY_ASIA_TONE_FILTER', True)) and wd == 0 and sess == 'ASIA':
+            if bool(globals().get('AUTOTRADE_DTS_MONDAY_ASIA_TONE_FILTER', False)) and wd == 0 and sess == 'ASIA':
                 market_green, market_reason = _autotrade_market_broad_green_from_pulse()
                 if side == 'BUY' and not market_green and not exact_ok:
                     return False, f'dts_prior_monday_asia_buy_block_market_not_green:{market_reason}:{exact_reason}'
@@ -40526,7 +40529,7 @@ def _setup_assumptions_text(uid: int) -> str:
             '3) Live sync assumptions',
             '• /screen, setup email and AutoTrade use the same shared live gate.',
             f'• User-visible WATCH allowed: {"YES" if _user_visible_allow_watch_policy("screen") else "NO"}; AutoTrade WATCH allowed: {"YES" if _autotrade_allow_watch_policy() else "NO"}.',
-            '• AutoTrade can still skip a visible KEEP setup for duplicate symbol, safe leverage, blocked symbol, risk-cap, stale entry-window or Bybit rejection.',
+            '• AutoTrade can still skip a visible KEEP setup for duplicate symbol, safe leverage, temporary rolling symbol guard, risk-cap, stale entry-window or Bybit rejection.',
             '',
             '4) Dynamic day/time/session assumptions',
             '• No permanent Friday/Sunday/Monday fixed rule is applied by default.',
@@ -40542,9 +40545,9 @@ def _setup_assumptions_text(uid: int) -> str:
             lines.append('• Current weak day/time/session contexts: none strong enough to block.')
         lines.extend(['', '5) Current micro-edge assumptions'])
         if symbol_blocks:
-            lines.append('• Blocked symbols from rolling evidence: ' + ', '.join(list(symbol_blocks.keys())[:12]))
+            lines.append('• Temporary blocked symbols from rolling evidence, max 24h: ' + ', '.join(list(symbol_blocks.keys())[:12]))
         else:
-            lines.append('• Blocked symbols from rolling evidence: none')
+            lines.append('• Temporary blocked symbols from rolling evidence, max 24h: none')
         if weak_hours:
             lines.append('• Weak Melbourne hour evidence snapshot:')
             for k, m in weak_hours[:6]:
@@ -41927,7 +41930,6 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = {'true' if bool(summary.get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)) else 'false'}",
             f"AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK = {'true' if bool(summary.get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)) else 'false'}",
             f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED = {'true' if bool(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT = {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)):.2f}",
             f"AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) else 'false'}",
             f"AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED = {'true' if bool(summary.get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_STRICT_KEEP_EDGE_ENABLED = {'true' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)) else 'false'}",
@@ -41978,7 +41980,6 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true",
             "• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK true",
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true",
-            "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
             "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true   (diagnostic overlay; current KEEP policy still controls live entries)",
@@ -42036,7 +42037,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY',
         'AUTOTRADE_STRICT_TPSL_ONLY', 'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL',
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
-        'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT',
+        'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED',
         'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED',
         'AUTOTRADE_ALLOW_WATCH_POLICY', 'USER_VISIBLE_ALLOW_WATCH_POLICY',
         'AUTOTRADE_TP_RR_CAP_ENABLED', 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED', 'AUTOTRADE_DYNAMIC_TP_BASE_RR', 'AUTOTRADE_MAX_LIVE_RR', 'AUTOTRADE_MIN_LIVE_RR',
@@ -42195,9 +42196,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             globals()['AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED'] = bool(val)
             _autotrade_config_set(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT':
-            val = max(0.0, min(100.0, float(value_raw)))
-            globals()['AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT'] = float(val)
-            _autotrade_config_set(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY, val)
+            await update.message.reply_text('ℹ️ AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT is no longer configurable from Telegram. Use the daily/open risk-cap controls instead.')
+            return
         elif key == 'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE'] = bool(val)
@@ -50464,7 +50464,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v165:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v166:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50483,7 +50483,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v165:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v166:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -50533,7 +50533,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v165:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v166:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50551,7 +50551,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v165:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v166:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50928,7 +50928,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v165:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v166:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50954,7 +50954,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v165:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v166:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -50973,7 +50973,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v165:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v166:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -51004,7 +51004,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v165:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v166:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51478,7 +51478,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v165:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v166:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51503,7 +51503,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v165:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v166:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -51521,7 +51521,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v165:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v166:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51546,7 +51546,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v165:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v166:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55655,7 +55655,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v165:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v166:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55675,7 +55675,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v165:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v166:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55696,7 +55696,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v165:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v166:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -58938,6 +58938,95 @@ def _resolve_same_symbol_setup_conflicts(setups: list, session_name: str = '', u
         return list(setups or [])
 
 
+
+def _setup_merge_unique_candidates(primary: list, extra: list, session_name: str = '', user_id: int = 0, *, limit: int = 60) -> list:
+    """Merge setup candidates without losing recent actionable KEEP rows.
+
+    yver166: a setup can become Policy=KEEP in /setup_audit while not being present in
+    the in-memory email pool because the scheduler was busy or a per-user fan-out was
+    skipped.  Merge recent DB/generated candidates into the email lane every cycle,
+    not only when the normal pool is empty.  Presend gates still decide final delivery.
+    """
+    out = []
+    seen = set()
+    for s0 in list(primary or []) + list(extra or []):
+        if s0 is None:
+            continue
+        try:
+            sid = str(getattr(s0, 'setup_id', '') or getattr(s0, 'id', '') or '').strip()
+            sym = str(getattr(s0, 'symbol', '') or '').upper().strip()
+            side = str(getattr(s0, 'side', '') or '').upper().strip()
+            entry = round(float(getattr(s0, 'entry', 0.0) or 0.0), 8)
+            sl = round(float(getattr(s0, 'sl', 0.0) or 0.0), 8)
+            tp = round(float(_setup_target_tp(s0, 0.0) or 0.0), 8)
+            key = sid or f'{sym}:{side}:{entry}:{sl}:{tp}'
+        except Exception:
+            key = str(id(s0))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s0)
+        if len(out) >= int(limit or 60):
+            break
+    return out
+
+
+def _setup_recent_actionable_recovery_candidates(user_id: int, session_name: str, *, max_age_min: int | None = None, limit: int = 48) -> list:
+    """Recent setup objects that may be missing from the email pool but are still actionable.
+
+    Sources are intentionally broad (executable_setups + recent generated/candidate rows),
+    but every row is re-routed and re-checked by the same executable + KEEP policy gates
+    before it can be emailed or AutoTraded.
+    """
+    try:
+        uid = int(user_id or 0)
+        sess = str(session_name or '').upper().strip()
+        if max_age_min is None:
+            max_age_min = _setup_email_actionable_queue_window_min()
+        ts_from = float(time.time()) - max(60.0, float(max_age_min or 60) * 60.0)
+        merged = []
+        # Per-user executable queue.
+        try:
+            rows = db_list_executable_setups(uid, session_name=sess, ts_from=ts_from, limit=max(12, int(limit or 48)))
+            merged = _setup_merge_unique_candidates(merged, _executable_rows_to_setup_objects(list(rows or []), session_name=sess), session_name=sess, user_id=uid, limit=limit)
+        except Exception:
+            pass
+        # Shared executable queue.
+        try:
+            rows0 = db_list_executable_setups(0, session_name=sess, ts_from=ts_from, limit=max(12, int(limit or 48)))
+            merged = _setup_merge_unique_candidates(merged, _executable_rows_to_setup_objects(list(rows0 or []), session_name=sess), session_name=sess, user_id=uid, limit=limit)
+        except Exception:
+            pass
+        # Recent generated/candidate rows.
+        try:
+            recent = _db_recent_candidate_setup_objects(uid, session_name=sess, max_age_min=int(max_age_min or 60), limit=max(12, int(limit or 48)))
+            merged = _setup_merge_unique_candidates(merged, list(recent or []), session_name=sess, user_id=uid, limit=limit)
+        except Exception:
+            pass
+        out = []
+        reasons = Counter()
+        for cand in list(merged or []):
+            try:
+                eff = _setup_route_candidate_for_executable_lane(cand, sess, uid)
+                ok, why = is_executable_setup_eligible(eff, session_name=sess)
+                if not ok:
+                    reasons[str(why or 'not_executable')] += 1
+                    continue
+                pol_ok, pol_why, pol_meta = _setup_user_visible_keep_policy_allows(eff, session_name=sess, user_id=uid, lane='email_recovery')
+                if not pol_ok:
+                    reasons[str(pol_why or 'policy_not_allowed')] += 1
+                    continue
+                out.append(eff)
+            except Exception as exc:
+                reasons[f'recovery_exception:{type(exc).__name__}'] += 1
+        try:
+            db_log_setup_pipeline_event(uid, stage='email_keep_recovery_candidates', status='ok' if out else 'empty', session=sess, mode='email', details={'input': len(merged or []), 'eligible': len(out), 'top_reasons': _pipeline_top_reasons(reasons, 6)})
+        except Exception:
+            pass
+        return list(out or [])
+    except Exception:
+        return []
+
 def _recent_stronger_same_symbol_delivery_exists(user_id: int, setup, session_name: str = '', max_age_min: int | None = None) -> tuple[bool, str]:
     """Return True when a recent emailed setup for the same symbol has stronger exact-lane evidence.
 
@@ -60729,6 +60818,28 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             else:
                 eligible = []
 
+            # yver166: always merge recent actionable KEEP rows, not only when the
+            # normal pool is empty. This fixes cases where /setup_audit shows a fresh
+            # Policy=KEEP row (e.g. SUI F2-ASIA-REV-BUY) but no email/autotrade was
+            # triggered because the in-memory pool or per-user fan-out missed it.
+            if str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
+                try:
+                    recovery_always = _setup_recent_actionable_recovery_candidates(
+                        int(uid),
+                        session_name=str(sess_name or ''),
+                        max_age_min=_setup_email_actionable_queue_window_min(),
+                        limit=max(int(EMAIL_SETUPS_N) * 8, 24),
+                    )
+                except Exception:
+                    recovery_always = []
+                if recovery_always:
+                    before_n = len(eligible or [])
+                    eligible = _setup_merge_unique_candidates(list(eligible or []), list(recovery_always or []), session_name=str(sess_name or ''), user_id=int(uid), limit=max(int(EMAIL_SETUPS_N) * 12, 48))
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_keep_recovery_merge', status='ok', session=str(sess_name or ''), mode='email', details={'before': before_n, 'recovery': len(recovery_always or []), 'after': len(eligible or [])})
+                    except Exception:
+                        pass
+
             if (not eligible) and str(sess_name or '').upper() in {'ASIA', 'LON', 'NY'}:
                 try:
                     recent_candidates = _db_recent_candidate_setup_objects(
@@ -60799,13 +60910,29 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     return 0.0
 
+            def _live_email_policy_rank(_s: Setup) -> int:
+                try:
+                    info = _setup_combo_policy_lookup_for_setup(_s, session_name=str(sess_name or ''), user_id=int(uid)) or {}
+                    st = _setup_policy_effective_status(str(info.get('status') or '').upper().strip(), found=bool(info.get('found')))
+                    return {'KEEP': 3, 'GATE': 2, 'WATCH': 1}.get(st, 0)
+                except Exception:
+                    return 0
+
+            def _live_email_fresh_ts(_s: Setup) -> float:
+                try:
+                    return float(getattr(_s, 'executable_ts', 0.0) or getattr(_s, 'created_ts', 0.0) or getattr(_s, 'signal_created_ts', 0.0) or 0.0)
+                except Exception:
+                    return 0.0
+
             eligible = sorted(
                 eligible,
                 key=lambda _s: (
+                    _live_email_policy_rank(_s),
                     float(getattr(_s, "quality_score", 0.0) or 0.0),
                     int(getattr(_s, "conf", 0) or 0),
                     _rr3(_s),
                     float(getattr(_s, "fut_vol_usd", 0.0) or 0.0),
+                    _live_email_fresh_ts(_s),
                 ),
                 reverse=True,
             )
