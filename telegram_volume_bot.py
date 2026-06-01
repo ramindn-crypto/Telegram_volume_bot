@@ -1,4 +1,5 @@
 # yver165: final deployment hardening for yver164; bumps heavy admin cache namespace to avoid stale v161 results and disables fixed day/time prior flags by default; no trading/risk changes.
+# yver167: hardens final KEEP delivery recovery: setup-email scans recent /setup_audit actionable KEEP rows as a last-mile source, prioritises unemailed KEEP rows, and exposes recovery diagnostics so Policy=KEEP rows are not silently missed.
 # yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
 # yver163: day-time-session live guard from ver161 baseline; ignores ver162 liquidity/soft-stop changes; synced /screen setup-email AutoTrade context gate; Monday pre-ASIA, Monday ASIA market-tone, and Saturday pre-ASIA directional filters.
 # yver161: final sync hardening for Monday audit: delivered/AutoTraded setup IDs are preserved in /setup_audit instead of daily de-duping them away; BigMove/F8 setup-email rows hydrate /screen from executable_setups even when signals metadata is missing; Bybit-verified AutoTrade TP/SL can override candle-audit for traded rows; weekly policy catch-up window/retry hardened; admin cache namespace bumped.
@@ -50464,7 +50465,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v166:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v167:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50483,7 +50484,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v166:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v167:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -50533,7 +50534,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v166:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v167:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50551,7 +50552,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v166:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v167:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50928,7 +50929,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v166:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v167:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50954,7 +50955,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v166:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v167:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -50973,7 +50974,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v166:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v167:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -51004,7 +51005,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v166:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v167:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51478,7 +51479,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v166:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v167:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51503,7 +51504,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v166:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v167:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -51521,7 +51522,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v166:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v167:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51546,7 +51547,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v166:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v167:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55655,7 +55656,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v166:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v167:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55675,7 +55676,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v166:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v167:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55696,7 +55697,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v166:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v167:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -58971,6 +58972,173 @@ def _setup_merge_unique_candidates(primary: list, extra: list, session_name: str
     return out
 
 
+
+def _setup_audit_rows_to_recovery_setup_objects(rows: list, session_name: str = '', user_id: int = 0) -> list:
+    """Hydrate recent /setup_audit rows back into setup-like objects for last-mile email recovery.
+
+    yver167: /setup_audit is the owner's visible truth for current Policy.  If it says
+    a fresh row is KEEP but the normal executable/email pool missed it, setup email
+    must still be able to recover it and then trigger AutoTrade through the normal
+    email-locked path.  These objects still pass is_executable_setup_eligible() and
+    _setup_user_visible_keep_policy_allows() before any email is sent.
+    """
+    from types import SimpleNamespace
+    out = []
+    try:
+        sess_default = str(session_name or '').upper().strip()
+        for row in list(rows or []):
+            try:
+                rr = _setup_audit_payload_from_row(dict(row or {}))
+                sid = str(rr.get('setup_id') or '').strip()
+                if not sid:
+                    continue
+                sess = str(rr.get('session') or rr.get('source_session') or sess_default or '').upper().strip()
+                if sess_default and sess and sess != sess_default:
+                    continue
+                sym_lin = str(_bybit_linear_symbol(rr.get('symbol') or '')).upper().strip()
+                sym_base = _symbol_base(sym_lin)
+                side = str(rr.get('side') or '').upper().strip()
+                entry = float(rr.get('entry') or 0.0)
+                sl = float(rr.get('sl') or 0.0)
+                tp = float(rr.get('tp') or 0.0)
+                if side not in {'BUY', 'SELL'} or not sym_base or entry <= 0 or sl <= 0 or tp <= 0:
+                    continue
+                created_ts = float(_setup_audit_row_ts(rr) or 0.0)
+                family_id = str(_setup_audit_family_from_row(rr) or '').upper().replace('-', '_')
+                item = SimpleNamespace(
+                    setup_id=sid,
+                    id=sid,
+                    symbol=str(sym_base or sym_lin).upper().strip(),
+                    market_symbol=str(rr.get('market_symbol') or _market_symbol_from_base(sym_lin) or '').strip(),
+                    side=side,
+                    conf=int(float(rr.get('conf') or 0)),
+                    entry=entry,
+                    sl=sl,
+                    tp=tp,
+                    alt_target_a=0.0,
+                    alt_target_b=0.0,
+                    fut_vol_usd=float(rr.get('fut_vol_usd') or 0.0),
+                    ch24=float(rr.get('ch24') or 0.0),
+                    ch4=float(rr.get('ch4') or 0.0),
+                    ch1=float(rr.get('ch1') or 0.0),
+                    ch15=float(rr.get('ch15') or 0.0),
+                    quality_score=float(rr.get('quality_score') or rr.get('exec_score') or 0.0),
+                    atr_pct=float(rr.get('atr_pct') or 0.0),
+                    engine=str(rr.get('engine') or '').upper().strip(),
+                    pullback_ready=bool(int(float(rr.get('pullback_ready') or 0))),
+                    pullback_bypass_hot=bool(int(float(rr.get('pullback_bypass_hot') or 0))),
+                    pullback_ema_dist_pct=float(rr.get('pullback_ema_dist_pct') or 0.0),
+                    ema_support_period=int(float(rr.get('ema_support_period') or 0)),
+                    ema_support_dist_pct=float(rr.get('ema_support_dist_pct') or 0.0),
+                    created_ts=created_ts,
+                    signal_created_ts=float(rr.get('signal_created_ts') or created_ts or 0.0),
+                    executable_ts=float(rr.get('executable_ts') or rr.get('ts') or created_ts or 0.0),
+                    email_logged_ts=0.0,
+                    generated_logged_ts=0.0,
+                    source_kind='setup_audit_recovery',
+                    source_session=sess,
+                    session=sess,
+                    family_id=family_id,
+                    family_version=str(rr.get('family_version') or RESEARCH_FAMILY_VERSION),
+                    regime_id=str(rr.get('regime_id') or ''),
+                    regime_primary=str(rr.get('regime_primary') or ''),
+                    allocator_plan_id=str(rr.get('allocator_plan_id') or ''),
+                    param_set_id=str(rr.get('param_set_id') or ''),
+                    family_score=float(rr.get('family_score') or 0.0),
+                    exec_score=float(rr.get('exec_score') or 0.0),
+                    validation_state=str(rr.get('validation_state') or 'approved'),
+                    challenger_flag=bool(int(float(rr.get('challenger_flag') or 0))),
+                    setup_strategy=str(rr.get('setup_strategy') or rr.get('strategy') or _setup_strategy_label(rr)),
+                    strategy=str(rr.get('setup_strategy') or rr.get('strategy') or _setup_strategy_label(rr)),
+                    strategy_mode=str(rr.get('setup_strategy') or rr.get('strategy') or _setup_strategy_label(rr)),
+                    strategy_reason=str(rr.get('strategy_reason') or 'setup_audit_recovery'),
+                    original_setup_id=str(rr.get('original_setup_id') or ''),
+                    original_side=str(rr.get('original_side') or ''),
+                    delivery_lane_locked=True,
+                )
+                try:
+                    item = _research_finalize_setup(item, session_name=sess)
+                except Exception:
+                    pass
+                out.append(item)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return out
+
+
+def _setup_recent_audit_actionable_recovery_candidates(user_id: int, session_name: str, *, max_age_min: int | None = None, limit: int = 48) -> list:
+    """Last-mile recovery from /setup_audit's current actionable KEEP rows.
+
+    This is intentionally conservative: it only returns rows whose own /setup_audit
+    Policy label is currently KEEP/WATCH and whose AT lifecycle is not already SENT/
+    AT_OPEN/AT_CLOSED.  The returned objects are still rechecked by the normal
+    presend executable + shared live gate before delivery.
+    """
+    try:
+        uid = int(user_id or 0)
+        sess = str(session_name or '').upper().strip()
+        if max_age_min is None:
+            max_age_min = _setup_email_actionable_queue_window_min()
+        hours = max(1, int(math.ceil(float(max_age_min or 60) / 60.0)) + 1)
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_candidates = []
+        for v in (uid, owner_uid, 0):
+            try:
+                vi = int(v or 0)
+                if vi >= 0 and vi not in uid_candidates:
+                    uid_candidates.append(vi)
+            except Exception:
+                pass
+        rows_all = []
+        for u in uid_candidates:
+            try:
+                rows_all.extend(_setup_audit_load_rows(int(u), hours=hours, limit=max(0, int(limit or 48)), dedup=True, source_mode_override='EXECUTABLE') or [])
+            except Exception:
+                continue
+        if not rows_all:
+            return []
+        out_rows = []
+        reasons = Counter()
+        seen = set()
+        for r0 in list(rows_all or []):
+            try:
+                r = _setup_audit_payload_from_row(dict(r0 or {}))
+                sid = str(r.get('setup_id') or '').strip()
+                sym = str(_symbol_base(r.get('symbol') or '')).upper().strip()
+                side = str(r.get('side') or '').upper().strip()
+                key = sid or f'{sym}:{side}:{float(r.get("entry") or 0.0):.8f}:{float(r.get("sl") or 0.0):.8f}:{float(r.get("tp") or 0.0):.8f}'
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                if sess and str(r.get('session') or r.get('source_session') or '').upper().strip() != sess:
+                    reasons['session_mismatch'] += 1
+                    continue
+                if not _setup_audit_row_inside_delivery_window(r):
+                    reasons['outside_delivery_window'] += 1
+                    continue
+                pol = _setup_audit_policy_label(r, uid=uid, session_name=sess or str(r.get('session') or ''), side=side)
+                if pol not in {'KEEP', 'WATCH'}:
+                    reasons[f'policy_{pol or "OFF"}'] += 1
+                    continue
+                at_state = _setup_audit_autotrade_state_for_row(r, owner_uid=owner_uid or uid)
+                if str(at_state or '-').upper().strip() not in {'', '-', 'NONE'}:
+                    reasons[f'already_{at_state}'] += 1
+                    continue
+                out_rows.append(r)
+            except Exception as exc:
+                reasons[f'audit_recovery_exception:{type(exc).__name__}'] += 1
+                continue
+        out = _setup_audit_rows_to_recovery_setup_objects(out_rows, session_name=sess, user_id=uid)
+        try:
+            db_log_setup_pipeline_event(uid, stage='email_audit_keep_recovery_candidates', status='ok' if out else 'empty', session=sess, mode='email', details={'input': len(rows_all or []), 'eligible': len(out), 'top_reasons': _pipeline_top_reasons(reasons, 8)})
+        except Exception:
+            pass
+        return list(out or [])[:max(1, int(limit or 48))]
+    except Exception:
+        return []
+
 def _setup_recent_actionable_recovery_candidates(user_id: int, session_name: str, *, max_age_min: int | None = None, limit: int = 48) -> list:
     """Recent setup objects that may be missing from the email pool but are still actionable.
 
@@ -60837,6 +61005,26 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     eligible = _setup_merge_unique_candidates(list(eligible or []), list(recovery_always or []), session_name=str(sess_name or ''), user_id=int(uid), limit=max(int(EMAIL_SETUPS_N) * 12, 48))
                     try:
                         db_log_setup_pipeline_event(int(uid), stage='email_keep_recovery_merge', status='ok', session=str(sess_name or ''), mode='email', details={'before': before_n, 'recovery': len(recovery_always or []), 'after': len(eligible or [])})
+                    except Exception:
+                        pass
+                # yver167: if /setup_audit itself shows a fresh Policy=KEEP row with AT=-,
+                # recover that exact row too. This closes the remaining gap where an
+                # executable/audit row was visible as actionable but never reached the
+                # setup-email queue, so AutoTrade could not attempt it.
+                try:
+                    audit_recovery = _setup_recent_audit_actionable_recovery_candidates(
+                        int(uid),
+                        session_name=str(sess_name or ''),
+                        max_age_min=_setup_email_actionable_queue_window_min(),
+                        limit=max(int(EMAIL_SETUPS_N) * 8, 24),
+                    )
+                except Exception:
+                    audit_recovery = []
+                if audit_recovery:
+                    before_n2 = len(eligible or [])
+                    eligible = _setup_merge_unique_candidates(list(eligible or []), list(audit_recovery or []), session_name=str(sess_name or ''), user_id=int(uid), limit=max(int(EMAIL_SETUPS_N) * 12, 48))
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_audit_keep_recovery_merge', status='ok', session=str(sess_name or ''), mode='email', details={'before': before_n2, 'recovery': len(audit_recovery or []), 'after': len(eligible or [])})
                     except Exception:
                         pass
 
