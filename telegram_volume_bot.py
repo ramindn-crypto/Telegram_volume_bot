@@ -1,3 +1,4 @@
+# ver03: small stability tuning over ver01: recovery job is throttled/hard-timed, Telegram fast-reply network noise is debug-only, and /screen rebuild notice uses fail-fast send.
 # yver171: major responsiveness/sync patch: fail-fast Telegram replies, no auto-posting huge admin reports, exact emailed setups are authoritative for AutoTrade, and duplicate setup-id re-entry is blocked.
 # ver01: emergency responsiveness and sync fix: no incomplete admin previews, no cached quick /screen snapshots, bounded screen refresh, and full setup_matrix/audit posts.
 # yver165: final deployment hardening for yver164; bumps heavy admin cache namespace to avoid stale v161 results and disables fixed day/time prior flags by default; no trading/risk changes.
@@ -27718,7 +27719,7 @@ async def _telegram_reply_text_fast(message, text, **kwargs):
         return None
     except (TimedOut, NetworkError, RetryAfter) as exc:
         try:
-            logger.info('Telegram fast reply failed (network): %s', exc)
+            logger.debug('Telegram fast reply failed (network): %s', exc)
         except Exception:
             pass
         return None
@@ -27726,7 +27727,7 @@ async def _telegram_reply_text_fast(message, text, **kwargs):
         msg = str(exc or '').lower()
         if ('timeout' in msg) or ('connecttimeout' in msg) or ('connect timeout' in msg) or ('timed out' in msg):
             try:
-                logger.info('Telegram fast reply failed (timeout): %s', exc)
+                logger.debug('Telegram fast reply failed (timeout): %s', exc)
             except Exception:
                 pass
             return None
@@ -58446,7 +58447,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ver01: do not show the quick ticker placeholder. It looked like a frozen
         # /screen result and hid the fact that the executable scan had not completed.
-        await update.message.reply_text("⏳ Full /screen executable scan is rebuilding. Please try /screen again in a moment.")
+        await _telegram_reply_text_fast(update.message, "⏳ Full /screen executable scan is rebuilding. Please try /screen again in a moment.")
         return
     except Exception as e:
         try:
@@ -60046,8 +60047,11 @@ EMAIL_SEND_TIMEOUT_SEC = max(6, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "8"
 # time to finish one small owner/session cycle.
 ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "70"))
 SETUP_EMAIL_RECOVERY_JOB_ENABLED = env_bool("SETUP_EMAIL_RECOVERY_JOB_ENABLED", True)
-SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "90") or 90)
-SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "25") or 25)
+# ver03: recovery is a fallback lane, not the main scanner. Run it less often and
+# hard-time it so it cannot cause APScheduler max_instances warnings or UI lag.
+SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "300") or 300)
+SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "75") or 75)
+SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC", "22") or 22)
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
@@ -64152,6 +64156,33 @@ async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def setup_email_recovery_job_runner(context: ContextTypes.DEFAULT_TYPE):
+    """Timed wrapper for setup_email_recovery_job.
+
+    ver03: the recovery lane is useful, but it must never occupy the scheduler for
+    several minutes. If it cannot finish quickly, skip and retry on the next cycle.
+    The main alert job remains the primary setup-email engine.
+    """
+    try:
+        timeout = max(8.0, float(globals().get('SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC', 22) or 22))
+    except Exception:
+        timeout = 22.0
+    try:
+        await asyncio.wait_for(setup_email_recovery_job(context), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            logger.info('setup_email_recovery_job skipped: timed out after %ss (will retry later)', int(timeout))
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        try:
+            logger.warning('setup_email_recovery_job_runner failed: %s: %s', type(e).__name__, e)
+        except Exception:
+            pass
+
+
 async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
     # yver171: hard-cap the detached email engine. Threaded CCXT/SMTP calls can
     # outlive asyncio.wait_for(), but the coroutine must release ALERT_LOCK quickly
@@ -64493,11 +64524,11 @@ def main():
         # KEEP rows and sends the matching setup email + AutoTrade queue.
         if bool(globals().get('SETUP_EMAIL_RECOVERY_JOB_ENABLED', True)):
             try:
-                _rec_interval = max(60, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 90) or 90))
+                _rec_interval = max(300, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 300) or 300))
                 app.job_queue.run_repeating(
-                    setup_email_recovery_job,
+                    setup_email_recovery_job_runner,
                     interval=_rec_interval,
-                    first=max(10, min(int(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 25) or 25), _rec_interval // 2)),
+                    first=max(45, min(int(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 75) or 75), _rec_interval // 2)),
                     name="setup_email_recovery_job",
                     job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
                 )
