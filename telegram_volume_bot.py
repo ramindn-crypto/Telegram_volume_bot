@@ -1,7 +1,7 @@
 # yver171: major responsiveness/sync patch: fail-fast Telegram replies, no auto-posting huge admin reports, exact emailed setups are authoritative for AutoTrade, and duplicate setup-id re-entry is blocked.
+# ver01: emergency responsiveness and sync fix: no incomplete admin previews, no cached quick /screen snapshots, bounded screen refresh, and full setup_matrix/audit posts.
 # yver165: final deployment hardening for yver164; bumps heavy admin cache namespace to avoid stale v161 results and disables fixed day/time prior flags by default; no trading/risk changes.
 # yver168: makes current Reco=KEEP authoritative for live policy immediately: /setup_matrix policy, enforceable lookup, screen/email/AutoTrade now promote Reco KEEP lanes (e.g. F1-LON-NOR-BUY, F8-NY-NOR-BUY) to Policy KEEP using latest score evidence, while preserving shared gates.
-# yver173: final speed/sync patch: recovery job is hard-timeout wrapped, alert job no longer waits minutes before setup-email lane, scheduler intervals are calmer, and setup email/AutoTrade consume the same recent executable email-authorised rows.
 # yver172: major responsiveness/email-recovery patch: adds independent DB-first setup-email recovery job, completes alert pipeline without premature hard-timeout, uses email executor for SMTP, and keeps heavy report previews non-blocking.
 # yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
 # yver163: day-time-session live guard from ver161 baseline; ignores ver162 liquidity/soft-stop changes; synced /screen setup-email AutoTrade context gate; Monday pre-ASIA, Monday ASIA market-tone, and Saturday pre-ASIA directional filters.
@@ -15013,7 +15013,6 @@ HDR = "━━━━━━━━━━━━━━━━━━━━"
 SEP = "────────────────────"
 
 ALERT_LOCK = asyncio.Lock()
-SETUP_EMAIL_RECOVERY_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
@@ -50743,7 +50742,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v173:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v172:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50762,7 +50761,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v173:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v172:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -50812,7 +50811,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v173:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v172:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50830,7 +50829,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v173:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v172:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50995,7 +50994,8 @@ async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
 # if full cached reports should be sent immediately again.
 ADMIN_REPORT_FAST_CACHE_MAX_CHARS = int(os.environ.get("ADMIN_REPORT_FAST_CACHE_MAX_CHARS", "3200") or 3200)
 ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE = env_bool("ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE", False)
-ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE = env_bool("ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE", False)
+ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE = env_bool("ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE", True)
+ADMIN_REPORT_NO_INCOMPLETE_PREVIEWS = env_bool("ADMIN_REPORT_NO_INCOMPLETE_PREVIEWS", True)
 
 
 def _admin_report_cached_preview(title: str, text: str, age: float | None, *, fresh: bool, started: bool) -> str:
@@ -51091,14 +51091,8 @@ async def _admin_report_background_refresh(
                 limit = int(globals().get('ADMIN_REPORT_FAST_CACHE_MAX_CHARS', 3200) or 3200)
             except Exception:
                 limit = 3200
-            # yver170: never auto-post huge reports from a background task. They were
-            # the main source of Telegram/httpx timeouts and made unrelated commands feel
-            # frozen. Cache the full text, then post a short fresh preview only.
-            if len(str(text or '')) > max(1200, limit):
-                preview = _admin_report_cached_preview(str(title or 'report'), text, 0, fresh=True, started=False)
-                await _telegram_reply_text_fast(update.message, preview, parse_mode=None, disable_web_page_preview=True)
-            else:
-                await send_long_message(update, header_plain + "\n" + SEP + "\n" + text, parse_mode=None, disable_web_page_preview=True)
+            # ver01: no incomplete previews. Always post the full fresh report in chunks.
+            await send_long_message(update, header_plain + "\n" + SEP + "\n" + text, parse_mode=parse_mode, disable_web_page_preview=True)
     except Exception as e:
         try:
             await _telegram_reply_text_fast(
@@ -51160,44 +51154,27 @@ async def _send_cached_or_queue_admin_report(
 
     fresh, age = _admin_report_cache_get_with_age(cache_key, fresh_ttl)
     if fresh:
-        is_long = len(str(fresh or '')) > int(globals().get('ADMIN_REPORT_FAST_CACHE_MAX_CHARS', 3200) or 3200)
-        if is_long and not bool(globals().get('ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE', False)):
-            started = _start_refresh_if_needed() if bool(globals().get('ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE', True)) else False
-            await _telegram_reply_text_fast(
-                update.message,
-                _admin_report_cached_preview(title_s, fresh, age, fresh=True, started=started),
-                parse_mode=None,
-                disable_web_page_preview=True,
-            )
-        else:
-            await send_long_message(update, fresh, parse_mode=pm, disable_web_page_preview=True)
+        # ver01: no truncated cached previews. Fresh complete cache is safe to show.
+        await send_long_message(update, fresh, parse_mode=pm, disable_web_page_preview=True)
         return
 
     stale, stale_age = _admin_report_cache_get_with_age(cache_key, stale_ttl)
     started = _start_refresh_if_needed()
 
-    if stale:
-        is_long = len(str(stale or '')) > int(globals().get('ADMIN_REPORT_FAST_CACHE_MAX_CHARS', 3200) or 3200)
-        if is_long and not bool(globals().get('ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE', False)):
-            await _telegram_reply_text_fast(
-                update.message,
-                _admin_report_cached_preview(title_s, stale, stale_age, fresh=False, started=started),
-                parse_mode=None,
-                disable_web_page_preview=True,
-            )
-        else:
-            note = (
-                f"⚡ <b>Latest cached result:</b> {html.escape(title_s)} "
-                f"(age {html.escape(_admin_report_age_text(stale_age))}). "
-                f"Fresh rebuild {'started in background' if started else 'already running in background'}.\n{SEP}\n"
-            )
-            await send_long_message(update, note + stale, parse_mode=pm, disable_web_page_preview=True)
+    if stale and bool(globals().get('ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE', False)):
+        note = (
+            f"⚡ <b>Latest complete cached result:</b> {html.escape(title_s)} "
+            f"(age {html.escape(_admin_report_age_text(stale_age))}). "
+            f"Fresh rebuild {'started in background' if started else 'already running in background'}.\n{SEP}\n"
+        )
+        await send_long_message(update, note + stale, parse_mode=pm, disable_web_page_preview=True)
         return
 
+    # ver01: no incomplete preview. Only a short acknowledgement; the background
+    # task will post the complete result.
     await _telegram_reply_text_fast(
         update.message,
-        f"⏳ {title_s} is heavy. No cached result yet. Fresh rebuild "
-        f"{'started in background' if started else 'is already running in background'}; I will post it here when ready.",
+        f"⏳ Building full {title_s} now. I will post the complete result when ready.",
         parse_mode=None,
         disable_web_page_preview=True,
     )
@@ -51219,7 +51196,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v173:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v172:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -51245,7 +51222,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v173:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v172:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -51264,7 +51241,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v173:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v172:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -51295,7 +51272,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v173:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v172:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51769,7 +51746,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v173:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v172:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51794,7 +51771,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v173:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v172:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -51812,7 +51789,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v173:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v172:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51837,7 +51814,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v173:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v172:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55946,7 +55923,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v173:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v172:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55966,7 +55943,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v173:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v172:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55987,7 +55964,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v173:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v172:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -57329,6 +57306,21 @@ def _screen_body_has_trade_setups(body: str) -> bool:
         return False
 
 
+
+def _screen_body_is_incomplete_snapshot(body: str) -> bool:
+    """True when /screen body is only a quick ticker/warmup placeholder, not a real screen cache."""
+    try:
+        low = str(body or '').lower()
+        return (
+            'executable scan is warming up' in low
+            or 'quick ticker snapshot' in low
+            or 'full executable scan warms up' in low
+            or 'a full executable-family refresh has been queued' in low
+            or 'no confirmed setup shown from the quick ticker snapshot' in low
+        )
+    except Exception:
+        return False
+
 def _screen_cache_put(cache_key: str, body: str, kb: list | None = None, ts: float | None = None, allow_empty_overwrite: bool = False) -> bool:
     """Write /screen cache without letting an empty refresh erase a useful recent setup view.
 
@@ -57341,6 +57333,14 @@ def _screen_cache_put(cache_key: str, body: str, kb: list | None = None, ts: flo
             return False
         body_s = str(body or '')
         now_ts = float(ts or time.time())
+        # ver01: never cache quick ticker/warmup placeholders. They made /screen
+        # look frozen because every user command kept receiving the same non-final snapshot.
+        if _screen_body_is_incomplete_snapshot(body_s):
+            try:
+                db_log_setup_pipeline_event(0, stage='screen_cache_put', status='skip_incomplete_snapshot', session=str(key).split('::')[-1], mode='screen', details={})
+            except Exception:
+                pass
+            return False
         new_has = _screen_body_has_trade_setups(body_s)
         old = _SCREEN_CACHE.get(key) or {}
         old_body = str(old.get('body') or '')
@@ -58444,29 +58444,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Last-resort instant ticker snapshot from cached tickers. Do NOT cache it as a
-        # full scan, otherwise it suppresses the next real rebuild for MAX_STALE_SCAN_SEC.
-        try:
-            quick_best = get_cached_futures_tickers() or {}
-            if quick_best:
-                body, kb, _ = _screen_quick_ticker_snapshot_body(quick_best, scan_session)
-                header = (
-                    f"*PulseFutures — Market Scan*\n"
-                    f"{HDR}\n"
-                    f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                    f"{_screen_when_line('Ticker snapshot', time.time())}"
-                    f"_Showing instant ticker snapshot while full executable scan warms up._\n"
-                )
-                await send_long_message(
-                    update,
-                    _screen_markdown_to_html((header + "\n" + body).strip()),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-                return
-        except Exception:
-            pass
-        await update.message.reply_text("🔎 /screen cache is warming up. Fresh scan is queued in the dedicated screen lane — run /screen again shortly.")
+        # ver01: do not show the quick ticker placeholder. It looked like a frozen
+        # /screen result and hid the fact that the executable scan had not completed.
+        await update.message.reply_text("⏳ Full /screen executable scan is rebuilding. Please try /screen again in a moment.")
         return
     except Exception as e:
         try:
@@ -60057,28 +60037,25 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
-EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "4"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "8"))
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "6"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "12"))
 EMAIL_SEND_TIMEOUT_SEC = max(6, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "8") or 8))
 # yver172: the alert pipeline runs in the background; killing it after 20–25s
 # prevented the session email pool from completing, so no setup emails were sent.
 # Keep Telegram command replies fast separately, but allow the email engine enough
 # time to finish one small owner/session cycle.
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "22"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "70"))
 SETUP_EMAIL_RECOVERY_JOB_ENABLED = env_bool("SETUP_EMAIL_RECOVERY_JOB_ENABLED", True)
-# yver173: this job must be short; it is a last-mile DB consumer, not a scanner.
-SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "180") or 180)
-SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "45") or 45)
-SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC", "14") or 14)
-SETUP_EMAIL_RECOVERY_DISABLE_WHEN_ALERT_RUNNING = env_bool("SETUP_EMAIL_RECOVERY_DISABLE_WHEN_ALERT_RUNNING", True)
+SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "90") or 90)
+SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "25") or 25)
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
-AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "300") or 300)
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "600") or 600)
 AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "0"))  # yver173: do not let BigMove starve setup emails; use manual/next cycles unless env re-enables
-ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "0"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
+ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "1"))
 ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC", "12"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
 ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", False)
@@ -63927,7 +63904,7 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def _setup_email_recovery_job_internal(context: ContextTypes.DEFAULT_TYPE):
+async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
     """DB-first last-mile setup email recovery lane.
 
     yver172: if the full alert/session scan is slow, this lightweight job still
@@ -64175,54 +64152,12 @@ async def _setup_email_recovery_job_internal(context: ContextTypes.DEFAULT_TYPE)
             pass
 
 
-async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
-    """Fast APScheduler wrapper around the recovery lane.
-
-    yver173: the previous direct job could stay running for minutes and APScheduler
-    repeatedly logged max_instances. This wrapper returns quickly, caps runtime,
-    and skips while the main alert engine owns the same email lane.
-    """
-    try:
-        if not bool(globals().get('SETUP_EMAIL_RECOVERY_JOB_ENABLED', True)):
-            return
-        if bool(globals().get('SETUP_EMAIL_RECOVERY_DISABLE_WHEN_ALERT_RUNNING', True)):
-            try:
-                if ALERT_LOCK.locked():
-                    return
-            except Exception:
-                pass
-        try:
-            if SETUP_EMAIL_RECOVERY_LOCK.locked():
-                return
-        except Exception:
-            pass
-        async with SETUP_EMAIL_RECOVERY_LOCK:
-            timeout_s = max(6, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC', 14) or 14))
-            try:
-                await asyncio.wait_for(_setup_email_recovery_job_internal(context), timeout=timeout_s)
-            except asyncio.TimeoutError:
-                try:
-                    logger.info('setup_email_recovery_job skipped: timed out after %ss (will retry later)', timeout_s)
-                except Exception:
-                    pass
-            except Exception as e:
-                try:
-                    logger.warning('setup_email_recovery_job failed: %s: %s', type(e).__name__, e)
-                except Exception:
-                    pass
-    except Exception as e:
-        try:
-            logger.warning('setup_email_recovery_job wrapper failed: %s: %s', type(e).__name__, e)
-        except Exception:
-            pass
-
-
 async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
     # yver171: hard-cap the detached email engine. Threaded CCXT/SMTP calls can
     # outlive asyncio.wait_for(), but the coroutine must release ALERT_LOCK quickly
     # so scheduler ticks and Telegram commands do not appear frozen for minutes.
     try:
-        hard_timeout = max(20.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 22) or 22) + 4.0)
+        hard_timeout = max(45.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 70) or 70) + 10.0)
         await asyncio.wait_for(_alert_job_async_internal(context), timeout=hard_timeout)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
@@ -64564,7 +64499,7 @@ def main():
                     interval=_rec_interval,
                     first=max(10, min(int(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 25) or 25), _rec_interval // 2)),
                     name="setup_email_recovery_job",
-                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 60},
+                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
                 )
             except Exception as _rec_sched_exc:
                 try:
