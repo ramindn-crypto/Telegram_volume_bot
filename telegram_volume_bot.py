@@ -1,6 +1,7 @@
 # yver171: major responsiveness/sync patch: fail-fast Telegram replies, no auto-posting huge admin reports, exact emailed setups are authoritative for AutoTrade, and duplicate setup-id re-entry is blocked.
 # yver165: final deployment hardening for yver164; bumps heavy admin cache namespace to avoid stale v161 results and disables fixed day/time prior flags by default; no trading/risk changes.
 # yver168: makes current Reco=KEEP authoritative for live policy immediately: /setup_matrix policy, enforceable lookup, screen/email/AutoTrade now promote Reco KEEP lanes (e.g. F1-LON-NOR-BUY, F8-NY-NOR-BUY) to Policy KEEP using latest score evidence, while preserving shared gates.
+# yver172: major responsiveness/email-recovery patch: adds independent DB-first setup-email recovery job, completes alert pipeline without premature hard-timeout, uses email executor for SMTP, and keeps heavy report previews non-blocking.
 # yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
 # yver163: day-time-session live guard from ver161 baseline; ignores ver162 liquidity/soft-stop changes; synced /screen setup-email AutoTrade context gate; Monday pre-ASIA, Monday ASIA market-tone, and Saturday pre-ASIA directional filters.
 # yver161: final sync hardening for Monday audit: delivered/AutoTraded setup IDs are preserved in /setup_audit instead of daily de-duping them away; BigMove/F8 setup-email rows hydrate /screen from executable_setups even when signals metadata is missing; Bybit-verified AutoTrade TP/SL can override candle-audit for traded rows; weekly policy catch-up window/retry hardened; admin cache namespace bumped.
@@ -27716,7 +27717,7 @@ async def _telegram_reply_text_fast(message, text, **kwargs):
         return None
     except (TimedOut, NetworkError, RetryAfter) as exc:
         try:
-            logger.warning('Telegram fast reply failed (network): %s', exc)
+            logger.info('Telegram fast reply failed (network): %s', exc)
         except Exception:
             pass
         return None
@@ -27724,7 +27725,7 @@ async def _telegram_reply_text_fast(message, text, **kwargs):
         msg = str(exc or '').lower()
         if ('timeout' in msg) or ('connecttimeout' in msg) or ('connect timeout' in msg) or ('timed out' in msg):
             try:
-                logger.warning('Telegram fast reply failed (timeout): %s', exc)
+                logger.info('Telegram fast reply failed (timeout): %s', exc)
             except Exception:
                 pass
             return None
@@ -50740,7 +50741,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v170:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v172:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50759,7 +50760,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v170:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v172:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -50809,7 +50810,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v170:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v172:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50827,7 +50828,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v170:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v172:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -51216,7 +51217,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v170:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v172:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -51242,7 +51243,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v170:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v172:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -51261,7 +51262,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v170:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v172:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -51292,7 +51293,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v170:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v172:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51766,7 +51767,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v170:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v172:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51791,7 +51792,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v170:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v172:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -51809,7 +51810,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v170:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v172:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51834,7 +51835,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v170:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v172:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55943,7 +55944,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v170:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v172:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55963,7 +55964,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v170:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v172:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55984,7 +55985,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v170:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v172:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -60054,10 +60055,17 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
-EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "5"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "8"))
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "6"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "12"))
 EMAIL_SEND_TIMEOUT_SEC = max(6, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "8") or 8))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "20"))
+# yver172: the alert pipeline runs in the background; killing it after 20–25s
+# prevented the session email pool from completing, so no setup emails were sent.
+# Keep Telegram command replies fast separately, but allow the email engine enough
+# time to finish one small owner/session cycle.
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "70"))
+SETUP_EMAIL_RECOVERY_JOB_ENABLED = env_bool("SETUP_EMAIL_RECOVERY_JOB_ENABLED", True)
+SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "90") or 90)
+SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "25") or 25)
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
@@ -61520,7 +61528,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Send ONE email containing MULTIPLE setups (timeout-protected)
             try:
                 ok = await asyncio.wait_for(
-                    to_thread_heavy(send_email_alert_multi, user, sess, chosen_list, best_fut, timeout=EMAIL_SEND_TIMEOUT_SEC),
+                    to_thread_email(send_email_alert_multi, user, sess, chosen_list, best_fut, timeout=EMAIL_SEND_TIMEOUT_SEC),
                     timeout=EMAIL_SEND_TIMEOUT_SEC + 2,
                 )
             except asyncio.TimeoutError:
@@ -63913,12 +63921,261 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+
+async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
+    """DB-first last-mile setup email recovery lane.
+
+    yver172: if the full alert/session scan is slow, this lightweight job still
+    consumes already persisted/recent actionable KEEP rows and sends the setup
+    email + AutoTrade queue. It does not run a heavy family scan; it only reads
+    the DB/recovery queues and therefore keeps /screen, /setup_audit, email and
+    AutoTrade from drifting out of sync.
+    """
+    try:
+        if not bool(globals().get('SETUP_EMAIL_RECOVERY_JOB_ENABLED', True)):
+            return
+        if not EMAIL_ENABLED or not email_config_ok():
+            return
+        try:
+            uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        except Exception:
+            uid = 0
+        if uid <= 0:
+            return
+        try:
+            if ALERT_LOCK.locked():
+                # Still allow DB-only recovery; do not use ALERT_LOCK here.
+                pass
+        except Exception:
+            pass
+        user = get_user(uid) or {}
+        if not user:
+            return
+        try:
+            sess = in_session_now(user)
+        except Exception:
+            sess = None
+        if not sess:
+            _LAST_EMAIL_DECISION[uid] = {
+                'status': 'SKIP',
+                'reasons': ['recovery_not_in_enabled_session'],
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            }
+            return
+        sess_name = str((sess or {}).get('name') or '').upper().strip()
+        if sess_name not in {'ASIA', 'LON', 'NY'}:
+            return
+
+        # Respect caps/gap exactly like the main email lane.
+        try:
+            tz, _tz_name = _zoneinfo_or_default(user.get('tz') or user.get('timezone'))
+        except Exception:
+            tz = MEL_TZ
+        try:
+            st = email_state_get(uid)
+        except Exception:
+            st = {}
+        try:
+            if str(st.get('session_key')) != str((sess or {}).get('session_key')):
+                email_state_set(uid, session_key=str((sess or {}).get('session_key')), sent_count=0, last_email_ts=0.0)
+                st = email_state_get(uid)
+        except Exception:
+            pass
+        try:
+            max_emails = int(user.get('max_emails_per_session', DEFAULT_MAX_EMAILS_PER_SESSION))
+        except Exception:
+            max_emails = int(DEFAULT_MAX_EMAILS_PER_SESSION)
+        try:
+            sent_in_session = int((st or {}).get('sent_count', 0) or 0)
+        except Exception:
+            sent_in_session = 0
+        if max_emails > 0 and sent_in_session >= max_emails:
+            return
+        try:
+            gap_min = int(user.get('email_gap_min', DEFAULT_MIN_EMAIL_GAP_MIN))
+        except Exception:
+            gap_min = int(DEFAULT_MIN_EMAIL_GAP_MIN)
+        try:
+            last_ts = float((st or {}).get('last_email_ts', 0.0) or 0.0)
+        except Exception:
+            last_ts = 0.0
+        if gap_min > 0 and (time.time() - last_ts) < max(0, gap_min) * 60:
+            return
+        try:
+            day_local = _user_day_local(user)
+        except Exception:
+            day_local = datetime.now(tz).date().isoformat()
+        try:
+            day_cap = int(user.get('max_emails_per_day', DEFAULT_MAX_EMAILS_PER_DAY))
+        except Exception:
+            day_cap = int(DEFAULT_MAX_EMAILS_PER_DAY)
+        try:
+            sent_today = _email_daily_get(uid, day_local)
+        except Exception:
+            sent_today = 0
+        if day_cap > 0 and sent_today >= day_cap:
+            return
+
+        # Pull fresh actionable rows from all light-weight sources. No heavy scan.
+        candidates = []
+        try:
+            candidates = _setup_merge_unique_candidates(candidates, _setup_recent_actionable_recovery_candidates(uid, session_name=sess_name, max_age_min=_setup_email_actionable_queue_window_min(), limit=max(int(EMAIL_SETUPS_N) * 10, 36)), session_name=sess_name, user_id=uid, limit=60)
+        except Exception:
+            pass
+        try:
+            candidates = _setup_merge_unique_candidates(candidates, _setup_recent_audit_actionable_recovery_candidates(uid, session_name=sess_name, max_age_min=_setup_email_actionable_queue_window_min(), limit=max(int(EMAIL_SETUPS_N) * 10, 36)), session_name=sess_name, user_id=uid, limit=60)
+        except Exception:
+            pass
+        if not candidates:
+            try:
+                db_log_setup_pipeline_event(uid, stage='setup_email_recovery_job', status='empty', session=sess_name, mode='email', details={'reason': 'no_recovery_candidates'})
+            except Exception:
+                pass
+            return
+
+        # Re-run the same pre-send gate, then cooldown/duplicate gates.
+        try:
+            candidates = _resolve_same_symbol_setup_conflicts(list(candidates or []), session_name=sess_name, user_id=uid, lane='email_recovery_job')
+        except Exception:
+            candidates = list(candidates or [])
+        try:
+            candidates, reasons = _setup_email_presend_executable_filter(uid, sess_name, list(candidates or []), lane='email_recovery_job')
+        except Exception:
+            reasons = Counter({'presend_exception': 1})
+            candidates = []
+        if not candidates:
+            try:
+                db_log_setup_pipeline_event(uid, stage='setup_email_recovery_job', status='empty_after_presend', session=sess_name, mode='email', details={'top_reasons': _pipeline_top_reasons(reasons, 8)})
+            except Exception:
+                pass
+            return
+
+        def _rr3(_s):
+            try:
+                final_tp = float(_setup_target_tp(_s, 0.0) or 0.0)
+                return float(rr_to_tp(float(_s.entry), float(_s.sl), final_tp)) if final_tp > 0 else 0.0
+            except Exception:
+                return 0.0
+        def _fresh_ts(_s):
+            try:
+                return float(getattr(_s, 'executable_ts', 0.0) or getattr(_s, 'created_ts', 0.0) or getattr(_s, 'signal_created_ts', 0.0) or 0.0)
+            except Exception:
+                return 0.0
+        candidates = sorted(list(candidates or []), key=lambda s: (float(getattr(s, 'quality_score', 0.0) or 0.0), int(getattr(s, 'conf', 0) or 0), _rr3(s), float(getattr(s, 'fut_vol_usd', 0.0) or 0.0), _fresh_ts(s)), reverse=True)
+
+        chosen = []
+        blocked = Counter()
+        for s in candidates:
+            if len(chosen) >= int(EMAIL_SETUPS_N):
+                break
+            sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+            side = str(getattr(s, 'side', '') or '').upper().strip()
+            try:
+                if _email_setup_identity_recently_sent(uid, s):
+                    blocked['identity_recently_sent'] += 1
+                    continue
+                if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
+                    blocked['symbol_recently_sent'] += 1
+                    continue
+                stronger, why_stronger = _recent_stronger_same_symbol_delivery_exists(uid, s, session_name=sess_name)
+                if stronger:
+                    blocked[str(why_stronger or 'stronger_same_symbol_recent')] += 1
+                    continue
+            except Exception:
+                pass
+            chosen.append(s)
+        if not chosen:
+            try:
+                db_log_setup_pipeline_event(uid, stage='setup_email_recovery_job', status='all_blocked', session=sess_name, mode='email', details={'blocked': dict(blocked.most_common(8))})
+            except Exception:
+                pass
+            return
+
+        try:
+            best_fut = await to_thread_email(_screen_best_fut_fast, timeout=max(3, int(EMAIL_FETCH_TIMEOUT_SEC or 6)))
+        except Exception:
+            best_fut = {}
+
+        try:
+            ok = await asyncio.wait_for(
+                to_thread_email(send_email_alert_multi, user, sess, list(chosen or []), best_fut or {}, timeout=EMAIL_SEND_TIMEOUT_SEC),
+                timeout=max(8, int(EMAIL_SEND_TIMEOUT_SEC) + 2),
+            )
+        except asyncio.TimeoutError:
+            try:
+                _LAST_SMTP_ERROR[uid] = f"recovery_timeout_after_{int(EMAIL_SEND_TIMEOUT_SEC)}s"
+            except Exception:
+                pass
+            ok = bool(_email_assume_sent_on_soft_smtp())
+            if ok:
+                try:
+                    _record_setup_email_delivery_side_effects(uid, sess_name, list(chosen or []), best_fut or {}, status='recovery_timeout_assumed_sent')
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                _LAST_SMTP_ERROR[uid] = f"recovery_{type(e).__name__}: {e}"
+            except Exception:
+                pass
+            ok = False
+
+        if not ok:
+            _LAST_EMAIL_DECISION[uid] = {'status': 'ERROR', 'reasons': ['setup_email_recovery_send_failed', _LAST_SMTP_ERROR.get(uid, 'unknown')], 'when': datetime.now(tz).isoformat(timespec='seconds')}
+            try:
+                db_log_setup_pipeline_event(uid, stage='setup_email_recovery_job', status='send_failed', session=sess_name, mode='email', details={'setups': len(chosen), 'error': _LAST_SMTP_ERROR.get(uid, '')})
+            except Exception:
+                pass
+            return
+
+        try:
+            email_state_set(uid, last_email_ts=time.time(), sent_count=int((st or {}).get('sent_count', 0) or 0) + 1)
+        except Exception:
+            pass
+        try:
+            _email_daily_inc(uid, day_local)
+        except Exception:
+            pass
+        for s in list(chosen or []):
+            try:
+                mark_symbol_emailed(uid, s.symbol, s.side, sess_name)
+            except Exception:
+                pass
+        _LAST_EMAIL_DECISION[uid] = {
+            'status': 'SENT',
+            'picked': ', '.join([f"{getattr(s, 'side', '')} {getattr(s, 'symbol', '')} conf={getattr(s, 'conf', '')}" for s in chosen]),
+            'when': datetime.now(tz).isoformat(timespec='seconds'),
+            'autotrade': 'queued_for_immediate_autotrade',
+            'reasons': ['setup_email_recovery_job_sent'],
+        }
+        _LAST_EMAIL_SENT[uid] = dict(_LAST_EMAIL_DECISION[uid])
+        try:
+            _LAST_AUTOTRADE_DECISION[uid] = {
+                'status': 'QUEUED',
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': 'setup_email_recovery_job_sent_waiting_for_immediate_autotrade',
+                'session': sess_name,
+                'mode': str(_autotrade_runtime_mode()).lower(),
+            }
+            _safe_create_task(_trigger_autotrade_after_email_async(uid, sess_name, list(chosen or [])), 'autotrade_after_recovery_email')
+        except Exception:
+            pass
+        try:
+            db_log_setup_pipeline_event(uid, stage='setup_email_recovery_job', status='sent', session=sess_name, mode='email', details={'setups': len(chosen), 'picked': [f"{getattr(s, 'side', '')} {getattr(s, 'symbol', '')}" for s in chosen[:8]]})
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            logger.warning('setup_email_recovery_job failed: %s: %s', type(e).__name__, e)
+        except Exception:
+            pass
+
+
 async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
     # yver171: hard-cap the detached email engine. Threaded CCXT/SMTP calls can
     # outlive asyncio.wait_for(), but the coroutine must release ALERT_LOCK quickly
     # so scheduler ticks and Telegram commands do not appear frozen for minutes.
     try:
-        hard_timeout = max(8.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 20) or 20) + 5.0)
+        hard_timeout = max(45.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 70) or 70) + 10.0)
         await asyncio.wait_for(_alert_job_async_internal(context), timeout=hard_timeout)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
@@ -64247,6 +64504,26 @@ def main():
                 "misfire_grace_time": 300,
             },
         )
+
+
+        # yver172: independent DB-first recovery lane. If the heavier alert/session
+        # scan is slow or times out, this still consumes recent /setup_audit/executable
+        # KEEP rows and sends the matching setup email + AutoTrade queue.
+        if bool(globals().get('SETUP_EMAIL_RECOVERY_JOB_ENABLED', True)):
+            try:
+                _rec_interval = max(60, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 90) or 90))
+                app.job_queue.run_repeating(
+                    setup_email_recovery_job,
+                    interval=_rec_interval,
+                    first=max(10, min(int(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 25) or 25), _rec_interval // 2)),
+                    name="setup_email_recovery_job",
+                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
+                )
+            except Exception as _rec_sched_exc:
+                try:
+                    logger.warning('setup_email_recovery_job schedule failed: %s', _rec_sched_exc)
+                except Exception:
+                    pass
 
         # Ver22 major patch: run the /screen-equivalent setup/email/autotrade lane
         # automatically. This is the safety net that prevents manual /screen from being
