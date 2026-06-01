@@ -1,3 +1,4 @@
+# yver170: major responsiveness/sync patch: fail-fast Telegram replies, no auto-posting huge admin reports, exact emailed setups are authoritative for AutoTrade, and duplicate setup-id re-entry is blocked.
 # yver165: final deployment hardening for yver164; bumps heavy admin cache namespace to avoid stale v161 results and disables fixed day/time prior flags by default; no trading/risk changes.
 # yver168: makes current Reco=KEEP authoritative for live policy immediately: /setup_matrix policy, enforceable lookup, screen/email/AutoTrade now promote Reco KEEP lanes (e.g. F1-LON-NOR-BUY, F8-NY-NOR-BUY) to Policy KEEP using latest score evidence, while preserving shared gates.
 # yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
@@ -12549,6 +12550,48 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         # AutoTrade is trying to consume before their entry window expires.
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
+
+        source_kind_u = str(getattr(s, "source_kind", "") or "").lower().strip()
+        family_u = str(getattr(s, "family_id", "") or getattr(s, "engine", "") or "").upper().strip()
+        is_authoritative_emailed = source_kind_u in {'emailed_setups', 'recent_email_cache', 'recent_email_lane'}
+
+        # yver170: once a setup email has passed the shared pre-send gate and is logged
+        # as recently emailed, AutoTrade should attempt the exact same setup. Do not
+        # re-run volatile final/context/symbol micro-guards here, because that creates
+        # the visible mismatch: Gmail has BUY LAB, but /autotrade_last has no LAB.
+        # Risk, duplicate-position, safe leverage, drift, capital caps and Bybit errors
+        # are still enforced later inside _autotrade_place_trade.
+        if is_authoritative_emailed:
+            if _autotrade_require_keep_policy():
+                try:
+                    policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+                    pinfo = _setup_combo_policy_lookup_for_setup(s, session_name=sess, user_id=policy_uid)
+                    pfound = bool((pinfo or {}).get('found'))
+                    praw = str((pinfo or {}).get('status') or '').upper().strip()
+                    pstatus = _setup_policy_effective_status(praw, found=pfound)
+                    if pstatus not in _autotrade_allowed_policy_statuses():
+                        return (False, f'autotrade_policy_not_allowed:{pstatus or praw or "WATCH"}')
+                except Exception:
+                    return (False, 'autotrade_keep_policy_check_exception')
+            entry = float(getattr(s, "entry", 0.0) or 0.0)
+            sl = float(getattr(s, "sl", 0.0) or 0.0)
+            final_tp = float(_setup_target_tp(s, 0.0) or 0.0)
+            if entry <= 0 or sl <= 0:
+                return (False, "missing_prices")
+            if final_tp <= 0:
+                return (False, "missing_tp")
+            if abs(entry - sl) <= 0:
+                return (False, "zero_risk_distance")
+            _, sess_conf, sess_rr = _execution_session_thresholds(sess)
+            conf_floor = int(max(MIN_SETUP_CONF, sess_conf))
+            conf = int(getattr(s, 'conf', 0) or 0)
+            if conf < conf_floor:
+                return (False, "below_exec_conf")
+            rr_final = float(rr_to_tp(entry, sl, final_tp)) if final_tp > 0 else 0.0
+            if rr_final < float(sess_rr):
+                return (False, "below_exec_rr")
+            return (True, "ok_emailed_authoritative")
+
         try:
             policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
             final_ok, final_why, _final_meta = _setup_final_quality_gate_allows_setup(s, sess, user_id=policy_uid)
@@ -13661,6 +13704,31 @@ def _autotrade_timeout_reconcile(uid: int, session_label: str, setup, timeout_re
         pass
     return False, reason_s
 
+def _autotrade_setup_id_already_traded(uid: int, setup_id: str) -> tuple[bool, str]:
+    """Return True when the exact setup_id already created an AutoTrade row.
+
+    yver170: prevents the same emailed setup from being opened twice when Telegram/SMTP
+    retries or a delayed immediate-AutoTrade task replays the same batch.
+    """
+    try:
+        sid = str(setup_id or '').strip()
+        if not sid:
+            return False, ''
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT trade_id,status,opened_ts FROM autotrade_trades WHERE uid=? AND setup_id=? ORDER BY opened_ts DESC LIMIT 1",
+                (int(uid), sid),
+            ).fetchone()
+            if row:
+                st = str(row['status'] or '').upper()
+                return True, f"blocked_duplicate_setup_id_already_traded:{sid}:{st or 'UNKNOWN'}"
+    except Exception:
+        return False, ''
+    return False, ''
+
+
 def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
     if not _autotrade_ready():
         return (False, 'autotrade_not_ready_or_disabled')
@@ -13704,6 +13772,18 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     intended_sl = float(getattr(s, 'sl', 0.0) or 0.0)
     sym = _bybit_linear_symbol(str(getattr(s, 'symbol', '') or '').upper())
     setup_id = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+    try:
+        _dup_setup, _dup_setup_reason = _autotrade_setup_id_already_traded(int(uid), setup_id)
+        if _dup_setup:
+            try:
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': str(_dup_setup_reason), 'setup_id_duplicate_guard': True})
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('duplicate_setup_id'), last_reason=str(_dup_setup_reason))
+            except Exception:
+                pass
+            return (False, str(_dup_setup_reason or 'blocked_duplicate_setup_id_already_traded'))
+    except Exception:
+        pass
     reserved_keys: list[str] = []
     runtime_lock_acquired = False
 
@@ -13782,24 +13862,27 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         return (False, 'setup_email_gate_exception')
 
-    # yver143: final live entry must still pass the same user-visible KEEP/context
-    # delivery gate used by setup email and /screen.  This prevents any fallback or
-    # stale-delivery object from opening after the live gate would now label it OFF.
-    try:
-        _uv_ok, _uv_why, _uv_meta = _setup_user_visible_keep_policy_allows(s, session_name=session_label, user_id=int(uid), lane='email')
-        if not _uv_ok:
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_user_visible_gate_block'), last_reason=str(_uv_why or 'autotrade_user_visible_gate_block'))
-            except Exception:
-                pass
-            return (False, str(_uv_why or 'autotrade_user_visible_gate_block'))
-    except Exception:
-        return (False, 'autotrade_user_visible_gate_exception')
-
     try:
         _source_kind_u = str(getattr(s, 'source_kind', '') or '').lower().strip()
     except Exception:
         _source_kind_u = ''
+    _is_authoritative_email_setup = _source_kind_u in {'emailed_setups', 'recent_email_lane', 'recent_email_cache'}
+
+    # yver143/yver170: raw/fallback rows must still pass the same live gate used by
+    # /screen and setup email. However, an already emailed setup is authoritative:
+    # it already passed that pre-send gate, so do not re-run volatile symbol/hour
+    # micro-guards seconds later and create an email-without-autotrade mismatch.
+    if not _is_authoritative_email_setup:
+        try:
+            _uv_ok, _uv_why, _uv_meta = _setup_user_visible_keep_policy_allows(s, session_name=session_label, user_id=int(uid), lane='email')
+            if not _uv_ok:
+                try:
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_user_visible_gate_block'), last_reason=str(_uv_why or 'autotrade_user_visible_gate_block'))
+                except Exception:
+                    pass
+                return (False, str(_uv_why or 'autotrade_user_visible_gate_block'))
+        except Exception:
+            return (False, 'autotrade_user_visible_gate_exception')
     if _source_kind_u in {'executable_setups', 'emailed_setups', 'recent_email_lane', 'recent_email_cache'}:
         exec_ok, exec_why = _autotrade_db_signal_structurally_valid(s, session_name=session_label)
     else:
@@ -13824,18 +13907,20 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         except Exception:
             return (False, 'autotrade_keep_policy_check_exception')
 
-    # yver91: repeat the execution-context guard at the final place-order point.
-    # This catches any candidate path that bypassed DB structural validation.
-    try:
-        ctx_ok, ctx_reason = _autotrade_policy_context_execution_allows(s, session_name=session_label, user_id=int(uid))
-        if not ctx_ok:
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_context_block'), last_reason=str(ctx_reason))
-            except Exception:
-                pass
-            return (False, str(ctx_reason or 'autotrade_policy_context_block'))
-    except Exception:
-        return (False, 'autotrade_policy_context_check_exception')
+    # yver91/yver170: repeat the execution-context guard for raw/fallback rows only.
+    # Recently emailed rows are already the synced live-delivery lane; risk/duplicate/
+    # leverage/drift gates below still protect capital.
+    if not _is_authoritative_email_setup:
+        try:
+            ctx_ok, ctx_reason = _autotrade_policy_context_execution_allows(s, session_name=session_label, user_id=int(uid))
+            if not ctx_ok:
+                try:
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_context_block'), last_reason=str(ctx_reason))
+                except Exception:
+                    pass
+                return (False, str(ctx_reason or 'autotrade_policy_context_block'))
+        except Exception:
+            return (False, 'autotrade_policy_context_check_exception')
 
     def _as_pos_float(x):
         try:
@@ -27575,22 +27660,29 @@ SAFE_CHUNK = 3800
 # user-facing replies should fail fast and retry/fallback instead of making the
 # bot feel frozen when Telegram/network is slow.
 async def _telegram_reply_text_fast(message, text, **kwargs):
+    """Fail-fast Telegram reply helper.
+
+    yver170: command responsiveness is more important than waiting on Telegram's
+    network stack. A timeout here must never crash the command handler or hold the
+    bot for many seconds; heavy reports are cached/backgrounded and can be retried
+    by the next command.
+    """
     try:
-        connect_timeout = float(os.getenv('TELEGRAM_REPLY_CONNECT_TIMEOUT_SEC', '2.5') or 2.5)
+        connect_timeout = float(os.getenv('TELEGRAM_REPLY_CONNECT_TIMEOUT_SEC', '0.8') or 0.8)
     except Exception:
-        connect_timeout = 2.5
+        connect_timeout = 0.8
     try:
-        read_timeout = float(os.getenv('TELEGRAM_REPLY_READ_TIMEOUT_SEC', '8.0') or 8.0)
+        read_timeout = float(os.getenv('TELEGRAM_REPLY_READ_TIMEOUT_SEC', '2.0') or 2.0)
     except Exception:
-        read_timeout = 8.0
+        read_timeout = 2.0
     try:
-        write_timeout = float(os.getenv('TELEGRAM_REPLY_WRITE_TIMEOUT_SEC', '8.0') or 8.0)
+        write_timeout = float(os.getenv('TELEGRAM_REPLY_WRITE_TIMEOUT_SEC', '2.0') or 2.0)
     except Exception:
-        write_timeout = 8.0
+        write_timeout = 2.0
     try:
-        pool_timeout = float(os.getenv('TELEGRAM_REPLY_POOL_TIMEOUT_SEC', '0.75') or 0.75)
+        pool_timeout = float(os.getenv('TELEGRAM_REPLY_POOL_TIMEOUT_SEC', '0.25') or 0.25)
     except Exception:
-        pool_timeout = 0.75
+        pool_timeout = 0.25
 
     send_kwargs = dict(kwargs)
     send_kwargs.setdefault('connect_timeout', connect_timeout)
@@ -27600,14 +27692,42 @@ async def _telegram_reply_text_fast(message, text, **kwargs):
     try:
         return await message.reply_text(text, **send_kwargs)
     except TypeError as exc:
-        # Older python-telegram-bot builds may not accept per-call timeout kwargs.
-        # Fall back without them rather than breaking replies.
         msg = str(exc).lower()
         if ('timeout' in msg) or ('unexpected keyword' in msg):
             for k in ('connect_timeout', 'read_timeout', 'write_timeout', 'pool_timeout'):
                 send_kwargs.pop(k, None)
-            return await message.reply_text(text, **send_kwargs)
-        raise
+            try:
+                return await asyncio.wait_for(message.reply_text(text, **send_kwargs), timeout=max(1.0, read_timeout))
+            except Exception as e2:
+                try:
+                    logger.warning('Telegram fast reply fallback failed: %s', e2)
+                except Exception:
+                    pass
+                return None
+        try:
+            logger.warning('Telegram fast reply type error: %s', exc)
+        except Exception:
+            pass
+        return None
+    except (TimedOut, NetworkError, RetryAfter) as exc:
+        try:
+            logger.warning('Telegram fast reply failed (network): %s', exc)
+        except Exception:
+            pass
+        return None
+    except Exception as exc:
+        msg = str(exc or '').lower()
+        if ('timeout' in msg) or ('connecttimeout' in msg) or ('connect timeout' in msg) or ('timed out' in msg):
+            try:
+                logger.warning('Telegram fast reply failed (timeout): %s', exc)
+            except Exception:
+                pass
+            return None
+        try:
+            logger.warning('Telegram fast reply failed: %s', exc)
+        except Exception:
+            pass
+        return None
 
 def _telegram_html_to_plain_for_fallback(value: str) -> str:
     """Best-effort HTML-to-plain conversion for long Telegram admin reports.
@@ -27854,7 +27974,7 @@ async def send_long_message(
                     logger.warning("Telegram plain fallback failed: %s", e2)
             else:
                 logger.warning("Telegram send failed (network): %s", e)
-                await asyncio.sleep(2)
+                # yver170: do not hold command handlers on Telegram retry after a network timeout.
                 try:
                     await _send(parse_mode)
                 except Exception as e2:
@@ -50615,7 +50735,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v169:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v170:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50634,7 +50754,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v169:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v170:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -50684,7 +50804,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v169:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v170:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50702,7 +50822,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v169:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v170:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50867,7 +50987,7 @@ async def setup_combo_policy_catchup_job(context: ContextTypes.DEFAULT_TYPE):
 # if full cached reports should be sent immediately again.
 ADMIN_REPORT_FAST_CACHE_MAX_CHARS = int(os.environ.get("ADMIN_REPORT_FAST_CACHE_MAX_CHARS", "3200") or 3200)
 ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE = env_bool("ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE", False)
-ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE = env_bool("ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE", True)
+ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE = env_bool("ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE", False)
 
 
 def _admin_report_cached_preview(title: str, text: str, age: float | None, *, fresh: bool, started: bool) -> str:
@@ -50958,13 +51078,25 @@ async def _admin_report_background_refresh(
         except Exception:
             pass
         if post_result:
-            header = f"✅ <b>Fresh result ready:</b> {html.escape(str(title or 'report'))}\n{SEP}\n"
-            await send_long_message(update, header + text, parse_mode=(parse_mode or ParseMode.HTML), disable_web_page_preview=True)
+            header_plain = f"✅ Fresh result ready: {str(title or 'report')}"
+            try:
+                limit = int(globals().get('ADMIN_REPORT_FAST_CACHE_MAX_CHARS', 3200) or 3200)
+            except Exception:
+                limit = 3200
+            # yver170: never auto-post huge reports from a background task. They were
+            # the main source of Telegram/httpx timeouts and made unrelated commands feel
+            # frozen. Cache the full text, then post a short fresh preview only.
+            if len(str(text or '')) > max(1200, limit):
+                preview = _admin_report_cached_preview(str(title or 'report'), text, 0, fresh=True, started=False)
+                await _telegram_reply_text_fast(update.message, preview, parse_mode=None, disable_web_page_preview=True)
+            else:
+                await send_long_message(update, header_plain + "\n" + SEP + "\n" + text, parse_mode=None, disable_web_page_preview=True)
     except Exception as e:
         try:
-            await update.message.reply_text(
+            await _telegram_reply_text_fast(
+                update.message,
                 f"⚠️ {str(title or 'Report')} background refresh failed: {type(e).__name__}: {html.escape(str(e))}",
-                parse_mode=ParseMode.HTML,
+                parse_mode=None,
                 disable_web_page_preview=True,
             )
         except Exception:
@@ -51079,7 +51211,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v169:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v170:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -51105,7 +51237,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v169:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v170:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -51124,7 +51256,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v169:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v170:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -51155,7 +51287,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v169:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v170:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51629,7 +51761,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v169:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v170:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51654,7 +51786,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v169:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v170:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -51672,7 +51804,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v169:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v170:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51697,7 +51829,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v169:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v170:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55806,7 +55938,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v169:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v170:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55826,7 +55958,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v169:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v170:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55847,7 +55979,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v169:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v170:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -63459,30 +63591,13 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                                 setattr(_s, 'created_ts', time.time())
                         except Exception:
                             pass
-                    try:
-                        _valid_for_at, _at_gate_reasons = _setup_email_presend_executable_filter(owner_uid, sess, list(chosen_list or []), lane='autotrade_after_email')
-                    except Exception:
-                        _valid_for_at, _at_gate_reasons = [], Counter({'autotrade_after_email_presend_exception': 1})
-                    if not _valid_for_at:
-                        try:
-                            _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                                'status': 'SKIP',
-                                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                                'reason': 'emailed_setups_failed_final_gate_before_autotrade_trying_keep_queue',
-                                'session': sess,
-                                'mode': str(_autotrade_runtime_mode()).lower(),
-                                'top_reasons': dict((_at_gate_reasons or Counter()).most_common(5)),
-                                'trigger': 'email_sent_immediate',
-                            }
-                        except Exception:
-                            pass
-                        try:
-                            db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email_presend_gate', status='empty', session=sess, mode='autotrade', details={'top_reasons': _pipeline_top_reasons(_at_gate_reasons, 8), 'input': len(list(chosen_list or []))})
-                        except Exception:
-                            pass
-                        chosen_list = []
-                    else:
-                        chosen_list = list(_valid_for_at or [])
+                    # yver170: the setup email is already the authoritative pre-send
+                    # gate. Do not re-run the volatile email/screen gate here; that was
+                    # the root cause of Gmail showing BUY LAB while /autotrade_last never
+                    # attempted LAB. Persist and try the exact just-emailed batch; the
+                    # central place-order path still enforces risk, duplicate positions,
+                    # safe leverage, drift, entry window and Bybit errors.
+                    chosen_list = list(chosen_list or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
                         cache_delete(f"autotrade_db_setups_v129:{owner_uid}:{sess}:24:30")
