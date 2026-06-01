@@ -2893,12 +2893,16 @@ SETUP_COMBO_POLICY_EXPIRY_HOURS = float(os.environ.get("SETUP_COMBO_POLICY_EXPIR
 # Ver11 hybrid policy governance:
 # - Weekly review (Sunday 23:00 Melbourne) remains the official policy update.
 # - Daily safety review (default 10:00 Melbourne, before ASIA) can only add temporary
-#   DISABLE rows for severe, statistically clear losers. It does not promote/enable combos
-#   and it expires at the next weekly review to avoid overfitting one noisy day.
+#   DISABLE rows for severe, statistically clear losers. It does not promote/enable combos.
+#   yver169: daily/intraday safety rows expire on a rolling max-24h horizon by default,
+#   instead of staying frozen until the next Sunday weekly policy review.
 SETUP_COMBO_DAILY_SAFETY_ENABLED = env_bool("SETUP_COMBO_DAILY_SAFETY_ENABLED", True)
 SETUP_COMBO_DAILY_SAFETY_HOUR = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_HOUR", "10") or 10)
 SETUP_COMBO_DAILY_SAFETY_MINUTE = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MINUTE", "0") or 0)
 SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS", "24") or 24)
+# yver169: daily/intraday safety is temporary. It must not freeze a weak row
+# until the next weekly cycle; it expires after a rolling 24h window by default.
+SETUP_COMBO_DAILY_SAFETY_EXPIRY_HOURS = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_EXPIRY_HOURS", "24") or 24)
 SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED", "8") or 8)
 SETUP_COMBO_DAILY_SAFETY_WR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_WR_MAX", "45") or 55)
 SETUP_COMBO_DAILY_SAFETY_AVGR_MAX = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_AVGR_MAX", "0.05") or 0.05)
@@ -2909,7 +2913,7 @@ SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_D
 SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL = int(os.environ.get("SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL", "4") or 4)
 # Ver23 profit-first safety loop: run the severe-loser safety pass during the day,
 # not only at the 10:00 tick. This keeps live policy aligned with the latest
-# executable-lane evidence while still expiring disables at the next weekly review.
+# executable-lane evidence while still expiring disables on the same rolling max-24h horizon.
 SETUP_COMBO_INTRADAY_SAFETY_ENABLED = env_bool("SETUP_COMBO_INTRADAY_SAFETY_ENABLED", True)
 SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS = float(os.environ.get("SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS", "3") or 3)
 SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED = env_bool("SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED", True)
@@ -47669,7 +47673,12 @@ def _setup_combo_apply_adaptive_parameter_bridge(uid: int, rows: list[dict], pol
             next_weekly_ts = float(_setup_combo_next_policy_review_dt(now_ts).astimezone(timezone.utc).timestamp())
         except Exception:
             next_weekly_ts = now_ts + 7 * 86400
-        expires_ts = next_weekly_ts if daily else now_ts + float(SETUP_COMBO_POLICY_EXPIRY_HOURS or 168.0) * 3600.0
+        if daily:
+            # yver169: daily/intraday bridge tighten rows must be short-lived.
+            daily_exp_h = max(1.0, float(globals().get('SETUP_COMBO_DAILY_SAFETY_EXPIRY_HOURS', 24.0) or 24.0))
+            expires_ts = now_ts + daily_exp_h * 3600.0
+        else:
+            expires_ts = now_ts + float(SETUP_COMBO_POLICY_EXPIRY_HOURS or 168.0) * 3600.0
         actions = []
         for row in list(rows or []):
             act = _setup_combo_bridge_action_for_row(row, policy_kind=policy_kind, window_hours=int(window_hours or 0))
@@ -47732,8 +47741,9 @@ def _setup_combo_run_daily_safety_policy(uid: int, start_ts: float | None = None
     """Run the daily 10:00 safety review.
 
     It persists the 24h score snapshot, then inserts temporary DISABLE rows only for
-    severe combos. The rows expire at the next Sunday 23:00 weekly review. Existing
-    weekly/interim policies for other combos are not changed.
+    severe combos. yver169: the rows expire on a rolling max-24h horizon by default
+    so temporary safety blocks do not survive for a full week. Existing weekly/interim
+    policies for other combos are not changed.
     """
     out = {'ok': False, 'disabled': [], 'rows': 0, 'run_id': '', 'expires_ts': 0.0}
     try:
@@ -47758,7 +47768,8 @@ def _setup_combo_run_daily_safety_policy(uid: int, start_ts: float | None = None
         rows = list((res or {}).get('rows') or [])
         run_id = str((res or {}).get('run_id') or ('SCM-DAILY-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')))
         now_ts = float(time.time())
-        expires_ts = float(_setup_combo_next_policy_review_dt(now_ts).astimezone(timezone.utc).timestamp())
+        daily_exp_h = max(1.0, float(globals().get('SETUP_COMBO_DAILY_SAFETY_EXPIRY_HOURS', 24.0) or 24.0))
+        expires_ts = float(now_ts) + daily_exp_h * 3600.0
         policy_tz = str(globals().get('SETUP_COMBO_POLICY_REVIEW_TZ', 'Australia/Melbourne') or 'Australia/Melbourne')
         disabled = []
         for r in rows:
@@ -47832,8 +47843,11 @@ def _setup_combo_latest_policy_update_info(uid: int = 0) -> dict:
         if not rows:
             return info
         latest = max(rows, key=lambda r: float(r.get('updated_ts') or 0.0))
-        enforceable_rows = [r for r in rows if str(r.get('policy_kind') or '').lower().strip() in {'scheduled', 'interim', 'emergency', 'daily_safety'}]
-        scheduled_rows = [r for r in rows if str(r.get('policy_kind') or '').lower().strip() == 'scheduled']
+        # yver169: show only currently enforceable rows as enforceable; old daily_safety
+        # rows are clamped by _setup_combo_policy_valid_for_enforcement even if an older
+        # build stored an over-long expiry timestamp.
+        enforceable_rows = [r for r in rows if str(r.get('policy_kind') or '').lower().strip() in {'scheduled', 'interim', 'emergency', 'daily_safety'} and _setup_combo_policy_valid_for_enforcement(r)]
+        scheduled_rows = [r for r in rows if str(r.get('policy_kind') or '').lower().strip() == 'scheduled' and _setup_combo_policy_valid_for_enforcement(r)]
         latest_enforceable = max(enforceable_rows, key=lambda r: float(r.get('updated_ts') or 0.0)) if enforceable_rows else None
         chosen = latest_enforceable or latest
         info.update({
@@ -47877,8 +47891,20 @@ def _setup_combo_policy_valid_for_enforcement(pol: dict | None) -> bool:
                     return False
             except Exception:
                 return False
+        now_ts = float(time.time())
+        if kind == 'daily_safety':
+            # yver169: older builds stored daily_safety rows until next Sunday.
+            # Clamp them at updated_ts + configured daily expiry hours so temporary
+            # data-driven safety blocks cannot silently freeze a lane for a week.
+            try:
+                daily_exp_h = max(1.0, float(globals().get('SETUP_COMBO_DAILY_SAFETY_EXPIRY_HOURS', 24.0) or 24.0))
+                upd_ts = float(pol.get('updated_ts') or 0.0)
+                if upd_ts > 0 and now_ts > (upd_ts + daily_exp_h * 3600.0):
+                    return False
+            except Exception:
+                pass
         expires_ts = float(pol.get('expires_ts') or 0.0)
-        if expires_ts > 0 and float(time.time()) > expires_ts:
+        if expires_ts > 0 and now_ts > expires_ts:
             return False
         return True
     except Exception:
@@ -50565,7 +50591,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
             f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
-            f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
+            f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b> | Expiry: <b>≤{float(globals().get('SETUP_COMBO_DAILY_SAFETY_EXPIRY_HOURS', 24.0) or 24.0):.0f}h</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
             f"KEEP rule: <b>Decided ≥ {int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY)}</b> and either <b>WR ≥ {float(SETUP_COMBO_POLICY_KEEP_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_POLICY_KEEP_AVG_R):+.2f} + TP≥SL</b>, or <b>WR ≥ {float(SETUP_COMBO_POLICY_WATCH_WR):.0f}% + strong AvgR ≥ {float(SETUP_COMBO_POLICY_PROMOTE_AVG_R):+.2f} + TP&gt;SL</b>. Experimental fast-KEEP is ON: <b>1–{int(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MAX_DECIDED)} decided with 100% WR + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR):+.2f}</b>, or <b>decided ≥ {int(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED)} + WR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR):+.2f}</b>, can be KEEP for live testing. 50% WR alone remains WATCH.\n"
             f"Why a row can still be WATCH: sample/Dec is too small, AvgR/payoff is not strong enough, or a daily/intraday safety row temporarily disabled/tightened it. Policy=the enforced state; Reco=this window's recommendation only.\n"
@@ -50589,7 +50615,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v168:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v169:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50608,7 +50634,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v168:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v169:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -50658,7 +50684,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v168:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v169:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50676,7 +50702,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v168:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v169:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -51053,7 +51079,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v168:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v169:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -51079,7 +51105,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v168:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v169:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -51098,7 +51124,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v168:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v169:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -51129,7 +51155,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v168:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v169:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51603,7 +51629,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v168:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v169:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51628,7 +51654,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v168:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v169:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -51646,7 +51672,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v168:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v169:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51671,7 +51697,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v168:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v169:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55780,7 +55806,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v168:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v169:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55800,7 +55826,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v168:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v169:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55821,7 +55847,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v168:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v169:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
