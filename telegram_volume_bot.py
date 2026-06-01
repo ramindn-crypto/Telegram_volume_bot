@@ -1,4 +1,4 @@
-# yver170: major responsiveness/sync patch: fail-fast Telegram replies, no auto-posting huge admin reports, exact emailed setups are authoritative for AutoTrade, and duplicate setup-id re-entry is blocked.
+# yver171: major responsiveness/sync patch: fail-fast Telegram replies, no auto-posting huge admin reports, exact emailed setups are authoritative for AutoTrade, and duplicate setup-id re-entry is blocked.
 # yver165: final deployment hardening for yver164; bumps heavy admin cache namespace to avoid stale v161 results and disables fixed day/time prior flags by default; no trading/risk changes.
 # yver168: makes current Reco=KEEP authoritative for live policy immediately: /setup_matrix policy, enforceable lookup, screen/email/AutoTrade now promote Reco KEEP lanes (e.g. F1-LON-NOR-BUY, F8-NY-NOR-BUY) to Policy KEEP using latest score evidence, while preserving shared gates.
 # yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
@@ -2847,9 +2847,9 @@ import functools as _functools
 
 _FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
 # User-facing heavy work: reports, diagnostics, manual runs.
-_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "4")))
+_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "2")))
 # Dedicated /screen lane: must not be starved by backtests, optimizer, email, or autotrade.
-_SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SCREEN_EXECUTOR_WORKERS", "2")))
+_SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SCREEN_EXECUTOR_WORKERS", "1")))
 # Dedicated email/network lane: SMTP/ticker calls must not wait behind research jobs.
 _EMAIL_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("EMAIL_EXECUTOR_WORKERS", "2")))
 # Dedicated autotrade lane: live entry/risk checks must never queue behind optimizers or scans.
@@ -2861,8 +2861,9 @@ _AUTONOMOUS_SCREEN_SYNC_LOCK = asyncio.Lock()
 # 07May_v01: this job was firing every 60s while one run often needed >60s,
 # which produced repeated APScheduler "maximum number of running instances" warnings.
 # Keep the autonomous lane hot, but make the schedule longer than the hard runtime budget.
-AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC", "90") or 90)
-AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC", "300") or 300)
+AUTONOMOUS_SCREEN_SYNC_ENABLED = env_bool("AUTONOMOUS_SCREEN_SYNC_ENABLED", False)
+AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC", "35") or 35)
+AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC", "900") or 900)
 AUTONOMOUS_SCREEN_SYNC_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_FIRST_SEC", "45") or 55)
 AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_USERS", "1") or 1)
 
@@ -3323,6 +3324,9 @@ SETUP_ADAPTIVE_WEAK_MIN_DECIDED = 1
 SETUP_ADAPTIVE_STRONG_MIN_DECIDED = max(2, int(globals().get('SETUP_ADAPTIVE_STRONG_MIN_DECIDED', 2) or 2))
 # yver55: 0 means unlimited/all eligible setups in the just-sent email batch.
 AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH = int(os.environ.get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', '0') or 0)
+# yver171: scheduled fallback should be lean. Immediate post-email AutoTrade remains
+# the source of truth for just-sent setups; the periodic job only catches stragglers.
+AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK = int(os.environ.get('AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK', '1') or 1)
 # Ver57: AutoTrade must not open from a hidden executable row before the setup email is sent.
 # The scheduled job can still catch up emailed rows, but email is the authorising/sync point.
 AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
@@ -15010,17 +15014,18 @@ ALERT_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
-AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "55") or 55)
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "18") or 18)
 # Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
 # Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
-AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "300") or 300)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "30") or 30)
+AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "600") or 600)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "20") or 20)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
 AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", False)
-AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "15") or 15)
-AUTOTRADE_GUARDIAN_INTERVAL_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_INTERVAL_SEC", "150") or 150)
+AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "8") or 8)
+AUTOTRADE_GUARDIAN_INTERVAL_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_INTERVAL_SEC", "600") or 600)
 AUTOTRADE_GUARDIAN_MIN_GAP_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_MIN_GAP_SEC", "20") or 20)
+AUTOTRADE_GUARDIAN_LEGACY_CLEANUP_ENABLED = env_bool("AUTOTRADE_GUARDIAN_LEGACY_CLEANUP_ENABLED", False)
 _LAST_AUTOTRADE_GUARDIAN_TS = 0.0
 
 def _autotrade_guardian_recent(max_age_sec: int | None = None) -> bool:
@@ -60049,14 +60054,14 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # EMAIL JOB
 # =========================================================
 
-EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "8"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "12"))
-EMAIL_SEND_TIMEOUT_SEC = max(8, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "12") or 12))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "35"))
+EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "5"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "8"))
+EMAIL_SEND_TIMEOUT_SEC = max(6, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "8") or 8))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "20"))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
-AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "300") or 300)
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "600") or 600)
 AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
@@ -60067,7 +60072,7 @@ ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
-BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "60") or 60)
+BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "18") or 18)
 # yver160 speed mode: keep scheduler jobs short and user commands responsive.
 ALERT_JOB_FAST_SCHEDULER_MODE = env_bool("ALERT_JOB_FAST_SCHEDULER_MODE", True)
 EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED = env_bool("EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED", False)
@@ -60076,7 +60081,7 @@ BIGMOVE_FIRE_AND_FORGET_ENABLED = env_bool("BIGMOVE_FIRE_AND_FORGET_ENABLED", Tr
 # Ver22: autonomous setup discovery must stay hot. A 10-minute rebuild floor made /screen
 # look like the trigger because manual /screen used the dedicated screen lane while the
 # email lane waited on stale/empty pools. Keep it short by default.
-EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "240"))
+EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "120"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
 PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "300"))
@@ -60265,7 +60270,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
         # TIMEOUT-PROTECTED fetch (prevents lock being held forever)
         try:
-            best_fut = await _to_thread_with_timeout(fetch_futures_tickers, EMAIL_FETCH_TIMEOUT_SEC)
+            best_fut = await _to_thread_with_timeout(_screen_best_fut_fast, EMAIL_FETCH_TIMEOUT_SEC)
         except asyncio.TimeoutError:
             return
         except Exception:
@@ -63009,7 +63014,7 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
     except Exception:
         budget = 10.0
     try:
-        max_items = int(os.getenv('AUTOTRADE_GUARDIAN_MAX_ITEMS', '10') or 10)
+        max_items = int(os.getenv('AUTOTRADE_GUARDIAN_MAX_ITEMS', '3') or 3)
     except Exception:
         max_items = 10
 
@@ -63020,14 +63025,16 @@ def _autotrade_monitor_live_exit_protection(uid: int) -> list[dict]:
             return False
 
     try:
-        # First remove legacy standalone Conditional exit rows left by older builds.
-        # This also clears orphan pf_tp/pf_cond orders for symbols that no longer have a position.
-        try:
-            cancelled_orphans = _autotrade_cancel_all_legacy_conditional_exit_orders(max_cancel=50)
-            if int(cancelled_orphans or 0) > 0:
-                repaired.append({'checked': True, 'placement': 'legacy_conditional_cleanup', 'legacy_conditional_cancelled': int(cancelled_orphans or 0)})
-        except Exception:
-            pass
+        # yver171 speed mode: legacy Conditional cleanup is expensive and should not run
+        # on every guardian tick on Render. Native Full TP/SL is attached at entry;
+        # legacy cleanup remains available via /autotrade_fix_exits or env override.
+        if bool(globals().get('AUTOTRADE_GUARDIAN_LEGACY_CLEANUP_ENABLED', False)):
+            try:
+                cancelled_orphans = _autotrade_cancel_all_legacy_conditional_exit_orders(max_cancel=10)
+                if int(cancelled_orphans or 0) > 0:
+                    repaired.append({'checked': True, 'placement': 'legacy_conditional_cleanup', 'legacy_conditional_cancelled': int(cancelled_orphans or 0)})
+            except Exception:
+                pass
 
         live_positions = list(_bybit_get_open_positions_linear() or [])
         journal_open = list(_autotrade_db_open_trades(int(uid)) or [])
@@ -63576,9 +63583,56 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 return
         except Exception:
             pass
-        # Do not silently skip a just-emailed setup because the scheduled
-        # AutoTrade job is briefly running. Queue by waiting for the shared lock.
-        async with AUTOTRADE_EXEC_LOCK:
+        # yver171: do not let a just-emailed setup disappear behind a long
+        # scheduled AutoTrade/Bybit task. Record the emailed batch as queued, then wait
+        # only briefly for the execution lock. If it is busy, leave a visible reason and
+        # schedule a retry; the persisted emailed row is also available to scheduled AT.
+        _lock_wait_sec = float(os.getenv('AUTOTRADE_AFTER_EMAIL_LOCK_WAIT_SEC', '8') or 8)
+        try:
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'QUEUED', 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': 'emailed_setup_waiting_for_execution_lock', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'email_sent_immediate',
+                'attempted_candidates': [
+                    {'setup_id': str(getattr(x, 'setup_id', '') or ''), 'symbol': str(getattr(x, 'symbol', '') or ''), 'side': str(getattr(x, 'side', '') or '')}
+                    for x in list(chosen_list or [])[:8]
+                ],
+            }
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(AUTOTRADE_EXEC_LOCK.acquire(), timeout=max(1.0, _lock_wait_sec))
+            _lock_acquired = True
+        except asyncio.TimeoutError:
+            try:
+                for _s in list(chosen_list or []):
+                    setattr(_s, 'source_kind', 'emailed_setups')
+                    setattr(_s, 'source_session', sess)
+                    setattr(_s, 'delivery_lane_locked', True)
+                    if not float(getattr(_s, 'created_ts', 0.0) or 0.0):
+                        setattr(_s, 'created_ts', time.time())
+                await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_lock_busy_retry', timeout=4)
+            except Exception:
+                pass
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'QUEUED', 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': f'autotrade_exec_lock_busy_retry_next_tick>{int(_lock_wait_sec)}s',
+                'session': sess, 'mode': str(_autotrade_runtime_mode()).lower(),
+                'trigger': 'email_sent_immediate',
+                'attempted_candidates': [
+                    {'setup_id': str(getattr(x, 'setup_id', '') or ''), 'symbol': str(getattr(x, 'symbol', '') or ''), 'side': str(getattr(x, 'side', '') or '')}
+                    for x in list(chosen_list or [])[:8]
+                ],
+            }
+            try:
+                async def _retry_later():
+                    await asyncio.sleep(float(os.getenv('AUTOTRADE_AFTER_EMAIL_RETRY_DELAY_SEC', '12') or 12))
+                    await _trigger_autotrade_after_email_async(uid, session_name, chosen_list)
+                _safe_create_task(_retry_later(), 'autotrade_after_email_lock_retry')
+            except Exception:
+                pass
+            return
+        try:
             # Force selected emailed setups into the owner's executable lane and clear stale empty cache.
             try:
                 if chosen_list:
@@ -63690,6 +63744,12 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             }
             try:
                 db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email', status='placed' if placed_count > 0 else 'skip', session=sess, mode='autotrade', details={'reason': reason, 'attempted': attempted, 'placed': int(placed_count), 'candidates': attempts_meta[:5]})
+            except Exception:
+                pass
+        finally:
+            try:
+                if '_lock_acquired' in locals() and _lock_acquired:
+                    AUTOTRADE_EXEC_LOCK.release()
             except Exception:
                 pass
     except Exception as e:
@@ -63854,15 +63914,25 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
-    # yver157: run the autonomous email/setup/autotrade pipeline as a detached task.
-    # The JobQueue callback returns immediately; _alert_job_async_internal still owns
-    # ALERT_LOCK so overlapping ticks quietly skip instead of blocking commands or
-    # producing APScheduler max_instances warnings.
+    # yver171: hard-cap the detached email engine. Threaded CCXT/SMTP calls can
+    # outlive asyncio.wait_for(), but the coroutine must release ALERT_LOCK quickly
+    # so scheduler ticks and Telegram commands do not appear frozen for minutes.
     try:
-        await _alert_job_async_internal(context)
+        hard_timeout = max(8.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 20) or 20) + 5.0)
+        await asyncio.wait_for(_alert_job_async_internal(context), timeout=hard_timeout)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
             _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
+        except Exception:
+            pass
+    except asyncio.TimeoutError:
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"alert_job_hard_timeout>{int(hard_timeout)}s"
+        except Exception:
+            pass
+        _hb_touch('email', ok=False, error=f'alert_job_hard_timeout>{int(hard_timeout)}s', details='alert_job_timeout')
+        try:
+            logger.warning('alert_job hard-timeout after %ss; released scheduler lock, retry next tick', int(hard_timeout))
         except Exception:
             pass
     except asyncio.CancelledError:
@@ -63963,8 +64033,8 @@ def main():
         Application.builder()
         .token(TOKEN)
         .post_init(_post_init)
-        .concurrent_updates(int(os.getenv('TELEGRAM_CONCURRENT_UPDATES', '64') or 64))
-        .connection_pool_size(int(os.getenv('TELEGRAM_CONNECTION_POOL_SIZE', '256') or 256))
+        .concurrent_updates(int(os.getenv('TELEGRAM_CONCURRENT_UPDATES', '16') or 16))
+        .connection_pool_size(int(os.getenv('TELEGRAM_CONNECTION_POOL_SIZE', '64') or 64))
         .pool_timeout(float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0))
         .connect_timeout(float(os.getenv('TELEGRAM_CONNECT_TIMEOUT_SEC', '3.0') or 3.0))
         .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '30.0') or 30.0))
@@ -63974,7 +64044,7 @@ def main():
     # Configure them on ApplicationBuilder to remove the warning and keep polling stable.
     for _method, _value in (
         ('get_updates_connect_timeout', float(os.getenv('TELEGRAM_POLL_CONNECT_TIMEOUT_SEC', '10') or 10)),
-        ('get_updates_read_timeout', float(os.getenv('TELEGRAM_POLL_READ_TIMEOUT_SEC', '35') or 35)),
+        ('get_updates_read_timeout', float(os.getenv('TELEGRAM_POLL_READ_TIMEOUT_SEC', '25') or 25)),
         ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '20') or 20)),
         ('get_updates_pool_timeout', float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0)),
     ):
@@ -64183,22 +64253,23 @@ def main():
         # the only thing that discovers and emails setups.
         # Ver110: the screen sync lane is a safety/UX accelerator. Keep it slower
         # than its runtime budget to prevent repeated max_instances warnings.
-        auto_screen_interval_sec = max(
-            300,
-            int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 300),
-            int(AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC or 90) + 120,
-        )
-        app.job_queue.run_repeating(
-            autonomous_screen_sync_job,
-            interval=auto_screen_interval_sec,
-            first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
-            name="autonomous_screen_sync_job",
-            job_kwargs={
-                "max_instances": 1,
-                "coalesce": True,
-                "misfire_grace_time": 900,
-            },
-        )
+        if bool(globals().get('AUTONOMOUS_SCREEN_SYNC_ENABLED', False)):
+            auto_screen_interval_sec = max(
+                900,
+                int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 900),
+                int(AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC or 35) + 300,
+            )
+            app.job_queue.run_repeating(
+                autonomous_screen_sync_job,
+                interval=auto_screen_interval_sec,
+                first=max(90, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 120), auto_screen_interval_sec // 2)),
+                name="autonomous_screen_sync_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 900,
+                },
+            )
 
         if SETUP_COMBO_REVIEW_ENABLED:
             app.job_queue.run_repeating(
@@ -64332,7 +64403,7 @@ def main():
         # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
-            interval=max(int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 150), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 45),
+            interval=max(600, int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 600), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 8) + 300),
             first=90,
             name="autotrade_exit_guardian_job",
             job_kwargs={
@@ -64345,7 +64416,7 @@ def main():
         # AutoTrade loop (owner-only)
         app.job_queue.run_repeating(
             autotrade_job,
-            interval=max(300, int(AUTOTRADE_JOB_INTERVAL_SEC or 300), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 30) + 180),
+            interval=max(600, int(AUTOTRADE_JOB_INTERVAL_SEC or 600), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 20) + 300),
             first=45,
             name="autotrade_job",
             job_kwargs={
