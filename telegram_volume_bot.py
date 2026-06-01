@@ -1,5 +1,5 @@
 # yver165: final deployment hardening for yver164; bumps heavy admin cache namespace to avoid stale v161 results and disables fixed day/time prior flags by default; no trading/risk changes.
-# yver167: hardens final KEEP delivery recovery: setup-email scans recent /setup_audit actionable KEEP rows as a last-mile source, prioritises unemailed KEEP rows, and exposes recovery diagnostics so Policy=KEEP rows are not silently missed.
+# yver168: makes current Reco=KEEP authoritative for live policy immediately: /setup_matrix policy, enforceable lookup, screen/email/AutoTrade now promote Reco KEEP lanes (e.g. F1-LON-NOR-BUY, F8-NY-NOR-BUY) to Policy KEEP using latest score evidence, while preserving shared gates.
 # yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
 # yver163: day-time-session live guard from ver161 baseline; ignores ver162 liquidity/soft-stop changes; synced /screen setup-email AutoTrade context gate; Monday pre-ASIA, Monday ASIA market-tone, and Saturday pre-ASIA directional filters.
 # yver161: final sync hardening for Monday audit: delivered/AutoTraded setup IDs are preserved in /setup_audit instead of daily de-duping them away; BigMove/F8 setup-email rows hydrate /screen from executable_setups even when signals metadata is missing; Bybit-verified AutoTrade TP/SL can override candle-audit for traded rows; weekly policy catch-up window/retry hardened; admin cache namespace bumped.
@@ -40524,8 +40524,8 @@ def _setup_assumptions_text(uid: int) -> str:
             '2) Policy assumptions',
             f'• Active policy counts now: KEEP={keep} | WATCH={watch} | DISABLE/OFF={off}.',
             '• KEEP is data-driven: normal KEEP rules + experimental strong small-sample rules + current Reco promotion when evidence qualifies.',
-            '• Reco=KEEP can promote an active WATCH row to KEEP when it is not explicitly DISABLE/OFF.',
-            '• Explicit DISABLE/OFF/BLOCK/PAUSE still wins over a Reco promotion.',
+            '• Reco=KEEP is now promoted immediately to Policy=KEEP in the live overlay.',
+            '• This Reco=KEEP live overlay is shared by /setup_matrix policy, /screen, setup email and AutoTrade.',
             '',
             '3) Live sync assumptions',
             '• /screen, setup email and AutoTrade use the same shared live gate.',
@@ -49145,6 +49145,107 @@ def _setup_edge_guard_snapshot_text(uid: int = 0, hours: int | None = None) -> s
         return f"Micro edge guard: ERROR {type(exc).__name__}: {exc}"
 
 
+
+def _setup_combo_latest_score_lookup(uid: int = 0) -> dict:
+    """Return latest setup_combo_scores rows keyed by exact Family-Session-Strategy-Side.
+
+    yver168: this is the live Reco source. If the latest score says Reco=KEEP,
+    policy display/enforcement should promote that lane immediately instead of
+    waiting for a weekly/daily policy cache row to be rewritten.
+    """
+    out = {}
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        ids = []
+        if int(uid or 0) > 0:
+            ids.append(int(uid))
+        if owner_uid > 0 and owner_uid not in ids:
+            ids.append(owner_uid)
+        if 0 not in ids:
+            ids.append(0)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            qmarks = ','.join(['?'] * len(ids))
+            latest = cur.execute(
+                f"SELECT run_id FROM setup_combo_scores WHERE user_id IN ({qmarks}) ORDER BY evaluated_ts DESC LIMIT 1",
+                tuple(ids)
+            ).fetchone()
+            if not latest or not latest['run_id']:
+                return {}
+            for sr in cur.execute("SELECT * FROM setup_combo_scores WHERE run_id=?", (latest['run_id'],)).fetchall() or []:
+                d = dict(sr)
+                fam = str(d.get('family') or '').upper().strip()
+                sess = str(d.get('session') or '').upper().strip()
+                strat = str(d.get('strategy') or 'NOR').upper().strip() or 'NOR'
+                side = str(d.get('side') or 'BOTH').upper().strip() or 'BOTH'
+                combo = str(d.get('combo') or '').upper().strip()
+                if not combo and fam and sess:
+                    if strat in {'NOR', 'REV'} and side in {'BUY', 'SELL'}:
+                        combo = _setup_combo_strategy_side_key(fam, sess, strat, side)
+                    elif strat in {'NOR', 'REV'}:
+                        combo = _setup_combo_strategy_key(fam, sess, strat)
+                    else:
+                        combo = f'{fam}-{sess}'
+                if not combo:
+                    continue
+                d['combo'] = combo
+                out[combo] = d
+    except Exception:
+        return {}
+    return out
+
+
+def _setup_combo_reco_keep_promote_enabled() -> bool:
+    try:
+        return bool(globals().get('SETUP_COMBO_CURRENT_RECO_PROMOTE_ENABLED', True)) and bool(env_bool('SETUP_COMBO_RECO_KEEP_PROMOTE_IMMEDIATE', True))
+    except Exception:
+        return True
+
+
+def _setup_combo_reco_keep_score_is_keep(score: dict | None) -> bool:
+    try:
+        if not _setup_combo_reco_keep_promote_enabled():
+            return False
+        if str((score or {}).get('action') or '').upper().strip() == 'KEEP':
+            return True
+        # Defensive fallback: if action text is stale/missing, mirror the current
+        # data-driven KEEP rule from the row metrics.
+        dec = int((score or {}).get('decided') or 0)
+        tp = int((score or {}).get('tp') or 0)
+        sl = int((score or {}).get('sl') or 0)
+        wr = float((score or {}).get('win_rate') if (score or {}).get('win_rate') is not None else 0.0)
+        avg = float((score or {}).get('avg_r') or 0.0)
+        ok, _why = _setup_combo_data_driven_keep_override(dec, tp, sl, wr, avg)
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _setup_combo_policy_row_from_score(score: dict, uid: int = 0) -> dict:
+    try:
+        fam = str(score.get('family') or '').upper().strip()
+        sess = str(score.get('session') or '').upper().strip()
+        strat = str(score.get('strategy') or 'NOR').upper().strip() or 'NOR'
+        side = str(score.get('side') or 'BOTH').upper().strip() or 'BOTH'
+        combo = str(score.get('combo') or '').upper().strip()
+        if not combo and fam and sess:
+            combo = _setup_combo_strategy_side_key(fam, sess, strat, side) if strat in {'NOR','REV'} and side in {'BUY','SELL'} else f'{fam}-{sess}'
+        return {
+            'user_id': int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0),
+            'family': fam, 'session': sess, 'strategy': strat, 'side': side,
+            'combo': combo, 'status': 'KEEP', 'enabled': 1,
+            'policy_kind': 'reco_keep_live_overlay',
+            'last_setups': int(score.get('setups') or 0),
+            'last_decided': int(score.get('decided') or 0),
+            'last_win_rate': float(score.get('win_rate') if score.get('win_rate') is not None else 0.0),
+            'last_avg_r': float(score.get('avg_r') or 0.0),
+            'last_score': float(score.get('score') or 0.0),
+            'notes': 'yver168 latest Reco=KEEP promoted to live Policy=KEEP',
+        }
+    except Exception:
+        return {'status': 'KEEP', 'enabled': 1, 'policy_kind': 'reco_keep_live_overlay', 'notes': 'yver168 latest Reco=KEEP promoted'}
+
 def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
     """Return current enforceable policy rows keyed by combo/lane.
 
@@ -49209,6 +49310,27 @@ def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
                     out[combo] = pol_out
             except Exception:
                 continue
+        # yver168: current Reco=KEEP is immediately enforceable.
+        # This fixes lanes such as F1-LON-NOR-BUY and F8-NY-NOR-BUY showing
+        # Reco KEEP but Policy WATCH. It also feeds the same state to /screen,
+        # setup email and AutoTrade through the shared policy lookup.
+        try:
+            if _setup_combo_reco_keep_promote_enabled():
+                latest_score_lookup = _setup_combo_latest_score_lookup(int(uid or 0))
+                for combo_s, score_s in (latest_score_lookup or {}).items():
+                    combo_s = str(combo_s or '').upper().strip()
+                    if not combo_s or not _setup_combo_reco_keep_score_is_keep(score_s):
+                        continue
+                    pol_keep = _setup_combo_policy_row_from_score(dict(score_s or {}), int(uid or 0))
+                    existing = dict(out.get(combo_s) or {})
+                    # Owner decision: Reco KEEP must become Policy KEEP immediately.
+                    existing.update(pol_keep)
+                    existing['status'] = 'KEEP'
+                    existing['enabled'] = 1
+                    existing['notes'] = (str(existing.get('notes') or '') + ' | yver168 immediate Reco=KEEP overlay')[:500]
+                    out[combo_s] = existing
+        except Exception:
+            pass
         return out
     except Exception:
         return {}
@@ -50386,24 +50508,26 @@ def _setup_combo_policy_text(uid: int) -> str:
             wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
             avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
             adv = str(score.get('action') or '-').upper().strip() or '-'
-            # yver154: keep /setup_matrix policy display synced with the live
-            # experimental KEEP overlay. Runtime lookup already promotes eligible
-            # exact WATCH lanes; this fixes the policy table so rows such as
-            # F8-LON-NOR-SELL (60% WR, AvgR +0.80) and F6-NY-REV-SELL
-            # (75% WR, AvgR +0.65) no longer display as GATE/WATCH.
+            # yver168: keep /setup_matrix policy display synced with live enforcement.
+            # If this window's Reco is KEEP, Policy must become KEEP immediately.
+            # Also mirror the data-driven KEEP override, not only the older experimental overlay.
             try:
-                if (not full_disabled) and (not side_block) and str(live_state or '').upper().strip() == 'WATCH':
-                    tp_v = int(score.get('tp') if score.get('tp') is not None else 0)
-                    sl_v = int(score.get('sl') if score.get('sl') is not None else 0)
-                    if dec_v > 0 and (tp_v + sl_v) <= 0:
-                        tp_v = int(round((float(wr_v) / 100.0) * dec_v))
-                        sl_v = max(0, int(dec_v) - int(tp_v))
-                    exp_keep, exp_reason = _setup_combo_experimental_keep_override(dec_v, tp_v, sl_v, wr_v, avg_v)
-                    if exp_keep:
-                        exec_state = 'KEEP'
-                        live_state = 'KEEP'
-                        if adv == '-' or adv == 'WATCH':
-                            adv = 'KEEP'
+                tp_v = int(score.get('tp') if score.get('tp') is not None else 0)
+                sl_v = int(score.get('sl') if score.get('sl') is not None else 0)
+                if dec_v > 0 and (tp_v + sl_v) <= 0:
+                    tp_v = int(round((float(wr_v) / 100.0) * dec_v))
+                    sl_v = max(0, int(dec_v) - int(tp_v))
+                data_keep, data_reason = _setup_combo_data_driven_keep_override(dec_v, tp_v, sl_v, wr_v, avg_v)
+                reco_keep = str(adv or '').upper().strip() == 'KEEP'
+                if _setup_combo_reco_keep_promote_enabled() and (reco_keep or data_keep):
+                    old_live_state = str(live_state or '').upper().strip()
+                    if old_live_state in {'DISABLE', 'OFF', 'BLOCK', 'PAUSE'}:
+                        disabled_count = max(0, disabled_count - 1); active_count += 1
+                    elif old_live_state == 'TIGHTEN':
+                        partial_count = max(0, partial_count - 1); active_count += 1
+                    exec_state = 'KEEP'
+                    live_state = 'KEEP'
+                    adv = 'KEEP'
             except Exception:
                 pass
             # yver67: keep policy table focused. Row-level Kind was confusing and
@@ -50436,7 +50560,7 @@ def _setup_combo_policy_text(uid: int) -> str:
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid), _overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168))))
         note = (
             f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL). <b>ExecNow</b> is the actual executable state now. <b>Policy</b> is the enforced policy state. <b>Reco</b> is this window's recommendation only. <b>PART</b>=this exact lane is tightened by its own evidence. <b>OFF</b>=this exact lane is disabled by scheduled/daily safety policy. No-evidence lanes show '-' metrics."
+            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL). <b>ExecNow</b> is the actual executable state now. <b>Policy</b> is the enforced policy state. <b>Reco</b> is this window's recommendation; Reco=KEEP is promoted immediately to Policy=KEEP. <b>PART</b>=this exact lane is tightened by its own evidence. <b>OFF</b>=this exact lane is disabled by scheduled/daily safety policy. No-evidence lanes show '-' metrics."
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
@@ -50465,7 +50589,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v167:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v168:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50484,7 +50608,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v167:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v168:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -50534,7 +50658,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v167:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v168:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50552,7 +50676,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v167:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v168:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50929,7 +51053,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v167:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v168:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50955,7 +51079,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v167:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v168:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -50974,7 +51098,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v167:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v168:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -51005,7 +51129,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v167:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v168:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51479,7 +51603,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v167:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v168:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51504,7 +51628,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v167:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v168:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -51522,7 +51646,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v167:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v168:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51547,7 +51671,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v167:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v168:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55656,7 +55780,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v167:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v168:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55676,7 +55800,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v167:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v168:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55697,7 +55821,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v167:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v168:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
