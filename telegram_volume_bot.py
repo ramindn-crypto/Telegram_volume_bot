@@ -1,3 +1,5 @@
+# yver164: data-driven day/time/session guard from setup_deep_analysis/edge metrics; promotes WATCH rows to KEEP when current Reco/metrics qualify (e.g. F8-NY-NOR-BUY); adds /assumptions admin command; no risk changes.
+# yver163: day-time-session live guard from ver161 baseline; ignores ver162 liquidity/soft-stop changes; synced /screen setup-email AutoTrade context gate; Monday pre-ASIA, Monday ASIA market-tone, and Saturday pre-ASIA directional filters.
 # yver161: final sync hardening for Monday audit: delivered/AutoTraded setup IDs are preserved in /setup_audit instead of daily de-duping them away; BigMove/F8 setup-email rows hydrate /screen from executable_setups even when signals metadata is missing; Bybit-verified AutoTrade TP/SL can override candle-audit for traded rows; weekly policy catch-up window/retry hardened; admin cache namespace bumped.
 # yver153: broaden experimental strong-KEEP promotion for high payoff lanes (>=4 decided, WR>=60%, AvgR>=+0.60), so lanes such as F8-LON-NOR-SELL and F6-NY-REV-SELL can be live-tested as KEEP; no risk/SL/TP changes.
 # yver149: fixes /setup_audit_compare pre-window open matching.
@@ -5257,6 +5259,35 @@ AUTOTRADE_CONTEXT_WATCH_LOW_SAMPLE_MIN_CONF = int(os.environ.get("AUTOTRADE_CONT
 AUTOTRADE_CONTEXT_WATCH_LOW_SAMPLE_MIN_DYNAMIC = float(os.environ.get("AUTOTRADE_CONTEXT_WATCH_LOW_SAMPLE_MIN_DYNAMIC", "75") or 75)
 
 
+# yver163: Day + time + session live-context guard.
+# This is intentionally NOT a risk change and NOT a 30M liquidity-floor change.
+# It uses the same shared context gate as /screen, setup-email and AutoTrade so
+# user-visible setups and real entries stay synced while background audit still learns.
+AUTOTRADE_DAY_TIME_SESSION_GUARD_ENABLED = env_bool("AUTOTRADE_DAY_TIME_SESSION_GUARD_ENABLED", True)
+AUTOTRADE_DTS_STRONG_ESCAPE_MIN_DECIDED = int(os.environ.get("AUTOTRADE_DTS_STRONG_ESCAPE_MIN_DECIDED", "10") or 10)
+AUTOTRADE_DTS_STRONG_ESCAPE_WR = float(os.environ.get("AUTOTRADE_DTS_STRONG_ESCAPE_WR", "65.0") or 65.0)
+AUTOTRADE_DTS_STRONG_ESCAPE_AVGR = float(os.environ.get("AUTOTRADE_DTS_STRONG_ESCAPE_AVGR", "0.55") or 0.55)
+AUTOTRADE_DTS_MARKET_PULSE_MAX_AGE_SEC = int(os.environ.get("AUTOTRADE_DTS_MARKET_PULSE_MAX_AGE_SEC", "1800") or 1800)
+AUTOTRADE_DTS_MONDAY_PRE_ASIA_STRICT = env_bool("AUTOTRADE_DTS_MONDAY_PRE_ASIA_STRICT", True)
+AUTOTRADE_DTS_SATURDAY_PRE_ASIA_BUY_STRICT = env_bool("AUTOTRADE_DTS_SATURDAY_PRE_ASIA_BUY_STRICT", True)
+AUTOTRADE_DTS_MONDAY_ASIA_TONE_FILTER = env_bool("AUTOTRADE_DTS_MONDAY_ASIA_TONE_FILTER", True)
+
+# yver164: replace fixed day/time assumptions with a data-driven guard.
+# The bot learns weak DAY + HOUR + SESSION + SIDE contexts from the same evidence
+# behind /setup_deep_analysis 168/overall. Fixed priors are disabled by default and
+# are only retained as optional fallback flags for emergency testing.
+AUTOTRADE_DTS_DATA_DRIVEN_ENABLED = env_bool("AUTOTRADE_DTS_DATA_DRIVEN_ENABLED", True)
+AUTOTRADE_DTS_FALLBACK_PRIOR_ENABLED = env_bool("AUTOTRADE_DTS_FALLBACK_PRIOR_ENABLED", False)
+AUTOTRADE_DTS_CONTEXT_MIN_DECIDED = int(os.environ.get("AUTOTRADE_DTS_CONTEXT_MIN_DECIDED", "8") or 8)
+AUTOTRADE_DTS_CONTEXT_WR_BLOCK_MAX = float(os.environ.get("AUTOTRADE_DTS_CONTEXT_WR_BLOCK_MAX", "40.0") or 40.0)
+AUTOTRADE_DTS_CONTEXT_AVGR_BLOCK_MAX = float(os.environ.get("AUTOTRADE_DTS_CONTEXT_AVGR_BLOCK_MAX", "0.00") or 0.00)
+AUTOTRADE_DTS_CONTEXT_SL_MARGIN = int(os.environ.get("AUTOTRADE_DTS_CONTEXT_SL_MARGIN", "2") or 2)
+AUTOTRADE_DTS_CONTEXT_CAUTION_MIN_DECIDED = int(os.environ.get("AUTOTRADE_DTS_CONTEXT_CAUTION_MIN_DECIDED", "12") or 12)
+AUTOTRADE_DTS_CONTEXT_CAUTION_WR_MAX = float(os.environ.get("AUTOTRADE_DTS_CONTEXT_CAUTION_WR_MAX", "45.0") or 45.0)
+AUTOTRADE_DTS_CONTEXT_CAUTION_AVGR_MAX = float(os.environ.get("AUTOTRADE_DTS_CONTEXT_CAUTION_AVGR_MAX", "-0.05") or -0.05)
+SETUP_COMBO_CURRENT_RECO_PROMOTE_ENABLED = env_bool("SETUP_COMBO_CURRENT_RECO_PROMOTE_ENABLED", True)
+
+
 def _autotrade_daily_realized_loss_stop_allows(uid: int) -> tuple[bool, str]:
     """Hard real-money brake: do not open new AutoTrades after a bad Melbourne day."""
     try:
@@ -5408,6 +5439,210 @@ def _autotrade_exact_lane_watch_escape_from_setup_audit(data: dict, combo: str) 
     except Exception as exc:
         return False, f'exact_watch_escape_error:{type(exc).__name__}'
 
+
+def _autotrade_dts_setup_local_dt(setup_or_row) -> datetime:
+    """Best-effort Melbourne timestamp for day/time/session guard."""
+    try:
+        ts = 0.0
+        if isinstance(setup_or_row, dict):
+            for k in ('executable_ts', 'ts', 'signal_created_ts', 'created_ts', 'setup_ts', 'when_ts'):
+                try:
+                    ts = float((setup_or_row or {}).get(k) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if ts > 0:
+                    break
+        else:
+            for k in ('executable_ts', 'created_ts', 'signal_created_ts', 'setup_ts', 'ts'):
+                try:
+                    ts = float(getattr(setup_or_row, k, 0.0) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if ts > 0:
+                    break
+        if ts > 0:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+    except Exception:
+        pass
+    try:
+        return datetime.now(MEL_TZ)
+    except Exception:
+        return datetime.now(timezone.utc).astimezone(MEL_TZ)
+
+
+def _autotrade_dts_exact_strong(data: dict, combo: str) -> tuple[bool, str]:
+    """Strict escape for bad day/time/session contexts using exact-lane evidence."""
+    try:
+        key = str(combo or '').upper().strip()
+        m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(key) or {})
+        if not m:
+            return False, f'no_exact_metrics:{key}'
+        dec = int(m.get('decided') or 0)
+        wr = float(m.get('wr') or 0.0)
+        avg = float(m.get('avg_r') or 0.0)
+        min_dec = int(globals().get('AUTOTRADE_DTS_STRONG_ESCAPE_MIN_DECIDED', 10) or 10)
+        min_wr = float(globals().get('AUTOTRADE_DTS_STRONG_ESCAPE_WR', 65.0) or 65.0)
+        min_avg = float(globals().get('AUTOTRADE_DTS_STRONG_ESCAPE_AVGR', 0.55) or 0.55)
+        ok = dec >= min_dec and wr >= min_wr and avg >= min_avg
+        return bool(ok), f'{key}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
+    except Exception as exc:
+        return False, f'exact_strong_error:{type(exc).__name__}'
+
+
+def _autotrade_latest_market_pulse(max_age_sec: int | None = None) -> dict:
+    """Read latest /screen market pulse so Monday-ASIA filter can use market tone.
+    Returns {} if missing/stale. This is intentionally best-effort and never raises.
+    """
+    try:
+        max_age = int(max_age_sec if max_age_sec is not None else globals().get('AUTOTRADE_DTS_MARKET_PULSE_MAX_AGE_SEC', 1800) or 1800)
+        now_ts = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT created_ts, market_pulse_json FROM market_scan_snapshots ORDER BY created_ts DESC LIMIT 1")
+            row = c.fetchone()
+        if not row:
+            return {}
+        created_ts = float(row[0] or 0.0)
+        if created_ts <= 0 or (now_ts - created_ts) > max_age:
+            return {}
+        raw = row[1] or '{}'
+        try:
+            pulse = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except Exception:
+            try:
+                pulse = _json_loads_safe(raw, {})
+            except Exception:
+                pulse = {}
+        if isinstance(pulse, dict):
+            pulse['_age_sec'] = max(0.0, now_ts - created_ts)
+            return pulse
+    except Exception:
+        pass
+    return {}
+
+
+def _autotrade_market_broad_green_from_pulse() -> tuple[bool, str]:
+    """True when the latest market pulse is broadly green/risk-on."""
+    try:
+        p = _autotrade_latest_market_pulse()
+        if not p:
+            return False, 'market_pulse_missing_or_stale'
+        tone = str(p.get('risk_tone') or '').lower().strip()
+        leaders = int(p.get('leaders_n') or 0)
+        losers = int(p.get('losers_n') or 0)
+        adv = int(p.get('breadth_adv') or 0)
+        dec = int(p.get('breadth_dec') or 0)
+        avg_adv = float(p.get('avg_adv_24h') or 0.0)
+        # Require either explicit risk_on, or clearly more leaders/advancers with real positive move.
+        green = (tone == 'risk_on' and leaders >= max(3, losers + 2)) or (leaders >= max(4, losers + 3)) or (adv >= max(6, int(dec * 1.35)) and avg_adv >= 1.0)
+        return bool(green), f'tone={tone or "?"}:leaders={leaders}:losers={losers}:adv={adv}:dec={dec}:avgAdv={avg_adv:.1f}:age={float(p.get("_age_sec") or 0.0):.0f}s'
+    except Exception as exc:
+        return False, f'market_pulse_error:{type(exc).__name__}'
+
+
+def _autotrade_dts_context_candidates(dt_local: datetime, sess: str, side: str) -> list[tuple[str, str]]:
+    try:
+        wd = dt_local.strftime('%a').upper()[:3]
+        hr = dt_local.strftime('%H:00')
+        sess_u = str(sess or '-').upper().strip() or '-'
+        side_u = str(side or '-').upper().strip() or '-'
+        return [
+            (f'{wd}-{hr}-{sess_u}-{side_u}', 'day+hour+session+side'),
+            (f'{wd}-{sess_u}-{side_u}', 'day+session+side'),
+            (f'{wd}-{hr}-{side_u}', 'day+hour+side'),
+            (f'{hr}-{sess_u}-{side_u}', 'hour+session+side'),
+            (f'{hr}-{side_u}', 'hour+side'),
+        ]
+    except Exception:
+        return []
+
+
+def _autotrade_dts_metric_is_weak(m: dict) -> tuple[bool, str]:
+    try:
+        dec = int(m.get('decided') or 0)
+        tp = int(m.get('tp') or 0)
+        sl = int(m.get('sl') or 0)
+        wr = float(m.get('wr') or 0.0)
+        avg = float(m.get('avg_r') or 0.0)
+        min_dec = int(globals().get('AUTOTRADE_DTS_CONTEXT_MIN_DECIDED', 8) or 8)
+        wr_max = float(globals().get('AUTOTRADE_DTS_CONTEXT_WR_BLOCK_MAX', 40.0) or 40.0)
+        avg_max = float(globals().get('AUTOTRADE_DTS_CONTEXT_AVGR_BLOCK_MAX', 0.0) or 0.0)
+        sl_margin = int(globals().get('AUTOTRADE_DTS_CONTEXT_SL_MARGIN', 2) or 2)
+        if dec >= min_dec and wr <= wr_max and avg <= avg_max and sl >= max(tp + sl_margin, min_dec // 2):
+            return True, f'weak_context:WR{wr:.1f}:AvgR{avg:+.2f}:TP{tp}:SL{sl}:n{dec}'
+        cmin = int(globals().get('AUTOTRADE_DTS_CONTEXT_CAUTION_MIN_DECIDED', 12) or 12)
+        cwr = float(globals().get('AUTOTRADE_DTS_CONTEXT_CAUTION_WR_MAX', 45.0) or 45.0)
+        cavg = float(globals().get('AUTOTRADE_DTS_CONTEXT_CAUTION_AVGR_MAX', -0.05) or -0.05)
+        if dec >= cmin and wr <= cwr and avg <= cavg and sl > tp:
+            return True, f'caution_context:WR{wr:.1f}:AvgR{avg:+.2f}:TP{tp}:SL{sl}:n{dec}'
+        return False, f'context_ok_or_insufficient:WR{wr:.1f}:AvgR{avg:+.2f}:TP{tp}:SL{sl}:n{dec}'
+    except Exception as exc:
+        return False, f'context_metric_error:{type(exc).__name__}'
+
+
+def _autotrade_day_time_session_guard_allows(setup_or_row, *, data: dict, combo: str, side: str, sess: str) -> tuple[bool, str]:
+    """Data-driven day + time + session guard, shared by /screen, setup-email and AutoTrade.
+
+    yver164: the guard is no longer a fixed Monday/Saturday assumption. It reads the
+    same overall evidence used by /setup_deep_analysis 168/overall and blocks only the
+    DAY/HOUR/SESSION/SIDE contexts that are currently weak. Exact strong lanes can
+    still escape weak broad context.
+    """
+    try:
+        if not bool(globals().get('AUTOTRADE_DAY_TIME_SESSION_GUARD_ENABLED', True)):
+            return True, 'day_time_session_guard_disabled'
+        side = str(side or '').upper().strip()
+        sess = str(sess or '').upper().strip()
+        dt_local = _autotrade_dts_setup_local_dt(setup_or_row)
+        exact_ok, exact_reason = _autotrade_dts_exact_strong(data, combo)
+        try:
+            _setup_quality_gate_set_attr(setup_or_row, 'day_time_session_guard_note', f'{dt_local.strftime("%a %H:%M")} {sess} {side}; exact={exact_reason}')
+        except Exception:
+            pass
+
+        # Primary rule: current evidence decides. No fixed Friday/Sunday/Monday rule is
+        # permanent; when data improves, the context automatically stops blocking.
+        if bool(globals().get('AUTOTRADE_DTS_DATA_DRIVEN_ENABLED', True)):
+            dts = dict((data or {}).get('day_time_session_metrics') or (data or {}).get('dts_metrics') or {})
+            if dts and side in {'BUY', 'SELL'}:
+                for key, label in _autotrade_dts_context_candidates(dt_local, sess, side):
+                    m = dict(dts.get(key) or {})
+                    if not m:
+                        continue
+                    weak, why = _autotrade_dts_metric_is_weak(m)
+                    if weak:
+                        if exact_ok:
+                            return True, f'dts_data_exact_escape:{label}:{key}:{why}:{exact_reason}'
+                        return False, f'dts_data_context_block:{label}:{key}:{why}:{exact_reason}'
+                return True, 'dts_data_context_ok'
+
+        # Optional legacy priors are off by default. They can be re-enabled via env only
+        # if the owner deliberately wants fixed day/time priors in addition to data.
+        if bool(globals().get('AUTOTRADE_DTS_FALLBACK_PRIOR_ENABLED', False)):
+            wd = int(dt_local.weekday())
+            hh = int(dt_local.hour)
+            if bool(globals().get('AUTOTRADE_DTS_MONDAY_PRE_ASIA_STRICT', True)) and wd == 0 and 2 <= hh < 10:
+                if exact_ok:
+                    return True, f'dts_prior_monday_pre_asia_exact_escape:{exact_reason}'
+                return False, f'dts_prior_monday_pre_asia_block:{dt_local.strftime("%a %H:%M")}:{exact_reason}'
+            if bool(globals().get('AUTOTRADE_DTS_SATURDAY_PRE_ASIA_BUY_STRICT', True)) and wd == 5 and 2 <= hh < 10 and side == 'BUY':
+                if exact_ok:
+                    return True, f'dts_prior_saturday_pre_asia_buy_exact_escape:{exact_reason}'
+                return False, f'dts_prior_saturday_pre_asia_buy_block:{dt_local.strftime("%a %H:%M")}:{exact_reason}'
+            if bool(globals().get('AUTOTRADE_DTS_MONDAY_ASIA_TONE_FILTER', True)) and wd == 0 and sess == 'ASIA':
+                market_green, market_reason = _autotrade_market_broad_green_from_pulse()
+                if side == 'BUY' and not market_green and not exact_ok:
+                    return False, f'dts_prior_monday_asia_buy_block_market_not_green:{market_reason}:{exact_reason}'
+                if side == 'SELL' and market_green and not exact_ok:
+                    return False, f'dts_prior_monday_asia_sell_block_green_market:{market_reason}:{exact_reason}'
+                return True, f'dts_prior_monday_asia_tone_ok:{market_reason}'
+
+        return True, 'day_time_session_guard_ok'
+    except Exception as exc:
+        # Fail open to avoid bot stoppage; other policy/leverage/risk gates still apply.
+        return True, f'day_time_session_guard_error_allowed:{type(exc).__name__}'
+
+
 def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0, *, apply_strict_keep_edge: bool = True) -> tuple[bool, str]:
     """Final real-money filter: policy KEEP + realised AutoTrade edge + setup-audit context."""
     try:
@@ -5440,6 +5675,15 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
             return True, 'autotrade_realized_combo_ok'
         hours = _overall_report_effective_hours(int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
         data = _setup_edge_guard_build(owner_uid, hours=hours, force=False) or {}
+
+        # yver163: shared DAY + TIME + SESSION guard. This is the replacement for
+        # a blunt hour-only block: it stays synced across /screen, setup email and
+        # AutoTrade, but keeps background audit rows untouched.
+        dts_ok, dts_why = _autotrade_day_time_session_guard_allows(
+            setup_or_row, data=data, combo=combo, side=side, sess=sess_k
+        )
+        if not dts_ok:
+            return False, dts_why
 
         # yver156: keep /screen, setup email and AutoTrade synchronised.
         # If the active policy lookup says an exact lane is KEEP, AutoTrade must not
@@ -40225,6 +40469,105 @@ async def usdt_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # grant_standard_access(user_id)
     # grant_pro_access(user_id)
 
+def _assumptions_rank_metric_items(metrics: dict, weak_only: bool = False, limit: int = 8) -> list[tuple[str, dict]]:
+    try:
+        items = []
+        for k, v in dict(metrics or {}).items():
+            m = dict(v or {})
+            dec = int(m.get('decided') or 0)
+            if dec <= 0:
+                continue
+            if weak_only:
+                weak, _ = _autotrade_dts_metric_is_weak(m)
+                if not weak:
+                    continue
+            score = float(m.get('score') or 0.0)
+            wr = float(m.get('wr') or 0.0)
+            avg = float(m.get('avg_r') or 0.0)
+            items.append((str(k), m, score, wr, avg, dec))
+        items.sort(key=lambda x: (x[2], x[3], x[4], -x[5]))
+        return [(k, m) for k, m, *_ in items[:max(1, int(limit or 8))]]
+    except Exception:
+        return []
+
+
+def _setup_assumptions_text(uid: int) -> str:
+    try:
+        uid = int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        hours = _overall_report_effective_hours(int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
+        data = _setup_edge_guard_build(uid, hours=hours, force=False) or {}
+        pol = _setup_combo_enforceable_policy_lookup(uid) or {}
+        keep = sum(1 for p in pol.values() if str((p or {}).get('status') or '').upper() == 'KEEP' and int((p or {}).get('enabled') if (p or {}).get('enabled') is not None else 1) == 1)
+        watch = sum(1 for p in pol.values() if str((p or {}).get('status') or '').upper() == 'WATCH' and int((p or {}).get('enabled') if (p or {}).get('enabled') is not None else 1) == 1)
+        off = sum(1 for p in pol.values() if str((p or {}).get('status') or '').upper() in {'DISABLE','OFF','BLOCK','PAUSE'} or int((p or {}).get('enabled') if (p or {}).get('enabled') is not None else 1) == 0)
+        dts_metrics = dict((data or {}).get('day_time_session_metrics') or {})
+        weak_dts = _assumptions_rank_metric_items(dts_metrics, weak_only=True, limit=10)
+        weak_hours = _assumptions_rank_metric_items(dict((data or {}).get('hour_metrics') or {}), weak_only=False, limit=8)
+        symbol_blocks = dict((data or {}).get('symbol_block') or {})
+        lines = [
+            '🧠 PulseFutures Assumptions / Live Rules',
+            HDR,
+            'Purpose: show the assumptions currently used to create, show, email and AutoTrade setups.',
+            f'Evidence window: {_overall_report_window_label(hours)} | Source: setup_audit + setup_deep_analysis overall/168-equivalent | Built rows: {int((data or {}).get("rows") or 0)}',
+            '',
+            '1) Setup generation assumptions',
+            f'• Background scanner still records EXECUTABLE+GENERATED rows for learning, even when live delivery blocks them.',
+            f'• Audit volume floor remains ${_setup_min_volume_floor_usd()/1e6:.0f}M unless config changes it.',
+            '• Result basis: TP/(TP+SL); OPEN/NOHIT are tracked but excluded from WR.',
+            '• Combo identity is Family-Session-Strategy-Side, e.g. F8-NY-NOR-BUY.',
+            '',
+            '2) Policy assumptions',
+            f'• Active policy counts now: KEEP={keep} | WATCH={watch} | DISABLE/OFF={off}.',
+            '• KEEP is data-driven: normal KEEP rules + experimental strong small-sample rules + current Reco promotion when evidence qualifies.',
+            '• Reco=KEEP can promote an active WATCH row to KEEP when it is not explicitly DISABLE/OFF.',
+            '• Explicit DISABLE/OFF/BLOCK/PAUSE still wins over a Reco promotion.',
+            '',
+            '3) Live sync assumptions',
+            '• /screen, setup email and AutoTrade use the same shared live gate.',
+            f'• User-visible WATCH allowed: {"YES" if _user_visible_allow_watch_policy("screen") else "NO"}; AutoTrade WATCH allowed: {"YES" if _autotrade_allow_watch_policy() else "NO"}.',
+            '• AutoTrade can still skip a visible KEEP setup for duplicate symbol, safe leverage, blocked symbol, risk-cap, stale entry-window or Bybit rejection.',
+            '',
+            '4) Dynamic day/time/session assumptions',
+            '• No permanent Friday/Sunday/Monday fixed rule is applied by default.',
+            '• The live guard learns weak DAY+HOUR+SESSION+SIDE contexts from the same overall evidence as /setup_deep_analysis 168/overall.',
+            f'• Weak context block threshold: decided≥{int(globals().get("AUTOTRADE_DTS_CONTEXT_MIN_DECIDED",8) or 8)}, WR≤{float(globals().get("AUTOTRADE_DTS_CONTEXT_WR_BLOCK_MAX",40.0) or 40.0):.1f}%, AvgR≤{float(globals().get("AUTOTRADE_DTS_CONTEXT_AVGR_BLOCK_MAX",0.0) or 0.0):+.2f}.',
+            f'• Strong exact-lane escape: decided≥{int(globals().get("AUTOTRADE_DTS_STRONG_ESCAPE_MIN_DECIDED",10) or 10)}, WR≥{float(globals().get("AUTOTRADE_DTS_STRONG_ESCAPE_WR",65.0) or 65.0):.1f}%, AvgR≥{float(globals().get("AUTOTRADE_DTS_STRONG_ESCAPE_AVGR",0.55) or 0.55):+.2f}.',
+        ]
+        if weak_dts:
+            lines.append('• Current weak day/time/session contexts:')
+            for k, m in weak_dts:
+                lines.append(f'  - {k}: WR={float(m.get("wr") or 0.0):.1f}% AvgR={float(m.get("avg_r") or 0.0):+.2f} TP={int(m.get("tp") or 0)} SL={int(m.get("sl") or 0)} n={int(m.get("decided") or 0)}')
+        else:
+            lines.append('• Current weak day/time/session contexts: none strong enough to block.')
+        lines.extend(['', '5) Current micro-edge assumptions'])
+        if symbol_blocks:
+            lines.append('• Blocked symbols from rolling evidence: ' + ', '.join(list(symbol_blocks.keys())[:12]))
+        else:
+            lines.append('• Blocked symbols from rolling evidence: none')
+        if weak_hours:
+            lines.append('• Weak Melbourne hour evidence snapshot:')
+            for k, m in weak_hours[:6]:
+                lines.append(f'  - {k}: WR={float(m.get("wr") or 0.0):.1f}% AvgR={float(m.get("avg_r") or 0.0):+.2f} n={int(m.get("decided") or 0)}')
+        lines.extend(['', '6) How to verify', '• /setup_matrix policy = enforced lane policy.', '• /setup_deep_analysis 168 = broad evidence by lane/symbol/hour/session/side.', '• /setup_audit_keep and /autotrade_report validate whether the live policy is profitable.'])
+        return '\n'.join(lines)
+    except Exception as exc:
+        return f'🧠 PulseFutures Assumptions\n{HDR}\nCould not build assumptions: {type(exc).__name__}: {exc}'
+
+
+async def assumptions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uid = int(update.effective_user.id if update and update.effective_user else 0)
+        if not is_admin_user(uid) and uid != int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0):
+            await update.message.reply_text('⛔ Admin only.')
+            return
+        await send_long_message(update, _setup_assumptions_text(uid), parse_mode=None)
+    except Exception as exc:
+        try:
+            await update.message.reply_text(f'❌ /assumptions failed: {type(exc).__name__}: {exc}')
+        except Exception:
+            pass
+
+
 # =========================================================
 # HELP TEXT (USER)
 # =========================================================
@@ -40477,6 +40820,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
     "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
     "setup_deep_analysis": "Deep setup analytics: family/session, symbol, side, Melbourne hour/day, regime buckets. Usage: /setup_deep_analysis 168",
+    "assumptions": "Current live setup assumptions: policy, /screen/email/AutoTrade sync gate, data-driven day/time/session rules, symbol/hour guards",
     "autotrade_on": "Enable NEW AutoTrade entries; existing TP/SL guardian and reports remain active",
     "autotrade_off": "Pause NEW AutoTrade entries without disabling reports/guardian/flat commands",
     "autotrade_debug": "Premium AutoTrade readiness, risk, carry, and last-decision diagnostics",
@@ -40530,7 +40874,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_audit_keep_watch", "setup_audit_keep", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
+    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_audit_keep_watch", "setup_audit_keep", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis", "assumptions"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autotrade_closed", "autotrade_report_overall", "autotrade_report_matrix", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_test_data", "admin_reset_signal_reports", "reset", "restore"]),
@@ -48503,6 +48847,10 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
         by_symbol: dict[str, dict] = {}
         by_symbol_recent: dict[str, dict] = {}
         by_hour: dict[str, dict] = {}
+        # yver164: data-driven DAY+TIME+SESSION+SIDE contexts.
+        # Keys are intentionally multi-level so the guard can learn e.g.
+        # MON-13:00-ASIA-BUY as well as broader 13:00-BUY weakness.
+        by_dts: dict[str, dict] = {}
         for r in list(rows or []):
             try:
                 sid = str(r.get('setup_id') or '').strip()
@@ -48533,8 +48881,22 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
                 if ts > 0 and ts >= symbol_block_cutoff_ts:
                     _setup_edge_guard_add(by_symbol_recent, sym, result, r_mult)
                 if ts > 0:
-                    hr_key = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%H:00')
+                    dt_mel = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+                    hr_key = dt_mel.strftime('%H:00')
+                    wd_key = dt_mel.strftime('%a').upper()[:3]
                     _setup_edge_guard_add(by_hour, hr_key, result, r_mult)
+                    # Data-driven contextual buckets used by yver164 live guard.
+                    # These are evidence buckets, not fixed assumptions; they update as
+                    # /setup_deep_analysis / edge-guard evidence updates.
+                    if side in {'BUY', 'SELL'}:
+                        for dts_key in (
+                            f'{wd_key}-{hr_key}-{sess}-{side}',
+                            f'{wd_key}-{sess}-{side}',
+                            f'{wd_key}-{hr_key}-{side}',
+                            f'{hr_key}-{sess}-{side}',
+                            f'{hr_key}-{side}',
+                        ):
+                            _setup_edge_guard_add(by_dts, dts_key, result, r_mult)
             except Exception:
                 continue
 
@@ -48624,6 +48986,8 @@ def _setup_edge_guard_build(uid: int = 0, hours: int | None = None, force: bool 
             'side_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_side.items()},
             'symbol_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_symbol.items()},
             'hour_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_hour.items()},
+            'day_time_session_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_dts.items()},
+            'dts_metrics': {k: _setup_edge_bucket_metrics(v) for k, v in by_dts.items()},
             'reason': 'ok',
         }
         cache.update({'ts': now_ts, 'uid': eval_uid, 'hours': hrs, 'data': data})
@@ -48831,11 +49195,11 @@ def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
                         avg_pol = float(pol_out.get('last_avg_r') or 0.0)
                         tp_pol = int(round((wr_pol / 100.0) * dec_pol)) if dec_pol > 0 else 0
                         sl_pol = max(0, dec_pol - tp_pol)
-                        exp_keep, exp_reason = _setup_combo_experimental_keep_override(dec_pol, tp_pol, sl_pol, wr_pol, avg_pol)
+                        exp_keep, exp_reason = _setup_combo_data_driven_keep_override(dec_pol, tp_pol, sl_pol, wr_pol, avg_pol)
                         if exp_keep:
                             pol_out['status'] = 'KEEP'
                             pol_out['enabled'] = 1
-                            pol_out['notes'] = (str(pol_out.get('notes') or '') + ' | yver152 ' + exp_reason)[:500]
+                            pol_out['notes'] = (str(pol_out.get('notes') or '') + ' | yver164 ' + exp_reason)[:500]
                 except Exception:
                     pass
                 old = out.get(combo)
@@ -48895,13 +49259,13 @@ def _setup_combo_enrich_rows_with_active_policy(uid: int, rows: list[dict]) -> l
                     sl_e = int(r.get('sl') or 0)
                     wr_e = float(r.get('win_rate') if r.get('win_rate') is not None else r.get('wr') or 0.0)
                     avg_e = float(r.get('avg_r') or 0.0)
-                    exp_keep, exp_reason = _setup_combo_experimental_keep_override(dec_e, tp_e, sl_e, wr_e, avg_e)
+                    exp_keep, exp_reason = _setup_combo_data_driven_keep_override(dec_e, tp_e, sl_e, wr_e, avg_e)
                     if exp_keep:
                         r['effective_action'] = 'KEEP'
                         r['active_policy_status'] = 'KEEP'
                         r['active_policy_enabled'] = 1
-                        r['active_policy_kind'] = str(r.get('active_policy_kind') or '-') + '+EXP'
-                        r['notes'] = (str(r.get('notes') or '') + ' | yver153 ' + str(exp_reason))[:500]
+                        r['active_policy_kind'] = str(r.get('active_policy_kind') or '-') + '+DATA'
+                        r['notes'] = (str(r.get('notes') or '') + ' | yver164 ' + str(exp_reason))[:500]
             except Exception:
                 pass
             enriched.append(r)
@@ -48945,7 +49309,7 @@ def _setup_combo_policy_rows_for_bridge(uid: int, matrix_rows: list[dict] | None
                 avg_r = float(base.get('avg_r') if base.get('avg_r') is not None else (pol.get('last_avg_r') or 0.0))
                 try:
                     if action == 'WATCH' and enabled:
-                        exp_keep, exp_reason = _setup_combo_experimental_keep_override(decided, tp, sl, wr, avg_r)
+                        exp_keep, exp_reason = _setup_combo_data_driven_keep_override(decided, tp, sl, wr, avg_r)
                         if exp_keep:
                             action = 'KEEP'
                             status = 'KEEP'
@@ -49010,6 +49374,40 @@ def _setup_combo_sync_active_policy_bridge(uid: int, matrix_rows: list[dict] | N
         except Exception:
             pass
         return rep
+
+def _setup_combo_data_driven_keep_override(decided: int, tp: int, sl: int, wr: float, avg_r: float) -> tuple[bool, str]:
+    """Current data-driven KEEP promotion.
+
+    This mirrors the actual matrix recommendation logic for active WATCH rows.
+    It lets a row such as F8-NY-NOR-BUY become KEEP when the current evidence says
+    Reco=KEEP, without overriding explicit DISABLE/OFF safety policy rows.
+    """
+    try:
+        if not bool(globals().get('SETUP_COMBO_CURRENT_RECO_PROMOTE_ENABLED', True)):
+            return False, 'current_reco_promotion_disabled'
+        dec = int(decided or 0)
+        tp_i = int(tp or 0)
+        sl_i = int(sl or 0)
+        wr_f = float(wr or 0.0)
+        avg_f = float(avg_r or 0.0)
+        exp_keep, exp_reason = _setup_combo_experimental_keep_override(dec, tp_i, sl_i, wr_f, avg_f)
+        if exp_keep:
+            return True, exp_reason
+        min_dec = max(1, int(globals().get('SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY', 4) or 4))
+        if dec < min_dec:
+            return False, f'not_enough_decided_for_current_keep:n{dec}<{min_dec}'
+        keep_wr = float(globals().get('SETUP_COMBO_POLICY_KEEP_WR', 55.0) or 55.0)
+        keep_avg = float(globals().get('SETUP_COMBO_POLICY_KEEP_AVG_R', 0.05) or 0.05)
+        watch_wr = float(globals().get('SETUP_COMBO_POLICY_WATCH_WR', 50.0) or 50.0)
+        promote_avg = float(globals().get('SETUP_COMBO_POLICY_PROMOTE_AVG_R', 0.35) or 0.35)
+        if wr_f >= keep_wr and avg_f >= keep_avg and tp_i >= max(1, sl_i):
+            return True, f'current_reco_keep:WR{wr_f:.1f}:AvgR{avg_f:+.2f}:n{dec}'
+        if wr_f >= watch_wr and avg_f >= promote_avg and tp_i > sl_i:
+            return True, f'current_reco_keep_strong_avgR:WR{wr_f:.1f}:AvgR{avg_f:+.2f}:n{dec}'
+        return False, f'current_reco_not_keep:WR{wr_f:.1f}:AvgR{avg_f:+.2f}:n{dec}'
+    except Exception as exc:
+        return False, f'current_reco_keep_error:{type(exc).__name__}'
+
 
 def _setup_combo_experimental_keep_override(decided: int, tp: int, sl: int, wr: float, avg_r: float) -> tuple[bool, str]:
     """Owner-requested fast promotion for very strong lanes.
@@ -63099,6 +63497,7 @@ def main():
     app.add_handler(CommandHandler("setup_deep_analysis", setup_deep_analysis_cmd, block=False))
     app.add_handler(CommandHandler("setup_edge_deep", setup_deep_analysis_cmd, block=False))
     app.add_handler(CommandHandler("setup_matrix_deep", setup_deep_analysis_cmd, block=False))
+    app.add_handler(CommandHandler("assumptions", assumptions_cmd, block=False))
 
     app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
