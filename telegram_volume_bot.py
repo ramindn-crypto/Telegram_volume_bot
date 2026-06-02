@@ -1,3 +1,4 @@
+# ver22: setup-audit AT lifecycle attribution fix: AT_OPEN is tied to the exact latest OPEN setup_id for the live symbol/side, preventing older same-symbol OFF rows from inheriting a newer open position.
 # ver21: frozen setup-policy snapshot fix: freezes KEEP/WATCH at executable/email creation, audit displays creation policy not live recalculation, and AutoTrade accepts emailed snapshot policy while keeping drift/risk gates.
 # ver10: /screen freshness fix: never serve stale cached scans as final; stale/missing cache schedules one non-blocking full scan and posts the fresh result when ready. Other commands remain responsive.
 # ver08: /screen non-blocking hardening: no long lock wait, release screen lock before Telegram final send/sync, and move screen-sync off the command/send path so other commands remain responsive while full /screen builds.
@@ -46252,6 +46253,72 @@ def _setup_audit_live_position_present(symbol: str, side: str) -> bool:
     return False
 
 
+
+def _setup_audit_latest_open_trade_for_symbol_side(uid: int, symbol: str, side: str) -> dict:
+    """Return latest OPEN AutoTrade journal row for this live symbol/side.
+
+    Ver22: /setup_audit must not mark every historical setup with the same
+    symbol+side as AT_OPEN just because Bybit has one current live position.
+    Bybit one-way/hedge still gives a symbol+side live truth, but the setup
+    attribution must be the newest still-OPEN bot journal row for that
+    symbol+side. Older same-symbol setup rows are consumed/closed for audit
+    display unless their exact setup_id is the latest OPEN row.
+    """
+    try:
+        uid_i = int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        side_u = str(side or '').upper().strip()
+        sym_lin = str(_bybit_linear_symbol(symbol or '')).upper().strip()
+        sym_base = _symbol_base(sym_lin or str(symbol or ''))
+        if uid_i <= 0 or side_u not in {'BUY', 'SELL'} or not sym_base:
+            return {}
+        variants = []
+        for v in (sym_lin, sym_base, str(symbol or '').upper().strip()):
+            if v and v not in variants:
+                variants.append(v)
+        if not variants:
+            return {}
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            q = f"""
+                SELECT setup_id, trade_id, symbol, side, status, opened_ts, closed_ts, outcome
+                FROM autotrade_trades
+                WHERE uid=?
+                  AND UPPER(COALESCE(side,''))=?
+                  AND UPPER(COALESCE(status,''))='OPEN'
+                  AND COALESCE(closed_ts,0)=0
+                  AND UPPER(COALESCE(symbol,'')) IN ({','.join(['?'] * len(variants))})
+                ORDER BY COALESCE(opened_ts, created_ts, 0) DESC
+                LIMIT 1
+            """
+            r = cur.execute(q, tuple([uid_i, side_u] + variants)).fetchone()
+            return dict(r) if r else {}
+    except Exception:
+        return {}
+
+
+def _setup_audit_open_trade_is_latest_for_symbol_side(uid: int, row: dict, trade_row: dict) -> bool:
+    """True only when this setup_id owns the current symbol/side OPEN attribution."""
+    try:
+        rr = dict(row or {})
+        tr = dict(trade_row or {})
+        sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
+        tsid = str(tr.get('setup_id') or '').strip()
+        if not sid or not tsid or sid != tsid:
+            return False
+        sym = str(rr.get('symbol') or tr.get('symbol') or '').upper().strip()
+        side = str(rr.get('side') or tr.get('side') or '').upper().strip()
+        latest = _setup_audit_latest_open_trade_for_symbol_side(int(uid or 0), sym, side)
+        if not latest:
+            return True
+        latest_sid = str(latest.get('setup_id') or '').strip()
+        if latest_sid and latest_sid != sid:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: str = '') -> str:
     """Return setup lifecycle state for /setup_audit display.
 
@@ -46331,8 +46398,14 @@ def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: st
                         # Only show AT_OPEN if the symbol/side is still live now;
                         # otherwise mark it as already consumed/closed instead of
                         # making /setup_audit disagree with /autotrade_debug.
+                        # ver22: exact setup attribution. A live Bybit position only proves
+                        # that one setup for this symbol/side is open; it must not make
+                        # older same-symbol setup rows show AT_OPEN. Only the latest OPEN
+                        # AutoTrade journal row for this symbol/side can own AT_OPEN.
                         if _setup_audit_live_position_present(sym_lin or sym_raw, side_u):
-                            return 'AT_OPEN'
+                            if _setup_audit_open_trade_is_latest_for_symbol_side(owner_uid, rr, r0):
+                                return 'AT_OPEN'
+                            return 'AT_CLOSED'
                         return 'AT_CLOSED'
                     return 'AT_CLOSED' if r0.get('closed_ts') else 'AT'
                 if sid:
