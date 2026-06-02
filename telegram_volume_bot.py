@@ -56951,6 +56951,8 @@ _SCREEN_LOCK = asyncio.Lock()
 _SCREEN_REFRESH_TASK = None  # asyncio.Task
 _SCREEN_REFRESH_TASK_TS = 0.0
 SCREEN_REFRESH_STUCK_SEC = int(os.environ.get("SCREEN_REFRESH_STUCK_SEC", "25") or 25)
+# ver05: /screen on-demand full result delivery tasks, keyed by user/session.
+_SCREEN_ONDEMAND_TASKS: dict[str, asyncio.Task] = {}
 
 # Keep recent screen cards in memory for PF- lookup.
 # /screen is built from the executable lane, but these cached cards themselves are
@@ -58269,6 +58271,128 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
         return {"status": "error", "reason": f"screen_sync_exception ({type(e).__name__}: {e})"}
 
 
+
+
+async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, user: dict, live_session: str, scan_session: str):
+    """ver05: Build and POST the full /screen result after an initial quick acknowledgement.
+
+    The command path must stay fast, but the user must not be left with only a
+    market-only snapshot. This worker owns the full executable build, updates the
+    same /screen cache used by email/autotrade, and posts the final screen back to
+    the same chat when ready.
+    """
+    task_key = f"{int(uid or 0)}::{str(scan_session or '').upper()}"
+    try:
+        # If another screen refresh is holding the lock, wait briefly; if it is stuck,
+        # continue after the scheduler cancels/replaces it on the next user request.
+        try:
+            await asyncio.wait_for(_SCREEN_LOCK.acquire(), timeout=float(os.getenv('SCREEN_ONDEMAND_LOCK_WAIT_SEC', '45') or 3))
+            got_lock = True
+        except Exception:
+            got_lock = False
+        if not got_lock:
+            try:
+                await _telegram_reply_text_fast(update.message, "⏳ /screen full scan is already running. Please try again shortly.")
+            except Exception:
+                pass
+            return
+        try:
+            best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=int(os.getenv('SCREEN_ONDEMAND_TICKER_TIMEOUT_SEC', '8') or 8))
+            if not best_fut:
+                await _telegram_reply_text_fast(update.message, "⚠️ /screen full scan could not fetch tickers. Please try again shortly.")
+                return
+            body, kb, shown_setups = await to_thread_screen(
+                _build_screen_body_and_kb,
+                best_fut,
+                str(scan_session or '').upper(),
+                int(uid or 0),
+                timeout=int(os.getenv('SCREEN_ONDEMAND_BUILD_TIMEOUT_SEC', '35') or 35),
+            )
+            if not body:
+                await _telegram_reply_text_fast(update.message, "⚠️ /screen full scan finished but found no displayable result.")
+                return
+            try:
+                _screen_cache_put(f"uid:{int(uid or 0)}::{str(scan_session or '').upper()}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=False)
+                _screen_cache_put(f"global::{str(scan_session or '').upper()}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=False)
+            except Exception:
+                pass
+            try:
+                loc_label, loc_time = user_location_and_time(user or {})
+            except Exception:
+                loc_label, loc_time = "Melbourne (Australia)", _fmt_dt_local(datetime.now(timezone.utc), "%Y-%m-%d %H:%M")
+            header = (
+                f"✅ Fresh result ready: /screen\n"
+                f"{HDR}\n"
+                f"*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{_screen_when_line('Full scan built', time.time())}"
+            )
+            keyboard = [
+                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                for (sym, sid) in (kb or [])
+            ]
+            await send_long_message(
+                update,
+                _screen_markdown_to_html((header + "\n" + str(body or '')).strip()),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            )
+            # Sync the exact displayed setups to email/autotrade lane, same as the cached path.
+            try:
+                if MANUAL_SCREEN_SYNC_ENABLED and shown_setups:
+                    await _screen_sync_pipeline_async(
+                        int(uid or 0),
+                        dict(user or {}),
+                        str(live_session or ''),
+                        str(scan_session or '').upper(),
+                        best_fut or {},
+                        list(shown_setups or []),
+                    )
+            except Exception as sync_e:
+                try:
+                    logger.warning('screen on-demand sync failed uid=%s: %s', uid, sync_e)
+                except Exception:
+                    pass
+        finally:
+            try:
+                _SCREEN_LOCK.release()
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            logger.warning('screen on-demand full scan failed uid=%s session=%s: %s', uid, scan_session, e)
+        except Exception:
+            pass
+        try:
+            await _telegram_reply_text_fast(update.message, "⚠️ /screen full scan failed. Please try again shortly.")
+        except Exception:
+            pass
+    finally:
+        try:
+            cur = _SCREEN_ONDEMAND_TASKS.get(task_key)
+            if cur is asyncio.current_task():
+                _SCREEN_ONDEMAND_TASKS.pop(task_key, None)
+        except Exception:
+            pass
+
+
+def _schedule_screen_full_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, user: dict, live_session: str, scan_session: str) -> bool:
+    """Schedule one on-demand /screen full result per user/session."""
+    try:
+        key = f"{int(uid or 0)}::{str(scan_session or '').upper()}"
+        t = _SCREEN_ONDEMAND_TASKS.get(key)
+        if t is not None and not t.done():
+            return False
+        _SCREEN_ONDEMAND_TASKS[key] = _safe_create_task(
+            _deliver_screen_full_scan_when_ready(update, context, int(uid or 0), dict(user or {}), str(live_session or ''), str(scan_session or '').upper()),
+            'screen_on_demand_full_delivery'
+        )
+        return True
+    except Exception:
+        return False
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _hb_touch('screen', ok=True, details='screen_cmd_invoked')
 
@@ -58477,32 +58601,17 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # ver04: Last-resort fallback. Do not leave /screen unusable when the full
-        # executable cache is cold/stuck. Show a clearly labelled market-only snapshot
-        # and keep the full refresh queued. This is not cached as a full setup scan.
+        # ver05: Last-resort fallback. Do not show a market-only snapshot as /screen,
+        # because it looks like /screen is frozen and never completes. Queue one full
+        # executable scan and post the actual result here when ready.
         try:
-            quick_best2 = get_cached_futures_tickers() or {}
-            if not quick_best2:
-                quick_best2 = await to_thread_screen(_screen_best_fut_fast, timeout=4)
-            if quick_best2:
-                qbody, qkb, _ = _screen_quick_ticker_snapshot_body(quick_best2, str(scan_session or ''))
-                qheader = (
-                    f"*PulseFutures — Market Scan*\n"
-                    f"{HDR}\n"
-                    f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                    f"{_screen_when_line('Ticker snapshot', time.time())}"
-                    f"_Market-only snapshot shown while the full executable scan refreshes._\n"
-                )
-                await send_long_message(
-                    update,
-                    _screen_markdown_to_html((qheader + "\n" + str(qbody or '')).strip()),
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-                return
+            scheduled = _schedule_screen_full_delivery(update, context, int(uid), dict(user or {}), str(live_session or ''), str(scan_session or '').upper())
         except Exception:
-            pass
-        await _telegram_reply_text_fast(update.message, "⏳ Full /screen scan is still warming up. Fresh refresh is queued; try again shortly.")
+            scheduled = False
+        if scheduled:
+            await _telegram_reply_text_fast(update.message, "⏳ Building full /screen now. I will post the complete result when ready.")
+        else:
+            await _telegram_reply_text_fast(update.message, "⏳ Full /screen scan is already running. I will post the complete result when ready.")
         return
     except Exception as e:
         try:
