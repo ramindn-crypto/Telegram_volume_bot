@@ -1,3 +1,4 @@
+# ver10: /screen freshness fix: never serve stale cached scans as final; stale/missing cache schedules one non-blocking full scan and posts the fresh result when ready. Other commands remain responsive.
 # ver08: /screen non-blocking hardening: no long lock wait, release screen lock before Telegram final send/sync, and move screen-sync off the command/send path so other commands remain responsive while full /screen builds.
 # ver03: small stability tuning over ver01: recovery job is throttled/hard-timed, Telegram fast-reply network noise is debug-only, and /screen rebuild notice uses fail-fast send.
 # yver171: major responsiveness/sync patch: fail-fast Telegram replies, no auto-posting huge admin reports, exact emailed setups are authoritative for AutoTrade, and duplicate setup-id re-entry is blocked.
@@ -58554,10 +58555,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        if cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
-            note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
-            if age <= float(SCREEN_CACHE_TTL_SEC):
-                note = "_Showing latest cached scan._\n"
+        if cache_entry.get('body') and age <= float(SCREEN_CACHE_TTL_SEC):
+            note = "_Showing latest cached scan._\n"
             header = (
                 f"*PulseFutures — Market Scan*\n"
                 f"{HDR}\n"
@@ -58584,7 +58583,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _fallback_keys = [_k for _k in list(_SCREEN_CACHE.keys()) if str(_k).startswith((f"uid:{int(uid)}::", "global::"))]
             fallback_entry, fallback_age = _screen_choose_best_cache(_fallback_keys)
             fallback_ts = float((fallback_entry or {}).get('ts', 0.0) or 0.0)
-            if (fallback_entry or {}).get('body') and fallback_age <= max(float(SCREEN_STALE_CACHE_MAX_SEC or 0), 3600.0):
+            if False and (fallback_entry or {}).get('body') and fallback_age <= max(float(SCREEN_STALE_CACHE_MAX_SEC or 0), 3600.0):
                 header_f = (
                     f"*PulseFutures — Market Scan*\n"
                     f"{HDR}\n"
@@ -58610,6 +58609,13 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Telegram command path. That was the source of visible lag and Render warnings.
         # A dedicated background refresh was already queued above; return a ticker
         # snapshot immediately so /equity, /why, /status and /open_trades stay responsive.
+
+        # ver10: cache is stale/missing. Start exactly one non-blocking full /screen build now.
+        # We may still show a recent DB queue below, but the fresh full result will be posted when ready.
+        try:
+            _ver10_screen_scheduled = _schedule_screen_full_delivery(update, context, int(uid), dict(user or {}), str(live_session or ''), str(scan_session or '').upper())
+        except Exception:
+            _ver10_screen_scheduled = False
 
         # First try a lightweight SQLite fallback. This is important immediately after
         # deployment: memory cache is empty, but recent executable/email setups may
@@ -58674,15 +58680,14 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # because it looks like /screen is frozen and never completes. Queue one full
         # executable scan and post the actual result here when ready.
         try:
-            scheduled = _schedule_screen_full_delivery(update, context, int(uid), dict(user or {}), str(live_session or ''), str(scan_session or '').upper())
+            scheduled = bool(locals().get('_ver10_screen_scheduled', False)) or _schedule_screen_full_delivery(update, context, int(uid), dict(user or {}), str(live_session or ''), str(scan_session or '').upper())
         except Exception:
             scheduled = False
         if scheduled:
-            await _telegram_reply_text_fast(update.message, "⏳ Building full /screen now. I will post the complete result when ready.")
+            await _telegram_reply_text_fast(update.message, "⏳ Building fresh /screen now. I will post the complete result when ready.")
         else:
-            # ver09: do not spam duplicate "already running" messages on repeated /screen taps.
-            # Existing worker will post the result.
-            pass
+            # Existing worker will post the result. Keep command path non-blocking and avoid spam.
+            await _telegram_reply_text_fast(update.message, "⏳ /screen is already building. I will post the fresh result when ready.")
         return
     except Exception as e:
         try:
