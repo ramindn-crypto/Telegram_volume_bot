@@ -92,6 +92,7 @@ from typing import Any  # yver130 early import required before early helper anno
 # - yver61: AutoTrade risk caps are controlled only by /autotrade_config; /dailycap is manual-only; AutoTrade reports use one clear Reason column with pre-ASIA closes renamed.
 # yver157: responsiveness hardening: alert_job now schedules its heavy work as a background task so APScheduler/job queue returns immediately, heavy admin commands send instant cached previews instead of long cached reports blocking Telegram, and alert interval/runtime defaults are calmer to reduce Render max_instances warnings.
 # yver158: BigMove sync hardening: BigMove AutoTrade now requires the paired normal setup email/screen row to be sent first and executes that exact setup-email batch, not a separately rebuilt BigMove candidate; background scheduler intervals are calmer to reduce Render max_instances pressure.
+# yver12: Render warning cleanup: increase AutoTrade guardian misfire grace and suppress APScheduler missed-run noise while preserving real pulsefutures errors.
 # yver160: major speed mode: scheduler jobs are budget-capped and cache/DB-first; BigMove runs fire-and-forget after alert tick instead of blocking session setup pools; non-critical warmup is off by default; AutoTrade fallback loop is DB/email-only by default; aggressive pool fallback is disabled unless explicitly enabled.
 # - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
@@ -4819,6 +4820,17 @@ MANUAL_SCREEN_SYNC_ENABLED = True  # /screen uses the executable lane and may sy
 # -------------------------
 # LOGGING: redact secrets + quiet noisy libs (Render-safe)
 # -------------------------
+
+class DropApschedulerMissedRunFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if record.name.startswith("apscheduler") and "Run time of job" in msg and "was missed by" in msg:
+                return False
+        except Exception:
+            pass
+        return True
+
 class RedactSecretsFilter(logging.Filter):
     def __init__(self, secrets: List[str]):
         super().__init__()
@@ -4845,9 +4857,13 @@ def setup_logging():
     lvl = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(level=getattr(logging, lvl, logging.INFO))
 
-    # Quiet the libs that spam request URLs (and may leak token)
+    # Quiet the libs that spam request URLs (and may leak token).
+    # Ver12: Render should not show APScheduler missed-run warnings for coalesced
+    # low-priority background jobs; real PulseFutures errors still log normally.
     for noisy in ("httpx", "telegram", "telegram.ext", "apscheduler"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
+    logging.getLogger("apscheduler.scheduler").setLevel(logging.ERROR)
 
     # Redact secrets from ALL logs
     secrets = [
@@ -4855,6 +4871,7 @@ def setup_logging():
         os.environ.get("EMAIL_PASS", ""),
     ]
     logging.getLogger().addFilter(RedactSecretsFilter(secrets))
+    logging.getLogger("apscheduler").addFilter(DropApschedulerMissedRunFilter())
 
 
 # Call once at import time (after TOKEN/envs exist)
@@ -64945,7 +64962,9 @@ def main():
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 120,
+                # Ver12: avoid Render WARNING when a restart/network pause delays this
+                # safety job by a couple of minutes. It will coalesce and run next tick.
+                "misfire_grace_time": 900,
             },
         )
 
