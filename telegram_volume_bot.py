@@ -3,6 +3,7 @@
 # ver01: emergency responsiveness and sync fix: no incomplete admin previews, no cached quick /screen snapshots, bounded screen refresh, and full setup_matrix/audit posts.
 # yver165: final deployment hardening for yver164; bumps heavy admin cache namespace to avoid stale v161 results and disables fixed day/time prior flags by default; no trading/risk changes.
 # yver168: makes current Reco=KEEP authoritative for live policy immediately: /setup_matrix policy, enforceable lookup, screen/email/AutoTrade now promote Reco KEEP lanes (e.g. F1-LON-NOR-BUY, F8-NY-NOR-BUY) to Policy KEEP using latest score evidence, while preserving shared gates.
+# ver04: /screen reliability patch: bounded screen refresh, stale-cache fallback, quick market snapshot fallback, and lower stuck threshold so /screen never loops forever on rebuilding.
 # yver172: major responsiveness/email-recovery patch: adds independent DB-first setup-email recovery job, completes alert pipeline without premature hard-timeout, uses email executor for SMTP, and keeps heavy report previews non-blocking.
 # yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
 # yver163: day-time-session live guard from ver161 baseline; ignores ver162 liquidity/soft-stop changes; synced /screen setup-email AutoTrade context gate; Monday pre-ASIA, Monday ASIA market-tone, and Saturday pre-ASIA directional filters.
@@ -33544,7 +33545,7 @@ async def scan_intelligence_job(context: ContextTypes.DEFAULT_TYPE):
     if not SCAN_INTELLIGENCE_ENABLED:
         return
     try:
-        best_fut = await to_thread_screen(fetch_futures_tickers, timeout=20)
+        best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=6)
         if not best_fut:
             return
 
@@ -56936,10 +56937,12 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = int(os.environ.get("SCREEN_CACHE_TTL_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)  # seconds
-SCREEN_STALE_CACHE_MAX_SEC = int(os.environ.get("SCREEN_STALE_CACHE_MAX_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)  # force fresh rebuild when stale
-SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", "900") or 900)
-SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", "900") or 900)
+# ver04: keep /screen usable after restarts. A full executable scan can fail/timeout
+# on small Render instances; stale full cache is safer than repeated "rebuilding".
+SCREEN_CACHE_TTL_SEC = int(os.environ.get("SCREEN_CACHE_TTL_SEC", "120") or 120)  # fresh label threshold
+SCREEN_STALE_CACHE_MAX_SEC = int(os.environ.get("SCREEN_STALE_CACHE_MAX_SEC", "1800") or 1800)  # still usable cache window
+SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", "600") or 600)
+SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", "300") or 300)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE: dict[str, dict] = {}
 _SCREEN_LOCK = asyncio.Lock()
@@ -56947,7 +56950,7 @@ _SCREEN_LOCK = asyncio.Lock()
 # Background refresh task for /screen (keeps UX instant)
 _SCREEN_REFRESH_TASK = None  # asyncio.Task
 _SCREEN_REFRESH_TASK_TS = 0.0
-SCREEN_REFRESH_STUCK_SEC = int(os.environ.get("SCREEN_REFRESH_STUCK_SEC", "90") or 90)
+SCREEN_REFRESH_STUCK_SEC = int(os.environ.get("SCREEN_REFRESH_STUCK_SEC", "25") or 25)
 
 # Keep recent screen cards in memory for PF- lookup.
 # /screen is built from the executable lane, but these cached cards themselves are
@@ -57074,7 +57077,7 @@ async def _refresh_screen_cache_async():
             best_fut,
             session,
             0,
-            timeout=75,
+            timeout=22,
         )
         cache_key = f"global::{str(session or '').upper()}"
         _screen_cache_put(cache_key, body, list(kb or []), ts=time.time())
@@ -57096,12 +57099,12 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
         if _SCREEN_LOCK.locked() or SCAN_LOCK.locked():
             return
         async with _SCREEN_LOCK:
-            best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=10)
+            best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=6)
             if not best_fut:
                 return
             sess = str(session or scan_session_name_utc(datetime.now(timezone.utc)) or '').upper()
             try:
-                body, kb, _setups = await to_thread_screen(_build_screen_body_and_kb, best_fut, sess, int(uid or 0), timeout=75)
+                body, kb, _setups = await to_thread_screen(_build_screen_body_and_kb, best_fut, sess, int(uid or 0), timeout=22)
             except Exception as e:
                 try:
                     db_log_setup_pipeline_event(int(uid or 0), stage='screen_cache_refresh', status='error', session=str(sess or ''), mode='screen', details={'error': f'{type(e).__name__}: {e}'})
@@ -58381,6 +58384,35 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
             return
+
+        # ver04: If the current-session cache is missing/stale, still show the freshest
+        # full /screen body from any session instead of only saying "rebuilding".
+        try:
+            _fallback_keys = [_k for _k in list(_SCREEN_CACHE.keys()) if str(_k).startswith((f"uid:{int(uid)}::", "global::"))]
+            fallback_entry, fallback_age = _screen_choose_best_cache(_fallback_keys)
+            fallback_ts = float((fallback_entry or {}).get('ts', 0.0) or 0.0)
+            if (fallback_entry or {}).get('body') and fallback_age <= max(float(SCREEN_STALE_CACHE_MAX_SEC or 0), 3600.0):
+                header_f = (
+                    f"*PulseFutures — Market Scan*\n"
+                    f"{HDR}\n"
+                    f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                    f"{_screen_when_line('Last full scan built', fallback_ts)}"
+                    f"_Showing last full scan while a fresh scan refreshes._\n"
+                )
+                keyboard_f = [
+                    [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                    for (sym, sid) in ((fallback_entry or {}).get('kb') or [])
+                ]
+                await send_long_message(
+                    update,
+                    _screen_markdown_to_html((header_f + "\n" + str((fallback_entry or {}).get('body') or '')).strip()),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(keyboard_f) if keyboard_f else None,
+                )
+                return
+        except Exception:
+            pass
         # No usable full cache exists. Do NOT run a cold OHLCV rebuild inside the
         # Telegram command path. That was the source of visible lag and Render warnings.
         # A dedicated background refresh was already queued above; return a ticker
@@ -58445,9 +58477,32 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # ver01: do not show the quick ticker placeholder. It looked like a frozen
-        # /screen result and hid the fact that the executable scan had not completed.
-        await _telegram_reply_text_fast(update.message, "⏳ Full /screen executable scan is rebuilding. Please try /screen again in a moment.")
+        # ver04: Last-resort fallback. Do not leave /screen unusable when the full
+        # executable cache is cold/stuck. Show a clearly labelled market-only snapshot
+        # and keep the full refresh queued. This is not cached as a full setup scan.
+        try:
+            quick_best2 = get_cached_futures_tickers() or {}
+            if not quick_best2:
+                quick_best2 = await to_thread_screen(_screen_best_fut_fast, timeout=4)
+            if quick_best2:
+                qbody, qkb, _ = _screen_quick_ticker_snapshot_body(quick_best2, str(scan_session or ''))
+                qheader = (
+                    f"*PulseFutures — Market Scan*\n"
+                    f"{HDR}\n"
+                    f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                    f"{_screen_when_line('Ticker snapshot', time.time())}"
+                    f"_Market-only snapshot shown while the full executable scan refreshes._\n"
+                )
+                await send_long_message(
+                    update,
+                    _screen_markdown_to_html((qheader + "\n" + str(qbody or '')).strip()),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                return
+        except Exception:
+            pass
+        await _telegram_reply_text_fast(update.message, "⏳ Full /screen scan is still warming up. Fresh refresh is queued; try again shortly.")
         return
     except Exception as e:
         try:
