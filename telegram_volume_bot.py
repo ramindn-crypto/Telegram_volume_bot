@@ -189,6 +189,7 @@ def start_keepalive_http_server():
 _LAST_SCAN_UNIVERSE = []
 
 #!/usr/bin/env python3
+# ver23: fixes /autotrade_last mixed-candidate diagnostics by freezing attempt identity per candidate.
 """
 PulseFutures — Bybit Futures (Swap) Screener + Signals Email + Risk Manager + Trade Journal (Telegram)
 
@@ -13665,15 +13666,57 @@ def _autotrade_clone_setup_for_execution(setup, **overrides):
 
 
 def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict | None = None, status: str = '', reason: str = '') -> None:
-    """Keep a short in-memory list of recent AutoTrade attempts for /autotrade_last."""
+    """Keep a short in-memory list of recent AutoTrade attempts for /autotrade_last.
+
+    Ver23: never let the global _LAST_AUTOTRADE_DETAIL snapshot overwrite the
+    candidate identity supplied by meta.  The detail object is process-global per
+    user and can still contain the previous successfully opened setup (for example
+    ZEC) when the current candidate (for example NEAR) is rejected early by the
+    duplicate/drift guards.  That was causing /autotrade_last to display mixed rows
+    such as "ZEC SELL" with a NEAR setup_id/entry.
+    """
     try:
         u = int(uid)
         row = {}
         if isinstance(meta, dict):
             row.update(meta)
+
+        # Candidate identity is authoritative from meta.  Detail may enrich risk,
+        # leverage and execution fields only when it appears to belong to the same
+        # candidate, or for non-identity fields where no candidate value exists.
+        meta_sid = str(row.get('setup_id') or row.get('id') or '').strip()
+        meta_sym = str(row.get('symbol') or row.get('symbol_sent') or row.get('symbol_raw') or '').upper().strip()
+        meta_side = str(row.get('side') or '').upper().strip()
+
+        def _same_detail_candidate(d: dict) -> bool:
+            try:
+                dsid = str(d.get('setup_id') or d.get('id') or '').strip()
+                if meta_sid and dsid and meta_sid != dsid:
+                    return False
+                dsym = str(d.get('symbol') or d.get('symbol_sent') or d.get('symbol_raw') or '').upper().strip()
+                if meta_sym and dsym and meta_sym != dsym:
+                    return False
+                dside = str(d.get('side') or '').upper().strip()
+                if meta_side and dside and meta_side != dside:
+                    return False
+            except Exception:
+                return False
+            return True
+
         if isinstance(detail, dict):
-            for k in ('when','setup_id','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct','dynamic_risk_score','risk_multiplier','configured_risk_pct','allowed_risk_pct','risk_actual_pct','risk_actual_usd','configured_leverage','safe_leverage','leverage_downgrade_applied','leverage_policy','leverage_downgrade_blocked'):
-                if k in detail and detail.get(k) not in (None, ''):
+            same_detail = _same_detail_candidate(detail)
+            identity_keys = {'setup_id', 'id', 'symbol', 'symbol_sent', 'symbol_raw', 'side'}
+            price_keys = {'entry', 'sl', 'setup_entry'}
+            for k in ('when','setup_id','symbol','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct','dynamic_risk_score','risk_multiplier','configured_risk_pct','allowed_risk_pct','risk_actual_pct','risk_actual_usd','configured_leverage','safe_leverage','leverage_downgrade_applied','leverage_policy','leverage_downgrade_blocked'):
+                if k not in detail or detail.get(k) in (None, ''):
+                    continue
+                if k in identity_keys:
+                    if not row.get(k) and same_detail:
+                        row[k] = detail.get(k)
+                    continue
+                if k in price_keys and (not same_detail) and row.get(k) not in (None, ''):
+                    continue
+                if same_detail or row.get(k) in (None, ''):
                     row[k] = detail.get(k)
         row['when'] = str(row.get('when') or datetime.now(timezone.utc).isoformat(timespec='seconds'))
         row['status'] = str(status or row.get('status') or '').upper() or ('PLACED' if not reason else 'SKIP')
@@ -13900,11 +13943,39 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     sym = _bybit_linear_symbol(str(getattr(s, 'symbol', '') or '').upper())
     setup_id = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
     try:
+        # Ver23: seed the per-user detail snapshot with the current candidate before
+        # any early return.  Otherwise duplicate/drift rejects can inherit the
+        # previous trade's symbol/setup_id in /autotrade_last diagnostics.
+        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'setup_id': setup_id,
+            'symbol': str(getattr(s, 'symbol', '') or ''),
+            'symbol_sent': sym,
+            'symbol_raw': str(getattr(s, 'symbol', '') or ''),
+            'side': side,
+            'entry': intended_entry,
+            'setup_entry': intended_entry,
+            'sl': intended_sl,
+        })
+    except Exception:
+        pass
+    try:
         _dup_setup, _dup_setup_reason = _autotrade_setup_id_already_traded(int(uid), setup_id)
         if _dup_setup:
             try:
                 _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
-                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': str(_dup_setup_reason), 'setup_id_duplicate_guard': True})
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                    'setup_id': setup_id,
+                    'symbol': str(getattr(s, 'symbol', '') or ''),
+                    'symbol_sent': sym,
+                    'symbol_raw': str(getattr(s, 'symbol', '') or ''),
+                    'side': side,
+                    'entry': intended_entry,
+                    'setup_entry': intended_entry,
+                    'sl': intended_sl,
+                    'reject_reason': str(_dup_setup_reason),
+                    'setup_id_duplicate_guard': True,
+                })
                 _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('duplicate_setup_id'), last_reason=str(_dup_setup_reason))
             except Exception:
                 pass
