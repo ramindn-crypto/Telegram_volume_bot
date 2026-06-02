@@ -56943,6 +56943,7 @@ def user_location_and_time(user: dict):
 # on small Render instances; stale full cache is safer than repeated "rebuilding".
 SCREEN_CACHE_TTL_SEC = int(os.environ.get("SCREEN_CACHE_TTL_SEC", "120") or 120)  # fresh label threshold
 SCREEN_STALE_CACHE_MAX_SEC = int(os.environ.get("SCREEN_STALE_CACHE_MAX_SEC", "1800") or 1800)  # still usable cache window
+SCREEN_VER11_NO_STALE_RESULT_MAX_SEC = int(os.environ.get("SCREEN_VER11_NO_STALE_RESULT_MAX_SEC", "900") or 900)  # ver11: do not display very stale /screen as fresh
 SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", "600") or 600)
 SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", "300") or 300)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
@@ -58312,10 +58313,15 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
             # A background cache refresh can briefly hold _SCREEN_LOCK immediately after
             # /screen is pressed. Wait for it, then post the full result from this task.
             try:
-                await asyncio.wait_for(_SCREEN_LOCK.acquire(), timeout=float(os.getenv('SCREEN_ONDEMAND_LOCK_WAIT_SEC_LONG', '45') or 45))
+                await asyncio.wait_for(_SCREEN_LOCK.acquire(), timeout=float(os.getenv('SCREEN_ONDEMAND_LOCK_WAIT_SEC_LONG', '4') or 4))
                 got_lock = True
             except Exception:
-                # Silent exit: the command already acknowledged the build. Avoid duplicate Telegram spam.
+                # ver11: do not wait for a long-running /screen worker. It will post when done;
+                # exiting here keeps the Telegram command loop responsive.
+                try:
+                    logger.info('screen full builder already busy uid=%s session=%s; not blocking command loop', uid, scan_session)
+                except Exception:
+                    pass
                 return
         try:
             best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=int(os.getenv('SCREEN_ONDEMAND_TICKER_TIMEOUT_SEC', '15') or 15))
@@ -58331,13 +58337,13 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                     best_fut,
                     str(scan_session or '').upper(),
                     int(uid or 0),
-                    timeout=int(os.getenv('SCREEN_ONDEMAND_BUILD_TIMEOUT_SEC', '120') or 120),
+                    timeout=int(os.getenv('SCREEN_ONDEMAND_BUILD_TIMEOUT_SEC', '45') or 45),
                 )
             except Exception as _build_e:
                 # Ver07: if the full OHLCV executable builder fails/times out, /screen must
                 # still return a useful result and must not poison the bot with a failure loop.
                 try:
-                    logger.warning('screen full builder failed uid=%s session=%s: %s', uid, scan_session, _build_e)
+                    logger.warning('screen full builder failed uid=%s session=%s: %s: %s', uid, scan_session, type(_build_e).__name__, _build_e)
                 except Exception:
                     pass
                 body, kb, shown_setups = _screen_recent_db_body_and_kb(
@@ -60285,13 +60291,13 @@ EMAIL_SEND_TIMEOUT_SEC = max(6, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "8"
 # prevented the session email pool from completing, so no setup emails were sent.
 # Keep Telegram command replies fast separately, but allow the email engine enough
 # time to finish one small owner/session cycle.
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "70"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "35"))  # ver11: shorter budget prevents scheduler lag
 SETUP_EMAIL_RECOVERY_JOB_ENABLED = env_bool("SETUP_EMAIL_RECOVERY_JOB_ENABLED", True)
 # ver03: recovery is a fallback lane, not the main scanner. Run it less often and
 # hard-time it so it cannot cause APScheduler max_instances warnings or UI lag.
-SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "300") or 300)
+SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "900") or 900)  # ver11: reduce recovery-lane pressure
 SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "75") or 75)
-SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC", "22") or 22)
+SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC", "8") or 8)  # ver11: never let recovery block scheduler
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
@@ -64404,7 +64410,7 @@ async def setup_email_recovery_job_runner(context: ContextTypes.DEFAULT_TYPE):
     The main alert job remains the primary setup-email engine.
     """
     try:
-        timeout = max(8.0, float(globals().get('SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC', 22) or 22))
+        timeout = max(5.0, float(globals().get('SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC', 8) or 8))
     except Exception:
         timeout = 22.0
     try:
@@ -64428,7 +64434,7 @@ async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
     # outlive asyncio.wait_for(), but the coroutine must release ALERT_LOCK quickly
     # so scheduler ticks and Telegram commands do not appear frozen for minutes.
     try:
-        hard_timeout = max(45.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 70) or 70) + 10.0)
+        hard_timeout = max(20.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 35) or 35) + 5.0)
         await asyncio.wait_for(_alert_job_async_internal(context), timeout=hard_timeout)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
@@ -64764,7 +64770,7 @@ def main():
         # KEEP rows and sends the matching setup email + AutoTrade queue.
         if bool(globals().get('SETUP_EMAIL_RECOVERY_JOB_ENABLED', True)):
             try:
-                _rec_interval = max(300, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 300) or 300))
+                _rec_interval = max(900, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 900) or 900))
                 app.job_queue.run_repeating(
                     setup_email_recovery_job_runner,
                     interval=_rec_interval,
@@ -64933,7 +64939,7 @@ def main():
         # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
-            interval=max(600, int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 600), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 8) + 300),
+            interval=max(900, int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 600), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 8) + 600),
             first=90,
             name="autotrade_exit_guardian_job",
             job_kwargs={
