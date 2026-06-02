@@ -1,3 +1,4 @@
+# ver21: frozen setup-policy snapshot fix: freezes KEEP/WATCH at executable/email creation, audit displays creation policy not live recalculation, and AutoTrade accepts emailed snapshot policy while keeping drift/risk gates.
 # ver10: /screen freshness fix: never serve stale cached scans as final; stale/missing cache schedules one non-blocking full scan and posts the fresh result when ready. Other commands remain responsive.
 # ver08: /screen non-blocking hardening: no long lock wait, release screen lock before Telegram final send/sync, and move screen-sync off the command/send path so other commands remain responsive while full /screen builds.
 # ver03: small stability tuning over ver01: recovery job is throttled/hard-timed, Telegram fast-reply network noise is debug-only, and /screen rebuild notice uses fail-fast send.
@@ -4029,6 +4030,104 @@ def _setup_policy_effective_status(status: str = '', found: bool = False) -> str
     except Exception:
         return 'WATCH'
 
+
+
+def _setup_policy_snapshot_for_setup(setup_or_row, session_name: str = '', user_id: int = 0, lane: str = 'email') -> dict:
+    """ver21: immutable creation-time policy snapshot for setup delivery/autotrade.
+
+    The live policy can legitimately change minutes later as price/context/cooldown changes.
+    A setup that was selected/emailed as KEEP must not be relabelled OFF in /setup_audit
+    or blocked by AutoTrade purely because the current actionability gate changed after delivery.
+    """
+    out = {
+        'policy_at_creation': 'OFF',
+        'policy_status_raw_at_creation': '',
+        'policy_combo_at_creation': '',
+        'policy_reason_at_creation': '',
+        'policy_created_ts': float(time.time()),
+    }
+    try:
+        sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        try:
+            owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        except Exception:
+            owner_uid = 0
+        try:
+            uid_i = int(user_id or 0)
+        except Exception:
+            uid_i = 0
+        policy_uid = owner_uid if owner_uid > 0 else uid_i
+        # Use raw policy lookup first so KEEP is captured before delivery cooldowns can turn the row OFF.
+        info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(policy_uid or 0)) or {}
+        raw = str(info.get('status') or '').upper().strip()
+        found = bool(info.get('found'))
+        status = _setup_policy_effective_status(raw, found=found)
+        combo = str(info.get('combo') or '').upper().strip()
+        try:
+            enabled = int(info.get('enabled') if info.get('enabled') is not None else (1 if not found else 0)) == 1
+        except Exception:
+            enabled = True if not found else False
+        reason = 'policy_lookup'
+        if (not enabled) or status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}:
+            status = 'OFF'
+            reason = 'policy_disabled_at_creation'
+        # For visible delivery lanes, confirm the row was actually user-visible at creation time.
+        # If this check fails but raw status is KEEP, keep the raw KEEP only for emailed_setups
+        # because the email path has already passed its presend gates before this side effect runs.
+        try:
+            visible_ok, visible_why, visible_meta = _setup_user_visible_keep_policy_allows(setup_or_row, session_name=sess, user_id=int(policy_uid or uid_i or 0), lane=str(lane or 'email'))
+            reason = str(visible_why or reason)
+            if isinstance(visible_meta, dict):
+                combo = combo or str(visible_meta.get('policy_combo') or '').upper().strip()
+            if visible_ok:
+                status = str((visible_meta or {}).get('policy_status_effective') or status or 'OFF').upper().strip()
+        except Exception as exc:
+            reason = f'visible_snapshot_exception:{type(exc).__name__}'
+        if status not in {'KEEP', 'WATCH'}:
+            status = 'OFF'
+        out.update({
+            'policy_at_creation': status,
+            'policy_status_raw_at_creation': raw,
+            'policy_combo_at_creation': combo,
+            'policy_reason_at_creation': str(reason or '')[:500],
+            'policy_created_ts': float(time.time()),
+        })
+    except Exception as exc:
+        out['policy_reason_at_creation'] = f'policy_snapshot_error:{type(exc).__name__}'
+    return out
+
+
+def _setup_policy_snapshot_from_row(row: dict) -> dict:
+    """Read a frozen policy snapshot from row columns or details_json."""
+    rr = dict(row or {})
+    out = {}
+    try:
+        for k in ('policy_at_creation','policy_status_raw_at_creation','policy_combo_at_creation','policy_reason_at_creation','policy_created_ts'):
+            if rr.get(k) not in (None, ''):
+                out[k] = rr.get(k)
+        if not out and rr.get('details_json'):
+            try:
+                data = json.loads(str(rr.get('details_json') or '{}'))
+                if isinstance(data, dict):
+                    for k in ('policy_at_creation','policy_status_raw_at_creation','policy_combo_at_creation','policy_reason_at_creation','policy_created_ts'):
+                        if data.get(k) not in (None, ''):
+                            out[k] = data.get(k)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def _setup_frozen_policy_label(row: dict) -> str:
+    try:
+        snap = _setup_policy_snapshot_from_row(row)
+        st = str(snap.get('policy_at_creation') or '').upper().strip()
+        if st in {'KEEP', 'WATCH', 'OFF'}:
+            return st
+    except Exception:
+        pass
+    return ''
 
 def _setup_policy_status_is_unknownish(status: str = '') -> bool:
     try:
@@ -18405,6 +18504,13 @@ def db_init():
             'original_setup_id': "TEXT NOT NULL DEFAULT ''",
             'original_side': "TEXT NOT NULL DEFAULT ''",
             'strategy_reason': "TEXT NOT NULL DEFAULT ''",
+            # ver21: immutable policy snapshot captured when the setup enters the executable/email lane.
+            # This prevents historical setup rows from flipping KEEP -> OFF later when live policy/gates change.
+            'policy_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_status_raw_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_combo_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_reason_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_created_ts': "REAL NOT NULL DEFAULT 0",
         }
         for _col, _ddl in exec_add_cols.items():
             if _col not in x_cols:
@@ -18412,6 +18518,19 @@ def db_init():
                 x_cols.add(_col)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_executable_setups_uid_ts ON executable_setups(user_id, executable_ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_executable_setups_uid_session_ts ON executable_setups(user_id, session, executable_ts)")
+        # ver21: keep an immutable delivery-policy snapshot on the email row too.
+        cur.execute("PRAGMA table_info(emailed_setups)")
+        e_cols = {r[1] for r in cur.fetchall()}
+        for _col, _ddl in {
+            'policy_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_status_raw_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_combo_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_reason_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_created_ts': "REAL NOT NULL DEFAULT 0",
+        }.items():
+            if _col not in e_cols:
+                cur.execute(f"ALTER TABLE emailed_setups ADD COLUMN {_col} {_ddl}")
+                e_cols.add(_col)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_emailed_setups_uid_setup_ts ON emailed_setups(user_id, setup_id, emailed_ts)")
     except Exception:
         pass
@@ -24137,13 +24256,39 @@ def db_list_signals_since(ts_from: float) -> List[dict]:
 # SIGNAL EVALUATION (EMAIL -> OUTCOME TABLE)
 # =========================================================
 
-def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts: float):
+def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts: float, s=None, policy_snapshot: dict | None = None):
+    snap = dict(policy_snapshot or {})
+    if not snap:
+        try:
+            snap = _setup_policy_snapshot_for_setup(s, session_name=str(session or ''), user_id=int(user_id or 0), lane='email') if s is not None else {}
+        except Exception:
+            snap = {}
+    pol = str(snap.get('policy_at_creation') or '').upper().strip()
+    raw = str(snap.get('policy_status_raw_at_creation') or '').upper().strip()
+    combo = str(snap.get('policy_combo_at_creation') or '').upper().strip()
+    reason = str(snap.get('policy_reason_at_creation') or '')[:500]
+    pts = float(snap.get('policy_created_ts') or emailed_ts or time.time())
     con = db_connect()
     cur = con.cursor()
+    try:
+        cur.execute("PRAGMA table_info(emailed_setups)")
+        cols = {r[1] for r in cur.fetchall()}
+        for _col, _ddl in {
+            'policy_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_status_raw_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_combo_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_reason_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_created_ts': "REAL NOT NULL DEFAULT 0",
+        }.items():
+            if _col not in cols:
+                cur.execute(f"ALTER TABLE emailed_setups ADD COLUMN {_col} {_ddl}")
+                cols.add(_col)
+    except Exception:
+        pass
     cur.execute(
-        """INSERT OR REPLACE INTO emailed_setups (user_id, setup_id, session, emailed_ts)
-           VALUES (?, ?, ?, ?)""",
-        (int(user_id), str(setup_id).strip(), str(session or ""), float(emailed_ts)),
+        """INSERT OR REPLACE INTO emailed_setups (user_id, setup_id, session, emailed_ts, policy_at_creation, policy_status_raw_at_creation, policy_combo_at_creation, policy_reason_at_creation, policy_created_ts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (int(user_id), str(setup_id).strip(), str(session or ""), float(emailed_ts), pol, raw, combo, reason, pts),
     )
     con.commit()
     con.close()
@@ -24334,22 +24479,72 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
     ema_support_dist_pct = float(getattr(s, 'ema_support_dist_pct', 0.0) or 0.0) if s is not None else 0.0
     details_json = _setup_executable_details_json(s, session=session_txt) if s is not None else ''
 
+    # ver21: freeze the policy snapshot at the moment the setup enters the executable/email lane.
+    try:
+        snap = _setup_policy_snapshot_for_setup(s if s is not None else {'setup_id': sid, 'session': session_txt, 'symbol': symbol, 'side': side}, session_name=session_txt, user_id=int(user_id or 0), lane='email')
+    except Exception:
+        snap = {}
+    policy_at_creation = str((snap or {}).get('policy_at_creation') or '').upper().strip()
+    policy_status_raw_at_creation = str((snap or {}).get('policy_status_raw_at_creation') or '').upper().strip()
+    policy_combo_at_creation = str((snap or {}).get('policy_combo_at_creation') or '').upper().strip()
+    policy_reason_at_creation = str((snap or {}).get('policy_reason_at_creation') or '')[:500]
+    policy_created_ts = float((snap or {}).get('policy_created_ts') or exec_ts or time.time())
+
     con = db_connect()
     cur = con.cursor()
+    # Preserve a previously frozen KEEP/WATCH snapshot for the same setup_id.
+    try:
+        cur.execute("PRAGMA table_info(executable_setups)")
+        cols0 = {r[1] for r in cur.fetchall()}
+        for _col, _ddl in {
+            'policy_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_status_raw_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_combo_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_reason_at_creation': "TEXT NOT NULL DEFAULT ''",
+            'policy_created_ts': "REAL NOT NULL DEFAULT 0",
+        }.items():
+            if _col not in cols0:
+                cur.execute(f"ALTER TABLE executable_setups ADD COLUMN {_col} {_ddl}")
+                cols0.add(_col)
+        old = cur.execute("SELECT policy_at_creation, policy_status_raw_at_creation, policy_combo_at_creation, policy_reason_at_creation, policy_created_ts FROM executable_setups WHERE user_id=? AND setup_id=?", (int(user_id), sid)).fetchone()
+        if old and str((old[0] if old else '') or '').upper().strip() in {'KEEP','WATCH'} and policy_at_creation not in {'KEEP','WATCH'}:
+            policy_at_creation = str(old[0] or '').upper().strip()
+            policy_status_raw_at_creation = str(old[1] or policy_status_raw_at_creation or '').upper().strip()
+            policy_combo_at_creation = str(old[2] or policy_combo_at_creation or '').upper().strip()
+            policy_reason_at_creation = str(old[3] or policy_reason_at_creation or '')[:500]
+            policy_created_ts = float(old[4] or policy_created_ts or exec_ts or time.time())
+    except Exception:
+        pass
+    try:
+        if details_json:
+            _dj = json.loads(details_json) if isinstance(details_json, str) else {}
+            if isinstance(_dj, dict):
+                _dj.update({
+                    'policy_at_creation': policy_at_creation,
+                    'policy_status_raw_at_creation': policy_status_raw_at_creation,
+                    'policy_combo_at_creation': policy_combo_at_creation,
+                    'policy_reason_at_creation': policy_reason_at_creation,
+                    'policy_created_ts': policy_created_ts,
+                })
+                details_json = json.dumps(_dj, separators=(',', ':'))
+    except Exception:
+        pass
     cur.execute(
         """INSERT OR REPLACE INTO executable_setups (
                user_id, setup_id, session, executable_ts, signal_created_ts,
                symbol, market_symbol, side, conf, entry, sl, tp, alt_target_a, alt_target_b,
                fut_vol_usd, ch24, ch4, ch1, ch15, quality_score, atr_pct, engine,
                pullback_ready, pullback_bypass_hot, pullback_ema_dist_pct,
-               ema_support_period, ema_support_dist_pct, source_kind, details_json
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               ema_support_period, ema_support_dist_pct, source_kind, details_json,
+               policy_at_creation, policy_status_raw_at_creation, policy_combo_at_creation, policy_reason_at_creation, policy_created_ts
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             int(user_id), sid, session_txt, exec_ts, signal_created_ts,
             symbol, market_symbol, side, conf, entry, sl, tp, alt_target_a, alt_target_b,
             fut_vol_usd, ch24, ch4, ch1, ch15, quality_score, atr_pct, engine,
             int(pullback_ready), int(pullback_bypass_hot), pullback_ema_dist_pct,
             int(ema_support_period), ema_support_dist_pct, str(source_kind or 'executable_setups'), details_json,
+            policy_at_creation, policy_status_raw_at_creation, policy_combo_at_creation, policy_reason_at_creation, policy_created_ts,
         ),
     )
     try:
@@ -45878,10 +46073,17 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                             x_orig_id_expr = "COALESCE(original_setup_id, '') AS original_setup_id" if 'original_setup_id' in x_cols else "'' AS original_setup_id"
                             x_orig_side_expr = "COALESCE(original_side, '') AS original_side" if 'original_side' in x_cols else "'' AS original_side"
                             x_strategy_reason_expr = "COALESCE(strategy_reason, '') AS strategy_reason" if 'strategy_reason' in x_cols else "'' AS strategy_reason"
+                            x_pol_expr = "COALESCE(policy_at_creation, '') AS policy_at_creation" if 'policy_at_creation' in x_cols else "'' AS policy_at_creation"
+                            x_pol_raw_expr = "COALESCE(policy_status_raw_at_creation, '') AS policy_status_raw_at_creation" if 'policy_status_raw_at_creation' in x_cols else "'' AS policy_status_raw_at_creation"
+                            x_pol_combo_expr = "COALESCE(policy_combo_at_creation, '') AS policy_combo_at_creation" if 'policy_combo_at_creation' in x_cols else "'' AS policy_combo_at_creation"
+                            x_pol_reason_expr = "COALESCE(policy_reason_at_creation, '') AS policy_reason_at_creation" if 'policy_reason_at_creation' in x_cols else "'' AS policy_reason_at_creation"
+                            x_pol_ts_expr = "COALESCE(policy_created_ts, 0) AS policy_created_ts" if 'policy_created_ts' in x_cols else "0 AS policy_created_ts"
                             cur.execute(f"""
                                 SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                                        fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
-                                       {x_family_expr}, {x_strategy_expr}, {x_orig_id_expr}, {x_orig_side_expr}, {x_strategy_reason_expr}, entry, sl, tp, alt_target_a, alt_target_b
+                                       {x_family_expr}, {x_strategy_expr}, {x_orig_id_expr}, {x_orig_side_expr}, {x_strategy_reason_expr},
+                                       {x_pol_expr}, {x_pol_raw_expr}, {x_pol_combo_expr}, {x_pol_reason_expr}, {x_pol_ts_expr},
+                                       entry, sl, tp, alt_target_a, alt_target_b
                                 FROM executable_setups
                                 {where}
                                 ORDER BY executable_ts DESC{lim_clause}
@@ -46175,6 +46377,16 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
         if sym_u.endswith('USDT'):
             sym_u = sym_u[:-4]
 
+        # ver21: Policy is the immutable creation/delivery policy for audit rows.
+        # A setup that was created/emailed as KEEP must not flip to OFF minutes later
+        # just because the live actionability/cooldown/context gate changed.
+        frozen = _setup_frozen_policy_label(rr)
+        if frozen in {'KEEP', 'WATCH'}:
+            return frozen
+        if frozen == 'OFF':
+            return 'OFF'
+
+        # Fallback for legacy rows that do not have a frozen policy snapshot yet.
         # Final check: Policy is CURRENT actionability, not raw historical policy.
         # A setup row outside the active session or outside AUTOTRADE_ENTRY_WINDOW_MIN
         # can be audited, but it cannot still be emailed or opened by AutoTrade.
@@ -46359,7 +46571,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; Bybit-verified AutoTrade TP/SL overrides traded rows. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "Policy = fresh-current delivery/actionability gate only. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions, so stale open journal rows no longer look live after closure.",
+        "Policy = frozen creation/delivery policy (KEEP/WATCH/OFF at setup creation/email time), not live recalculation. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions, so stale open journal rows no longer look live after closure.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
@@ -48704,6 +48916,19 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         found = bool(info.get('found'))
         raw_status = str(info.get('status') or '').upper().strip()
         status = _setup_policy_effective_status(raw_status, found=found)
+        # ver21: an emailed/executable setup carries an immutable creation policy.
+        # Do not let a later live-policy/cooldown recalculation flip that snapshot OFF.
+        try:
+            _frozen_status = _setup_frozen_policy_label(setup_or_row)
+            if _frozen_status in {'KEEP', 'WATCH'}:
+                raw_status = _frozen_status
+                status = _frozen_status
+                found = True
+                info = dict(info or {})
+                info['enabled'] = 1
+                info['status'] = _frozen_status
+        except Exception:
+            pass
         # Ver44: do not let missing strategy-specific rows (F2-LON-REV/MON/etc.)
         # become fatal UNKNOWN states.  They are WATCH probation and are still
         # protected by strict quality, risk, SL/TP, cooldown and micro-edge gates.
@@ -59318,7 +59543,7 @@ def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, s
                 continue
             for tuid in target_uids:
                 try:
-                    db_mark_emailed_setup(int(tuid), sid, sess_u, now_ts)
+                    db_mark_emailed_setup(int(tuid), sid, sess_u, now_ts, s=s)
                 except Exception:
                     pass
                 try:
