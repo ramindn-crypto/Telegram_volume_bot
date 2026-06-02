@@ -58297,20 +58297,40 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 pass
             return
         try:
-            best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=int(os.getenv('SCREEN_ONDEMAND_TICKER_TIMEOUT_SEC', '8') or 8))
+            best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=int(os.getenv('SCREEN_ONDEMAND_TICKER_TIMEOUT_SEC', '15') or 15))
             if not best_fut:
-                await _telegram_reply_text_fast(update.message, "⚠️ /screen full scan could not fetch tickers. Please try again shortly.")
+                # Ver07: fall back to cached tickers rather than failing /screen.
+                best_fut = get_cached_futures_tickers() or {}
+            if not best_fut:
+                await _telegram_reply_text_fast(update.message, "⚠️ /screen could not fetch market data yet. Please try again shortly.")
                 return
-            body, kb, shown_setups = await to_thread_screen(
-                _build_screen_body_and_kb,
-                best_fut,
-                str(scan_session or '').upper(),
-                int(uid or 0),
-                timeout=int(os.getenv('SCREEN_ONDEMAND_BUILD_TIMEOUT_SEC', '35') or 35),
-            )
+            try:
+                body, kb, shown_setups = await to_thread_screen(
+                    _build_screen_body_and_kb,
+                    best_fut,
+                    str(scan_session or '').upper(),
+                    int(uid or 0),
+                    timeout=int(os.getenv('SCREEN_ONDEMAND_BUILD_TIMEOUT_SEC', '120') or 120),
+                )
+            except Exception as _build_e:
+                # Ver07: if the full OHLCV executable builder fails/times out, /screen must
+                # still return a useful result and must not poison the bot with a failure loop.
+                try:
+                    logger.warning('screen full builder failed uid=%s session=%s: %s', uid, scan_session, _build_e)
+                except Exception:
+                    pass
+                body, kb, shown_setups = _screen_recent_db_body_and_kb(
+                    int(uid or 0),
+                    str(scan_session or '').upper(),
+                    best_fut or {},
+                    max_age_min=max(int(_screen_actionable_fallback_max_age_min()), 180),
+                    include_email_source=bool(_screen_user_can_see_email_source(int(uid or 0), user or {})),
+                )
+                if not body:
+                    body, kb, shown_setups = _screen_quick_ticker_snapshot_body(best_fut or {}, str(scan_session or '').upper())
             if not body:
-                await _telegram_reply_text_fast(update.message, "⚠️ /screen full scan finished but found no displayable result.")
-                return
+                body = "*Top Trade Setups*\n━━━━━━━━━━━━━━━━━━━━\n_No high-quality setups right now._"
+                kb, shown_setups = [], []
             try:
                 _screen_cache_put(f"uid:{int(uid or 0)}::{str(scan_session or '').upper()}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=False)
                 _screen_cache_put(f"global::{str(scan_session or '').upper()}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=False)
@@ -58332,13 +58352,25 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
                 for (sym, sid) in (kb or [])
             ]
-            await send_long_message(
-                update,
-                _screen_markdown_to_html((header + "\n" + str(body or '')).strip()),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-            )
+            _screen_out_html = _screen_markdown_to_html((header + "\n" + str(body or '')).strip())
+            try:
+                await send_long_message(
+                    update,
+                    _screen_out_html,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+                )
+            except Exception as _send_e:
+                # Ver07: never let Telegram send/network failure turn a completed /screen
+                # build into a user-visible full-scan failure. Retry once as a compact
+                # no-keyboard message so /screen still returns useful output.
+                try:
+                    logger.warning('screen full result send retry uid=%s: %s', uid, _send_e)
+                except Exception:
+                    pass
+                _plain = _screen_plain_cleanup((header + "\n" + str(body or '')).strip())
+                await _telegram_reply_text_fast(update.message, _plain[:3900])
             # Sync the exact displayed setups to email/autotrade lane, same as the cached path.
             try:
                 if MANUAL_SCREEN_SYNC_ENABLED and shown_setups:
@@ -58362,11 +58394,11 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 pass
     except Exception as e:
         try:
-            logger.warning('screen on-demand full scan failed uid=%s session=%s: %s', uid, scan_session, e)
+            logger.exception('screen on-demand full scan failed uid=%s session=%s', uid, scan_session)
         except Exception:
             pass
         try:
-            await _telegram_reply_text_fast(update.message, "⚠️ /screen full scan failed. Please try again shortly.")
+            await _telegram_reply_text_fast(update.message, "⚠️ /screen full scan hit a temporary error. I kept the bot responsive; try /screen again shortly.")
         except Exception:
             pass
     finally:
