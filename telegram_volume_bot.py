@@ -1,3 +1,4 @@
+# ver24: hard setup-email send reservation/dedup: atomic DB lock before SMTP by setup_id and identity prevents duplicate NEAR emails during rapid deploy/recovery/screen jobs.
 # ver22: setup-audit AT lifecycle attribution fix: AT_OPEN is tied to the exact latest OPEN setup_id for the live symbol/side, preventing older same-symbol OFF rows from inheriting a newer open position.
 # ver21: frozen setup-policy snapshot fix: freezes KEEP/WATCH at executable/email creation, audit displays creation policy not live recalculation, and AutoTrade accepts emailed snapshot policy while keeping drift/risk gates.
 # ver10: /screen freshness fix: never serve stale cached scans as final; stale/missing cache schedules one non-blocking full scan and posts the fresh result when ready. Other commands remain responsive.
@@ -2794,6 +2795,144 @@ def _mark_emailed_setup_identity(user_id: int, setup, emailed_ts: float | None =
             cur.execute(
                 "INSERT OR REPLACE INTO emailed_setup_identities(user_id, identity_key, symbol, side, setup_id, emailed_ts) VALUES(?,?,?,?,?,?)",
                 (int(user_id), str(ident), str(sym), str(side), str(setup_id), float(ts)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _setup_email_send_reservation_key(setup) -> tuple[str, str]:
+    """Return (setup_id, identity_key) used to atomically reserve setup-email sends.
+
+    Ver24: deployment/recovery/screen jobs can overlap for a few minutes. The old
+    duplicate checks happened before SMTP but were only marked after SMTP, so two
+    jobs could pass the check and send the same setup. This reservation is written
+    before SMTP and is shared across all setup-email lanes.
+    """
+    try:
+        sid = str((setup.get('setup_id', '') if isinstance(setup, dict) else getattr(setup, 'setup_id', '')) or '').strip()
+    except Exception:
+        sid = ''
+    try:
+        ident = str(_setup_identity_from_obj(setup) or '').strip()
+    except Exception:
+        ident = ''
+    return sid, ident
+
+
+def _setup_email_reservation_recent(user_id: int, setup, lookback_hours: float | None = None) -> bool:
+    sid, ident = _setup_email_send_reservation_key(setup)
+    if not sid and not ident:
+        return False
+    cutoff_hours = float(lookback_hours or AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS or 6.0)
+    since = time.time() - max(0.0, cutoff_hours * 3600.0)
+    try:
+        with sqlite3.connect(DB_PATH, timeout=8) as conn:
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS setup_email_send_reservations (
+                user_id INTEGER NOT NULL,
+                setup_id TEXT NOT NULL DEFAULT '',
+                identity_key TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                session TEXT NOT NULL DEFAULT '',
+                reserved_ts REAL NOT NULL DEFAULT 0,
+                sent_ts REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'RESERVED',
+                PRIMARY KEY(user_id, setup_id, identity_key)
+            )""")
+            row = cur.execute(
+                """SELECT MAX(COALESCE(NULLIF(sent_ts,0), reserved_ts))
+                   FROM setup_email_send_reservations
+                   WHERE user_id=? AND COALESCE(NULLIF(sent_ts,0), reserved_ts)>=?
+                     AND ((setup_id<>'' AND setup_id=?) OR (identity_key<>'' AND identity_key=?))""",
+                (int(user_id), float(since), str(sid), str(ident)),
+            ).fetchone()
+            return bool(row and row[0])
+    except Exception:
+        return False
+
+
+def _reserve_setup_email_send(user_id: int, setup, session_name: str = '', lookback_hours: float | None = None) -> tuple[bool, str]:
+    """Atomically reserve a setup email before SMTP. Returns (allowed, reason)."""
+    sid, ident = _setup_email_send_reservation_key(setup)
+    if not sid and not ident:
+        return True, 'no_reservation_key'
+    cutoff_hours = float(lookback_hours or AUTOTRADE_DUPLICATE_IDENTITY_COOLDOWN_HOURS or 6.0)
+    now_ts = time.time()
+    since = now_ts - max(0.0, cutoff_hours * 3600.0)
+    try:
+        sym = str(_bybit_linear_symbol(setup.get('symbol', '') if isinstance(setup, dict) else getattr(setup, 'symbol', '')) or '').upper().strip()
+    except Exception:
+        sym = str((setup.get('symbol', '') if isinstance(setup, dict) else getattr(setup, 'symbol', '')) or '').upper().strip()
+    side = str((setup.get('side', '') if isinstance(setup, dict) else getattr(setup, 'side', '')) or '').upper().strip()
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10, isolation_level=None) as conn:
+            cur = conn.cursor()
+            cur.execute('BEGIN IMMEDIATE')
+            cur.execute("""CREATE TABLE IF NOT EXISTS setup_email_send_reservations (
+                user_id INTEGER NOT NULL,
+                setup_id TEXT NOT NULL DEFAULT '',
+                identity_key TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                session TEXT NOT NULL DEFAULT '',
+                reserved_ts REAL NOT NULL DEFAULT 0,
+                sent_ts REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'RESERVED',
+                PRIMARY KEY(user_id, setup_id, identity_key)
+            )""")
+            row = cur.execute(
+                """SELECT setup_id, identity_key, reserved_ts, sent_ts, status
+                   FROM setup_email_send_reservations
+                   WHERE user_id=? AND COALESCE(NULLIF(sent_ts,0), reserved_ts)>=?
+                     AND ((setup_id<>'' AND setup_id=?) OR (identity_key<>'' AND identity_key=?))
+                   ORDER BY COALESCE(NULLIF(sent_ts,0), reserved_ts) DESC LIMIT 1""",
+                (int(user_id), float(since), str(sid), str(ident)),
+            ).fetchone()
+            if row:
+                cur.execute('COMMIT')
+                return False, f'setup_email_already_reserved:{row[0] or row[1]}:{row[4] or "RESERVED"}'
+            cur.execute(
+                """INSERT OR REPLACE INTO setup_email_send_reservations
+                   (user_id, setup_id, identity_key, symbol, side, session, reserved_ts, sent_ts, status)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (int(user_id), str(sid), str(ident), str(sym), str(side), str(session_name or '').upper().strip(), float(now_ts), 0.0, 'RESERVED'),
+            )
+            cur.execute('COMMIT')
+            return True, 'reserved'
+    except Exception as e:
+        try:
+            return False, f'setup_email_reservation_error:{type(e).__name__}'
+        except Exception:
+            return False, 'setup_email_reservation_error'
+
+
+def _mark_setup_email_reservation_sent(user_id: int, setup, sent_ts: float | None = None, status: str = 'SENT') -> None:
+    sid, ident = _setup_email_send_reservation_key(setup)
+    if not sid and not ident:
+        return
+    ts = float(sent_ts or time.time())
+    try:
+        with sqlite3.connect(DB_PATH, timeout=8) as conn:
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS setup_email_send_reservations (
+                user_id INTEGER NOT NULL,
+                setup_id TEXT NOT NULL DEFAULT '',
+                identity_key TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                session TEXT NOT NULL DEFAULT '',
+                reserved_ts REAL NOT NULL DEFAULT 0,
+                sent_ts REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'RESERVED',
+                PRIMARY KEY(user_id, setup_id, identity_key)
+            )""")
+            cur.execute(
+                """UPDATE setup_email_send_reservations
+                   SET sent_ts=?, status=?
+                   WHERE user_id=? AND ((setup_id<>'' AND setup_id=?) OR (identity_key<>'' AND identity_key=?))""",
+                (float(ts), str(status or 'SENT'), int(user_id), str(sid), str(ident)),
             )
             conn.commit()
     except Exception:
@@ -60296,6 +60435,41 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
             pass
         return False
 
+    # Ver24: atomic pre-SMTP reservation. This blocks duplicate setup emails from
+    # overlapping alert/recovery/screen jobs and rapid Render redeploys before the
+    # normal post-send emailed_setups marker is written.
+    try:
+        _reserved_setups = []
+        _reservation_reasons = []
+        for _s in list(setups or []):
+            _ok_res, _why_res = _reserve_setup_email_send(int(uid), _s, session_name=str(display_session or sess_name or ''))
+            if _ok_res:
+                _reserved_setups.append(_s)
+            else:
+                _reservation_reasons.append(str(_why_res or 'already_reserved'))
+        if not _reserved_setups:
+            try:
+                _LAST_EMAIL_DECISION[int(uid)] = {
+                    'status': 'SKIP',
+                    'picked': '-',
+                    'when': datetime.now(tz).isoformat(timespec='seconds'),
+                    'reasons': ['duplicate_setup_email_reservation', *(_reservation_reasons[:5])],
+                }
+            except Exception:
+                pass
+            try:
+                db_log_setup_pipeline_event(int(uid), stage='setup_email_reservation', status='skip_duplicate', session=str(display_session or sess_name or ''), mode='email', details={'reasons': _reservation_reasons[:8]})
+            except Exception:
+                pass
+            return False
+        setups = list(_reserved_setups or [])
+    except Exception as _res_exc:
+        try:
+            _LAST_EMAIL_DECISION[int(uid)] = {'status': 'SKIP', 'picked': '-', 'when': datetime.now(tz).isoformat(timespec='seconds'), 'reasons': [f'setup_email_reservation_exception:{type(_res_exc).__name__}']}
+        except Exception:
+            pass
+        return False
+
     first = setups[0]
     subject = f"PulseFutures • {display_session} • {first.side} {first.symbol}"
     if len(setups) > 1:
@@ -60408,6 +60582,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         pass
                     try:
                         _mark_emailed_setup_identity(int(_target_uid), s, emailed_ts=float(now_ts))
+                    except Exception:
+                        pass
+                    try:
+                        _mark_setup_email_reservation_sent(int(_target_uid), s, sent_ts=float(now_ts), status='SENT')
                     except Exception:
                         pass
                 try:
@@ -64689,6 +64867,9 @@ async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
             sym = str(getattr(s, 'symbol', '') or '').upper().strip()
             side = str(getattr(s, 'side', '') or '').upper().strip()
             try:
+                if _setup_email_reservation_recent(uid, s):
+                    blocked['email_send_reserved_recently'] += 1
+                    continue
                 if _email_setup_identity_recently_sent(uid, s):
                     blocked['identity_recently_sent'] += 1
                     continue
