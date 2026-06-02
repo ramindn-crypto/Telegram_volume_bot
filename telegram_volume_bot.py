@@ -1,3 +1,4 @@
+# ver08: /screen non-blocking hardening: no long lock wait, release screen lock before Telegram final send/sync, and move screen-sync off the command/send path so other commands remain responsive while full /screen builds.
 # ver03: small stability tuning over ver01: recovery job is throttled/hard-timed, Telegram fast-reply network noise is debug-only, and /screen rebuild notice uses fail-fast send.
 # yver171: major responsiveness/sync patch: fail-fast Telegram replies, no auto-posting huge admin reports, exact emailed setups are authoritative for AutoTrade, and duplicate setup-id re-entry is blocked.
 # ver01: emergency responsiveness and sync fix: no incomplete admin previews, no cached quick /screen snapshots, bounded screen refresh, and full setup_matrix/audit posts.
@@ -2853,7 +2854,7 @@ _FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WOR
 # User-facing heavy work: reports, diagnostics, manual runs.
 _HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "2")))
 # Dedicated /screen lane: must not be starved by backtests, optimizer, email, or autotrade.
-_SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SCREEN_EXECUTOR_WORKERS", "1")))
+_SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SCREEN_EXECUTOR_WORKERS", "2")))
 # Dedicated email/network lane: SMTP/ticker calls must not wait behind research jobs.
 _EMAIL_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("EMAIL_EXECUTOR_WORKERS", "2")))
 # Dedicated autotrade lane: live entry/risk checks must never queue behind optimizers or scans.
@@ -57134,10 +57135,25 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
                 if MANUAL_SCREEN_SYNC_ENABLED and int(uid or 0) > 0 and _setups:
                     _u = get_user(int(uid or 0)) or {}
                     _live_sess = str(current_session_utc() or '')
-                    await _screen_sync_pipeline_async(int(uid or 0), dict(_u or {}), _live_sess, str(sess or ''), best_fut or {}, list(_setups or []))
+                    # ver08: never run email/autotrade sync inside the /screen refresh task.
+                    # It can call exchange/SMTP/Bybit and delay Telegram command handling.
+                    _safe_create_task(
+                        to_thread_bg(
+                            _run_async_in_new_loop,
+                            _screen_sync_pipeline_async,
+                            int(uid or 0),
+                            dict(_u or {}),
+                            _live_sess,
+                            str(sess or ''),
+                            best_fut or {},
+                            list(_setups or []),
+                            timeout=int(os.getenv('SCREEN_SYNC_BG_TIMEOUT_SEC', '20') or 20),
+                        ),
+                        'screen_cache_refresh_sync_bg'
+                    )
             except Exception as _sync_e:
                 try:
-                    logger.warning('screen_cache_refresh_sync failed uid=%s: %s', uid, _sync_e)
+                    logger.warning('screen_cache_refresh_sync schedule failed uid=%s: %s', uid, _sync_e)
                 except Exception:
                     pass
     except Exception:
@@ -58286,7 +58302,7 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
         # If another screen refresh is holding the lock, wait briefly; if it is stuck,
         # continue after the scheduler cancels/replaces it on the next user request.
         try:
-            await asyncio.wait_for(_SCREEN_LOCK.acquire(), timeout=float(os.getenv('SCREEN_ONDEMAND_LOCK_WAIT_SEC', '45') or 3))
+            await asyncio.wait_for(_SCREEN_LOCK.acquire(), timeout=float(os.getenv('SCREEN_ONDEMAND_LOCK_WAIT_SEC', '0.2') or 0.2))
             got_lock = True
         except Exception:
             got_lock = False
@@ -58336,6 +58352,12 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 _screen_cache_put(f"global::{str(scan_session or '').upper()}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=False)
             except Exception:
                 pass
+            # ver08: cache is updated; release /screen build lock before Telegram sends.
+            # Sending a long result can timeout and must not block the next /screen or refresh lane.
+            try:
+                _SCREEN_LOCK.release()
+            except Exception:
+                pass
             try:
                 loc_label, loc_time = user_location_and_time(user or {})
             except Exception:
@@ -58374,17 +58396,24 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
             # Sync the exact displayed setups to email/autotrade lane, same as the cached path.
             try:
                 if MANUAL_SCREEN_SYNC_ENABLED and shown_setups:
-                    await _screen_sync_pipeline_async(
-                        int(uid or 0),
-                        dict(user or {}),
-                        str(live_session or ''),
-                        str(scan_session or '').upper(),
-                        best_fut or {},
-                        list(shown_setups or []),
+                    # ver08: schedule sync off the Telegram delivery task.
+                    _safe_create_task(
+                        to_thread_bg(
+                            _run_async_in_new_loop,
+                            _screen_sync_pipeline_async,
+                            int(uid or 0),
+                            dict(user or {}),
+                            str(live_session or ''),
+                            str(scan_session or '').upper(),
+                            best_fut or {},
+                            list(shown_setups or []),
+                            timeout=int(os.getenv('SCREEN_SYNC_BG_TIMEOUT_SEC', '20') or 20),
+                        ),
+                        'screen_on_demand_sync_bg'
                     )
             except Exception as sync_e:
                 try:
-                    logger.warning('screen on-demand sync failed uid=%s: %s', uid, sync_e)
+                    logger.warning('screen on-demand sync schedule failed uid=%s: %s', uid, sync_e)
                 except Exception:
                     pass
         finally:
