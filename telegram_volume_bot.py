@@ -58307,11 +58307,15 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
         except Exception:
             got_lock = False
         if not got_lock:
+            # ver09: do NOT send a second confusing "already running" message.
+            # A background cache refresh can briefly hold _SCREEN_LOCK immediately after
+            # /screen is pressed. Wait for it, then post the full result from this task.
             try:
-                await _telegram_reply_text_fast(update.message, "⏳ /screen full scan is already running. Please try again shortly.")
+                await asyncio.wait_for(_SCREEN_LOCK.acquire(), timeout=float(os.getenv('SCREEN_ONDEMAND_LOCK_WAIT_SEC_LONG', '45') or 45))
+                got_lock = True
             except Exception:
-                pass
-            return
+                # Silent exit: the command already acknowledged the build. Avoid duplicate Telegram spam.
+                return
         try:
             best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=int(os.getenv('SCREEN_ONDEMAND_TICKER_TIMEOUT_SEC', '15') or 15))
             if not best_fut:
@@ -58487,7 +58491,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         cache_entry, age = _screen_choose_best_cache(cache_keys)
-        _schedule_screen_cache_refresh(int(uid), scan_session)
+        # ver09: Do not start the autonomous /screen cache refresh before the on-demand
+        # full /screen worker. It competes for _SCREEN_LOCK and caused the duplicate
+        # "Building... / already running" messages plus no final result. The on-demand
+        # worker now owns the rebuild and updates the same cache.
+        # _schedule_screen_cache_refresh(int(uid), scan_session)
         can_show_email_source = _screen_user_can_see_email_source(int(uid), user)
         try:
             screen_fallback_min = int(_screen_actionable_fallback_max_age_min())
@@ -58672,7 +58680,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if scheduled:
             await _telegram_reply_text_fast(update.message, "⏳ Building full /screen now. I will post the complete result when ready.")
         else:
-            await _telegram_reply_text_fast(update.message, "⏳ Full /screen scan is already running. I will post the complete result when ready.")
+            # ver09: do not spam duplicate "already running" messages on repeated /screen taps.
+            # Existing worker will post the result.
+            pass
         return
     except Exception as e:
         try:
