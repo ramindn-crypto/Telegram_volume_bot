@@ -59087,7 +59087,24 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                     pass
                 return
         try:
-            best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=int(os.getenv('SCREEN_ONDEMAND_TICKER_TIMEOUT_SEC', '15') or 15))
+            # ver36: the fast ticker snapshot is allowed to time out under Render load.
+            # Treat this as normal fallback behaviour, not an ERROR/traceback.  The
+            # slower dedicated screen/cache lane can continue separately; /screen must
+            # stay responsive and must not pollute Render logs with expected timeouts.
+            try:
+                best_fut = await to_thread_screen(_screen_best_fut_fast, timeout=int(os.getenv('SCREEN_ONDEMAND_TICKER_TIMEOUT_SEC', '8') or 8))
+            except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
+                best_fut = get_cached_futures_tickers() or {}
+                try:
+                    logger.debug('screen ticker snapshot timed out uid=%s session=%s; using cached ticker fallback', uid, scan_session)
+                except Exception:
+                    pass
+            except Exception as _ticker_e:
+                best_fut = get_cached_futures_tickers() or {}
+                try:
+                    logger.debug('screen ticker snapshot failed uid=%s session=%s: %s', uid, scan_session, _ticker_e)
+                except Exception:
+                    pass
             if not best_fut:
                 # Ver07: fall back to cached tickers rather than failing /screen.
                 best_fut = get_cached_futures_tickers() or {}
@@ -59210,9 +59227,21 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 _SCREEN_LOCK.release()
             except Exception:
                 pass
+    except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError) as e:
+        # ver36: expected timeout/cancel path from asyncio.wait_for / executor.
+        # Do not emit traceback/ERROR to Render. Serve a quiet fallback note only if needed.
+        try:
+            logger.debug('screen on-demand full scan timed out/cancelled uid=%s session=%s; fallback path kept bot responsive', uid, scan_session)
+        except Exception:
+            pass
+        try:
+            # Usually a fallback has already been sent; this message is only a last-resort guard.
+            await _telegram_reply_text_fast(update.message, "⚠️ /screen is still refreshing. I kept the bot responsive; try /screen again shortly.")
+        except Exception:
+            pass
     except Exception as e:
         try:
-            logger.exception('screen on-demand full scan failed uid=%s session=%s', uid, scan_session)
+            logger.warning('screen on-demand full scan failed uid=%s session=%s: %s: %s', uid, scan_session, type(e).__name__, e)
         except Exception:
             pass
         try:
