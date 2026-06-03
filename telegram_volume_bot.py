@@ -1,3 +1,4 @@
+# ver4: full responsiveness patch: /setup_audit is ack-only/background, audit lifecycle checks are batched, alert job yields during admin commands, /autotrade_last avoids live network calls, and post-email AutoTrade always records/tries the exact emailed batch.
 # ver3: responsiveness/dedup/audit-time fix: /setup_audit uses delivery/executable time, removes duplicate same-data rows, and admin reports run in parallel background workers.
 # ver2: emergency responsiveness/audit-time fix: /setup_audit uses original signal_created_ts instead of batch executable_ts, avoids live OHLCV fetches by default, and alert timeout is fail-soft so Telegram commands stay responsive.
 # ver32: /screen timeout hardening: full builder first returns recent actionable email/executable queue before heavy pool rebuild, and expected on-demand build timeouts fall back without Render WARNING noise.
@@ -47169,6 +47170,156 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
     except Exception:
         return 'OFF'
 
+
+def _setup_audit_collect_lifecycle_maps(uid: int, rows: list[dict], start_ts: float = 0.0, end_ts: float = 0.0) -> dict:
+    """Batch DB/live lookups for /setup_audit lifecycle labels.
+
+    ver4: the previous table called _setup_audit_autotrade_state_label once per
+    row. Each call could open SQLite and occasionally read live Bybit positions.
+    For a 24h audit this made the command feel slow. This helper loads trades,
+    emailed setup ids, and live positions once, then the row loop is in-memory.
+    """
+    out = {'trades_by_setup': {}, 'emailed_by_setup': {}, 'latest_open_by_symbol_side': {}, 'live_symbol_side': set(), 'now': float(time.time())}
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        if uid_i <= 0:
+            return out
+        now = float(time.time())
+        start = float(start_ts or 0.0)
+        end = float(end_ts or now)
+        setup_ids = []
+        for r in rows or []:
+            sid = str((r or {}).get('setup_id') or (r or {}).get('id') or '').strip()
+            if sid and sid not in setup_ids:
+                setup_ids.append(sid)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            if setup_ids:
+                for i in range(0, len(setup_ids), 300):
+                    chunk = setup_ids[i:i+300]
+                    q = ','.join(['?'] * len(chunk))
+                    trs = [dict(x) for x in (cur.execute(f"""
+                        SELECT setup_id, trade_id, symbol, side, status, opened_ts, closed_ts, outcome
+                        FROM autotrade_trades
+                        WHERE uid=? AND setup_id IN ({q})
+                        ORDER BY COALESCE(opened_ts,0) DESC, COALESCE(closed_ts,0) DESC
+                    """, tuple([uid_i] + chunk)).fetchall() or [])]
+                    for tr in trs:
+                        sid = str(tr.get('setup_id') or '').strip()
+                        if sid and sid not in out['trades_by_setup']:
+                            out['trades_by_setup'][sid] = tr
+                    ers = [dict(x) for x in (cur.execute(f"""
+                        SELECT setup_id, MAX(emailed_ts) AS emailed_ts
+                        FROM emailed_setups
+                        WHERE user_id=? AND setup_id IN ({q})
+                        GROUP BY setup_id
+                    """, tuple([uid_i] + chunk)).fetchall() or [])]
+                    for er in ers:
+                        sid = str(er.get('setup_id') or '').strip()
+                        if sid:
+                            out['emailed_by_setup'][sid] = float(er.get('emailed_ts') or 0.0)
+            # Load recent/open trades once for legacy symbol-side fallback and latest-open ownership.
+            qstart = max(0.0, start - 7200.0)
+            qend = max(end + 7200.0, now + 3600.0)
+            trs = [dict(x) for x in (cur.execute("""
+                SELECT setup_id, trade_id, symbol, side, status, opened_ts, closed_ts, outcome
+                FROM autotrade_trades
+                WHERE uid=? AND COALESCE(opened_ts,0)>=? AND COALESCE(opened_ts,0)<=?
+                ORDER BY COALESCE(opened_ts,0) DESC
+            """, (uid_i, qstart, qend)).fetchall() or [])]
+            out['recent_trades'] = trs
+            for tr in trs:
+                try:
+                    st = str(tr.get('status') or '').upper().strip()
+                    if st == 'OPEN' and not tr.get('closed_ts'):
+                        key = (_symbol_base(str(tr.get('symbol') or '')), str(tr.get('side') or '').upper().strip())
+                        if key[0] and key[1] in {'BUY','SELL'} and key not in out['latest_open_by_symbol_side']:
+                            out['latest_open_by_symbol_side'][key] = tr
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    try:
+        # One short live-position check per report, not per row.
+        cache = globals().setdefault('_SETUP_AUDIT_LIVE_POS_CACHE', {'ts': 0.0, 'rows': []})
+        now = float(time.time())
+        if isinstance(cache, dict) and (now - float(cache.get('ts') or 0.0)) <= 8.0:
+            live_rows = list(cache.get('rows') or [])
+        else:
+            live_rows = list(_bybit_get_open_positions_linear() or [])
+            cache['ts'] = now
+            cache['rows'] = list(live_rows or [])
+        live_set = set()
+        for p in live_rows or []:
+            try:
+                psym = _symbol_base(str(_pos_symbol(p) or p.get('symbol') or ''))
+                pside = str(_pos_side_text(p) or p.get('side') or '').upper().strip()
+                if psym and pside in {'BUY','SELL'}:
+                    live_set.add((psym, pside))
+            except Exception:
+                continue
+        out['live_symbol_side'] = live_set
+    except Exception:
+        pass
+    return out
+
+
+def _setup_audit_autotrade_state_label_fast(row: dict, uid: int = 0, session_name: str = '', maps: dict | None = None) -> str:
+    try:
+        if not isinstance(maps, dict):
+            return _setup_audit_autotrade_state_label(row, uid=uid, session_name=session_name)
+        rr = dict(row or {})
+        sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
+        side_u = str(rr.get('side') or '').upper().strip()
+        sym_base = _symbol_base(str(rr.get('symbol') or rr.get('market_symbol') or ''))
+        setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
+        entry_win_sec = float(max(60, int(_autotrade_entry_window_min()) * 60))
+        tr = dict((maps.get('trades_by_setup') or {}).get(sid) or {}) if sid else {}
+        if not tr and sym_base and side_u in {'BUY','SELL'}:
+            match_start = max(0.0, setup_ts - 300.0) if setup_ts > 0 else 0.0
+            match_end = (setup_ts + entry_win_sec + 900.0) if setup_ts > 0 else float(time.time()) + 3600.0
+            for cand in list((maps.get('recent_trades') or [])):
+                try:
+                    if str(cand.get('side') or '').upper().strip() != side_u:
+                        continue
+                    ots = float(cand.get('opened_ts') or 0.0)
+                    if ots < match_start or ots > match_end:
+                        continue
+                    if _symbol_base(str(cand.get('symbol') or '')) == sym_base:
+                        tr = dict(cand)
+                        break
+                except Exception:
+                    continue
+        if tr:
+            st = str(tr.get('status') or '').upper().strip()
+            outc = str(tr.get('outcome') or st or '').upper().strip()
+            if outc in {'TP','SL'}:
+                return f'AT_{outc}'
+            if st == 'OPEN' and not tr.get('closed_ts'):
+                try:
+                    audit_res = str(rr.get('result') or rr.get('res') or rr.get('outcome') or '').upper().strip()
+                    if audit_res in {'TP','SL'}:
+                        return 'AT_CLOSED'
+                except Exception:
+                    pass
+                key = (sym_base, side_u)
+                if key in (maps.get('live_symbol_side') or set()):
+                    latest = dict((maps.get('latest_open_by_symbol_side') or {}).get(key) or {})
+                    latest_sid = str(latest.get('setup_id') or '').strip()
+                    if sid and latest_sid and latest_sid == sid:
+                        return 'AT_OPEN'
+                    return 'AT_CLOSED'
+                return 'AT_CLOSED'
+            return 'AT_CLOSED' if tr.get('closed_ts') else 'AT'
+        if sid:
+            ets = float((maps.get('emailed_by_setup') or {}).get(sid) or 0.0)
+            if ets > 0:
+                return 'SENT' if (float(time.time()) - ets) <= entry_win_sec else 'SENT_OLD'
+        return '-'
+    except Exception:
+        return _setup_audit_autotrade_state_label(row, uid=uid, session_name=session_name)
+
 def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     """Compact setup audit with current Policy lane per setup."""
     limit = max(0, int(limit or 0))
@@ -47216,6 +47367,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
 
     table_rows = []
     tp_n = sl_n = nohit_n = open_n = 0
+    lifecycle_maps = _setup_audit_collect_lifecycle_maps(int(uid), rows, start_ts=requested_start_ts, end_ts=now_ts + 3600.0)
     for r in rows:
         sid = str(r.get('setup_id') or '').strip()
         side = str(r.get('side') or '').upper().strip()
@@ -47246,7 +47398,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
             volm = 0.0
         combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
         policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
-        at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
+        at_state = _setup_audit_autotrade_state_label_fast(r, uid=int(uid), session_name=sess_row, maps=lifecycle_maps)
         table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n
@@ -51964,6 +52116,27 @@ ADMIN_REPORT_SEND_FULL_CACHED_IMMEDIATE = env_bool("ADMIN_REPORT_SEND_FULL_CACHE
 ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE = env_bool("ADMIN_REPORT_AUTO_POST_FULL_FOR_LONG_CACHE", True)
 ADMIN_REPORT_NO_INCOMPLETE_PREVIEWS = env_bool("ADMIN_REPORT_NO_INCOMPLETE_PREVIEWS", True)
 
+# ver4: while a large admin report is being generated or posted, scheduled alert
+# scans should yield. This keeps Telegram commands responsive on a small Render
+# instance instead of letting /setup_audit + alert_job compete for CPU/DB/network.
+_ADMIN_REPORT_ACTIVITY_UNTIL_TS = 0.0
+
+def _admin_report_mark_activity(sec: float = 90.0) -> None:
+    global _ADMIN_REPORT_ACTIVITY_UNTIL_TS
+    try:
+        # Do not let one huge report suppress scheduled email scans for many minutes.
+        # This is only a short yield window for interactive responsiveness.
+        dur = min(180.0, max(5.0, float(sec or 0.0)))
+        _ADMIN_REPORT_ACTIVITY_UNTIL_TS = max(float(_ADMIN_REPORT_ACTIVITY_UNTIL_TS or 0.0), float(time.time()) + dur)
+    except Exception:
+        pass
+
+def _admin_report_interactive_busy(grace_sec: float = 0.0) -> bool:
+    try:
+        return float(time.time()) <= (float(_ADMIN_REPORT_ACTIVITY_UNTIL_TS or 0.0) + max(0.0, float(grace_sec or 0.0)))
+    except Exception:
+        return False
+
 
 def _admin_report_cached_preview(title: str, text: str, age: float | None, *, fresh: bool, started: bool) -> str:
     try:
@@ -52046,6 +52219,10 @@ async def _admin_report_background_refresh(
     """Build a heavy admin report outside the Telegram command timeout and post it when ready."""
     kwargs = dict(kwargs or {})
     try:
+        _admin_report_mark_activity(max(60, int(background_timeout or 120)))
+    except Exception:
+        pass
+    try:
         text = await to_thread_bg(fn, *(args or ()), timeout=background_timeout, **kwargs)
         text = str(text or '').strip() or 'No data found.'
         try:
@@ -52071,8 +52248,74 @@ async def _admin_report_background_refresh(
         except Exception:
             pass
     finally:
+        try:
+            _admin_report_mark_activity(10)
+        except Exception:
+            pass
         _admin_report_bg_done(str(cache_key or ''))
 
+
+async def _admin_report_send_cached_result(update: Update, title: str, text: str, age: float | None, parse_mode=None) -> None:
+    """Post an already-built cached report outside the command handler."""
+    try:
+        _admin_report_mark_activity(45)
+        prefix = f"⚡ Cached result ready: {str(title or 'report')}"
+        if age is not None:
+            prefix += f" (age {_admin_report_age_text(age)})"
+        await send_long_message(update, prefix + "\n" + SEP + "\n" + str(text or ''), parse_mode=parse_mode or ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as e:
+        try:
+            await _telegram_reply_text_fast(update.message, f"⚠️ Cached {str(title or 'report')} send failed: {type(e).__name__}: {e}", parse_mode=None, disable_web_page_preview=True)
+        except Exception:
+            pass
+
+
+async def _queue_admin_report_ack_only(
+    update: Update,
+    title: str,
+    cache_key: str,
+    fn,
+    args: tuple = (),
+    kwargs: dict | None = None,
+    parse_mode=None,
+    background_timeout: int | None = 600,
+) -> None:
+    """Always acknowledge immediately and build/post the full report in background.
+
+    ver4: used by /setup_audit because even a cached full audit table can take a
+    few seconds to send/chunk on Telegram. The command must never block other
+    commands; it should only confirm that the full result is being built and then
+    post the complete report when ready.
+    """
+    cache_key = str(cache_key or '')
+    title_s = str(title or 'report').strip() or 'report'
+    pm = parse_mode or ParseMode.HTML
+    try:
+        _admin_report_mark_activity(max(60, int(background_timeout or 120)))
+    except Exception:
+        pass
+    started = _admin_report_bg_try_start(cache_key)
+    if started:
+        _safe_create_task(
+            _admin_report_background_refresh(
+                update,
+                title_s,
+                cache_key,
+                fn,
+                args=tuple(args or ()),
+                kwargs=dict(kwargs or {}),
+                parse_mode=pm,
+                background_timeout=background_timeout,
+                post_result=True,
+            ),
+            label=f"admin-report-refresh:{cache_key}",
+        )
+    await _telegram_reply_text_fast(
+        update.message,
+        f"⏳ Building full {title_s} now. I will post the complete result when ready." if started else f"⏳ Full {title_s} is already building. I will post the complete result when ready.",
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
 
 async def _send_cached_or_queue_admin_report(
     update: Update,
@@ -52101,6 +52344,10 @@ async def _send_cached_or_queue_admin_report(
     def _start_refresh_if_needed() -> bool:
         started_local = False
         if force_refresh:
+            try:
+                _admin_report_mark_activity(max(45, int(background_timeout or 120)))
+            except Exception:
+                pass
             started_local = _admin_report_bg_try_start(cache_key)
             if started_local:
                 _safe_create_task(
@@ -52121,8 +52368,19 @@ async def _send_cached_or_queue_admin_report(
 
     fresh, age = _admin_report_cache_get_with_age(cache_key, fresh_ttl)
     if fresh:
-        # ver01: no truncated cached previews. Fresh complete cache is safe to show.
-        await send_long_message(update, fresh, parse_mode=pm, disable_web_page_preview=True)
+        # ver4: even sending a long cached report can occupy the Telegram loop.
+        # Acknowledge instantly, then post the cached full result from a background task.
+        try:
+            _admin_report_mark_activity(45)
+        except Exception:
+            pass
+        await _telegram_reply_text_fast(
+            update.message,
+            f"⚡ Cached {title_s} is ready. Posting the complete result now.",
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+        _safe_create_task(_admin_report_send_cached_result(update, title_s, fresh, age, pm), label=f"admin-report-cached-send:{cache_key}")
         return
 
     stale, stale_age = _admin_report_cache_get_with_age(cache_key, stale_ttl)
@@ -52236,16 +52494,17 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         limit = 0
         hours = 24
-    await _send_cached_or_queue_admin_report(
+    # ver4: /setup_audit can produce a long full table. Always acknowledge first
+    # and build/send the complete result in background so Telegram command handling
+    # remains responsive while the audit runs.
+    await _queue_admin_report_ack_only(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:ver3:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:ver4:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}:{int(time.time() // 30)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
-        fresh_ttl=45,
-        stale_ttl=6 * 3600,
-        background_timeout=90,
+        background_timeout=120,
     )
 
 
@@ -56027,11 +56286,23 @@ def _autotrade_reconcile_attempt_rows_for_display(uid: int, hist: list) -> list:
         pass
 
     try:
-        cache_delete('bybit_open_positions_linear')
-    except Exception:
-        pass
-    try:
-        for pos in list(_bybit_get_open_positions_linear() or []):
+        live_rows = []
+        # ver4: /autotrade_last is a diagnostic command and must be instant.
+        # Do not force a fresh Bybit positions request here; use the recent cache.
+        # Deep live reconciliation remains available with AUTOTRADE_LAST_LIVE_RECONCILE_ENABLED=1.
+        if env_bool('AUTOTRADE_LAST_LIVE_RECONCILE_ENABLED', False):
+            try:
+                cache_delete('bybit_open_positions_linear')
+            except Exception:
+                pass
+            live_rows = list(_bybit_get_open_positions_linear() or [])
+        else:
+            try:
+                cached_pos = cache_get('bybit_open_positions_linear')
+                live_rows = list(cached_pos or []) if isinstance(cached_pos, list) else []
+            except Exception:
+                live_rows = []
+        for pos in list(live_rows or []):
             try:
                 qty = abs(float(_pos_size(pos) or 0.0))
                 if qty <= 0:
@@ -61499,6 +61770,10 @@ ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALER
 BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "18") or 18)
 # yver160 speed mode: keep scheduler jobs short and user commands responsive.
 ALERT_JOB_FAST_SCHEDULER_MODE = env_bool("ALERT_JOB_FAST_SCHEDULER_MODE", True)
+# ver4: user/admin commands must stay instant. If an admin command/report just
+# arrived, skip this alert tick and let the next scheduled/recovery tick continue.
+ALERT_JOB_SKIP_ON_RECENT_COMMAND = env_bool("ALERT_JOB_SKIP_ON_RECENT_COMMAND", True)
+ALERT_JOB_RECENT_COMMAND_DEFER_SEC = int(os.environ.get("ALERT_JOB_RECENT_COMMAND_DEFER_SEC", "20") or 20)
 EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED = env_bool("EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED", False)
 SCREEN_CACHE_WARMUP_ENABLED = env_bool("SCREEN_CACHE_WARMUP_ENABLED", False)
 BIGMOVE_FIRE_AND_FORGET_ENABLED = env_bool("BIGMOVE_FIRE_AND_FORGET_ENABLED", True)
@@ -61618,12 +61893,20 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
     # Big-Move pending confirmations must still run.
     if ALERT_LOCK.locked():
         return
+    try:
+        if _admin_report_interactive_busy(0) or (bool(globals().get('ALERT_JOB_SKIP_ON_RECENT_COMMAND', True)) and _recent_user_activity(int(globals().get('ALERT_JOB_RECENT_COMMAND_DEFER_SEC', 20) or 20))):
+            _hb_touch('email', ok=True, details='alert_job_skip_recent_admin_command')
+            return
+    except Exception:
+        pass
 
     async with ALERT_LOCK:
         job_started_ts = time.time()
 
         def _job_budget_exhausted() -> bool:
             try:
+                if _admin_report_interactive_busy(0):
+                    return True
                 return (time.time() - job_started_ts) >= float(ALERT_JOB_MAX_RUNTIME_SEC or 55)
             except Exception:
                 return False
@@ -65220,14 +65503,20 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             # Do not pull the latest generic executable queue here; otherwise AutoTrade can
             # open rows that were not in the email, then the emailed rows show as duplicates.
             db_setups = []
-            for _s in list(chosen_list or []):
+            raw_email_candidates = list(chosen_list or [])
+            for _s in raw_email_candidates:
                 try:
                     _s_eff = _setup_route_unless_delivery_locked(_s, sess, owner_uid, source_kind=str(getattr(_s, 'source_kind', '') or 'emailed_setups'))
-                    ok_s, _why_s = is_executable_setup_eligible(_s_eff, session_name=sess)
-                    if ok_s:
-                        db_setups.append(_s_eff)
+                    # ver4: the setup email is the pre-send gate. Do not drop the
+                    # just-emailed candidate through another volatile eligibility
+                    # filter here; _autotrade_place_trade still enforces risk,
+                    # duplicate/live-position, drift, entry window, leverage, and Bybit errors.
+                    db_setups.append(_s_eff)
                 except Exception:
-                    continue
+                    try:
+                        db_setups.append(_s)
+                    except Exception:
+                        continue
             attempted = 0
             placed_count = 0
             attempts_meta = []
@@ -65241,6 +65530,22 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             # style rows that were never emailed to the subscriber/admin.
             if max_batch_places > 0:
                 _email_batch_candidates = _email_batch_candidates[:max_batch_places]
+            if not _email_batch_candidates:
+                reason = 'no_candidates_in_just_emailed_batch'
+                for _raw in list(raw_email_candidates or [])[:8]:
+                    try:
+                        attempts_meta.append({
+                            'setup_id': str(getattr(_raw, 'setup_id', '') or getattr(_raw, 'id', '') or ''),
+                            'symbol': str(getattr(_raw, 'symbol', '') or ''),
+                            'side': str(getattr(_raw, 'side', '') or ''),
+                            'source_kind': str(getattr(_raw, 'source_kind', '') or 'emailed_setups'),
+                            'status': 'SKIP',
+                            'reason': reason,
+                            'entry': getattr(_raw, 'entry', ''),
+                            'sl': getattr(_raw, 'sl', ''),
+                        })
+                    except Exception:
+                        pass
             for cand in _email_batch_candidates:
                 attempted += 1
                 try:
@@ -65290,6 +65595,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                 'reason': (f'placed_{placed_count}_from_email_batch' if placed_count > 0 else str(reason or 'no_tradable_setup')),
                 'attempted': int(attempted),
+                'placed': int(placed_count),
                 'session': sess,
                 'mode': str(_autotrade_runtime_mode()).lower(),
                 'attempted_candidates': attempts_meta,
@@ -65747,11 +66053,11 @@ async def setup_email_recovery_job_runner(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
-    # yver171: hard-cap the detached email engine. Threaded CCXT/SMTP calls can
-    # outlive asyncio.wait_for(), but the coroutine must release ALERT_LOCK quickly
-    # so scheduler ticks and Telegram commands do not appear frozen for minutes.
+    # ver4: hard-cap the detached email engine, but treat timeout as a soft budget
+    # yield, not as an email error. The DB-first recovery lane will retry.
     try:
-        hard_timeout = max(45.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 35) or 35) + 20.0)
+        base_budget = float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 25) or 25)
+        hard_timeout = max(25.0, min(40.0, base_budget + 8.0))
         await asyncio.wait_for(_alert_job_async_internal(context), timeout=hard_timeout)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
@@ -65760,12 +66066,13 @@ async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
             pass
     except asyncio.TimeoutError:
         try:
-            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"alert_job_hard_timeout>{int(hard_timeout)}s"
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
+            _EMAIL_LOOP_HEARTBEAT["last_note"] = f"alert_job_budget_yield>{int(hard_timeout)}s"
         except Exception:
             pass
-        _hb_touch('email', ok=False, error=f'alert_job_hard_timeout>{int(hard_timeout)}s', details='alert_job_timeout')
+        _hb_touch('email', ok=True, details=f'alert_job_budget_yield>{int(hard_timeout)}s')
         try:
-            logger.info('alert_job soft-timeout after %ss; released scheduler lock, retry next tick', int(hard_timeout))
+            logger.info('alert_job budget-yield after %ss; scheduler lock released, recovery/next tick will retry', int(hard_timeout))
         except Exception:
             pass
     except asyncio.CancelledError:
@@ -65792,6 +66099,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         interval = float(getattr(job, "interval", 0) or 0)
         if interval > 0:
             _EMAIL_LOOP_HEARTBEAT["next_tick_ts"] = now_ts + interval
+    except Exception:
+        pass
+    try:
+        if _admin_report_interactive_busy(0) or (bool(globals().get('ALERT_JOB_SKIP_ON_RECENT_COMMAND', True)) and _recent_user_activity(int(globals().get('ALERT_JOB_RECENT_COMMAND_DEFER_SEC', 20) or 20))):
+            _hb_touch('email', ok=True, details='alert_job_skip_recent_admin_command')
+            return
     except Exception:
         pass
     try:
