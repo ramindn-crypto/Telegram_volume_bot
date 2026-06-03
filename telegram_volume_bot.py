@@ -1,3 +1,4 @@
+# ver2: emergency responsiveness/audit-time fix: /setup_audit uses original signal_created_ts instead of batch executable_ts, avoids live OHLCV fetches by default, and alert timeout is fail-soft so Telegram commands stay responsive.
 # ver32: /screen timeout hardening: full builder first returns recent actionable email/executable queue before heavy pool rebuild, and expected on-demand build timeouts fall back without Render WARNING noise.
 # ver35: BigMove confirmed alerts now create paired F8 setup emails via a controlled BigMove policy escape when the setup is technically executable, so alerts like WLD UP do not disappear from setup/email/audit lanes.
 # ver30: final pipeline hardening: stale /screen cards use real email age not refreshed executable_ts; BigMove generated-only diagnostics never enter executable/email lanes; setup-email recovery runs faster so KEEP setups are delivered promptly.
@@ -45687,7 +45688,10 @@ def _setup_audit_family_code(row_or_family) -> str:
 
 def _setup_audit_row_ts(row: dict) -> float:
     try:
-        return float((row or {}).get('ts') or (row or {}).get('created_ts') or (row or {}).get('signal_created_ts') or (row or {}).get('executable_ts') or 0.0)
+        rr = row or {}
+        # ver2: display/evaluate the true setup creation time first.  executable_ts
+        # is only the batch/cache time and can make many rows appear at one minute.
+        return float(rr.get('created_ts') or rr.get('signal_created_ts') or rr.get('first_seen_ts') or rr.get('ts') or rr.get('executable_ts') or rr.get('opened_ts') or 0.0)
     except Exception:
         return 0.0
 
@@ -46629,11 +46633,15 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                     try:
                         params = [int(uid)]
                         where = "WHERE user_id=?"
-                        if cutoff > 0:
-                            where += " AND executable_ts>=?"
-                            params.append(float(cutoff))
                         x_cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
                         if x_cols:
+                            # ver2: audit windows must use the original setup/signal time,
+                            # not the later executable batch timestamp.  This prevents
+                            # /setup_audit showing a whole batch as one minute (e.g. 22:08).
+                            x_time_expr = "COALESCE(NULLIF(signal_created_ts,0), executable_ts)" if 'signal_created_ts' in x_cols else "executable_ts"
+                            if cutoff > 0:
+                                where += f" AND {x_time_expr}>=?"
+                                params.append(float(cutoff))
                             x_family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
                             x_strategy_expr = "COALESCE(setup_strategy, '') AS setup_strategy" if 'setup_strategy' in x_cols else "'' AS setup_strategy"
                             x_orig_id_expr = "COALESCE(original_setup_id, '') AS original_setup_id" if 'original_setup_id' in x_cols else "'' AS original_setup_id"
@@ -46645,7 +46653,7 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                             x_pol_reason_expr = "COALESCE(policy_reason_at_creation, '') AS policy_reason_at_creation" if 'policy_reason_at_creation' in x_cols else "'' AS policy_reason_at_creation"
                             x_pol_ts_expr = "COALESCE(policy_created_ts, 0) AS policy_created_ts" if 'policy_created_ts' in x_cols else "0 AS policy_created_ts"
                             cur.execute(f"""
-                                SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
+                                SELECT {x_time_expr} AS ts, signal_created_ts, executable_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                                        fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
                                        {x_family_expr}, {x_strategy_expr}, {x_orig_id_expr}, {x_orig_side_expr}, {x_strategy_reason_expr},
                                        {x_pol_expr}, {x_pol_raw_expr}, {x_pol_combo_expr}, {x_pol_reason_expr}, {x_pol_ts_expr},
@@ -47160,7 +47168,12 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         )
 
     audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
-    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
+    # ver2: /setup_audit is an admin command and must never freeze Telegram by
+    # fetching historical OHLCV for every symbol.  Use cached outcomes/tickers by
+    # default; enable SETUP_AUDIT_PRELOAD_OHLCV=1 only for manual deep diagnostics.
+    candles_by_symbol = {}
+    if str(os.environ.get('SETUP_AUDIT_PRELOAD_OHLCV', '0')).strip().lower() in {'1','true','yes','on'}:
+        candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
     actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=requested_start_ts, end_ts=now_ts + 3600.0)
 
     table_rows = []
@@ -52188,13 +52201,13 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v172:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:ver2:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
         fresh_ttl=45,
         stale_ttl=6 * 3600,
-        background_timeout=600,
+        background_timeout=90,
     )
 
 
@@ -65700,7 +65713,7 @@ async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
     # outlive asyncio.wait_for(), but the coroutine must release ALERT_LOCK quickly
     # so scheduler ticks and Telegram commands do not appear frozen for minutes.
     try:
-        hard_timeout = max(20.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 35) or 35) + 5.0)
+        hard_timeout = max(45.0, float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 35) or 35) + 20.0)
         await asyncio.wait_for(_alert_job_async_internal(context), timeout=hard_timeout)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
@@ -65714,7 +65727,7 @@ async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
             pass
         _hb_touch('email', ok=False, error=f'alert_job_hard_timeout>{int(hard_timeout)}s', details='alert_job_timeout')
         try:
-            logger.warning('alert_job hard-timeout after %ss; released scheduler lock, retry next tick', int(hard_timeout))
+            logger.info('alert_job soft-timeout after %ss; released scheduler lock, retry next tick', int(hard_timeout))
         except Exception:
             pass
     except asyncio.CancelledError:
