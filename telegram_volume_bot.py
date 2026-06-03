@@ -1,4 +1,4 @@
-# ver6: emergency responsiveness patch: admin bypasses DB guard, /screen is ack-first/background-only, /setup_audit uses lightweight cached audit, background alert jobs are delayed/deferred longer, and heavy report jobs start only after acknowledgement.
+# ver10: fix audit/email/screen/autotrade sync starvation: alert_job no longer skips the setup-email lane during admin commands; fresh /setup_audit KEEP recovery rows are shown on /screen and can be emailed/autotraded.
 # ver8: /screen email-sync hardening: latest Gmail/emailed_setups row wins over stale screen cache; emailed rows are not re-gated live; keeps ver7 AutoTrade placement stability.
 # ver3: responsiveness/dedup/audit-time fix: /setup_audit uses delivery/executable time, removes duplicate same-data rows, and admin reports run in parallel background workers.
 # ver2: emergency responsiveness/audit-time fix: /setup_audit uses original signal_created_ts instead of batch executable_ts, avoids live OHLCV fetches by default, and alert timeout is fail-soft so Telegram commands stay responsive.
@@ -28692,7 +28692,11 @@ async def send_long_message(
             cur = []
             cur_len = 0
             # Leave room for prefix/header on first message and <pre> tags.
-            first_limit = max(700, max_len - len(prefix) - len('<pre></pre>') - 40)
+            # ver09: small report headers stay with the first table chunk; very
+            # large headers are sent separately so the first table rows are never lost.
+            prefix_inline = bool(prefix and len(str(prefix)) <= int(max_len * 0.45))
+            prefix_for_table = str(prefix or '') if prefix_inline else ''
+            first_limit = max(700, max_len - len(prefix_for_table) - len('<pre></pre>') - 40)
             next_limit = max(700, max_len - len('<pre></pre>') - 40)
             cur_limit = first_limit
             for ln in table_lines:
@@ -28716,9 +28720,47 @@ async def send_long_message(
                 chunks_pre = [[]]
 
             first_msg = True
+
+            # ver09: Never attach a large HTML prefix to the first <pre> chunk.
+            # /setup_matrix policy has a long explanation before the table; in ver08
+            # that made the first Telegram payload exceed 4096 chars and Telegram
+            # silently lost the header/first KEEP rows. Send the prefix as its own
+            # safe chunks first, then send the table with a repeated header.
+            if prefix and not prefix_inline:
+                prefix_chunks = []
+                _buf = ''
+                for _line in str(prefix).splitlines(True):
+                    if len(_buf) + len(_line) > max_len and _buf:
+                        prefix_chunks.append(_buf.rstrip())
+                        _buf = ''
+                    while len(_line) > max_len:
+                        prefix_chunks.append(_line[:max_len].rstrip())
+                        _line = _line[max_len:]
+                    _buf += _line
+                if _buf.strip():
+                    prefix_chunks.append(_buf.rstrip())
+                for _pc in prefix_chunks:
+                    await _send_chunk_safe(_pc, ParseMode.HTML, reply_markup if first_msg else None)
+                    first_msg = False
+
+            # Repeat tabulate header on every continuation chunk so screenshots never
+            # start mid-table without column names. The first two lines are header +
+            # separator for grid/table formats; for plain format this still keeps the
+            # column header visible.
+            table_header_lines = []
+            if table_lines:
+                table_header_lines = [table_lines[0]]
+                if len(table_lines) > 1 and set(str(table_lines[1]).strip()) <= set('- +=|:'):
+                    table_header_lines.append(table_lines[1])
+
             for idx, rows_chunk in enumerate(chunks_pre):
-                chunk_table = '\n'.join(rows_chunk)
-                body = (prefix + '\n' if idx == 0 and prefix else '') + '<pre>' + chunk_table + '</pre>'
+                rows_to_send = list(rows_chunk or [])
+                if idx > 0 and table_header_lines:
+                    # Avoid duplicating if the chunk already starts with the header.
+                    if not rows_to_send or str(rows_to_send[0]).strip() != str(table_header_lines[0]).strip():
+                        rows_to_send = table_header_lines + rows_to_send
+                chunk_table = '\n'.join(rows_to_send)
+                body = ((prefix_for_table + '\n') if idx == 0 and prefix_for_table else '') + '<pre>' + chunk_table + '</pre>'
                 # Put suffix after the last table chunk if it fits; otherwise send separately.
                 if idx == len(chunks_pre) - 1 and suffix and len(body) + len(suffix) + 2 <= max_len:
                     body = body + '\n' + suffix
@@ -28726,7 +28768,21 @@ async def send_long_message(
                 await _send_chunk_safe(body, ParseMode.HTML, reply_markup if first_msg else None)
                 first_msg = False
             if suffix:
-                await _send_chunk_safe(suffix, ParseMode.HTML, None)
+                # Send long suffix safely too.
+                suffix_chunks = []
+                _buf = ''
+                for _line in str(suffix).splitlines(True):
+                    if len(_buf) + len(_line) > max_len and _buf:
+                        suffix_chunks.append(_buf.rstrip())
+                        _buf = ''
+                    while len(_line) > max_len:
+                        suffix_chunks.append(_line[:max_len].rstrip())
+                        _line = _line[max_len:]
+                    _buf += _line
+                if _buf.strip():
+                    suffix_chunks.append(_buf.rstrip())
+                for _sc in suffix_chunks:
+                    await _send_chunk_safe(_sc, ParseMode.HTML, None)
             return
     except Exception as e:
         try:
@@ -52069,16 +52125,19 @@ def _setup_combo_policy_text(uid: int) -> str:
         )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
-            f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
-            f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b> | Expiry: <b>≤{float(globals().get('SETUP_COMBO_DAILY_SAFETY_EXPIRY_HOURS', 24.0) or 24.0):.0f}h</b>\n"
+            f"Official cycle: <b>weekly</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
+            f"Visible combos: <b>{len(table_rows)}</b> | Active/probation: <b>{active_count}</b> | Tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
+            f"Last policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly: <b>{html.escape(str(next_txt))}</b>\n"
+            f"Legend: <b>ExecNow</b>=current executable state, <b>Policy</b>=enforced state used by /screen, email and AutoTrade, <b>Reco</b>=latest evidence recommendation. KEEP rows are sorted first.\n"
+            f"<pre>{html.escape(table)}</pre>\n"
+            f"\n<b>Policy details</b>\n{HDR}\n"
+            f"Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Safety window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Expiry: <b>≤{float(globals().get('SETUP_COMBO_DAILY_SAFETY_EXPIRY_HOURS', 24.0) or 24.0):.0f}h</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
-            f"KEEP rule: <b>Decided ≥ {int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY)}</b> and either <b>WR ≥ {float(SETUP_COMBO_POLICY_KEEP_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_POLICY_KEEP_AVG_R):+.2f} + TP≥SL</b>, or <b>WR ≥ {float(SETUP_COMBO_POLICY_WATCH_WR):.0f}% + strong AvgR ≥ {float(SETUP_COMBO_POLICY_PROMOTE_AVG_R):+.2f} + TP&gt;SL</b>. Experimental fast-KEEP is ON: <b>1–{int(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MAX_DECIDED)} decided with 100% WR + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR):+.2f}</b>, <b>decided ≥ {int(SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_DECIDED)} + WR ≥ {float(SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_AVGR):+.2f}</b>, or <b>decided ≥ {int(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED)} + WR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR):+.2f}</b>, can be KEEP for live testing. 50% WR alone remains WATCH.\n"
-            f"Why a row can still be WATCH: sample/Dec is too small, AvgR/payoff is not strong enough, or a daily/intraday safety row temporarily disabled/tightened it. Policy=the enforced state; Reco=this window's recommendation only.\n"
-            f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
-            + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
+            f"KEEP rule: Decided ≥ <b>{int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY)}</b> with WR/AvgR/payoff strength; experimental fast-KEEP can promote very strong small samples. 50% WR alone remains WATCH.\n"
+            f"Why WATCH: sample too small, AvgR/payoff weak, or temporary safety/micro-edge tightening.\n"
+            + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
             f"{guard_txt}\n{html.escape(_setup_nor_rev_router_note(int(owner_uid), []))}\n{note}\n"
-            f"Self-improvement flow: /setup_audit_overall and /setup_matrix policy now use the same fixed 15 May setup-result evidence; /setup_matrix policy refreshes the enforceable lane policy first, then the optimizer bridge mirrors those policy rows into runtime family/session gates. Side/session context is now fed into lane policy; weak symbol/hour evidence is enforced through the micro-edge/final gate because policy rows are not symbol/hour-specific. Manual /setup_matrix rows remain advisory; scheduled/baseline policy rows, daily safety rows, micro-edge guard, final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately.\n"
-            f"<pre>{html.escape(table)}</pre>"
+            f"Self-improvement flow: /setup_audit_overall and /setup_matrix policy use the same fixed 15 May evidence. Policy rows are enforced by executable queue, /screen, setup email, AutoTrade and optimizer bridge. Combo identity includes side, so NOR/REV and BUY/SELL are tracked separately."
         )
     except Exception as e:
         return f"❌ setup_combo_policy failed: {type(e).__name__}: {html.escape(str(e))}"
@@ -59150,6 +59209,16 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
             sources.append(('executable', _executable_rows_to_setup_objects(rows, session_name=sess) or []))
         except Exception:
             sources.append(('executable', []))
+        # ver10: if /setup_audit shows fresh KEEP rows with AT='-' but the normal
+        # executable/email fan-out missed them, /screen must still surface the same
+        # audit recovery lane instead of showing an empty scan. This source is only
+        # built from current actionable KEEP/WATCH audit rows and still passes
+        # basic price/volume/policy checks below.
+        try:
+            audit_rows = _setup_recent_audit_actionable_recovery_candidates(int(uid), session_name=sess, max_age_min=max_age_min, limit=20)
+            sources.append(('audit_recovery', list(audit_rows or [])))
+        except Exception:
+            sources.append(('audit_recovery', []))
         # Ver10: do not show raw/recent generated candidates as Top Trade Setups.
         # /screen must match the executable/email/autotrade lane. Candidates that
         # are not in executable_setups can still appear in diagnostics/watch lists,
@@ -59171,12 +59240,11 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     if not _screen_setup_within_actionable_window(item, max_age_min=max_age_min):
                         continue
                     try:
-                        if source_name == 'emailed':
-                            # ver08: the email row is the source of truth for /screen.
-                            # Do not re-run live final-quality/context gates here because they can
-                            # change minutes after delivery and make /screen show an older email
-                            # (APR) instead of the latest sent setup (BEAT). Basic price/volume
-                            # structure + frozen KEEP/WATCH policy is enough for display.
+                        if source_name in {'emailed', 'audit_recovery'}:
+                            # ver08/ver10: delivered rows and audit-recovery rows are already
+                            # frozen/actionable lane snapshots. Do not re-run volatile live
+                            # final-quality gates here because they can flip minutes later and
+                            # hide the exact setup visible in /setup_audit.
                             ok_exec = bool(_basic_valid(item))
                         else:
                             ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=sess)
@@ -59187,10 +59255,10 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=sess, user_id=int(uid), lane='screen')
                     if not keep_ok:
                         continue
-                    if source_name != 'emailed' and not _screen_attach_email_delivery_or_skip(int(uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
+                    if source_name not in {'emailed', 'audit_recovery'} and not _screen_attach_email_delivery_or_skip(int(uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
                         continue
                     if not used_source_name:
-                        used_source_name = 'emailed' if _screen_requires_emailed_delivery_for_setup() else str(source_name or '')
+                        used_source_name = str(source_name or '')
                     out.append(item)
                     seen.add(dedupe_key)
                     if len(out) >= _screen_display_limit():
@@ -59286,6 +59354,14 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 sources.append(('executable', _executable_rows_to_setup_objects(rows, session_name=req_session_u) or []))
             except Exception:
                 sources.append(('executable', []))
+            # ver10: bridge fresh /setup_audit KEEP rows (AT='-') into /screen while
+            # the email/autotrade lane catches up. This keeps screen, audit, email,
+            # and AutoTrade synced instead of showing "no confirmed setup".
+            try:
+                audit_recovery = _setup_recent_audit_actionable_recovery_candidates(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 4)))
+                sources.append(('audit_recovery', list(audit_recovery or [])))
+            except Exception:
+                sources.append(('audit_recovery', []))
             # Ver10: no raw/recent-candidate fallback for Top Trade Setups.
             # If it is not emailed or in executable_setups, it must not be shown as
             # an actionable setup because email/autotrade will not consume it.
@@ -59303,7 +59379,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                             continue
                         if not _screen_setup_within_actionable_window(item, max_age_min=max_age_min):
                             continue
-                        if source_name == 'emailed':
+                        if source_name in {'emailed', 'audit_recovery'}:
                             ok_exec = _basic_valid(item)
                         else:
                             try:
@@ -59314,7 +59390,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                             keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=(req_session_u or src_session_u or _session), user_id=int(_uid), lane='screen')
                             if not keep_ok:
                                 continue
-                            if source_name != 'emailed' and not _screen_attach_email_delivery_or_skip(int(_uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
+                            if source_name not in {'emailed', 'audit_recovery'} and not _screen_attach_email_delivery_or_skip(int(_uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
                                 continue
                             out.append(item)
                             seen.add(dedupe_key)
@@ -61332,7 +61408,7 @@ def _setup_recent_audit_actionable_recovery_candidates(user_id: int, session_nam
         rows_all = []
         for u in uid_candidates:
             try:
-                rows_all.extend(_setup_audit_load_rows(int(u), hours=hours, limit=max(0, int(limit or 48)), dedup=True, source_mode_override='EXECUTABLE') or [])
+                rows_all.extend(_setup_audit_load_rows(int(u), hours=hours, limit=max(0, int(limit or 48)), dedup=True, apply_final_quality_gate=False, source_mode_override='EXECUTABLE') or [])
             except Exception:
                 continue
         if not rows_all:
@@ -61538,6 +61614,38 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
                 continue
             seen.add(key)
             ok, why = is_executable_setup_eligible(eff, session_name=sess)
+            if not ok:
+                # ver10: last-mile bridge for rows that /setup_audit already shows as
+                # fresh Policy=KEEP. The normal scanner can later return
+                # combo_policy_quality_gate_blocked/all_candidates_blocked after the
+                # audit row was frozen; do not let that suppress the setup email and
+                # therefore AutoTrade. This is deliberately narrow and still requires
+                # _setup_snapshot_keep_delivery_escape() to validate KEEP policy, session,
+                # entry window, side and SL/TP geometry.
+                try:
+                    src_kind_l = str(getattr(eff, 'source_kind', '') or '').lower().strip()
+                    is_audit_rec = src_kind_l == 'setup_audit_recovery' or bool(getattr(eff, 'setup_audit_recovery', False))
+                    why_l = str(why or '').lower()
+                    bypassable = any(tok in why_l for tok in ('combo_policy_quality_gate', 'final_quality_gate', 'all_candidates_blocked', 'policy_gate', 'watch_final_gate'))
+                    snap_ok, snap_why = _setup_snapshot_keep_delivery_escape(eff, session_name=sess)
+                    if is_audit_rec and bypassable and snap_ok:
+                        ok = True
+                        try:
+                            setattr(eff, 'ver10_audit_keep_presend_escape', True)
+                            setattr(eff, 'ver10_audit_keep_presend_reason', str(why or snap_why or 'audit_keep_recovery'))
+                            setattr(eff, 'policy_at_creation', 'KEEP')
+                            setattr(eff, 'delivery_policy', 'KEEP')
+                            setattr(eff, 'policy', 'KEEP')
+                        except Exception:
+                            pass
+                        try:
+                            db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_presend_gate', status='allow_audit_keep_recovery', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'blocked_reason': str(why or ''), 'escape_reason': str(snap_why or ''), 'gate_uid': int(gate_uid or 0)})
+                        except Exception:
+                            pass
+                    else:
+                        ok = False
+                except Exception:
+                    ok = False
             if not ok:
                 reasons[str(why or 'not_executable')] += 1
                 try:
@@ -62265,20 +62373,19 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
     # Big-Move pending confirmations must still run.
     if ALERT_LOCK.locked():
         return
-    try:
-        if _admin_report_interactive_busy(0) or (bool(globals().get('ALERT_JOB_SKIP_ON_RECENT_COMMAND', True)) and _recent_user_activity(int(globals().get('ALERT_JOB_RECENT_COMMAND_DEFER_SEC', 20) or 20))):
-            _hb_touch('email', ok=True, details='alert_job_skip_recent_admin_command')
-            return
-    except Exception:
-        pass
+    # ver10: never skip the whole setup-email/autotrade pipeline just because an
+    # admin command/report was pressed. Earlier versions returned here during
+    # /setup_audit, /setup_matrix, /screen, etc. That kept Telegram responsive but
+    # silently starved setup emails and AutoTrade exactly when fresh KEEP audit
+    # rows existed (for example LIT/NEAR/XLM). Heavy rebuilds still have their own
+    # time budgets below, but the persisted executable/audit recovery lane must
+    # always get a chance to run.
 
     async with ALERT_LOCK:
         job_started_ts = time.time()
 
         def _job_budget_exhausted() -> bool:
             try:
-                if _admin_report_interactive_busy(0):
-                    return True
                 return (time.time() - job_started_ts) >= float(ALERT_JOB_MAX_RUNTIME_SEC or 55)
             except Exception:
                 return False
@@ -66541,12 +66648,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
             _EMAIL_LOOP_HEARTBEAT["next_tick_ts"] = now_ts + interval
     except Exception:
         pass
-    try:
-        if _admin_report_interactive_busy(0) or (bool(globals().get('ALERT_JOB_SKIP_ON_RECENT_COMMAND', True)) and _recent_user_activity(int(globals().get('ALERT_JOB_RECENT_COMMAND_DEFER_SEC', 20) or 20))):
-            _hb_touch('email', ok=True, details='alert_job_skip_recent_admin_command')
-            return
-    except Exception:
-        pass
+    # ver10: do not suppress the autonomous email/autotrade loop during recent
+    # Telegram commands. The worker is isolated from the PTB command loop, so this
+    # skip only caused missed emails/AutoTrade attempts after /setup_audit or
+    # /setup_matrix. Keep only the overlap lock below.
     try:
         if ALERT_LOCK.locked():
             return
