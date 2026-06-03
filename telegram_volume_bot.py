@@ -14,6 +14,7 @@
 # yver168: makes current Reco=KEEP authoritative for live policy immediately: /setup_matrix policy, enforceable lookup, screen/email/AutoTrade now promote Reco KEEP lanes (e.g. F1-LON-NOR-BUY, F8-NY-NOR-BUY) to Policy KEEP using latest score evidence, while preserving shared gates.
 # ver04: /screen reliability patch: bounded screen refresh, stale-cache fallback, quick market snapshot fallback, and lower stuck threshold so /screen never loops forever on rebuilding.
 # yver172: major responsiveness/email-recovery patch: adds independent DB-first setup-email recovery job, completes alert pipeline without premature hard-timeout, uses email executor for SMTP, and keeps heavy report previews non-blocking.
+# yver168/ver38: frozen KEEP audit rows are authoritative for setup email/screen/autotrade recovery within entry window; do not let later live policy recalc suppress them.
 # yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
 # yver163: day-time-session live guard from ver161 baseline; ignores ver162 liquidity/soft-stop changes; synced /screen setup-email AutoTrade context gate; Monday pre-ASIA, Monday ASIA market-tone, and Saturday pre-ASIA directional filters.
 # yver161: final sync hardening for Monday audit: delivered/AutoTraded setup IDs are preserved in /setup_audit instead of daily de-duping them away; BigMove/F8 setup-email rows hydrate /screen from executable_setups even when signals metadata is missing; Bybit-verified AutoTrade TP/SL can override candle-audit for traded rows; weekly policy catch-up window/retry hardened; admin cache namespace bumped.
@@ -25184,7 +25185,14 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                 sym = str(getattr(s_eff, 'symbol', '') or '').upper()
                 side = str(getattr(s_eff, 'side', '') or '').upper()
                 try:
-                    final_ok, final_why, final_meta = _setup_final_quality_gate_allows_setup(s_eff, sess, user_id=int(_target_uid))
+                    _snap_ok_persist, _snap_why_persist = _setup_snapshot_keep_delivery_escape(s_eff, session_name=sess)
+                except Exception:
+                    _snap_ok_persist, _snap_why_persist = False, ''
+                try:
+                    if _snap_ok_persist:
+                        final_ok, final_why, final_meta = True, str(_snap_why_persist or 'frozen_keep_snapshot'), {'ver38_frozen_keep_persist_escape': True}
+                    else:
+                        final_ok, final_why, final_meta = _setup_final_quality_gate_allows_setup(s_eff, sess, user_id=int(_target_uid))
                     if not final_ok:
                         stats['combo_policy_skips'] += 1
                         db_log_setup_pipeline_event(
@@ -25206,7 +25214,7 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                     # Ver52: do not apply the micro-edge guard twice.  The shared
                     # final gate above has already decided whether a controlled
                     # scout is safe enough to enter the executable queue.
-                    if not (bool(_autotrade_setup_attr(s_eff, 'final_pipeline_locked_scout', False)) or bool(_autotrade_setup_attr(s_eff, 'ver52_executable_unblock', False))):
+                    if not (_snap_ok_persist or bool(_autotrade_setup_attr(s_eff, 'final_pipeline_locked_scout', False)) or bool(_autotrade_setup_attr(s_eff, 'ver52_executable_unblock', False))):
                         _edge_allowed, _edge_reason = _setup_edge_quality_guard_allows_setup(s_eff, sess, user_id=int(_target_uid))
                         if not _edge_allowed:
                             stats['edge_quality_skips'] = int(stats.get('edge_quality_skips', 0) or 0) + 1
@@ -37718,6 +37726,27 @@ def is_executable_setup_eligible(
             pass
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
+
+        # Ver38 final delivery sync: a fresh setup that was already stamped as
+        # Policy=KEEP in the generated/audit lane is authoritative for the
+        # 60-minute delivery window.  Do not let a later live combo/context
+        # recalc make email/screen/autotrade miss it.  The helper validates
+        # session, side, timestamp and SL/TP geometry, so this is not a blind
+        # bypass; risk, duplicate, conflict and Bybit entry gates still run
+        # downstream.
+        try:
+            _snap_ok, _snap_why = _setup_snapshot_keep_delivery_escape(s, session_name=sess)
+            if _snap_ok:
+                try:
+                    setattr(s, 'final_pipeline_locked_scout', True)
+                    setattr(s, 'ver38_frozen_keep_executable_escape', True)
+                    setattr(s, 'ver38_frozen_keep_executable_reason', str(_snap_why or 'frozen_keep_snapshot'))
+                except Exception:
+                    pass
+                return (True, 'ok')
+        except Exception:
+            pass
+
         try:
             policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
             final_ok, final_why, _final_meta = _setup_final_quality_gate_allows_setup(s, sess, user_id=policy_uid)
@@ -60533,10 +60562,27 @@ def _setup_recent_audit_actionable_recovery_candidates(user_id: int, session_nam
                 if not _setup_audit_row_inside_delivery_window(r):
                     reasons['outside_delivery_window'] += 1
                     continue
-                pol = _setup_audit_policy_label(r, uid=uid, session_name=sess or str(r.get('session') or ''), side=side)
+                # Ver38: prefer the frozen creation/delivery policy from the
+                # stored audit row. /setup_audit is the user's source of truth;
+                # if it shows a fresh KEEP row with AT=-, recovery must not be
+                # blocked by a live policy recalc performed minutes later.
+                frozen_pol = ''
+                try:
+                    frozen_pol = str(r.get('policy_at_creation') or r.get('delivery_policy') or r.get('policy') or '').upper().strip()
+                    if frozen_pol not in {'KEEP', 'WATCH'}:
+                        frozen_pol = str(_setup_frozen_policy_label(dict(r or {})) or '').upper().strip()
+                except Exception:
+                    frozen_pol = ''
+                pol = frozen_pol if frozen_pol in {'KEEP', 'WATCH'} else _setup_audit_policy_label(r, uid=uid, session_name=sess or str(r.get('session') or ''), side=side)
                 if pol not in {'KEEP', 'WATCH'}:
                     reasons[f'policy_{pol or "OFF"}'] += 1
                     continue
+                try:
+                    r['policy_at_creation'] = pol
+                    r['delivery_policy'] = pol
+                    r['policy'] = pol
+                except Exception:
+                    pass
                 at_state = _setup_audit_autotrade_state_for_row(r, owner_uid=owner_uid or uid)
                 if str(at_state or '-').upper().strip() not in {'', '-', 'NONE'}:
                     reasons[f'already_{at_state}'] += 1
@@ -62571,6 +62617,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 if audit_recovery:
                     before_n2 = len(eligible or [])
                     eligible = _setup_merge_unique_candidates(list(eligible or []), list(audit_recovery or []), session_name=str(sess_name or ''), user_id=int(uid), limit=max(int(EMAIL_SETUPS_N) * 12, 48))
+                    try:
+                        # Ver38: immediately mirror recovered audit KEEP rows into
+                        # executable_setups, so /screen and AutoTrade see the same
+                        # candidates that setup email is about to process.
+                        _persist_executable_candidates(int(uid), str(sess_name or ''), list(audit_recovery or []), source_kind='setup_audit_recovery', mode='email_audit_recovery')
+                    except Exception:
+                        pass
                     try:
                         db_log_setup_pipeline_event(int(uid), stage='email_audit_keep_recovery_merge', status='ok', session=str(sess_name or ''), mode='email', details={'before': before_n2, 'recovery': len(audit_recovery or []), 'after': len(eligible or [])})
                     except Exception:
