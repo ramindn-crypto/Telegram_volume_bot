@@ -1,3 +1,4 @@
+# ver16: fixes audit KEEP recovery crash: undefined _setup_audit_autotrade_state_for_row made /screen/email/AutoTrade ignore fresh KEEP OPEN rows visible in /setup_audit.
 # ver15: fixes /setup_audit KEEP rows missing from /screen/email/AutoTrade when the row exists only in generated_setups by making audit-recovery load ALL audit sources, not executable-only.
 # ver14: fixes /screen empty while /setup_audit has fresh KEEP rows by adding pre-heavy audit-recovery display, longer recovery fallback, and frozen KEEP audit-recovery email/screen-sync bypass.
 # ver12: restores autonomous setup generation by allowing the isolated alert/email engine enough runtime, starts recovery quickly after deploy, and sorts /setup_audit strictly by time.
@@ -61720,7 +61721,7 @@ def _setup_recent_audit_actionable_recovery_candidates(user_id: int, session_nam
                     r['policy'] = pol
                 except Exception:
                     pass
-                at_state = _setup_audit_autotrade_state_for_row(r, owner_uid=owner_uid or uid)
+                at_state = _setup_audit_autotrade_state_label(r, uid=int(owner_uid or uid or 0), session_name=sess)
                 if str(at_state or '-').upper().strip() not in {'', '-', 'NONE'}:
                     reasons[f'already_{at_state}'] += 1
                     continue
