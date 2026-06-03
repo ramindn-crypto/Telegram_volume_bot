@@ -46773,12 +46773,32 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     limit = max(0, int(limit or 0))
     hours = max(1, min(8760, int(hours or 24)))
     result_horizon = _setup_audit_result_horizon_hours()
-    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit, dedup=True)
+
+    # Ver25: keep the requested audit window explicit and stable. Previously the
+    # header Start/End was calculated from returned rows only, so /setup_audit 2
+    # could display Start=End=11:14 when only one minute of rows survived the
+    # executable/final gate. That made the 2h command look unsynced with matrix
+    # policy even though the filter was correct. Use one timestamp for loading,
+    # PnL lookup and reporting, and show returned-row span separately.
+    now_ts = float(time.time())
+    requested_start_ts = max(0.0, now_ts - float(hours) * 3600.0)
+
+    def _audit_ts_txt(ts_val: float) -> str:
+        try:
+            return datetime.fromtimestamp(float(ts_val or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            return '-'
+
+    requested_start_txt = _audit_ts_txt(requested_start_ts)
+    requested_end_txt = _audit_ts_txt(now_ts)
+
+    rows = _setup_audit_load_rows(int(uid), hours=None, start_ts=requested_start_ts, limit=limit, dedup=True)
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not rows:
         return (
             f"🧪 <b>Setup Audit</b>\n{HDR}\n"
-            f"No stored setup rows above ${min_vol_m:.0f}M volume in the last {hours}h.\n"
+            f"Window: <b>last {hours}h</b> | Requested: <b>{html.escape(requested_start_txt)}</b> → <b>{html.escape(requested_end_txt)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>\n"
+            f"No stored setup rows above ${min_vol_m:.0f}M volume survived the audit lane filters in this requested window.\n"
             f"This is an analytics-data message only; it does not mean setup generation is blocked. "
             f"Check <code>/email_decision</code>, <code>/why</code>, and <code>/screen</code> for current live scan status.\n\n"
             f"Use <code>/setup_audit h</code> for the guide."
@@ -46786,7 +46806,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
 
     audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
     candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
-    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=requested_start_ts, end_ts=now_ts + 3600.0)
 
     table_rows = []
     tp_n = sl_n = nohit_n = open_n = 0
@@ -46826,11 +46846,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
     wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
-    try:
-        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        now_txt = ''
+    now_txt = requested_end_txt
     win = _setup_audit_window_summary(rows)
+    row_span_txt = f"{html.escape(str(win.get('start_txt') or '-'))} → {html.escape(str(win.get('end_txt') or '-'))}"
 
     # Ver16: show all rows. send_long_message now chunks <pre> tables safely,
     # so there is no need to hide audit rows for Telegram length limits.
@@ -46851,7 +46869,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         "🧪 <b>Setup Audit</b>",
         HDR,
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
-        f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        f"Requested: <b>{html.escape(requested_start_txt)}</b> → <b>{html.escape(requested_end_txt)}</b> | Row span: <b>{row_span_txt}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; Bybit-verified AutoTrade TP/SL overrides traded rows. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
         "Policy = frozen creation/delivery policy (KEEP/WATCH/OFF at setup creation/email time), not live recalculation. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions, so stale open journal rows no longer look live after closure.",
