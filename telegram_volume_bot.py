@@ -1,3 +1,4 @@
+# ver11: fixes /setup_matrix policy ordered full-page delivery and makes /screen/email/autotrade consume fresh /setup_audit KEEP rows even when raw audit load is dominated by newer OFF rows.
 # ver10: fix audit/email/screen/autotrade sync starvation: alert_job no longer skips the setup-email lane during admin commands; fresh /setup_audit KEEP recovery rows are shown on /screen and can be emailed/autotraded.
 # ver8: /screen email-sync hardening: latest Gmail/emailed_setups row wins over stale screen cache; emailed rows are not re-gated live; keeps ver7 AutoTrade placement stability.
 # ver3: responsiveness/dedup/audit-time fix: /setup_audit uses delivery/executable time, removes duplicate same-data rows, and admin reports run in parallel background workers.
@@ -28643,12 +28644,33 @@ async def send_long_message(
 
             async def _send_chunk_safe(body: str, pm=ParseMode.HTML, markup=None):
                 try:
-                    await _telegram_reply_text_fast(update.message,
-                        body,
-                        parse_mode=pm,
-                        disable_web_page_preview=disable_web_page_preview,
-                        reply_markup=markup,
-                    )
+                    # ver11: _telegram_reply_text_fast is fail-soft and returns None
+                    # on a transient Telegram/network timeout. For admin report pages
+                    # (especially page 1 of /setup_matrix policy) that meant the
+                    # first/header/KEEP rows could silently disappear. Retry the
+                    # exact page a few times before falling back to plain text.
+                    sent_ok = None
+                    for _try_i in range(3):
+                        sent_ok = await _telegram_reply_text_fast(update.message,
+                            body,
+                            parse_mode=pm,
+                            disable_web_page_preview=disable_web_page_preview,
+                            reply_markup=markup if _try_i == 0 else None,
+                        )
+                        if sent_ok is not None:
+                            return
+                        await asyncio.sleep(0.8 + 0.4 * _try_i)
+                    plain_body = _telegram_html_to_plain_for_fallback(body)
+                    for _try_i in range(2):
+                        sent_ok = await _telegram_reply_text_fast(update.message,
+                            plain_body,
+                            parse_mode=None,
+                            disable_web_page_preview=disable_web_page_preview,
+                            reply_markup=markup if _try_i == 0 else None,
+                        )
+                        if sent_ok is not None:
+                            return
+                        await asyncio.sleep(1.0)
                     return
                 except BadRequest as e:
                     try:
@@ -28753,6 +28775,7 @@ async def send_long_message(
                 if len(table_lines) > 1 and set(str(table_lines[1]).strip()) <= set('- +=|:'):
                     table_header_lines.append(table_lines[1])
 
+            total_pre_pages = max(1, len(chunks_pre))
             for idx, rows_chunk in enumerate(chunks_pre):
                 rows_to_send = list(rows_chunk or [])
                 if idx > 0 and table_header_lines:
@@ -28760,7 +28783,10 @@ async def send_long_message(
                     if not rows_to_send or str(rows_to_send[0]).strip() != str(table_header_lines[0]).strip():
                         rows_to_send = table_header_lines + rows_to_send
                 chunk_table = '\n'.join(rows_to_send)
-                body = ((prefix_for_table + '\n') if idx == 0 and prefix_for_table else '') + '<pre>' + chunk_table + '</pre>'
+                page_note = f"\n<b>Page {idx + 1}/{total_pre_pages}</b>"
+                if idx > 0:
+                    page_note += " — continuation"
+                body = ((prefix_for_table + '\n') if idx == 0 and prefix_for_table else '') + page_note + '\n<pre>' + chunk_table + '</pre>'
                 # Put suffix after the last table chunk if it fits; otherwise send separately.
                 if idx == len(chunks_pre) - 1 and suffix and len(body) + len(suffix) + 2 <= max_len:
                     body = body + '\n' + suffix
@@ -52445,6 +52471,21 @@ def _admin_report_cached_preview(title: str, text: str, age: float | None, *, fr
 # ================= NON-BLOCKING ADMIN REPORT RUNNER (yver145) =================
 _ADMIN_REPORT_BG_RUNNING: set[str] = set()
 _ADMIN_REPORT_BG_LOCK = threading.Lock()
+# ver11: serialize multi-chunk report sends per report key. Without this, a
+# second /setup_matrix policy request can interleave with the first one's page
+# chunks and Telegram may show a shuffled/incomplete table.
+_ADMIN_REPORT_SEND_LOCKS: dict[str, asyncio.Lock] = {}
+
+def _admin_report_send_lock_for(cache_key: str) -> asyncio.Lock:
+    try:
+        key = str(cache_key or 'default')[:160]
+        lock = _ADMIN_REPORT_SEND_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _ADMIN_REPORT_SEND_LOCKS[key] = lock
+        return lock
+    except Exception:
+        return asyncio.Lock()
 
 
 def _admin_report_cache_get_with_age(cache_key: str, ttl_sec: float | None = None) -> tuple[str, float | None]:
@@ -52527,8 +52568,11 @@ async def _admin_report_background_refresh(
                 limit = int(globals().get('ADMIN_REPORT_FAST_CACHE_MAX_CHARS', 3200) or 3200)
             except Exception:
                 limit = 3200
-            # ver01: no incomplete previews. Always post the full fresh report in chunks.
-            await send_long_message(update, header_plain + "\n" + SEP + "\n" + text, parse_mode=parse_mode, disable_web_page_preview=True)
+            # ver11: serialize multi-page report output for this cache key so
+            # /setup_matrix policy pages cannot be shuffled by another request.
+            async with _admin_report_send_lock_for(str(cache_key or title or 'report')):
+                # ver01: no incomplete previews. Always post the full fresh report in chunks.
+                await send_long_message(update, header_plain + "\n" + SEP + "\n" + text, parse_mode=parse_mode, disable_web_page_preview=True)
     except Exception as e:
         try:
             await _telegram_reply_text_fast(
@@ -52554,7 +52598,8 @@ async def _admin_report_send_cached_result(update: Update, title: str, text: str
         prefix = f"⚡ Cached result ready: {str(title or 'report')}"
         if age is not None:
             prefix += f" (age {_admin_report_age_text(age)})"
-        await send_long_message(update, prefix + "\n" + SEP + "\n" + str(text or ''), parse_mode=parse_mode or ParseMode.HTML, disable_web_page_preview=True)
+        async with _admin_report_send_lock_for(str(title or 'cached-report')):
+            await send_long_message(update, prefix + "\n" + SEP + "\n" + str(text or ''), parse_mode=parse_mode or ParseMode.HTML, disable_web_page_preview=True)
     except Exception as e:
         try:
             await _telegram_reply_text_fast(update.message, f"⚠️ Cached {str(title or 'report')} send failed: {type(e).__name__}: {e}", parse_mode=None, disable_web_page_preview=True)
@@ -59215,7 +59260,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         # built from current actionable KEEP/WATCH audit rows and still passes
         # basic price/volume/policy checks below.
         try:
-            audit_rows = _setup_recent_audit_actionable_recovery_candidates(int(uid), session_name=sess, max_age_min=max_age_min, limit=20)
+            audit_rows = _setup_recent_audit_actionable_recovery_candidates(int(uid), session_name=sess, max_age_min=max_age_min, limit=120)
             sources.append(('audit_recovery', list(audit_rows or [])))
         except Exception:
             sources.append(('audit_recovery', []))
@@ -59253,6 +59298,19 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     if not ok_exec:
                         continue
                     keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=sess, user_id=int(uid), lane='screen')
+                    if not keep_ok and source_name == 'audit_recovery':
+                        try:
+                            snap_ok, snap_why = _setup_snapshot_keep_delivery_escape(item, session_name=sess)
+                            pol_snap = str(getattr(item, 'policy_at_creation', '') or getattr(item, 'delivery_policy', '') or getattr(item, 'policy', '') or '').upper().strip()
+                            if snap_ok or pol_snap == 'KEEP':
+                                keep_ok = True
+                                try:
+                                    setattr(item, 'frozen_keep_delivery_escape', True)
+                                    setattr(item, 'frozen_keep_delivery_escape_reason', str(snap_why or _keep_why or 'audit_keep_screen_recovery'))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                     if not keep_ok:
                         continue
                     if source_name not in {'emailed', 'audit_recovery'} and not _screen_attach_email_delivery_or_skip(int(uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
@@ -59358,7 +59416,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
             # the email/autotrade lane catches up. This keeps screen, audit, email,
             # and AutoTrade synced instead of showing "no confirmed setup".
             try:
-                audit_recovery = _setup_recent_audit_actionable_recovery_candidates(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 4)))
+                audit_recovery = _setup_recent_audit_actionable_recovery_candidates(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(96, int(limit * 16)))
                 sources.append(('audit_recovery', list(audit_recovery or [])))
             except Exception:
                 sources.append(('audit_recovery', []))
@@ -59388,6 +59446,23 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                                 ok_exec, _why_exec = False, 'screen_lane_exec_gate_exception'
                         if ok_exec:
                             keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=(req_session_u or src_session_u or _session), user_id=int(_uid), lane='screen')
+                            if not keep_ok and source_name == 'audit_recovery':
+                                # ver11: /setup_audit recovery rows carry a frozen
+                                # delivery policy. A later live policy recalculation
+                                # must not make /screen hide rows that /setup_audit
+                                # still shows as fresh KEEP with AT='-'.
+                                try:
+                                    snap_ok, snap_why = _setup_snapshot_keep_delivery_escape(item, session_name=(req_session_u or src_session_u or _session))
+                                    pol_snap = str(getattr(item, 'policy_at_creation', '') or getattr(item, 'delivery_policy', '') or getattr(item, 'policy', '') or '').upper().strip()
+                                    if snap_ok or pol_snap == 'KEEP':
+                                        keep_ok = True
+                                        try:
+                                            setattr(item, 'frozen_keep_delivery_escape', True)
+                                            setattr(item, 'frozen_keep_delivery_escape_reason', str(snap_why or _keep_why or 'audit_keep_screen_recovery'))
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
                             if not keep_ok:
                                 continue
                             if source_name not in {'emailed', 'audit_recovery'} and not _screen_attach_email_delivery_or_skip(int(_uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
@@ -59418,8 +59493,21 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         _early_setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=_screen_actionable_fallback_max_age_min(), limit=max(1, int(SETUPS_N))) or [])
         if _early_setups:
             try:
-                _early_setups = [s for s in list(_early_setups or []) if _setup_volume_ok(s)]
-                _early_setups = _filter_user_visible_keep_setups(_early_setups, session_name=str(session or ''), user_id=int(uid), lane='screen')
+                _early_raw_setups = [s for s in list(_early_setups or []) if _setup_volume_ok(s)]
+                _early_setups = _filter_user_visible_keep_setups(_early_raw_setups, session_name=str(session or ''), user_id=int(uid), lane='screen')
+                if not _early_setups:
+                    # ver11: keep frozen audit-recovery rows visible on /screen
+                    # even when volatile live policy recalculation would filter them.
+                    _tmp_keep = []
+                    for _s0 in list(_early_raw_setups or []):
+                        try:
+                            if str(getattr(_s0, 'source_kind', '') or '').lower().strip() == 'setup_audit_recovery' or bool(getattr(_s0, 'setup_audit_recovery', False)):
+                                pol_snap = str(getattr(_s0, 'policy_at_creation', '') or getattr(_s0, 'delivery_policy', '') or getattr(_s0, 'policy', '') or '').upper().strip()
+                                if pol_snap == 'KEEP' and _screen_setup_within_actionable_window(_s0, max_age_min=_screen_actionable_fallback_max_age_min()):
+                                    _tmp_keep.append(_s0)
+                        except Exception:
+                            continue
+                    _early_setups = _tmp_keep
                 _early_setups = list(_early_setups or [])[:_screen_display_limit()]
             except Exception:
                 _early_setups = list(_early_setups or [])[:max(1, int(SETUPS_N))]
@@ -61408,7 +61496,11 @@ def _setup_recent_audit_actionable_recovery_candidates(user_id: int, session_nam
         rows_all = []
         for u in uid_candidates:
             try:
-                rows_all.extend(_setup_audit_load_rows(int(u), hours=hours, limit=max(0, int(limit or 48)), dedup=True, apply_final_quality_gate=False, source_mode_override='EXECUTABLE') or [])
+                # ver11: raw audit rows are often time-sorted and can be dominated
+                # by newer OFF rows. Load a wider slice, then filter for fresh KEEP/
+                # WATCH below, otherwise valid rows like LIT/NEAR/XLM never reach
+                # /screen/email/autotrade recovery.
+                rows_all.extend(_setup_audit_load_rows(int(u), hours=hours, limit=max(160, int(limit or 48)), dedup=True, apply_final_quality_gate=False, source_mode_override='EXECUTABLE') or [])
             except Exception:
                 continue
         if not rows_all:
@@ -63503,7 +63595,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         int(uid),
                         session_name=str(sess_name or ''),
                         max_age_min=_setup_email_actionable_queue_window_min(),
-                        limit=max(int(EMAIL_SETUPS_N) * 8, 24),
+                        limit=max(int(EMAIL_SETUPS_N) * 24, 120),
                     )
                 except Exception:
                     recovery_always = []
@@ -63523,7 +63615,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         int(uid),
                         session_name=str(sess_name or ''),
                         max_age_min=_setup_email_actionable_queue_window_min(),
-                        limit=max(int(EMAIL_SETUPS_N) * 8, 24),
+                        limit=max(int(EMAIL_SETUPS_N) * 24, 120),
                     )
                 except Exception:
                     audit_recovery = []
@@ -66356,11 +66448,11 @@ async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
         # Pull fresh actionable rows from all light-weight sources. No heavy scan.
         candidates = []
         try:
-            candidates = _setup_merge_unique_candidates(candidates, _setup_recent_actionable_recovery_candidates(uid, session_name=sess_name, max_age_min=_setup_email_actionable_queue_window_min(), limit=max(int(EMAIL_SETUPS_N) * 10, 36)), session_name=sess_name, user_id=uid, limit=60)
+            candidates = _setup_merge_unique_candidates(candidates, _setup_recent_actionable_recovery_candidates(uid, session_name=sess_name, max_age_min=_setup_email_actionable_queue_window_min(), limit=max(int(EMAIL_SETUPS_N) * 24, 120)), session_name=sess_name, user_id=uid, limit=120)
         except Exception:
             pass
         try:
-            candidates = _setup_merge_unique_candidates(candidates, _setup_recent_audit_actionable_recovery_candidates(uid, session_name=sess_name, max_age_min=_setup_email_actionable_queue_window_min(), limit=max(int(EMAIL_SETUPS_N) * 10, 36)), session_name=sess_name, user_id=uid, limit=60)
+            candidates = _setup_merge_unique_candidates(candidates, _setup_recent_audit_actionable_recovery_candidates(uid, session_name=sess_name, max_age_min=_setup_email_actionable_queue_window_min(), limit=max(int(EMAIL_SETUPS_N) * 24, 120)), session_name=sess_name, user_id=uid, limit=120)
         except Exception:
             pass
         if not candidates:
