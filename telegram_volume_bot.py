@@ -25116,6 +25116,82 @@ def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: flo
     return out
 
 
+
+def _persist_audit_visibility_candidates(user_id: int, session_name: str, setups: list, *, source_kind: str = 'audit_visibility', mode: str = 'scan', reason: str = '') -> dict:
+    """Persist generated candidates for audit visibility without making them email/AT executable.
+
+    This is the safety layer for the setup-generation pipeline: a valid setup-shaped
+    candidate must not disappear from /setup_audit just because a later policy/quality/
+    email gate blocks delivery.  The rows are written to signals/generated_setups and
+    executable_setups with an audit-only source/state so /setup_audit, /why and
+    /email_decision can explain them.  Email and AutoTrade still re-read through
+    db_list_executable_setups()/presend gates, so blocked audit-only rows cannot be
+    traded just because they are visible.
+    """
+    stats = {'attempted': 0, 'persisted': 0, 'errors': 0}
+    try:
+        uid = int(user_id or 0)
+        if uid <= 0:
+            return stats
+        sess = str(session_name or '').upper().strip()
+        now_ts = float(time.time())
+        seen = set()
+        for raw in list(setups or []):
+            stats['attempted'] += 1
+            try:
+                s_eff = raw
+                try:
+                    if not _setup_delivery_lane_locked(raw, source_kind=str(source_kind or '')):
+                        s_eff = _setup_adaptive_strategy_route_setup(raw, sess, int(uid))
+                except Exception:
+                    s_eff = raw
+                sid = str(getattr(s_eff, 'setup_id', '') or getattr(s_eff, 'id', '') or '').strip()
+                sym = str(getattr(s_eff, 'symbol', '') or '').upper().strip()
+                side = str(getattr(s_eff, 'side', '') or '').upper().strip()
+                try:
+                    entry = float(getattr(s_eff, 'entry', 0.0) or 0.0)
+                    sl = float(getattr(s_eff, 'sl', 0.0) or 0.0)
+                    tp = float(_setup_target_tp(s_eff, 0.0) or 0.0)
+                except Exception:
+                    entry = sl = tp = 0.0
+                if not sid or not sym or side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+                    continue
+                k = (sid, sym, side, round(entry, 8), round(sl, 8), round(tp, 8))
+                if k in seen:
+                    continue
+                seen.add(k)
+                try:
+                    setattr(s_eff, 'audit_visibility_only', True)
+                    setattr(s_eff, 'audit_visibility_reason', str(reason or source_kind or 'audit_visibility'))
+                    if not getattr(s_eff, 'session', None):
+                        setattr(s_eff, 'session', sess)
+                    setattr(s_eff, 'source_session', sess)
+                except Exception:
+                    pass
+                try:
+                    db_insert_signal(s_eff, user_id=int(uid))
+                except Exception:
+                    pass
+                try:
+                    db_log_generated_setup(int(uid), str(source_kind or 'audit_visibility'), sess, s_eff)
+                except Exception:
+                    pass
+                try:
+                    db_mark_executable_setup(int(uid), sid, sess, now_ts, s=s_eff, source_kind=str(source_kind or 'audit_visibility'), state='audit_visibility_only')
+                    stats['persisted'] += 1
+                except Exception:
+                    stats['errors'] += 1
+            except Exception:
+                stats['errors'] += 1
+                continue
+        try:
+            db_log_setup_pipeline_event(int(uid), stage='audit_visibility_persist', status='ok' if stats.get('persisted') else 'empty', session=sess, mode=str(mode or ''), details={**stats, 'source_kind': str(source_kind or ''), 'reason': str(reason or '')})
+        except Exception:
+            pass
+        return stats
+    except Exception:
+        return stats
+
 def _persist_executable_candidates(user_id: int, session_name: str, setups: List[Setup], source_kind: str = 'executable_setups', mode: str = 'email') -> dict:
     stats = {
         'attempted': 0,
@@ -25195,6 +25271,19 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                         final_ok, final_why, final_meta = _setup_final_quality_gate_allows_setup(s_eff, sess, user_id=int(_target_uid))
                     if not final_ok:
                         stats['combo_policy_skips'] += 1
+                        # Ver39: never let a later policy/quality gate make a valid
+                        # setup-shaped candidate disappear from /setup_audit.  Persist
+                        # it as audit-only/OFF visibility, but do not count it as a
+                        # live executable candidate for email/AutoTrade.
+                        try:
+                            _persist_audit_visibility_candidates(
+                                int(_target_uid), sess, [s_eff],
+                                source_kind='audit_only_final_gate_blocked',
+                                mode=str(mode or ''),
+                                reason=str(final_why or 'final_quality_gate_blocked'),
+                            )
+                        except Exception:
+                            pass
                         db_log_setup_pipeline_event(
                             int(_target_uid),
                             stage='executable_final_quality_gate',
@@ -57600,6 +57689,17 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     # Shared Top Setup gate (applies to BOTH /screen and email)
     # -----------------------------------------------------
     gate_source = 'screen' if str(mode or '').lower().strip() == 'exec' else mode
+    # Ver39: save the pre-gate setup-shaped candidates as audit visibility rows
+    # before the shared gate reduces the live delivery pool.  This prevents
+    # /setup_audit from going blank and makes OFF/blocked candidates explainable.
+    try:
+        if uid is not None and ordered:
+            _persist_audit_visibility_candidates(
+                int(uid), str(session_name or ''), list(ordered or [])[:max(12, int(n_target) * 4)],
+                source_kind='audit_pre_shared_gate', mode=str(mode or ''), reason='pre_shared_top_setup_gate'
+            )
+    except Exception:
+        pass
     try:
         ordered = [s for s in (ordered or []) if is_top_setup_eligible(s, source=gate_source, session_name=session_name)[0]]
     except Exception:
@@ -61334,7 +61434,7 @@ SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
-AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "600") or 600)
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "180") or 180)
 AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
@@ -62829,6 +62929,75 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                 chosen_list.append(s)
+
+            if not chosen_list:
+                # Ver39 last-chance delivery sync: if /setup_audit/current policy says
+                # a fresh setup is KEEP, do not let a stale live quality recalc make the
+                # email/AutoTrade lane miss it.  Still enforce geometry/executable,
+                # duplicate/cooldown, flip, external-position and diversification guards.
+                try:
+                    recovered_keep = []
+                    recovered_seen = set()
+                    for s in list(picks or []):
+                        if len(recovered_keep) >= int(EMAIL_SETUPS_N):
+                            break
+                        try:
+                            sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+                            side = str(getattr(s, 'side', '') or '').upper().strip()
+                            sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+                            if not sym or side not in {'BUY', 'SELL'}:
+                                continue
+                            ok_exec, _why_exec = is_executable_setup_eligible(s, session_name=sess_name)
+                            if not ok_exec:
+                                continue
+                            snap_ok, snap_why = _setup_snapshot_keep_delivery_escape(s, session_name=sess_name)
+                            pol_status = ''
+                            try:
+                                pinfo = _setup_combo_policy_lookup_for_setup(s, session_name=sess_name, user_id=int(uid)) or {}
+                                pol_status = _setup_policy_effective_status(str(pinfo.get('status') or '').upper().strip(), found=bool(pinfo.get('found')))
+                            except Exception:
+                                pol_status = ''
+                            if not (snap_ok or pol_status == 'KEEP'):
+                                continue
+                            if symbol_flip_guard_active(uid, sym, side, sess_name):
+                                continue
+                            if _email_setup_identity_recently_sent(uid, s):
+                                continue
+                            if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=sid):
+                                continue
+                            if int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(_autotrade_runtime_mode()).lower() == 'live':
+                                try:
+                                    _conflict = _autotrade_live_symbol_conflict(int(uid), sym, side=side)
+                                except Exception:
+                                    _conflict = {}
+                                if bool((_conflict or {}).get('has_conflict')) and str((_conflict or {}).get('owner_kind') or '') == 'external':
+                                    continue
+                            try:
+                                dk = (sym, side, round(float(getattr(s,'entry',0) or 0),8), round(float(getattr(s,'sl',0) or 0),8), round(float(_setup_target_tp(s,0) or 0),8))
+                            except Exception:
+                                dk = (sym, side, sid)
+                            if dk in recovered_seen:
+                                continue
+                            recovered_seen.add(dk)
+                            try:
+                                setattr(s, 'policy_at_creation', 'KEEP')
+                                setattr(s, 'delivery_policy', 'KEEP')
+                                setattr(s, 'policy', 'KEEP')
+                                setattr(s, 'ver39_last_chance_keep_delivery', True)
+                                setattr(s, 'frozen_keep_delivery_escape', True)
+                            except Exception:
+                                pass
+                            recovered_keep.append(s)
+                        except Exception:
+                            continue
+                    if recovered_keep:
+                        chosen_list = list(recovered_keep)
+                        try:
+                            db_log_setup_pipeline_event(int(uid), stage='email_last_chance_keep_delivery', status='ok', session=str(sess_name or ''), mode='email', details={'recovered': len(recovered_keep), 'reason': 'fresh_keep_policy_or_snapshot_bypass_current_recalc'})
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
             if not chosen_list:
                 reasons = []
@@ -65847,7 +66016,11 @@ def main():
         # the pipeline alive.
         # Ver110: schedule interval must be longer than the allowed runtime to avoid
         # APScheduler max_instances skipped-run warnings on Render.
-        interval_sec = max(300, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 300), int(ALERT_JOB_MAX_RUNTIME_SEC or 35) + 120)
+        # Ver40: keep autonomous setup generation alive every ~3 minutes by default.
+        # Previous code still forced a 300s minimum, so the Ver39 180s setting was
+        # not actually honoured.  Runtime/overlap is still protected by ALERT_LOCK,
+        # max_instances=1 and coalesce=True.
+        interval_sec = max(180, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 180), int(ALERT_JOB_MAX_RUNTIME_SEC or 35) + 120)
     
         app.job_queue.run_repeating(
             alert_job,
