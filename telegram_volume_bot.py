@@ -1,3 +1,4 @@
+# ver5: hard isolation patch: alert_job + setup_email_recovery run in dedicated thread/event-loop executors, first startup tick is delayed, recent command defer is longer, fast-path commands mark activity, and /screen no longer forces fresh access DB checks.
 # ver4: full responsiveness patch: /setup_audit is ack-only/background, audit lifecycle checks are batched, alert job yields during admin commands, /autotrade_last avoids live network calls, and post-email AutoTrade always records/tries the exact emailed batch.
 # ver3: responsiveness/dedup/audit-time fix: /setup_audit uses delivery/executable time, removes duplicate same-data rows, and admin reports run in parallel background workers.
 # ver2: emergency responsiveness/audit-time fix: /setup_audit uses original signal_created_ts instead of batch executable_ts, avoids live OHLCV fetches by default, and alert timeout is fail-soft so Telegram commands stay responsive.
@@ -3497,6 +3498,12 @@ AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = env_bool('AUTOTRADE_REQUIRE_SETUP_EMAI
 
 # Background research / optimization work must not starve interactive commands.
 _BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "4")))
+# ver5: alert/email scheduler gets its own single worker so it can never starve Telegram command workers.
+_ALERT_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("ALERT_JOB_EXECUTOR_WORKERS", "1")))
+_ALERT_JOB_THREAD_LOCK = threading.Lock()
+_ALERT_JOB_THREAD_LAST_START_TS = 0.0
+_ALERT_JOB_THREAD_LAST_DONE_TS = 0.0
+
 
 # Background backtests can temporarily saturate the heavy pool and make the
 # email loop look unhealthy even when the scheduler is alive. Track them so
@@ -5065,7 +5072,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Commands that should force a fresh access check (never use cache)
         # (/screen is the only one you said can be slow; we keep it strict/fresh here)
-        FORCE_FRESH = {"screen"}
+        FORCE_FRESH = set()  # ver5: /screen must never force a fresh DB access check in the command path
 
         # 0) Channel subscription gate (optional)
         if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
@@ -5095,7 +5102,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 access_ok = await to_thread_fast(enforce_access_or_block, update, cmd)
                 # Only compute pro flag if needed later; but cheap enough to cache now
                 try:
-                    is_pro = bool(user_has_pro(uid))
+                    is_pro = bool(await to_thread_fast(user_has_pro, uid, timeout=1))
                 except Exception:
                     is_pro = False
 
@@ -26937,9 +26944,17 @@ def _report_closed_activity_profit_factor(rows: List[dict]) -> Optional[float]:
 
 async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = get_user(uid)
+    try:
+        user = await asyncio.wait_for(get_user_cached_fast_async(int(uid), ttl=300), timeout=0.8)
+    except Exception:
+        try:
+            user = cache_get(_user_cache_key(int(uid))) or {}
+        except Exception:
+            user = {}
 
-    if not has_active_access(uid, user):
+    # Access is already enforced by _command_guard. Do not let a locked/slow SQLite
+    # read inside /screen falsely block the owner/admin or freeze the command path.
+    if user and (not has_active_access(uid, user)):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -42109,7 +42124,10 @@ async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             user = await asyncio.wait_for(asyncio.shield(_safe_create_task(get_user_cached_fast_async(uid, ttl=30), 'instant_equity_user_lookup')), timeout=0.8)
         except Exception:
-            user = get_user_cached_fast(uid, ttl=300) or {}
+            try:
+                user = cache_get(_user_cache_key(int(uid))) or {}
+            except Exception:
+                user = {}
         txt = f"Manual Equity: ${float((user or {}).get('equity') or 0.0):.2f}"
         _instant_cache_set(_INSTANT_EQUITY_TEXT_CACHE, uid, txt)
         await update.message.reply_text(txt)
@@ -42162,6 +42180,10 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
         if not txt.startswith('/'):
             return
         cmd = txt.split()[0][1:].split('@')[0].strip().lower()
+        try:
+            _mark_user_activity()
+        except Exception:
+            pass
         if cmd not in FAST_PATH_COMMANDS:
             return
 
@@ -61746,7 +61768,7 @@ EMAIL_SEND_TIMEOUT_SEC = max(6, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "8"
 # prevented the session email pool from completing, so no setup emails were sent.
 # Keep Telegram command replies fast separately, but allow the email engine enough
 # time to finish one small owner/session cycle.
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "35"))  # ver11: shorter budget prevents scheduler lag
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "18"))  # ver5: shorter isolated budget prevents scheduler lag
 SETUP_EMAIL_RECOVERY_JOB_ENABLED = env_bool("SETUP_EMAIL_RECOVERY_JOB_ENABLED", True)
 # ver03: recovery is a fallback lane, not the main scanner. Run it less often and
 # hard-time it so it cannot cause APScheduler max_instances warnings or UI lag.
@@ -61757,7 +61779,7 @@ SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
 AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "180") or 180)
-AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
+AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "120") or 120)
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
 ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "1"))
@@ -61773,7 +61795,7 @@ ALERT_JOB_FAST_SCHEDULER_MODE = env_bool("ALERT_JOB_FAST_SCHEDULER_MODE", True)
 # ver4: user/admin commands must stay instant. If an admin command/report just
 # arrived, skip this alert tick and let the next scheduled/recovery tick continue.
 ALERT_JOB_SKIP_ON_RECENT_COMMAND = env_bool("ALERT_JOB_SKIP_ON_RECENT_COMMAND", True)
-ALERT_JOB_RECENT_COMMAND_DEFER_SEC = int(os.environ.get("ALERT_JOB_RECENT_COMMAND_DEFER_SEC", "20") or 20)
+ALERT_JOB_RECENT_COMMAND_DEFER_SEC = int(os.environ.get("ALERT_JOB_RECENT_COMMAND_DEFER_SEC", "90") or 90)
 EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED = env_bool("EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED", False)
 SCREEN_CACHE_WARMUP_ENABLED = env_bool("SCREEN_CACHE_WARMUP_ENABLED", False)
 BIGMOVE_FIRE_AND_FORGET_ENABLED = env_bool("BIGMOVE_FIRE_AND_FORGET_ENABLED", True)
@@ -66025,29 +66047,47 @@ async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-async def setup_email_recovery_job_runner(context: ContextTypes.DEFAULT_TYPE):
-    """Timed wrapper for setup_email_recovery_job.
+def _setup_email_recovery_thread_entry(context: ContextTypes.DEFAULT_TYPE, timeout: float) -> str:
+    """Run recovery away from the PTB event loop too."""
+    async def _runner():
+        await asyncio.wait_for(setup_email_recovery_job(context), timeout=max(5.0, float(timeout or 8)))
+    try:
+        _run_async_in_new_loop(_runner)
+        return 'ok'
+    except asyncio.TimeoutError:
+        try:
+            logger.debug('setup_email_recovery_job isolated timeout after %ss; retry later', int(timeout))
+        except Exception:
+            pass
+        return 'timeout'
+    except Exception as e:
+        try:
+            logger.warning('setup_email_recovery_job isolated failed: %s: %s', type(e).__name__, e)
+        except Exception:
+            pass
+        return f'error:{type(e).__name__}'
 
-    ver03: the recovery lane is useful, but it must never occupy the scheduler for
-    several minutes. If it cannot finish quickly, skip and retry on the next cycle.
-    The main alert job remains the primary setup-email engine.
-    """
+async def setup_email_recovery_job_runner(context: ContextTypes.DEFAULT_TYPE):
+    """Fast scheduler wrapper; actual recovery runs in the isolated alert worker."""
     try:
         timeout = max(5.0, float(globals().get('SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC', 8) or 8))
     except Exception:
-        timeout = 22.0
+        timeout = 8.0
     try:
-        await asyncio.wait_for(setup_email_recovery_job(context), timeout=timeout)
-    except asyncio.TimeoutError:
-        try:
-            logger.info('setup_email_recovery_job skipped: timed out after %ss (will retry later)', int(timeout))
-        except Exception:
-            pass
-    except asyncio.CancelledError:
-        raise
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(_ALERT_JOB_EXECUTOR, _setup_email_recovery_thread_entry, context, timeout)
+        def _done(_f):
+            try:
+                _ = _f.result()
+            except Exception as e:
+                try:
+                    logger.warning('setup_email_recovery_job future failed: %s: %s', type(e).__name__, e)
+                except Exception:
+                    pass
+        fut.add_done_callback(_done)
     except Exception as e:
         try:
-            logger.warning('setup_email_recovery_job_runner failed: %s: %s', type(e).__name__, e)
+            logger.warning('setup_email_recovery_job_runner schedule failed: %s: %s', type(e).__name__, e)
         except Exception:
             pass
 
@@ -66057,7 +66097,7 @@ async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
     # yield, not as an email error. The DB-first recovery lane will retry.
     try:
         base_budget = float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 25) or 25)
-        hard_timeout = max(25.0, min(40.0, base_budget + 8.0))
+        hard_timeout = max(8.0, min(22.0, base_budget + 4.0))
         await asyncio.wait_for(_alert_job_async_internal(context), timeout=hard_timeout)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
@@ -66072,7 +66112,7 @@ async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
             pass
         _hb_touch('email', ok=True, details=f'alert_job_budget_yield>{int(hard_timeout)}s')
         try:
-            logger.info('alert_job budget-yield after %ss; scheduler lock released, recovery/next tick will retry', int(hard_timeout))
+            logger.debug('alert_job budget-yield after %ss; isolated worker released, recovery/next tick will retry', int(hard_timeout))
         except Exception:
             pass
     except asyncio.CancelledError:
@@ -66088,6 +66128,50 @@ async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+
+
+def _alert_job_thread_entry(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Run the autonomous email/setup engine away from the Telegram event loop.
+
+    Previous ver04 still created an asyncio task on the main PTB event loop. Most
+    slow work was *intended* to be threaded, but any missed synchronous DB/ccxt/SMTP
+    path could still freeze /screen, /equity, /autotrade_last, etc. This hard
+    isolates the whole scheduler tick in a dedicated worker thread with its own
+    event loop. Telegram commands remain served by the main loop.
+    """
+    global _ALERT_JOB_THREAD_LAST_START_TS, _ALERT_JOB_THREAD_LAST_DONE_TS
+    acquired = False
+    try:
+        acquired = _ALERT_JOB_THREAD_LOCK.acquire(blocking=False)
+        if not acquired:
+            try:
+                _hb_touch('email', ok=True, details='alert_job_thread_already_running')
+            except Exception:
+                pass
+            return 'already_running'
+        _ALERT_JOB_THREAD_LAST_START_TS = float(time.time())
+        _run_async_in_new_loop(_alert_job_background_runner, context)
+        return 'ok'
+    except Exception as exc:
+        try:
+            _hb_touch('email', ok=False, error=f"{type(exc).__name__}: {exc}", details='alert_job_thread_error')
+        except Exception:
+            pass
+        try:
+            logger.warning('alert_job isolated worker failed: %s: %s', type(exc).__name__, exc)
+        except Exception:
+            pass
+        return f'error:{type(exc).__name__}'
+    finally:
+        try:
+            _ALERT_JOB_THREAD_LAST_DONE_TS = float(time.time())
+        except Exception:
+            pass
+        if acquired:
+            try:
+                _ALERT_JOB_THREAD_LOCK.release()
+            except Exception:
+                pass
 
 async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     """Fast scheduler wrapper for the background email engine."""
@@ -66113,7 +66197,23 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     try:
-        _safe_create_task(_alert_job_background_runner(context), label="alert_job_bg")
+        # ver5: DO NOT create an asyncio task on the PTB/main event loop.
+        # Run the whole autonomous email/setup engine in a dedicated worker thread.
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(_ALERT_JOB_EXECUTOR, _alert_job_thread_entry, context)
+        def _done(_f):
+            try:
+                _ = _f.result()
+            except Exception as e:
+                try:
+                    _EMAIL_LOOP_HEARTBEAT["last_error"] = f"thread_{type(e).__name__}: {e}"
+                except Exception:
+                    pass
+                try:
+                    logger.warning("Alert job isolated future failed: %s: %s", type(e).__name__, e)
+                except Exception:
+                    pass
+        fut.add_done_callback(_done)
     except Exception as e:
         try:
             _EMAIL_LOOP_HEARTBEAT["last_error"] = f"schedule_{type(e).__name__}: {e}"
