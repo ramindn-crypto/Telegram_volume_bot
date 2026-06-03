@@ -1,3 +1,4 @@
+# ver3: responsiveness/dedup/audit-time fix: /setup_audit uses delivery/executable time, removes duplicate same-data rows, and admin reports run in parallel background workers.
 # ver2: emergency responsiveness/audit-time fix: /setup_audit uses original signal_created_ts instead of batch executable_ts, avoids live OHLCV fetches by default, and alert timeout is fail-soft so Telegram commands stay responsive.
 # ver32: /screen timeout hardening: full builder first returns recent actionable email/executable queue before heavy pool rebuild, and expected on-demand build timeouts fall back without Render WARNING noise.
 # ver35: BigMove confirmed alerts now create paired F8 setup emails via a controlled BigMove policy escape when the setup is technically executable, so alerts like WLD UP do not disappear from setup/email/audit lanes.
@@ -3494,7 +3495,7 @@ AUTOTRADE_JOB_MAX_PLACEMENTS_PER_TICK = int(os.environ.get('AUTOTRADE_JOB_MAX_PL
 AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
 
 # Background research / optimization work must not starve interactive commands.
-_BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "1")))
+_BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BACKGROUND_EXECUTOR_WORKERS", "4")))
 
 # Background backtests can temporarily saturate the heavy pool and make the
 # email loop look unhealthy even when the scheduler is alive. Track them so
@@ -45689,9 +45690,20 @@ def _setup_audit_family_code(row_or_family) -> str:
 def _setup_audit_row_ts(row: dict) -> float:
     try:
         rr = row or {}
-        # ver2: display/evaluate the true setup creation time first.  executable_ts
-        # is only the batch/cache time and can make many rows appear at one minute.
-        return float(rr.get('created_ts') or rr.get('signal_created_ts') or rr.get('first_seen_ts') or rr.get('ts') or rr.get('executable_ts') or rr.get('opened_ts') or 0.0)
+        # ver3: user-facing audit time is the time the setup became actionable/delivered.
+        # Prefer emailed_ts (actual alert time), then executable_ts (queue/actionable time).
+        # Fall back to original signal/created time only for raw generated audit rows.
+        return float(
+            rr.get('emailed_ts')
+            or rr.get('email_logged_ts')
+            or rr.get('executable_ts')
+            or rr.get('created_ts')
+            or rr.get('signal_created_ts')
+            or rr.get('first_seen_ts')
+            or rr.get('ts')
+            or rr.get('opened_ts')
+            or 0.0
+        )
     except Exception:
         return 0.0
 
@@ -45732,17 +45744,22 @@ def _setup_audit_unique_key(row: dict) -> str:
         sess = str(rr.get('session') or rr.get('source_session') or '').upper().strip() or 'NOSESSION'
         strat = _setup_strategy_suffix(rr)
         key = f'{bucket}|{sess}|{strat}|{sym}|{side}|{fam}'
-        if bool(globals().get('SETUP_AUDIT_DEDUP_INCLUDE_LEVELS', False)):
-            entry = float(rr.get('entry') or 0.0)
-            sl = float(rr.get('sl') or 0.0)
-            tp = float(rr.get('tp') or 0.0)
-            if entry > 0:
-                entry_b = round(entry, max(0, 3 - int(math.log10(abs(entry))) if entry > 0 else 3))
-                sl_b = round(((entry - sl) / entry) * 100.0, 1) if sl > 0 else 0.0
-                tp_b = round(((tp - entry) / entry) * 100.0, 1) if tp > 0 else 0.0
-            else:
-                entry_b, sl_b, tp_b = 0.0, 0.0, 0.0
-            key += f'|{entry_b}|{sl_b}|{tp_b}'
+        # ver3: always include rounded price geometry so repeated saves of the
+        # exact same actionable idea collapse, while materially different levels remain.
+        entry = float(rr.get('entry') or 0.0)
+        sl = float(rr.get('sl') or 0.0)
+        tp = float(rr.get('tp') or 0.0)
+        if entry > 0:
+            try:
+                dec = max(0, 4 - int(math.log10(abs(entry)))) if entry > 0 else 4
+            except Exception:
+                dec = 4
+            entry_b = round(entry, dec)
+            sl_b = round(((entry - sl) / entry) * 100.0, 3) if sl > 0 else 0.0
+            tp_b = round(((tp - entry) / entry) * 100.0, 3) if tp > 0 else 0.0
+        else:
+            entry_b, sl_b, tp_b = 0.0, 0.0, 0.0
+        key += f'|{entry_b}|{sl_b}|{tp_b}'
         return key
     except Exception:
         sid = str((row or {}).get('setup_id') or '').strip()
@@ -45936,11 +45953,11 @@ def _setup_audit_find_row_by_setup_id(setup_id: str) -> dict:
             cur = conn.cursor()
             try:
                 x_cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
-                x_family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
-                x_strategy_expr = "COALESCE(setup_strategy, '') AS setup_strategy" if 'setup_strategy' in x_cols else "'' AS setup_strategy"
-                x_orig_id_expr = "COALESCE(original_setup_id, '') AS original_setup_id" if 'original_setup_id' in x_cols else "'' AS original_setup_id"
-                x_orig_side_expr = "COALESCE(original_side, '') AS original_side" if 'original_side' in x_cols else "'' AS original_side"
-                x_strategy_reason_expr = "COALESCE(strategy_reason, '') AS strategy_reason" if 'strategy_reason' in x_cols else "'' AS strategy_reason"
+                x_family_expr = "COALESCE(x.family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
+                x_strategy_expr = "COALESCE(x.setup_strategy, '') AS setup_strategy" if 'setup_strategy' in x_cols else "'' AS setup_strategy"
+                x_orig_id_expr = "COALESCE(x.original_setup_id, '') AS original_setup_id" if 'original_setup_id' in x_cols else "'' AS original_setup_id"
+                x_orig_side_expr = "COALESCE(x.original_side, '') AS original_side" if 'original_side' in x_cols else "'' AS original_side"
+                x_strategy_reason_expr = "COALESCE(x.strategy_reason, '') AS strategy_reason" if 'strategy_reason' in x_cols else "'' AS strategy_reason"
                 row = cur.execute(f"""
                     SELECT executable_ts AS ts, signal_created_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
                            fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
@@ -46109,7 +46126,20 @@ def _setup_audit_payload_from_row(row: dict) -> dict:
         out['symbol'] = _bybit_linear_symbol(str(out.get('symbol') or ''))
         out['market_symbol'] = str(out.get('market_symbol') or '').strip() or _market_symbol_from_base(out.get('symbol'))
         out['side'] = _norm_trade_side(str(out.get('side') or ''))
-        created = float(out.get('first_seen_ts') or out.get('signal_created_ts') or out.get('created_ts') or out.get('ts') or out.get('opened_ts') or 0.0)
+        # ver3: freeze the audit/display/evaluation start at delivery/actionable time
+        # where available. This aligns /setup_audit with the actual setup email time
+        # and prevents a full batch from appearing at the old signal_created_ts minute.
+        created = float(
+            out.get('emailed_ts')
+            or out.get('email_logged_ts')
+            or out.get('executable_ts')
+            or out.get('created_ts')
+            or out.get('signal_created_ts')
+            or out.get('first_seen_ts')
+            or out.get('ts')
+            or out.get('opened_ts')
+            or 0.0
+        )
         out['created_ts'] = float(created or 0.0)
         out['entry'] = float(out.get('entry') or 0.0)
         out['sl'] = float(out.get('sl') or 0.0)
@@ -46635,32 +46665,35 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                         where = "WHERE user_id=?"
                         x_cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
                         if x_cols:
-                            # ver2: audit windows must use the original setup/signal time,
-                            # not the later executable batch timestamp.  This prevents
-                            # /setup_audit showing a whole batch as one minute (e.g. 22:08).
-                            x_time_expr = "COALESCE(NULLIF(signal_created_ts,0), executable_ts)" if 'signal_created_ts' in x_cols else "executable_ts"
+                            # ver3: audit windows/display use delivery/actionable time.
+                            # emailed_ts is the real alert time; executable_ts is the fallback.
+                            x_sig_expr = "COALESCE(NULLIF(x.signal_created_ts,0), 0)" if 'signal_created_ts' in x_cols else "0"
+                            x_exec_expr = "COALESCE(NULLIF(x.executable_ts,0), 0)"
+                            x_time_expr = "COALESCE(MAX(e.emailed_ts), NULLIF(x.executable_ts,0), NULLIF(x.signal_created_ts,0), 0)" if 'signal_created_ts' in x_cols else "COALESCE(MAX(e.emailed_ts), NULLIF(x.executable_ts,0), 0)"
                             if cutoff > 0:
-                                where += f" AND {x_time_expr}>=?"
+                                where += " AND COALESCE(e.emailed_ts, x.executable_ts, x.signal_created_ts, 0)>=?" if 'signal_created_ts' in x_cols else " AND COALESCE(e.emailed_ts, x.executable_ts, 0)>=?"
                                 params.append(float(cutoff))
-                            x_family_expr = "COALESCE(family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
-                            x_strategy_expr = "COALESCE(setup_strategy, '') AS setup_strategy" if 'setup_strategy' in x_cols else "'' AS setup_strategy"
-                            x_orig_id_expr = "COALESCE(original_setup_id, '') AS original_setup_id" if 'original_setup_id' in x_cols else "'' AS original_setup_id"
-                            x_orig_side_expr = "COALESCE(original_side, '') AS original_side" if 'original_side' in x_cols else "'' AS original_side"
-                            x_strategy_reason_expr = "COALESCE(strategy_reason, '') AS strategy_reason" if 'strategy_reason' in x_cols else "'' AS strategy_reason"
-                            x_pol_expr = "COALESCE(policy_at_creation, '') AS policy_at_creation" if 'policy_at_creation' in x_cols else "'' AS policy_at_creation"
-                            x_pol_raw_expr = "COALESCE(policy_status_raw_at_creation, '') AS policy_status_raw_at_creation" if 'policy_status_raw_at_creation' in x_cols else "'' AS policy_status_raw_at_creation"
-                            x_pol_combo_expr = "COALESCE(policy_combo_at_creation, '') AS policy_combo_at_creation" if 'policy_combo_at_creation' in x_cols else "'' AS policy_combo_at_creation"
-                            x_pol_reason_expr = "COALESCE(policy_reason_at_creation, '') AS policy_reason_at_creation" if 'policy_reason_at_creation' in x_cols else "'' AS policy_reason_at_creation"
-                            x_pol_ts_expr = "COALESCE(policy_created_ts, 0) AS policy_created_ts" if 'policy_created_ts' in x_cols else "0 AS policy_created_ts"
+                            x_family_expr = "COALESCE(x.family_id, '') AS family_id" if 'family_id' in x_cols else "'' AS family_id"
+                            x_strategy_expr = "COALESCE(x.setup_strategy, '') AS setup_strategy" if 'setup_strategy' in x_cols else "'' AS setup_strategy"
+                            x_orig_id_expr = "COALESCE(x.original_setup_id, '') AS original_setup_id" if 'original_setup_id' in x_cols else "'' AS original_setup_id"
+                            x_orig_side_expr = "COALESCE(x.original_side, '') AS original_side" if 'original_side' in x_cols else "'' AS original_side"
+                            x_strategy_reason_expr = "COALESCE(x.strategy_reason, '') AS strategy_reason" if 'strategy_reason' in x_cols else "'' AS strategy_reason"
+                            x_pol_expr = "COALESCE(x.policy_at_creation, '') AS policy_at_creation" if 'policy_at_creation' in x_cols else "'' AS policy_at_creation"
+                            x_pol_raw_expr = "COALESCE(x.policy_status_raw_at_creation, '') AS policy_status_raw_at_creation" if 'policy_status_raw_at_creation' in x_cols else "'' AS policy_status_raw_at_creation"
+                            x_pol_combo_expr = "COALESCE(x.policy_combo_at_creation, '') AS policy_combo_at_creation" if 'policy_combo_at_creation' in x_cols else "'' AS policy_combo_at_creation"
+                            x_pol_reason_expr = "COALESCE(x.policy_reason_at_creation, '') AS policy_reason_at_creation" if 'policy_reason_at_creation' in x_cols else "'' AS policy_reason_at_creation"
+                            x_pol_ts_expr = "COALESCE(x.policy_created_ts, 0) AS policy_created_ts" if 'policy_created_ts' in x_cols else "0 AS policy_created_ts"
                             cur.execute(f"""
-                                SELECT {x_time_expr} AS ts, signal_created_ts, executable_ts, 'EXEC' AS source, session, setup_id, symbol, market_symbol, side, conf,
-                                       fut_vol_usd, ch24, ch4, ch1, ch15, engine, details_json, quality_score,
+                                SELECT {x_time_expr} AS ts, {x_sig_expr} AS signal_created_ts, x.executable_ts, COALESCE(MAX(e.emailed_ts),0) AS emailed_ts, 'EXEC' AS source, x.session, x.setup_id, x.symbol, x.market_symbol, x.side, x.conf,
+                                       x.fut_vol_usd, x.ch24, x.ch4, x.ch1, x.ch15, x.engine, x.details_json, x.quality_score,
                                        {x_family_expr}, {x_strategy_expr}, {x_orig_id_expr}, {x_orig_side_expr}, {x_strategy_reason_expr},
                                        {x_pol_expr}, {x_pol_raw_expr}, {x_pol_combo_expr}, {x_pol_reason_expr}, {x_pol_ts_expr},
-                                       entry, sl, tp, alt_target_a, alt_target_b
-                                FROM executable_setups
-                                {where}
-                                ORDER BY executable_ts DESC{lim_clause}
+                                       x.entry, x.sl, x.tp, x.alt_target_a, x.alt_target_b
+                                FROM executable_setups x
+                                LEFT JOIN emailed_setups e ON e.user_id=x.user_id AND e.setup_id=x.setup_id
+                                {where.replace('WHERE user_id=?','WHERE x.user_id=?')}
+                                GROUP BY x.user_id, x.setup_id
+                                ORDER BY COALESCE(MAX(e.emailed_ts), x.executable_ts, x.signal_created_ts, 0) DESC{x_time_expr and lim_clause}
                             """, tuple(params + params_extra))
                             rows.extend([dict(r) for r in (cur.fetchall() or [])])
                     except Exception:
@@ -46756,16 +46789,21 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
             except Exception:
                 delivered_setup_ids = set()
         deduped: dict[str, dict] = {}
-        # Keep the earliest raw scanner row per practical key, but never de-dupe away
-        # a setup that was actually emailed or AutoTraded. Those rows are the sync
-        # bridge between /screen, setup emails, /setup_audit and /autotrade_report.
+        # ver3: de-duplicate by the practical setup idea, not by setup_id.
+        # The same ETH/BTC/SKYAI setup can be persisted as EXEC + email + AT rows
+        # with different setup_ids but identical entry/SL/TP. Keep one best row:
+        # prefer emailed/AutoTrade rows, then newest actionable timestamp.
+        def _audit_row_rank(_r: dict) -> tuple:
+            try:
+                _sid = str((_r or {}).get('setup_id') or '').strip()
+                delivered = 1 if (_sid and _sid in delivered_setup_ids) or float((_r or {}).get('emailed_ts') or 0.0) > 0 else 0
+                at = 1 if _setup_audit_autotrade_state_label(_r, uid=int(uid), session_name=str((_r or {}).get('session') or '')).upper().strip() not in {'-', ''} else 0
+                return (delivered, at, float(_setup_audit_row_ts(_r) or 0.0))
+            except Exception:
+                return (0, 0, 0.0)
         for r in sorted(cleaned, key=lambda x: _setup_audit_row_ts(x)):
-            sid_r = str((r or {}).get('setup_id') or '').strip()
-            if sid_r and sid_r in delivered_setup_ids:
-                key = f"DELIVERED|{sid_r}"
-            else:
-                key = _setup_audit_unique_key(r)
-            if key not in deduped:
+            key = _setup_audit_unique_key(r)
+            if key not in deduped or _audit_row_rank(r) >= _audit_row_rank(deduped.get(key) or {}):
                 deduped[key] = r
         final = sorted(list(deduped.values()), key=lambda x: _setup_audit_row_ts(x), reverse=True)
     else:
@@ -51671,7 +51709,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v172:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v3:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -51690,7 +51728,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v172:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v3:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -51740,7 +51778,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v172:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v3:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -51758,7 +51796,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v172:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v3:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -52125,7 +52163,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v172:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v3:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -52151,7 +52189,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v172:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v3:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -52170,7 +52208,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v172:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v3:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -52201,7 +52239,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:ver2:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:ver3:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -52675,7 +52713,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v172:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v3:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -52700,7 +52738,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v172:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v3:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -52718,7 +52756,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v172:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v3:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -52743,7 +52781,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v172:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v3:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -56852,7 +56890,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v172:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v3:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -56872,7 +56910,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v172:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v3:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -56893,7 +56931,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v172:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v3:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
