@@ -1,4 +1,4 @@
-# ver13: deploy-start catch-up hardening: immediate startup setup/email recovery, faster DB-first recovery cadence, and no email/autotrade for audit rows already resolved TP/SL before recovery.
+# ver14: fixes /screen empty while /setup_audit has fresh KEEP rows by adding pre-heavy audit-recovery display, longer recovery fallback, and frozen KEEP audit-recovery email/screen-sync bypass.
 # ver12: restores autonomous setup generation by allowing the isolated alert/email engine enough runtime, starts recovery quickly after deploy, and sorts /setup_audit strictly by time.
 # ver11: fixes /setup_matrix policy ordered full-page delivery and makes /screen/email/autotrade consume fresh /setup_audit KEEP rows even when raw audit load is dominated by newer OFF rows.
 # ver10: fix audit/email/screen/autotrade sync starvation: alert_job no longer skips the setup-email lane during admin commands; fresh /setup_audit KEEP recovery rows are shown on /screen and can be emailed/autotraded.
@@ -59900,8 +59900,23 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             except Exception:
                 _exec_ok, _exec_why = False, 'screen_sync_exec_gate_exception'
             if not _exec_ok:
-                skipped.append(f'exec_gate:{_exec_why}')
-                continue
+                try:
+                    _audit_basic_ok, _audit_basic_why = _audit_recovery_frozen_keep_basic_allows(s, session_name=target_session)
+                except Exception:
+                    _audit_basic_ok, _audit_basic_why = False, 'audit_basic_exception'
+                if _audit_basic_ok:
+                    _exec_ok = True
+                    try:
+                        setattr(s, 'ver14_screen_sync_exec_escape', True)
+                        setattr(s, 'ver14_screen_sync_exec_escape_reason', str(_exec_why or _audit_basic_why or 'frozen_audit_keep_open'))
+                        setattr(s, 'policy_at_creation', 'KEEP')
+                        setattr(s, 'delivery_policy', 'KEEP')
+                        setattr(s, 'policy', 'KEEP')
+                    except Exception:
+                        pass
+                else:
+                    skipped.append(f'exec_gate:{_exec_why}')
+                    continue
             if db_has_emailed_setup(int(uid), sid, lookback_hours=12):
                 skipped.append('already_emailed')
                 continue
@@ -60032,6 +60047,95 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 except Exception:
                     pass
                 return
+        try:
+            # ver14: before any ticker/OHLCV/full-builder work, try the unified
+            # lightweight recovery lane (emailed -> executable -> fresh /setup_audit KEEP).
+            # This fixes the case where /setup_audit shows a fresh KEEP/OPEN row (AT='-')
+            # but /screen falls back to the market-only quick snapshot because the heavy
+            # builder times out.  The command has already acknowledged, so a few seconds
+            # here is acceptable and does not block other Telegram commands.
+            try:
+                _recovery_first_min = int(_screen_actionable_fallback_max_age_min())
+            except Exception:
+                _recovery_first_min = 60
+            try:
+                _best_cached_recovery = get_cached_futures_tickers() or {}
+            except Exception:
+                _best_cached_recovery = {}
+            try:
+                body, kb, shown_setups = await to_thread_fast(
+                    _screen_recent_db_body_and_kb,
+                    int(uid or 0),
+                    str(scan_session or '').upper(),
+                    _best_cached_recovery or {},
+                    max_age_min=int(_recovery_first_min),
+                    include_email_source=True,
+                    timeout=int(os.getenv('SCREEN_RECOVERY_FIRST_TIMEOUT_SEC', '6') or 6),
+                )
+            except Exception:
+                body, kb, shown_setups = '', [], []
+            if body and shown_setups:
+                try:
+                    _screen_cache_put(f"uid:{int(uid or 0)}::{str(scan_session or '').upper()}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=False)
+                    _screen_cache_put(f"global::{str(scan_session or '').upper()}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=False)
+                except Exception:
+                    pass
+                try:
+                    _SCREEN_LOCK.release()
+                except Exception:
+                    pass
+                try:
+                    loc_label, loc_time = user_location_and_time(user or {})
+                except Exception:
+                    loc_label, loc_time = "Melbourne (Australia)", _fmt_dt_local(datetime.now(timezone.utc), "%Y-%m-%d %H:%M")
+                header = (
+                    f"✅ Fresh result ready: /screen\n"
+                    f"{HDR}\n"
+                    f"*PulseFutures — Market Scan*\n"
+                    f"{HDR}\n"
+                    f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                    f"{_screen_when_line('Synced recovery queue built', time.time())}"
+                )
+                keyboard = [
+                    [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                    for (sym, sid) in (kb or [])
+                ]
+                await send_long_message(
+                    update,
+                    _screen_markdown_to_html((header + "\n" + str(body or '')).strip()),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+                )
+                try:
+                    if MANUAL_SCREEN_SYNC_ENABLED and shown_setups:
+                        _safe_create_task(
+                            to_thread_bg(
+                                _run_async_in_new_loop,
+                                _screen_sync_pipeline_async,
+                                int(uid or 0),
+                                dict(user or {}),
+                                str(live_session or ''),
+                                str(scan_session or '').upper(),
+                                _best_cached_recovery or {},
+                                list(shown_setups or []),
+                                timeout=int(os.getenv('SCREEN_SYNC_BG_TIMEOUT_SEC', '20') or 20),
+                            ),
+                            'screen_recovery_first_sync_bg'
+                        )
+                except Exception:
+                    pass
+                try:
+                    _schedule_screen_cache_refresh(int(uid or 0), str(scan_session or '').upper())
+                except Exception:
+                    pass
+                return
+        except Exception as _recovery_first_e:
+            try:
+                logger.debug('screen recovery-first fallback skipped uid=%s session=%s: %s', uid, scan_session, _recovery_first_e)
+            except Exception:
+                pass
+
         try:
             # ver08: latest setup email is the authoritative /screen source.
             # Before any ticker/OHLCV/full-builder work, show the newest delivered email lane.
@@ -60165,7 +60269,7 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                         best_fut or {},
                         max_age_min=int(_screen_actionable_fallback_max_age_min()),
                         include_email_source=bool(_screen_user_can_see_email_source(int(uid or 0), user or {})),
-                        timeout=2,
+                        timeout=int(os.getenv('SCREEN_RECOVERY_FALLBACK_TIMEOUT_SEC', '6') or 6),
                     )
                 except Exception:
                     body, kb, shown_setups = '', [], []
@@ -61726,6 +61830,59 @@ def _recent_stronger_same_symbol_delivery_exists(user_id: int, setup, session_na
     except Exception:
         return False, ''
 
+def _audit_recovery_frozen_keep_basic_allows(setup, session_name: str = '') -> tuple[bool, str]:
+    """ver14: narrow safety bypass for frozen /setup_audit KEEP recovery rows.
+
+    A row that is already visible in /setup_audit as fresh Policy=KEEP + OPEN should
+    not be lost by later volatile live-quality/confidence recalculation.  This does
+    NOT allow arbitrary candidates: it requires a setup_audit_recovery source, frozen
+    KEEP policy, valid session, fresh action window, valid SL/TP geometry, volume, and
+    cached audit result still OPEN.
+    """
+    try:
+        if setup is None:
+            return False, 'missing_setup'
+        src = str(getattr(setup, 'source_kind', '') or '').lower().strip()
+        if src != 'setup_audit_recovery' and not bool(getattr(setup, 'setup_audit_recovery', False)):
+            return False, 'not_audit_recovery'
+        pol = str(getattr(setup, 'policy_at_creation', '') or getattr(setup, 'delivery_policy', '') or getattr(setup, 'policy', '') or '').upper().strip()
+        if pol != 'KEEP':
+            return False, f'frozen_policy_not_keep:{pol or "-"}'
+        sess_req = str(session_name or '').upper().strip()
+        sess_src = str(getattr(setup, 'source_session', '') or getattr(setup, 'session', '') or '').upper().strip()
+        if sess_req and sess_src and sess_src != sess_req:
+            return False, f'session_mismatch:{sess_src}!={sess_req}'
+        try:
+            if not _screen_setup_within_actionable_window(setup, max_age_min=_setup_email_actionable_queue_window_min()):
+                return False, 'outside_action_window'
+        except Exception:
+            pass
+        try:
+            still_open, open_state = _setup_audit_recovery_row_still_open(setup)
+            if not still_open:
+                return False, f'already_resolved_{open_state}'
+        except Exception:
+            pass
+        side = str(getattr(setup, 'side', '') or '').upper().strip()
+        entry = float(getattr(setup, 'entry', 0.0) or 0.0)
+        sl = float(getattr(setup, 'sl', 0.0) or 0.0)
+        tp = float(_setup_target_tp(setup, 0.0) or getattr(setup, 'tp', 0.0) or 0.0)
+        if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+            return False, 'bad_prices'
+        if side == 'BUY' and not (sl < entry < tp):
+            return False, 'bad_buy_geometry'
+        if side == 'SELL' and not (tp < entry < sl):
+            return False, 'bad_sell_geometry'
+        try:
+            if not _setup_volume_ok(setup):
+                return False, 'volume_below_floor'
+        except Exception:
+            pass
+        return True, 'frozen_audit_keep_open_basic_ok'
+    except Exception as exc:
+        return False, f'audit_keep_basic_exception:{type(exc).__name__}'
+
+
 def _setup_email_presend_executable_filter(user_id: int, session_name: str, setups: list, lane: str = 'email') -> tuple[list, Counter]:
     """Return only setup rows that can be both emailed and autotrade-consumed.
 
@@ -61776,37 +61933,59 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
             seen.add(key)
             ok, why = is_executable_setup_eligible(eff, session_name=sess)
             if not ok:
-                # ver10: last-mile bridge for rows that /setup_audit already shows as
-                # fresh Policy=KEEP. The normal scanner can later return
-                # combo_policy_quality_gate_blocked/all_candidates_blocked after the
-                # audit row was frozen; do not let that suppress the setup email and
-                # therefore AutoTrade. This is deliberately narrow and still requires
-                # _setup_snapshot_keep_delivery_escape() to validate KEEP policy, session,
-                # entry window, side and SL/TP geometry.
+                # ver14: if this is a frozen /setup_audit KEEP row that is still OPEN,
+                # allow it through the email/autotrade lane even when the volatile
+                # executable gate now says low_confidence/final_quality/etc.
                 try:
-                    src_kind_l = str(getattr(eff, 'source_kind', '') or '').lower().strip()
-                    is_audit_rec = src_kind_l == 'setup_audit_recovery' or bool(getattr(eff, 'setup_audit_recovery', False))
-                    why_l = str(why or '').lower()
-                    bypassable = any(tok in why_l for tok in ('combo_policy_quality_gate', 'final_quality_gate', 'all_candidates_blocked', 'policy_gate', 'watch_final_gate'))
-                    snap_ok, snap_why = _setup_snapshot_keep_delivery_escape(eff, session_name=sess)
-                    if is_audit_rec and bypassable and snap_ok:
-                        ok = True
-                        try:
-                            setattr(eff, 'ver10_audit_keep_presend_escape', True)
-                            setattr(eff, 'ver10_audit_keep_presend_reason', str(why or snap_why or 'audit_keep_recovery'))
-                            setattr(eff, 'policy_at_creation', 'KEEP')
-                            setattr(eff, 'delivery_policy', 'KEEP')
-                            setattr(eff, 'policy', 'KEEP')
-                        except Exception:
-                            pass
-                        try:
-                            db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_presend_gate', status='allow_audit_keep_recovery', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'blocked_reason': str(why or ''), 'escape_reason': str(snap_why or ''), 'gate_uid': int(gate_uid or 0)})
-                        except Exception:
-                            pass
-                    else:
-                        ok = False
+                    _audit_basic_ok, _audit_basic_why = _audit_recovery_frozen_keep_basic_allows(eff, session_name=sess)
                 except Exception:
-                    ok = False
+                    _audit_basic_ok, _audit_basic_why = False, 'audit_basic_exception'
+                if _audit_basic_ok:
+                    ok = True
+                    try:
+                        setattr(eff, 'ver14_audit_keep_presend_escape', True)
+                        setattr(eff, 'ver14_audit_keep_presend_reason', str(why or _audit_basic_why or 'frozen_audit_keep_open'))
+                        setattr(eff, 'policy_at_creation', 'KEEP')
+                        setattr(eff, 'delivery_policy', 'KEEP')
+                        setattr(eff, 'policy', 'KEEP')
+                    except Exception:
+                        pass
+                    try:
+                        db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_presend_gate', status='allow_frozen_audit_keep_open', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'blocked_reason': str(why or ''), 'escape_reason': str(_audit_basic_why or ''), 'gate_uid': int(gate_uid or 0)})
+                    except Exception:
+                        pass
+                if not ok:
+                    # ver10: last-mile bridge for rows that /setup_audit already shows as
+                    # fresh Policy=KEEP. The normal scanner can later return
+                    # combo_policy_quality_gate_blocked/all_candidates_blocked after the
+                    # audit row was frozen; do not let that suppress the setup email and
+                    # therefore AutoTrade. This is deliberately narrow and still requires
+                    # _setup_snapshot_keep_delivery_escape() to validate KEEP policy, session,
+                    # entry window, side and SL/TP geometry.
+                    try:
+                        src_kind_l = str(getattr(eff, 'source_kind', '') or '').lower().strip()
+                        is_audit_rec = src_kind_l == 'setup_audit_recovery' or bool(getattr(eff, 'setup_audit_recovery', False))
+                        why_l = str(why or '').lower()
+                        bypassable = any(tok in why_l for tok in ('combo_policy_quality_gate', 'final_quality_gate', 'all_candidates_blocked', 'policy_gate', 'watch_final_gate'))
+                        snap_ok, snap_why = _setup_snapshot_keep_delivery_escape(eff, session_name=sess)
+                        if is_audit_rec and bypassable and snap_ok:
+                            ok = True
+                            try:
+                                setattr(eff, 'ver10_audit_keep_presend_escape', True)
+                                setattr(eff, 'ver10_audit_keep_presend_reason', str(why or snap_why or 'audit_keep_recovery'))
+                                setattr(eff, 'policy_at_creation', 'KEEP')
+                                setattr(eff, 'delivery_policy', 'KEEP')
+                                setattr(eff, 'policy', 'KEEP')
+                            except Exception:
+                                pass
+                            try:
+                                db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_presend_gate', status='allow_audit_keep_recovery', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'blocked_reason': str(why or ''), 'escape_reason': str(snap_why or ''), 'gate_uid': int(gate_uid or 0)})
+                            except Exception:
+                                pass
+                        else:
+                            ok = False
+                    except Exception:
+                        ok = False
             if not ok:
                 reasons[str(why or 'not_executable')] += 1
                 try:
