@@ -1,4 +1,5 @@
 # ver32: /screen timeout hardening: full builder first returns recent actionable email/executable queue before heavy pool rebuild, and expected on-demand build timeouts fall back without Render WARNING noise.
+# ver35: BigMove confirmed alerts now create paired F8 setup emails via a controlled BigMove policy escape when the setup is technically executable, so alerts like WLD UP do not disappear from setup/email/audit lanes.
 # ver30: final pipeline hardening: stale /screen cards use real email age not refreshed executable_ts; BigMove generated-only diagnostics never enter executable/email lanes; setup-email recovery runs faster so KEEP setups are delivered promptly.
 # ver27: setup generation sync hardening: frozen audit Policy now recovers KEEP/WATCH from emailed_setups for legacy sent rows; /screen emailed fallback expires at the AutoTrade entry window; F8/BigMove 1.20R is accepted in DB/executable AutoTrade selector.
 # ver24: hard setup-email send reservation/dedup: atomic DB lock before SMTP by setup_id and identity prevents duplicate NEAR emails during rapid deploy/recovery/screen jobs.
@@ -20954,7 +20955,11 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
         except Exception:
             routed_side, routed_strategy = str(side or '').upper().strip(), ''
         setattr(s, 'why', f"Confirmed Big-Move alert {str(c.get('direction') or '').upper()} | Routed {routed_strategy or 'NOR'} {routed_side or str(side).upper()} | SL {float(plan.get('sl_pct') or 0.0):.2f}% ({plan.get('sl_model')}) | TP {float(plan.get('tp_pct') or 0.0):.2f}% (~{float(plan.get('rr') or BIGMOVE_AUTOTRADE_RR):.2f}R)")
-        return _research_finalize_setup(s, session_name=session_name)
+        try:
+            final_s = _research_finalize_setup(s, session_name=session_name)
+            return final_s if final_s is not None else s
+        except Exception:
+            return s
     except Exception:
         return None
 
@@ -59102,7 +59107,13 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 # still return a useful result and must not poison the bot with a failure loop.
                 try:
                     if isinstance(_build_e, (asyncio.TimeoutError, TimeoutError)):
-                        logger.info('screen full builder timed out uid=%s session=%s; fallback served; dedicated scan will refresh cache later', uid, scan_session)
+                        
+                        # ver34: timeout here is an expected graceful fallback, not an operational warning.
+                        # Keep Render logs clean while still allowing opt-in INFO diagnostics.
+                        if str(os.getenv('SCREEN_TIMEOUT_INFO_LOG', 'false')).strip().lower() in ('1', 'true', 'yes', 'on'):
+                            logger.info('screen full builder timed out uid=%s session=%s; fallback served; dedicated scan will refresh cache later', uid, scan_session)
+                        else:
+                            logger.debug('screen full builder timed out uid=%s session=%s; fallback served; dedicated scan will refresh cache later', uid, scan_session)
                     else:
                         logger.warning('screen full builder failed uid=%s session=%s: %s: %s', uid, scan_session, type(_build_e).__name__, _build_e)
                 except Exception:
@@ -60576,12 +60587,47 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
                 continue
             keep_ok, keep_why, keep_meta = _setup_user_visible_keep_policy_allows(eff, session_name=sess, user_id=int(gate_uid or uid or 0), lane=str(lane or 'email'))
             if not keep_ok:
-                reasons[str(keep_why or 'email_policy_not_keep')] += 1
+                # Ver35: a confirmed Big-Move alert is already a user-visible market event.
+                # If it has been converted into a valid F8 setup (SL/TP/RR/executable OK),
+                # do not silently drop the paired setup email just because the generic
+                # lane policy is WATCH/GATE/OFF at that moment.  This fixes cases like
+                # WLD UP where the Big-Move alert email was delivered but no setup row/email
+                # appeared in /setup_audit, /screen, or AutoTrade.  Normal non-BigMove
+                # setup emails still require KEEP exactly as before.
                 try:
-                    db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
+                    _lane_l = str(lane or '').lower()
+                    _fam_l = str(getattr(eff, 'family_id', '') or getattr(eff, 'family', '') or '').upper()
+                    _sid_l = str(sid or '').upper()
+                    _is_bm = (_lane_l == 'bigmove_setup_email') and (_fam_l in {'F8', 'BIGMOVE', 'BIGMOVE/F8', 'F8_BIGMOVE_CONT'} or _sid_l.startswith(('BMAT-', 'BIGMOVE-')) or bool(getattr(eff, 'bigmove_signal', False)))
+                    _bm_conf = int(getattr(eff, 'conf', 0) or 0) >= 82
+                    _bm_side = str(getattr(eff, 'side', '') or '').upper() in {'BUY', 'SELL'}
+                    if _is_bm and _bm_conf and _bm_side:
+                        try:
+                            setattr(eff, 'policy_at_creation', 'KEEP')
+                            setattr(eff, 'delivery_policy', 'KEEP')
+                            setattr(eff, 'policy', 'KEEP')
+                            setattr(eff, 'bigmove_policy_escape', True)
+                            setattr(eff, 'bigmove_policy_escape_reason', str(keep_why or 'bigmove_confirmed_setup_policy_escape'))
+                        except Exception:
+                            pass
+                        try:
+                            db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='allow_bigmove_escape', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
+                        except Exception:
+                            pass
+                    else:
+                        reasons[str(keep_why or 'email_policy_not_keep')] += 1
+                        try:
+                            db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
+                        except Exception:
+                            pass
+                        continue
                 except Exception:
-                    pass
-                continue
+                    reasons[str(keep_why or 'email_policy_not_keep')] += 1
+                    try:
+                        db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
+                    except Exception:
+                        pass
+                    continue
             # yver159: keep setup email /screen /AutoTrade aligned when normal and
             # Big-Move/F8 create the same symbol at the same time.  Do not send a
             # weaker same-symbol setup if a stronger exact-lane setup was already
