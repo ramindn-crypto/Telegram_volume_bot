@@ -1,3 +1,4 @@
+# ver32: /screen timeout hardening: full builder first returns recent actionable email/executable queue before heavy pool rebuild, and expected on-demand build timeouts fall back without Render WARNING noise.
 # ver30: final pipeline hardening: stale /screen cards use real email age not refreshed executable_ts; BigMove generated-only diagnostics never enter executable/email lanes; setup-email recovery runs faster so KEEP setups are delivered promptly.
 # ver27: setup generation sync hardening: frozen audit Policy now recovers KEEP/WATCH from emailed_setups for legacy sent rows; /screen emailed fallback expires at the AutoTrade entry window; F8/BigMove 1.20R is accepted in DB/executable AutoTrade selector.
 # ver24: hard setup-email send reservation/dedup: atomic DB lock before SMTP by setup_id and identity prevents duplicate NEAR emails during rapid deploy/recovery/screen jobs.
@@ -58546,6 +58547,58 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     leaders_txt = build_leaders_table(best_fut)  # fast (top by futures volume)
     up_list, dn_list = compute_directional_lists(best_fut)
 
+    # Ver32: fast-path /screen from the already-synced delivery/executable lane before
+    # starting the expensive OHLCV/pool rebuild. This prevents harmless Render WARNINGs
+    # from on-demand /screen timeouts and keeps /screen aligned with setup email +
+    # AutoTrade. If no recent actionable row exists, we still fall through to the
+    # normal full builder so setup generation continues working.
+    try:
+        _early_setups = list(_recent_email_lane_screen_setups(int(uid), str(session or ''), max_age_min=_screen_actionable_fallback_max_age_min(), limit=max(1, int(SETUPS_N))) or [])
+        if _early_setups:
+            try:
+                _early_setups = [s for s in list(_early_setups or []) if _setup_volume_ok(s)]
+                _early_setups = _filter_user_visible_keep_setups(_early_setups, session_name=str(session or ''), user_id=int(uid), lane='screen')
+                _early_setups = list(_early_setups or [])[:_screen_display_limit()]
+            except Exception:
+                _early_setups = list(_early_setups or [])[:max(1, int(SETUPS_N))]
+            if _early_setups:
+                try:
+                    for _s in (_early_setups or []):
+                        if not hasattr(_s, 'conf') or _s.conf is None:
+                            _s.conf = 0
+                        _remember_recent_screen_signal(_s, session=session, user_id=uid)
+                except Exception:
+                    pass
+                _combined = _screen_format_setup_cards(_early_setups, int(uid), str(session or ''))
+                try:
+                    _market_txt = _screen_market_context_table(best_fut, leaders=up_list, losers=dn_list)
+                except Exception:
+                    _market_txt = ''
+                _body = "\n".join([
+                    '',
+                    '*Top Trade Setups*',
+                    SEP,
+                    '_Showing recent synced setup queue while the full scan refreshes. Stale setups are capped to the AutoTrade entry window._',
+                    _combined,
+                    '',
+                    _market_txt or '',
+                ]).strip()
+                _kb = []
+                try:
+                    _kb = [(s.symbol, s.setup_id) for s in (_early_setups or [])][:_screen_display_limit()]
+                except Exception:
+                    _kb = []
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='screen_fast_synced_queue', status='ok', session=str(session or ''), mode='screen', details={'shown': len(_early_setups), 'reason': 'ver32_pre_heavy_builder'})
+                except Exception:
+                    pass
+                return _body, _kb, list(_early_setups or [])
+    except Exception as _early_e:
+        try:
+            db_log_setup_pipeline_event(int(uid), stage='screen_fast_synced_queue', status='error', session=str(session or ''), mode='screen', details={'error': f'{type(_early_e).__name__}: {_early_e}'})
+        except Exception:
+            pass
+
     # Build the CURRENT executable pool first, persist it as the authoritative
     # executable queue for this user/session, then read /screen back from that same
     # source of truth so /screen and autotrade are wired to the same lane.
@@ -59048,7 +59101,10 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 # Ver07: if the full OHLCV executable builder fails/times out, /screen must
                 # still return a useful result and must not poison the bot with a failure loop.
                 try:
-                    logger.warning('screen full builder failed uid=%s session=%s: %s: %s', uid, scan_session, type(_build_e).__name__, _build_e)
+                    if isinstance(_build_e, (asyncio.TimeoutError, TimeoutError)):
+                        logger.info('screen full builder timed out uid=%s session=%s; using recent DB/market fallback', uid, scan_session)
+                    else:
+                        logger.warning('screen full builder failed uid=%s session=%s: %s: %s', uid, scan_session, type(_build_e).__name__, _build_e)
                 except Exception:
                     pass
                 body, kb, shown_setups = _screen_recent_db_body_and_kb(
