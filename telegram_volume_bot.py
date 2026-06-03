@@ -1,3 +1,4 @@
+# ver13: deploy-start catch-up hardening: immediate startup setup/email recovery, faster DB-first recovery cadence, and no email/autotrade for audit rows already resolved TP/SL before recovery.
 # ver12: restores autonomous setup generation by allowing the isolated alert/email engine enough runtime, starts recovery quickly after deploy, and sorts /setup_audit strictly by time.
 # ver11: fixes /setup_matrix policy ordered full-page delivery and makes /screen/email/autotrade consume fresh /setup_audit KEEP rows even when raw audit load is dominated by newer OFF rows.
 # ver10: fix audit/email/screen/autotrade sync starvation: alert_job no longer skips the setup-email lane during admin commands; fresh /setup_audit KEEP recovery rows are shown on /screen and can be emailed/autotraded.
@@ -61470,6 +61471,64 @@ def _setup_audit_rows_to_recovery_setup_objects(rows: list, session_name: str = 
     return out
 
 
+
+def _setup_audit_recovery_row_still_open(row: Any, horizon_hours: int | None = None) -> tuple[bool, str]:
+    """Return True only when an audit-recovery row is still actionable.
+
+    ver13: after a Render deploy, /setup_audit may contain KEEP rows created before
+    the new worker started.  If the cached price-path has already resolved them to
+    TP/SL, they are useful for analytics but must not be emailed or AutoTraded.
+    """
+    try:
+        if isinstance(row, dict):
+            rr = dict(row or {})
+        else:
+            rr = {
+                'setup_id': str(getattr(row, 'setup_id', '') or getattr(row, 'id', '') or ''),
+                'symbol': str(getattr(row, 'symbol', '') or ''),
+                'market_symbol': str(getattr(row, 'market_symbol', '') or ''),
+                'side': str(getattr(row, 'side', '') or ''),
+                'entry': float(getattr(row, 'entry', 0.0) or 0.0),
+                'sl': float(getattr(row, 'sl', 0.0) or 0.0),
+                'tp': float(_setup_target_tp(row, 0.0) or getattr(row, 'tp', 0.0) or 0.0),
+                'alt_target_a': float(getattr(row, 'alt_target_a', 0.0) or 0.0),
+                'alt_target_b': float(getattr(row, 'alt_target_b', 0.0) or 0.0),
+                'created_ts': float(getattr(row, 'created_ts', 0.0) or 0.0),
+                'signal_created_ts': float(getattr(row, 'signal_created_ts', 0.0) or 0.0),
+                'executable_ts': float(getattr(row, 'executable_ts', 0.0) or 0.0),
+                'ts': float(getattr(row, 'executable_ts', 0.0) or getattr(row, 'created_ts', 0.0) or 0.0),
+                'session': str(getattr(row, 'session', '') or getattr(row, 'source_session', '') or ''),
+            }
+        rr = _setup_audit_payload_from_row(rr)
+        sid = str(rr.get('setup_id') or '').strip()
+        try:
+            h = int(horizon_hours or _setup_audit_result_horizon_hours() or 24)
+        except Exception:
+            h = 24
+        result = 'OPEN'
+        try:
+            cached = _setup_audit_cached_result(sid, h, allow_open_fresh_sec=3600) if sid else {}
+            result = _setup_audit_result_label((cached or {}).get('result'))
+        except Exception:
+            result = 'OPEN'
+        if result == 'OPEN':
+            try:
+                fast = str(_setup_audit_result_from_cached_price_moves(rr, int(h)) or '').upper().strip()
+                if fast in {'WIN', 'TP'}:
+                    result = 'TP'
+                elif fast in {'LOSE', 'LOSS', 'SL'}:
+                    result = 'SL'
+                elif fast in {'NOHIT', 'NH'}:
+                    result = 'NOHIT'
+            except Exception:
+                pass
+        if result in {'TP', 'SL', 'NOHIT'}:
+            return False, result
+        return True, 'OPEN'
+    except Exception as exc:
+        # Fail open here; normal executable/policy/duplicate gates still run.
+        return True, f'unknown:{type(exc).__name__}'
+
 def _setup_recent_audit_actionable_recovery_candidates(user_id: int, session_name: str, *, max_age_min: int | None = None, limit: int = 48) -> list:
     """Last-mile recovery from /setup_audit's current actionable KEEP rows.
 
@@ -61523,6 +61582,16 @@ def _setup_recent_audit_actionable_recovery_candidates(user_id: int, session_nam
                     continue
                 if not _setup_audit_row_inside_delivery_window(r):
                     reasons['outside_delivery_window'] += 1
+                    continue
+                # ver13: a deploy can restart the worker after a setup was already
+                # resolved by price path.  Do not email/autotrade historical KEEP
+                # rows that are now TP/SL; keep them only in /setup_audit analytics.
+                try:
+                    _still_open, _open_state = _setup_audit_recovery_row_still_open(r)
+                except Exception:
+                    _still_open, _open_state = True, 'OPEN'
+                if not _still_open:
+                    reasons[f'already_resolved_{_open_state}'] += 1
                     continue
                 # Ver38: prefer the frozen creation/delivery policy from the
                 # stored audit row. /setup_audit is the user's source of truth;
@@ -61745,6 +61814,19 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
                 except Exception:
                     pass
                 continue
+            try:
+                _src_kind_l = str(getattr(eff, 'source_kind', '') or '').lower().strip()
+                if _src_kind_l == 'setup_audit_recovery' or bool(getattr(eff, 'setup_audit_recovery', False)):
+                    _still_open, _open_state = _setup_audit_recovery_row_still_open(eff)
+                    if not _still_open:
+                        reasons[f'audit_recovery_already_resolved_{_open_state}'] += 1
+                        try:
+                            db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_presend_gate', status='skip_resolved_audit_recovery', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'result': str(_open_state or ''), 'gate_uid': int(gate_uid or 0)})
+                        except Exception:
+                            pass
+                        continue
+            except Exception:
+                pass
             keep_ok, keep_why, keep_meta = _setup_user_visible_keep_policy_allows(eff, session_name=sess, user_id=int(gate_uid or uid or 0), lane=str(lane or 'email'))
             if not keep_ok:
                 _snap_ok, _snap_why = _setup_snapshot_keep_delivery_escape(eff, session_name=sess)
@@ -62312,7 +62394,7 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "6"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "28"))  # ver12: allow one live pool build to finish inside isolated alert worker
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "35"))  # ver13: allow startup/deploy live pool build to finish inside isolated alert worker
 EMAIL_SEND_TIMEOUT_SEC = max(6, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "8") or 8))
 # yver172: the alert pipeline runs in the background; killing it after 20–25s
 # prevented the session email pool from completing, so no setup emails were sent.
@@ -62326,14 +62408,14 @@ ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "75"
 SETUP_EMAIL_RECOVERY_JOB_ENABLED = env_bool("SETUP_EMAIL_RECOVERY_JOB_ENABLED", True)
 # ver03: recovery is a fallback lane, not the main scanner. Run it less often and
 # hard-time it so it cannot cause APScheduler max_instances warnings or UI lag.
-SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "180") or 180)  # ver11: reduce recovery-lane pressure
-SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "45") or 45)  # ver12: quicker recovery after deploy
-SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC", "18") or 18)  # ver12: enough time to consume/email fresh KEEP audit rows
+SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "45") or 45)  # ver13: DB-first recovery must catch fresh KEEP rows before they resolve
+SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "8") or 8)  # ver13: immediate recovery after deploy
+SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC", "28") or 28)  # ver13: enough time to consume/email fresh KEEP audit rows
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
-AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "180") or 180)
-AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "45") or 45)  # ver12: start setup generation quickly after deploy
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "120") or 120)
+AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "8") or 8)  # ver13: start setup generation immediately after deploy
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
 ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "1"))
@@ -62356,7 +62438,7 @@ BIGMOVE_FIRE_AND_FORGET_ENABLED = env_bool("BIGMOVE_FIRE_AND_FORGET_ENABLED", Tr
 # Ver22: autonomous setup discovery must stay hot. A 10-minute rebuild floor made /screen
 # look like the trigger because manual /screen used the dedicated screen lane while the
 # email lane waited on stale/empty pools. Keep it short by default.
-EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "120"))
+EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "45"))  # ver13: deployment/startup must not wait two minutes before rebuilding the email pool
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
 PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "300"))
@@ -67067,11 +67149,11 @@ def main():
         # Previous code still forced a 300s minimum, so the Ver39 180s setting was
         # not actually honoured.  Runtime/overlap is still protected by ALERT_LOCK,
         # max_instances=1 and coalesce=True.
-        interval_sec = max(180, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 180), int(ALERT_JOB_MAX_RUNTIME_SEC or 35) + 120)
+        interval_sec = max(120, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 120), int(ALERT_JOB_MAX_RUNTIME_SEC or 35) + 45)
     
         # ver12: do not wait 5 minutes after deploy before the first autonomous
         # setup/email scan. The engine is isolated, so a quick first tick is safe.
-        _alert_first_delay = max(15, min(interval_sec, int(os.getenv('ALERT_JOB_FIRST_RUN_DELAY_SEC', str(globals().get('AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC', 45))) or globals().get('AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC', 45))))
+        _alert_first_delay = max(5, min(interval_sec, int(os.getenv('ALERT_JOB_FIRST_RUN_DELAY_SEC', str(globals().get('AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC', 8))) or globals().get('AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC', 8))))
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
@@ -67083,6 +67165,18 @@ def main():
                 "misfire_grace_time": 300,
             },
         )
+        # ver13: explicit deploy bootstrap.  Render restarts can happen while a
+        # KEEP row is inside the entry window; do one immediate isolated tick in
+        # addition to the repeating schedule so setup email/AutoTrade does not wait.
+        try:
+            app.job_queue.run_once(
+                alert_job,
+                when=max(3, min(10, int(os.getenv('ALERT_JOB_BOOTSTRAP_DELAY_SEC', '6') or 6))),
+                name="alert_job_bootstrap_ver13",
+                job_kwargs={"misfire_grace_time": 120},
+            )
+        except Exception:
+            pass
 
 
         # yver172: independent DB-first recovery lane. If the heavier alert/session
@@ -67093,10 +67187,10 @@ def main():
                 # Ver30: 15-minute recovery was too slow; KEEP setups could sit in
                 # /setup_audit for many minutes without email. Keep it lightweight and
                 # run every ~3 minutes by default.
-                _rec_interval = max(180, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 180) or 180))
+                _rec_interval = max(45, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 45) or 45))
                 # ver12: start DB/audit recovery quickly after deploy; it is
                 # isolated and bounded, so the old 300s first delay only delayed emails.
-                _rec_first_delay = max(15, min(_rec_interval, int(os.getenv('SETUP_EMAIL_RECOVERY_JOB_FIRST_DELAY_SEC', str(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 45))) or globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 45))))
+                _rec_first_delay = max(5, min(_rec_interval, int(os.getenv('SETUP_EMAIL_RECOVERY_JOB_FIRST_DELAY_SEC', str(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 8))) or globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 8))))
                 app.job_queue.run_repeating(
                     setup_email_recovery_job_runner,
                     interval=_rec_interval,
@@ -67104,6 +67198,18 @@ def main():
                     name="setup_email_recovery_job",
                     job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
                 )
+                # ver13: run the DB-first recovery lane almost immediately after
+                # deployment so pre-deploy fresh KEEP rows are either consumed if
+                # still OPEN or explicitly skipped if already TP/SL.
+                try:
+                    app.job_queue.run_once(
+                        setup_email_recovery_job_runner,
+                        when=max(4, min(12, int(os.getenv('SETUP_EMAIL_RECOVERY_BOOTSTRAP_DELAY_SEC', '8') or 8))),
+                        name="setup_email_recovery_bootstrap_ver13",
+                        job_kwargs={"misfire_grace_time": 120},
+                    )
+                except Exception:
+                    pass
             except Exception as _rec_sched_exc:
                 try:
                     logger.warning('setup_email_recovery_job schedule failed: %s', _rec_sched_exc)
