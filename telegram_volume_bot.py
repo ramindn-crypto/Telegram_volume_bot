@@ -1,3 +1,4 @@
+# ver18: fixes /screen last-mile display from /setup_audit KEEP+OPEN rows by adding a direct, no-live-refilter audit recovery renderer before quick ticker fallback; keeps session-gap email/AutoTrade blocked unless unlimited is enabled.
 # ver17: fixes session-gap recovery: /screen/email/autotrade now directly consumes fresh /setup_audit KEEP+OPEN rows from ALL audit sources even when current live session is NONE and scan bucket is NY.
 # ver16: fixes audit KEEP recovery crash: undefined _setup_audit_autotrade_state_for_row made /screen/email/AutoTrade ignore fresh KEEP OPEN rows visible in /setup_audit.
 # ver15: fixes /setup_audit KEEP rows missing from /screen/email/AutoTrade when the row exists only in generated_setups by making audit-recovery load ALL audit sources, not executable-only.
@@ -59156,7 +59157,20 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
         return "🟢" if p >= 0 else "🔴"
 
     visible_setups = [s for s in list(setups or []) if _setup_volume_ok(s) and _screen_setup_within_actionable_window(s)]
-    visible_setups = _filter_user_visible_keep_setups(visible_setups, session_name=session, user_id=int(uid or 0), lane='screen')
+    # ver18: frozen /setup_audit KEEP recovery rows already passed the visible
+    # audit policy and must not be dropped by a later volatile live re-filter.
+    try:
+        _audit_recovery_visible = [
+            s for s in visible_setups
+            if bool(getattr(s, 'setup_audit_recovery', False))
+            and str(getattr(s, 'policy_at_creation', '') or getattr(s, 'delivery_policy', '') or getattr(s, 'policy', '') or '').upper().strip() == 'KEEP'
+        ]
+    except Exception:
+        _audit_recovery_visible = []
+    if _audit_recovery_visible:
+        visible_setups = _audit_recovery_visible
+    else:
+        visible_setups = _filter_user_visible_keep_setups(visible_setups, session_name=session, user_id=int(uid or 0), lane='screen')
     if not visible_setups:
         if _user_visible_require_keep_policy('screen'):
             return "_No KEEP/WATCH policy setup right now. Background scanner is still collecting DISABLE/probation evidence for learning._"
@@ -59216,6 +59230,186 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
             continue
 
     return ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
+
+
+def _screen_format_audit_recovery_cards_no_refilter(setups: list, uid: int, session: str) -> str:
+    """Format frozen /setup_audit KEEP recovery rows without live re-filtering.
+
+    Ver18: the normal /screen card formatter intentionally re-runs user-visible
+    policy/context filters. That is correct for live scanner output, but wrong for
+    frozen /setup_audit rows that already display as KEEP + OPEN + AT='-'.  Those
+    rows are the user's visible truth and must not disappear from /screen just
+    because a later volatile live recalculation flips the gate minutes later.
+    """
+    try:
+        items = list(setups or [])
+        if not items:
+            return "_No high-quality setups right now._"
+        lines2 = []
+        def _mv_dot(p: float) -> str:
+            try:
+                p = float(p or 0.0)
+            except Exception:
+                p = 0.0
+            if abs(p) < 2.0:
+                return "🟡"
+            return "🟢" if p >= 0 else "🔴"
+        for s in items[:_screen_display_limit()]:
+            try:
+                sym = str(getattr(s, "symbol", "") or "").upper().strip()
+                sid = str(getattr(s, "setup_id", "") or getattr(s, 'id', '') or "")
+                side = str(getattr(s, "side", "") or "").upper().strip()
+                conf = int(float(getattr(s, "conf", 0) or 0))
+                entry = float(getattr(s, "entry", 0.0) or 0.0)
+                sl = float(getattr(s, "sl", 0.0) or 0.0)
+                tp = float(_setup_target_tp(s, 0.0) or getattr(s, 'tp', 0.0) or 0.0)
+                vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+                ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
+                ch4 = float(getattr(s, "ch4", 0.0) or 0.0)
+                ch1 = float(getattr(s, "ch1", 0.0) or 0.0)
+                ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
+                if not sym or side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+                    continue
+                rr_den = abs(entry - sl)
+                rr = (abs(float(tp) - entry) / rr_den) if rr_den > 0 else 0.0
+                pos_word = "long" if side == "BUY" else "short"
+                size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+                emoji = "🟢" if side == "BUY" else "🔴"
+                fam_code = _setup_audit_family_code(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '')
+                block = [f"{emoji} *{side} — {sym}*"]
+                block.append(f"`{sid}` | Conf: `{conf}` | Family: `{fam_code}`")
+                block.append("📌 *Fresh /setup_audit KEEP recovery row* (not live-refiltered)")
+                block.append(f"RR(TP): `{rr:.2f}`")
+                block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
+                block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp, 0.0, 0.0, side) or 0.0))}`")
+                block.append(
+                    f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
+                    f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
+                )
+                block.append(f"Volume: ~{vol/1e6:.1f}M")
+                block.append(f"Chart: {tv_chart_url(sym)}")
+                block.append(f"`{size_cmd}`")
+                lines2.append("\n".join(block))
+            except Exception:
+                continue
+        return ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
+    except Exception:
+        return "_No high-quality setups right now._"
+
+
+def _screen_direct_audit_keep_recovery_body(uid: int, session: str, best_fut: dict | None = None, max_age_min: int | None = None, limit: int | None = None):
+    """Build a /screen body directly from /setup_audit KEEP+OPEN+AT='-' rows.
+
+    This is deliberately lighter than the normal DB/executable fallback and avoids
+    _resolve_same_symbol_setup_conflicts() / live policy re-filtering, both of which
+    caused ver17 to time out or drop rows that /setup_audit visibly showed as KEEP.
+    """
+    try:
+        uid = int(uid or 0)
+        if uid <= 0:
+            return '', [], []
+        sess = _setup_session_bucket_for_recovery(session)
+        if max_age_min is None:
+            max_age_min = _screen_actionable_fallback_max_age_min()
+        try:
+            max_age_min = max(1, int(max_age_min or 60))
+        except Exception:
+            max_age_min = 60
+        try:
+            lim = max(1, int(limit or _screen_display_limit() or 3))
+        except Exception:
+            lim = 3
+        candidates = list(_setup_audit_direct_keep_open_recovery_candidates(uid, session_name=sess, max_age_min=max_age_min, limit=max(12, lim * 6)) or [])
+        if not candidates:
+            try:
+                db_log_setup_pipeline_event(uid, stage='screen_direct_audit_keep_recovery_body', status='empty', session=str(sess or ''), mode='screen', details={'max_age_min': max_age_min})
+            except Exception:
+                pass
+            return '', [], []
+        out = []
+        seen_sym = set()
+        seen_id = set()
+        def _row_ts(x):
+            try:
+                return float(getattr(x, 'created_ts', 0.0) or getattr(x, 'signal_created_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or 0.0)
+            except Exception:
+                return 0.0
+        candidates.sort(key=_row_ts, reverse=True)
+        for s0 in candidates:
+            try:
+                sym = str(getattr(s0, 'symbol', '') or '').upper().strip()
+                sid = str(getattr(s0, 'setup_id', '') or getattr(s0, 'id', '') or '').strip()
+                side = str(getattr(s0, 'side', '') or '').upper().strip()
+                entry = float(getattr(s0, 'entry', 0.0) or 0.0)
+                sl = float(getattr(s0, 'sl', 0.0) or 0.0)
+                tp = float(_setup_target_tp(s0, 0.0) or getattr(s0, 'tp', 0.0) or 0.0)
+                if not sym or not sid or side not in {'BUY', 'SELL'}:
+                    continue
+                if sid in seen_id or sym in seen_sym:
+                    continue
+                if not _screen_setup_within_actionable_window(s0, max_age_min=max_age_min):
+                    continue
+                if not _setup_volume_ok(s0):
+                    continue
+                if side == 'BUY' and not (sl < entry < tp):
+                    continue
+                if side == 'SELL' and not (tp < entry < sl):
+                    continue
+                pol_snap = str(getattr(s0, 'policy_at_creation', '') or getattr(s0, 'delivery_policy', '') or getattr(s0, 'policy', '') or '').upper().strip()
+                if pol_snap != 'KEEP':
+                    continue
+                try:
+                    setattr(s0, 'source_kind', 'setup_audit_recovery')
+                    setattr(s0, 'setup_audit_recovery', True)
+                    setattr(s0, 'delivery_lane_locked', True)
+                    setattr(s0, 'frozen_keep_delivery_escape', True)
+                    setattr(s0, 'frozen_keep_delivery_escape_reason', 'screen_direct_audit_keep_recovery')
+                    setattr(s0, 'source_session', str(getattr(s0, 'source_session', '') or sess).upper().strip())
+                    setattr(s0, 'session', str(getattr(s0, 'session', '') or getattr(s0, 'source_session', '') or sess).upper().strip())
+                except Exception:
+                    pass
+                out.append(s0)
+                seen_sym.add(sym)
+                seen_id.add(sid)
+                if len(out) >= lim:
+                    break
+            except Exception:
+                continue
+        if not out:
+            try:
+                db_log_setup_pipeline_event(uid, stage='screen_direct_audit_keep_recovery_body', status='filtered_empty', session=str(sess or ''), mode='screen', details={'input': len(candidates), 'max_age_min': max_age_min})
+            except Exception:
+                pass
+            return '', [], []
+        try:
+            up_list, dn_list = compute_directional_lists(best_fut or {})
+        except Exception:
+            up_list, dn_list = [], []
+        try:
+            market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
+        except Exception:
+            market_txt = ''
+        body = "\n".join([
+            "",
+            "*Top Trade Setups*",
+            SEP,
+            "_Showing fresh /setup_audit KEEP recovery queue while the email/AutoTrade lane catches up._",
+            _screen_format_audit_recovery_cards_no_refilter(out, uid, sess),
+            "",
+            market_txt or "",
+        ]).strip()
+        kb = [(str(getattr(x, 'symbol', '') or '').upper(), str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or '')) for x in out]
+        try:
+            db_log_setup_pipeline_event(uid, stage='screen_direct_audit_keep_recovery_body', status='ok', session=str(sess or ''), mode='screen', details={'shown': len(out), 'input': len(candidates), 'max_age_min': max_age_min})
+        except Exception:
+            pass
+        return body, kb, list(out)
+    except Exception as exc:
+        try:
+            db_log_setup_pipeline_event(int(uid or 0), stage='screen_direct_audit_keep_recovery_body', status='error', session=str(session or ''), mode='screen', details={'error': f'{type(exc).__name__}: {exc}'})
+        except Exception:
+            pass
+        return '', [], []
 
 
 def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int | None = None, include_email_source: bool = True):
@@ -60083,15 +60277,27 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
             except Exception:
                 _best_cached_recovery = {}
             try:
+                # ver18: direct audit KEEP renderer first. It does not re-run live
+                # quality/policy filters and it is much lighter than the generic DB fallback.
                 body, kb, shown_setups = await to_thread_fast(
-                    _screen_recent_db_body_and_kb,
+                    _screen_direct_audit_keep_recovery_body,
                     int(uid or 0),
                     str(scan_session or '').upper(),
                     _best_cached_recovery or {},
                     max_age_min=int(_recovery_first_min),
-                    include_email_source=True,
-                    timeout=int(os.getenv('SCREEN_RECOVERY_FIRST_TIMEOUT_SEC', '6') or 6),
+                    limit=max(1, int(SETUPS_N)),
+                    timeout=int(os.getenv('SCREEN_DIRECT_AUDIT_RECOVERY_TIMEOUT_SEC', '4') or 4),
                 )
+                if not body:
+                    body, kb, shown_setups = await to_thread_fast(
+                        _screen_recent_db_body_and_kb,
+                        int(uid or 0),
+                        str(scan_session or '').upper(),
+                        _best_cached_recovery or {},
+                        max_age_min=int(_recovery_first_min),
+                        include_email_source=True,
+                        timeout=int(os.getenv('SCREEN_RECOVERY_FIRST_TIMEOUT_SEC', '6') or 6),
+                    )
             except Exception:
                 body, kb, shown_setups = '', [], []
             if body and shown_setups:
@@ -60520,6 +60726,41 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             latest_delivery_ts = 0.0
         cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
 
+        # ver18: if /setup_audit has fresh KEEP+OPEN rows, show them before any
+        # cached market-only /screen body. This also helps deployments where
+        # SCREEN_ACK_FIRST_MODE is disabled.
+        try:
+            quick_best_audit = get_cached_futures_tickers() or {}
+            body_a, kb_a, shown_a = _screen_direct_audit_keep_recovery_body(
+                int(uid), str(scan_session or '').upper(), quick_best_audit,
+                max_age_min=screen_fallback_min, limit=max(1, int(SETUPS_N))
+            )
+            if body_a and shown_a:
+                header_a = (
+                    f"*PulseFutures — Market Scan*\n"
+                    f"{HDR}\n"
+                    f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                    f"{_screen_when_line('Synced /setup_audit KEEP queue built', time.time())}"
+                )
+                keyboard_a = [[InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))] for (sym, sid) in (kb_a or [])]
+                await send_long_message(
+                    update,
+                    _screen_markdown_to_html((header_a + "\n" + body_a).strip()),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=InlineKeyboardMarkup(keyboard_a) if keyboard_a else None,
+                )
+                try:
+                    _safe_create_task(
+                        _screen_sync_pipeline_async(int(uid), dict(user or {}), str(live_session or ''), str(scan_session or '').upper(), quick_best_audit or {}, list(shown_a or [])),
+                        'screen_direct_audit_sync_once'
+                    )
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
         # Latest setup email wins over a cached scan only for Pro/trial users and admins,
         # because Standard users do not receive setup emails.
         if latest_delivery_ts > 0:
@@ -60635,13 +60876,21 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             quick_best = get_cached_futures_tickers() or {}
             if quick_best:
-                body, kb, shown_setups = _screen_recent_db_body_and_kb(
+                body, kb, shown_setups = _screen_direct_audit_keep_recovery_body(
                     int(uid),
                     str(scan_session or '').upper(),
                     quick_best,
                     max_age_min=screen_fallback_min,
-                    include_email_source=bool(can_show_email_source),
+                    limit=max(1, int(SETUPS_N)),
                 )
+                if not body:
+                    body, kb, shown_setups = _screen_recent_db_body_and_kb(
+                        int(uid),
+                        str(scan_session or '').upper(),
+                        quick_best,
+                        max_age_min=screen_fallback_min,
+                        include_email_source=bool(can_show_email_source),
+                    )
                 if body:
                     try:
                         source_ts = max([float(getattr(x, 'email_logged_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0) for x in (shown_setups or [])] or [0.0])
@@ -66839,7 +67088,7 @@ async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
             # waits for /sessions_on_unlimited or the next live session.
             _LAST_EMAIL_DECISION[uid] = {
                 'status': 'SKIP',
-                'reasons': ['recovery_not_in_enabled_session', f'fallback_scan_bucket={_setup_session_bucket_for_recovery("")}'],
+                'reasons': ['recovery_not_in_enabled_session', f'fallback_scan_bucket={_setup_session_bucket_for_recovery("")}', 'setup_email_autotrade_blocked_during_session_gap_unless_sessions_unlimited'],
                 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             }
             return
