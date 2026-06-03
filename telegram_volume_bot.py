@@ -1,3 +1,4 @@
+# ver27: setup generation sync hardening: frozen audit Policy now recovers KEEP/WATCH from emailed_setups for legacy sent rows; /screen emailed fallback expires at the AutoTrade entry window; F8/BigMove 1.20R is accepted in DB/executable AutoTrade selector.
 # ver24: hard setup-email send reservation/dedup: atomic DB lock before SMTP by setup_id and identity prevents duplicate NEAR emails during rapid deploy/recovery/screen jobs.
 # ver22: setup-audit AT lifecycle attribution fix: AT_OPEN is tied to the exact latest OPEN setup_id for the live symbol/side, preventing older same-symbol OFF rows from inheriting a newer open position.
 # ver21: frozen setup-policy snapshot fix: freezes KEEP/WATCH at executable/email creation, audit displays creation policy not live recalculation, and AutoTrade accepts emailed snapshot policy while keeping drift/risk gates.
@@ -13,6 +14,7 @@
 # yver166: final live-sync patch: no permanent hard-block symbols by default, symbol micro-blocks remain rolling/max 24h, /autotrade_config hides daily-loss pct control, and setup email lane always merges recent actionable KEEP candidates so /setup_audit KEEP rows are not missed.
 # yver163: day-time-session live guard from ver161 baseline; ignores ver162 liquidity/soft-stop changes; synced /screen setup-email AutoTrade context gate; Monday pre-ASIA, Monday ASIA market-tone, and Saturday pre-ASIA directional filters.
 # yver161: final sync hardening for Monday audit: delivered/AutoTraded setup IDs are preserved in /setup_audit instead of daily de-duping them away; BigMove/F8 setup-email rows hydrate /screen from executable_setups even when signals metadata is missing; Bybit-verified AutoTrade TP/SL can override candle-audit for traded rows; weekly policy catch-up window/retry hardened; admin cache namespace bumped.
+# yver28: promote small-sample high-WR positive-payoff lanes (decided>=3, WR>=66%, AvgR>=+0.35, TP>SL) to KEEP so lanes like F2-ASIA-REV-SELL and F4-ASIA-REV-SELL are not stuck as WATCH when evidence is strong enough.
 # yver153: broaden experimental strong-KEEP promotion for high payoff lanes (>=4 decided, WR>=60%, AvgR>=+0.60), so lanes such as F8-LON-NOR-SELL and F6-NY-REV-SELL can be live-tested as KEEP; no risk/SL/TP changes.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
@@ -3250,6 +3252,12 @@ SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR = float(os.environ.get("SETUP_COMBO_
 SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED", "4") or 4)
 SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR", "60.0") or 60.0)
 SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR", "0.60") or 0.60)
+# yver28: medium/small sample promotion for high-WR, positive-payoff lanes.
+# This is intentionally still stricter than WATCH: it needs at least 3 decided,
+# about 2 wins out of 3 (66%+), positive AvgR, and TP count greater than SL count.
+SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_DECIDED = int(os.environ.get("SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_DECIDED", "3") or 3)
+SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_WR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_WR", "66.0") or 66.0)
+SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_AVGR = float(os.environ.get("SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_AVGR", "0.35") or 0.35)
 
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
 # matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
@@ -4261,11 +4269,50 @@ def _setup_policy_snapshot_from_row(row: dict) -> dict:
 
 
 def _setup_frozen_policy_label(row: dict) -> str:
+    """Return the immutable delivery policy for a setup-audit row.
+
+    Ver27: prefer the row snapshot, but recover legacy sent rows from emailed_setups.
+    Older deploys could re-upsert executable_setups after a policy/safety refresh and
+    overwrite policy_at_creation to OFF while the setup had already been emailed as
+    actionable. For audit, an actually emailed setup must keep its delivery policy
+    frozen. Because setup emails are KEEP-only unless WATCH is explicitly allowed, a
+    legacy emailed row with no useful snapshot is recovered as KEEP.
+    """
     try:
-        snap = _setup_policy_snapshot_from_row(row)
+        rr = dict(row or {})
+        snap = _setup_policy_snapshot_from_row(rr)
         st = str(snap.get('policy_at_creation') or '').upper().strip()
-        if st in {'KEEP', 'WATCH', 'OFF'}:
+        if st in {'KEEP', 'WATCH'}:
             return st
+
+        sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
+        if sid:
+            try:
+                with sqlite3.connect(DB_PATH) as con:
+                    con.row_factory = sqlite3.Row
+                    cur = con.cursor()
+                    try:
+                        cols = {r[1] for r in cur.execute('PRAGMA table_info(emailed_setups)').fetchall()}
+                    except Exception:
+                        cols = set()
+                    if cols:
+                        pol_expr = "COALESCE(policy_at_creation,'')" if 'policy_at_creation' in cols else "''"
+                        row2 = cur.execute(
+                            f"SELECT {pol_expr} AS pol, MAX(emailed_ts) AS ets FROM emailed_setups WHERE setup_id=?",
+                            (sid,),
+                        ).fetchone()
+                        if row2 and float(row2['ets'] or 0.0) > 0:
+                            pol = str(row2['pol'] or '').upper().strip()
+                            if pol in {'KEEP', 'WATCH'}:
+                                return pol
+                            # Legacy setup emails had no frozen column; delivery itself
+                            # proves this was an actionable KEEP-lane setup.
+                            return 'KEEP'
+            except Exception:
+                pass
+
+        if st == 'OFF':
+            return 'OFF'
     except Exception:
         pass
     return ''
@@ -5221,14 +5268,17 @@ def _setup_email_actionable_queue_window_min() -> int:
 
 
 def _screen_actionable_fallback_max_age_min() -> int:
-    """Keep /screen's delivery/executable fallback age aligned with entry window."""
+    """Keep /screen's emailed/executable fallback age capped to the AutoTrade entry window.
+
+    Ver27: /screen should not keep advertising an old emailed setup after AutoTrade
+    is no longer allowed to open it. The previous implementation used max(screen
+    fallback age, entry window), so an env/default screen fallback > 60m could keep
+    showing stale setup cards even though AUTOTRADE_ENTRY_WINDOW_MIN was 60.
+    """
     try:
-        return max(int(SCREEN_FALLBACK_MAX_AGE_MIN or 45), int(_autotrade_entry_window_min()))
+        return int(_autotrade_entry_window_min())
     except Exception:
-        try:
-            return max(int(SCREEN_FALLBACK_MAX_AGE_MIN or 45), 60)
-        except Exception:
-            return 60
+        return 60
 
 
 def _setup_delivery_actionable_window_sec() -> float:
@@ -12934,7 +12984,21 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         if conf < conf_floor:
             return (False, "below_exec_conf")
         rr_final = float(rr_to_tp(entry, sl, final_tp)) if final_tp > 0 else 0.0
-        if rr_final < float(sess_rr):
+        # Ver27: DB/executable BigMove rows can be selected before they are hydrated
+        # as source_kind=emailed_setups. They use the configured BigMove/reverse RR
+        # around 1.20R, so the normal session RR floor must not reject them as
+        # below_exec_rr. Structural price, confidence, drift, duplicate and capital
+        # guards still run after selection.
+        rr_floor = float(sess_rr)
+        try:
+            fam_for_rr = str(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '').upper().strip()
+            sid_for_rr = str(getattr(s, 'setup_id', '') or '').upper().strip()
+            is_f8_rr = fam_for_rr in {'F8', 'F8_BIGMOVE_CONT', 'BIGMOVE', 'BIG_MOVE', 'BIGMOVE/F8'} or sid_for_rr.startswith(('BMAT-', 'BIGMOVE-'))
+            if is_f8_rr:
+                rr_floor = min(rr_floor, max(1.0, float(getattr(s, 'bigmove_rr', 0.0) or globals().get('SETUP_REVERSE_TARGET_RR', 1.2) or 1.2)))
+        except Exception:
+            pass
+        if rr_final < float(rr_floor):
             return (False, "below_exec_rr")
         return (True, "ok")
     except Exception:
@@ -50279,6 +50343,13 @@ def _setup_combo_experimental_keep_override(decided: int, tp: int, sl: int, wr: 
         min_avg = float(globals().get('SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR', 0.50) or 0.50)
         if 1 <= dec <= max_dec and tp_i == dec and sl_i == 0 and wr_f >= (min_wr - 1e-9) and avg_f >= min_avg:
             return True, f'experimental_fast_keep:perfect_small_sample:n{dec}:WR{wr_f:.1f}:AvgR{avg_f:+.2f}'
+        # yver28: promote lanes like F2-ASIA-REV-SELL / F4-ASIA-REV-SELL when
+        # they show a high WR and positive payoff with at least 3 decided samples.
+        medium_dec = max(1, int(globals().get('SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_DECIDED', 3) or 3))
+        medium_wr = float(globals().get('SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_WR', 66.0) or 66.0)
+        medium_avg = float(globals().get('SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_AVGR', 0.35) or 0.35)
+        if dec >= medium_dec and wr_f >= (medium_wr - 1e-9) and avg_f >= medium_avg and tp_i > sl_i:
+            return True, f'experimental_medium_keep:n{dec}:WR{wr_f:.1f}:AvgR{avg_f:+.2f}'
         strong_dec = max(1, int(globals().get('SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED', 4) or 4))
         strong_wr = float(globals().get('SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR', 75.0) or 75.0)
         strong_avg = float(globals().get('SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR', 0.60) or 0.60)
@@ -51292,7 +51363,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b> | Expiry: <b>≤{float(globals().get('SETUP_COMBO_DAILY_SAFETY_EXPIRY_HOURS', 24.0) or 24.0):.0f}h</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
-            f"KEEP rule: <b>Decided ≥ {int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY)}</b> and either <b>WR ≥ {float(SETUP_COMBO_POLICY_KEEP_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_POLICY_KEEP_AVG_R):+.2f} + TP≥SL</b>, or <b>WR ≥ {float(SETUP_COMBO_POLICY_WATCH_WR):.0f}% + strong AvgR ≥ {float(SETUP_COMBO_POLICY_PROMOTE_AVG_R):+.2f} + TP&gt;SL</b>. Experimental fast-KEEP is ON: <b>1–{int(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MAX_DECIDED)} decided with 100% WR + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR):+.2f}</b>, or <b>decided ≥ {int(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED)} + WR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR):+.2f}</b>, can be KEEP for live testing. 50% WR alone remains WATCH.\n"
+            f"KEEP rule: <b>Decided ≥ {int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY)}</b> and either <b>WR ≥ {float(SETUP_COMBO_POLICY_KEEP_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_POLICY_KEEP_AVG_R):+.2f} + TP≥SL</b>, or <b>WR ≥ {float(SETUP_COMBO_POLICY_WATCH_WR):.0f}% + strong AvgR ≥ {float(SETUP_COMBO_POLICY_PROMOTE_AVG_R):+.2f} + TP&gt;SL</b>. Experimental fast-KEEP is ON: <b>1–{int(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MAX_DECIDED)} decided with 100% WR + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_FAST_KEEP_MIN_AVGR):+.2f}</b>, <b>decided ≥ {int(SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_DECIDED)} + WR ≥ {float(SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_MEDIUM_KEEP_MIN_AVGR):+.2f}</b>, or <b>decided ≥ {int(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_DECIDED)} + WR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_EXPERIMENTAL_STRONG_KEEP_MIN_AVGR):+.2f}</b>, can be KEEP for live testing. 50% WR alone remains WATCH.\n"
             f"Why a row can still be WATCH: sample/Dec is too small, AvgR/payoff is not strong enough, or a daily/intraday safety row temporarily disabled/tightened it. Policy=the enforced state; Reco=this window's recommendation only.\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
