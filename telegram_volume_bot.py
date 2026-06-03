@@ -1,4 +1,4 @@
-# ver29: /screen hard-stale guard caps emailed setup cards to AutoTrade entry window; BigMove alert now always records generated F8 setup candidates and exposes gate reasons when paired setup email is blocked.
+# ver30: final pipeline hardening: stale /screen cards use real email age not refreshed executable_ts; BigMove generated-only diagnostics never enter executable/email lanes; setup-email recovery runs faster so KEEP setups are delivered promptly.
 # ver27: setup generation sync hardening: frozen audit Policy now recovers KEEP/WATCH from emailed_setups for legacy sent rows; /screen emailed fallback expires at the AutoTrade entry window; F8/BigMove 1.20R is accepted in DB/executable AutoTrade selector.
 # ver24: hard setup-email send reservation/dedup: atomic DB lock before SMTP by setup_id and identity prevents duplicate NEAR emails during rapid deploy/recovery/screen jobs.
 # ver22: setup-audit AT lifecycle attribution fix: AT_OPEN is tied to the exact latest OPEN setup_id for the live symbol/side, preventing older same-symbol OFF rows from inheriting a newer open position.
@@ -5297,20 +5297,45 @@ def _screen_setup_within_actionable_window(setup: Any, max_age_min: int | None =
         max_age_min = max(1, int(max_age_min or _screen_actionable_fallback_max_age_min()))
     except Exception:
         max_age_min = 60
+    # Ver30: for emailed /screen cards, age MUST be based on the real email
+    # timestamp only. Older builds used max(email_ts, executable_ts), so a stale
+    # email card could be refreshed by a later executable/audit write and remain
+    # visible well past AUTOTRADE_ENTRY_WINDOW_MIN.
+    email_ts = 0.0
+    try:
+        email_ts = max(email_ts, float(getattr(setup, 'emailed_ts', 0.0) or 0.0))
+    except Exception:
+        pass
+    try:
+        email_ts = max(email_ts, float(getattr(setup, 'email_logged_ts', 0.0) or 0.0))
+    except Exception:
+        pass
+    try:
+        sk = str(getattr(setup, 'source_kind', '') or '').lower().strip()
+    except Exception:
+        sk = ''
+    if email_ts > 0 or sk in {'emailed_setups', 'recent_email_cache', 'recent_email_lane'}:
+        if email_ts <= 0:
+            return False
+        try:
+            return (float(time.time()) - float(email_ts)) <= (float(max_age_min) * 60.0 + 5.0)
+        except Exception:
+            return False
+
     ts = 0.0
-    try:
-        ts = max(ts, float(getattr(setup, 'emailed_ts', 0.0) or 0.0))
-    except Exception:
-        pass
-    try:
-        ts = max(ts, float(getattr(setup, 'email_logged_ts', 0.0) or 0.0))
-    except Exception:
-        pass
     try:
         ts = max(ts, float(getattr(setup, 'executable_ts', 0.0) or 0.0))
     except Exception:
         pass
-    # If no delivery timestamp is available, do not block here; other gates decide.
+    try:
+        ts = max(ts, float(getattr(setup, 'created_ts', 0.0) or 0.0))
+    except Exception:
+        pass
+    try:
+        ts = max(ts, float(getattr(setup, 'signal_created_ts', 0.0) or 0.0))
+    except Exception:
+        pass
+    # If no timestamp is available, do not block here; other gates decide.
     if ts <= 0:
         return True
     try:
@@ -58145,9 +58170,14 @@ def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: flo
     because /screen should match the exact email-delivered setup batch.
     """
     try:
+        hours = float(lookback_hours if lookback_hours is not None else max(1.0, float(_screen_actionable_fallback_max_age_min()) / 60.0))
+    except Exception:
+        hours = 1.0
+    cutoff = float(time.time()) - max(1.0, hours) * 3600.0
+    try:
         ts0 = float(getattr(setup, 'email_logged_ts', 0.0) or getattr(setup, 'emailed_ts', 0.0) or 0.0)
         if ts0 > 0:
-            return ts0
+            return ts0 if ts0 >= cutoff else 0.0
     except Exception:
         pass
     try:
@@ -58156,11 +58186,6 @@ def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: flo
         uid = 0
     if uid <= 0:
         return 0.0
-    try:
-        hours = float(lookback_hours if lookback_hours is not None else max(1.0, float(_screen_actionable_fallback_max_age_min()) / 60.0))
-    except Exception:
-        hours = 1.0
-    cutoff = float(time.time()) - max(1.0, hours) * 3600.0
     sid = str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip()
     ident = ''
     try:
@@ -61014,7 +61039,7 @@ ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "35"
 SETUP_EMAIL_RECOVERY_JOB_ENABLED = env_bool("SETUP_EMAIL_RECOVERY_JOB_ENABLED", True)
 # ver03: recovery is a fallback lane, not the main scanner. Run it less often and
 # hard-time it so it cannot cause APScheduler max_instances warnings or UI lag.
-SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "900") or 900)  # ver11: reduce recovery-lane pressure
+SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "180") or 180)  # ver11: reduce recovery-lane pressure
 SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "75") or 75)
 SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC", "8") or 8)  # ver11: never let recovery block scheduler
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
@@ -61483,18 +61508,26 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     pass
             for stp in list(setups or []):
                 try:
-                    setattr(stp, 'email_logged_ts', now_ts)
-                    setattr(stp, 'emailed_ts', now_ts)
-                    setattr(stp, 'source_kind', 'emailed_setups')
+                    if generated_only:
+                        # Ver30: diagnostic-only BigMove candidates must NOT look emailed
+                        # or refresh /screen/autotrade. They are logged for analysis only.
+                        setattr(stp, 'source_kind', 'bigmove_generated_only')
+                        setattr(stp, 'email_logged_ts', 0.0)
+                        setattr(stp, 'emailed_ts', 0.0)
+                    else:
+                        setattr(stp, 'email_logged_ts', now_ts)
+                        setattr(stp, 'emailed_ts', now_ts)
+                        setattr(stp, 'source_kind', 'emailed_setups')
                     setattr(stp, 'source_session', sess_u)
                     setattr(stp, 'created_ts', float(getattr(stp, 'created_ts', 0.0) or now_ts))
                 except Exception:
                     pass
             for tuid in target_uids:
-                try:
-                    _persist_executable_candidates(int(tuid), sess_u, list(setups or []), source_kind='emailed_setups', mode='bigmove_email')
-                except Exception:
-                    pass
+                if not generated_only:
+                    try:
+                        _persist_executable_candidates(int(tuid), sess_u, list(setups or []), source_kind='emailed_setups', mode='bigmove_email')
+                    except Exception:
+                        pass
                 for stp in list(setups or []):
                     sid = str(getattr(stp, 'setup_id', '') or getattr(stp, 'id', '') or '')
                     if not generated_only:
@@ -65518,11 +65551,14 @@ def main():
         # KEEP rows and sends the matching setup email + AutoTrade queue.
         if bool(globals().get('SETUP_EMAIL_RECOVERY_JOB_ENABLED', True)):
             try:
-                _rec_interval = max(900, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 900) or 900))
+                # Ver30: 15-minute recovery was too slow; KEEP setups could sit in
+                # /setup_audit for many minutes without email. Keep it lightweight and
+                # run every ~3 minutes by default.
+                _rec_interval = max(180, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 180) or 180))
                 app.job_queue.run_repeating(
                     setup_email_recovery_job_runner,
                     interval=_rec_interval,
-                    first=max(45, min(int(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 75) or 75), _rec_interval // 2)),
+                    first=max(30, min(int(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 45) or 45), _rec_interval // 2)),
                     name="setup_email_recovery_job",
                     job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
                 )
