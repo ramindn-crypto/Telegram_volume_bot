@@ -1,3 +1,4 @@
+# ver15: fixes /setup_audit KEEP rows missing from /screen/email/AutoTrade when the row exists only in generated_setups by making audit-recovery load ALL audit sources, not executable-only.
 # ver14: fixes /screen empty while /setup_audit has fresh KEEP rows by adding pre-heavy audit-recovery display, longer recovery fallback, and frozen KEEP audit-recovery email/screen-sync bypass.
 # ver12: restores autonomous setup generation by allowing the isolated alert/email engine enough runtime, starts recovery quickly after deploy, and sorts /setup_audit strictly by time.
 # ver11: fixes /setup_matrix policy ordered full-page delivery and makes /screen/email/autotrade consume fresh /setup_audit KEEP rows even when raw audit load is dominated by newer OFF rows.
@@ -61659,11 +61660,12 @@ def _setup_recent_audit_actionable_recovery_candidates(user_id: int, session_nam
         rows_all = []
         for u in uid_candidates:
             try:
-                # ver11: raw audit rows are often time-sorted and can be dominated
-                # by newer OFF rows. Load a wider slice, then filter for fresh KEEP/
-                # WATCH below, otherwise valid rows like LIT/NEAR/XLM never reach
-                # /screen/email/autotrade recovery.
-                rows_all.extend(_setup_audit_load_rows(int(u), hours=hours, limit=max(160, int(limit or 48)), dedup=True, apply_final_quality_gate=False, source_mode_override='EXECUTABLE') or [])
+                # ver15: /setup_audit can show KEEP rows sourced from generated_setups
+                # before they are persisted into executable_setups. Recovery must therefore
+                # load ALL audit sources (EXEC + GENERATED), not executable-only; otherwise
+                # rows like ONDO KEEP OPEN appear in /setup_audit but /screen/email/AT stay empty.
+                # Load a wide slice, then filter for fresh KEEP/WATCH below.
+                rows_all.extend(_setup_audit_load_rows(int(u), hours=hours, limit=max(240, int(limit or 48) * 2), dedup=True, apply_final_quality_gate=False, source_mode_override='ALL') or [])
             except Exception:
                 continue
         if not rows_all:
@@ -61728,7 +61730,7 @@ def _setup_recent_audit_actionable_recovery_candidates(user_id: int, session_nam
                 continue
         out = _setup_audit_rows_to_recovery_setup_objects(out_rows, session_name=sess, user_id=uid)
         try:
-            db_log_setup_pipeline_event(uid, stage='email_audit_keep_recovery_candidates', status='ok' if out else 'empty', session=sess, mode='email', details={'input': len(rows_all or []), 'eligible': len(out), 'top_reasons': _pipeline_top_reasons(reasons, 8)})
+            db_log_setup_pipeline_event(uid, stage='email_audit_keep_recovery_candidates', status='ok' if out else 'empty', session=sess, mode='email', details={'input': len(rows_all or []), 'eligible': len(out), 'source_mode': 'ALL', 'top_reasons': _pipeline_top_reasons(reasons, 8)})
         except Exception:
             pass
         return list(out or [])[:max(1, int(limit or 48))]
