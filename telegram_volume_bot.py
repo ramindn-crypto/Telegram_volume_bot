@@ -1,3 +1,4 @@
+# ver12: restores autonomous setup generation by allowing the isolated alert/email engine enough runtime, starts recovery quickly after deploy, and sorts /setup_audit strictly by time.
 # ver11: fixes /setup_matrix policy ordered full-page delivery and makes /screen/email/autotrade consume fresh /setup_audit KEEP rows even when raw audit load is dominated by newer OFF rows.
 # ver10: fix audit/email/screen/autotrade sync starvation: alert_job no longer skips the setup-email lane during admin commands; fresh /setup_audit KEEP recovery rows are shown on /screen and can be emailed/autotraded.
 # ver8: /screen email-sync hardening: latest Gmail/emailed_setups row wins over stale screen cache; emailed rows are not re-gated live; keeps ver7 AutoTrade placement stability.
@@ -47576,12 +47577,10 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
 
     # Ver16: show all rows. send_long_message now chunks <pre> tables safely,
     # so there is no need to hide audit rows for Telegram length limits.
-    # yver151: Sort by Policy priority for readability: KEEP, WATCH, then OFF/disabled.
-    policy_rank = {'KEEP': 0, 'WATCH': 1, 'OFF': 2, 'DISABLE': 2, 'BLOCK': 2, 'PAUSE': 2}
-    display_rows = [row for _i, row in sorted(
-        enumerate(table_rows),
-        key=lambda kv: (policy_rank.get(str(kv[1][4]).upper().strip(), 9), kv[0])
-    )]
+    # ver12: keep /setup_audit strictly time-sorted (newest first). Policy-group
+    # sorting made the report look out of sequence and hid whether setup generation
+    # was fresh or stale.
+    display_rows = list(table_rows)
     hidden_rows = 0
     table = tabulate(
         display_rows,
@@ -47732,8 +47731,9 @@ def _setup_audit_text_light(uid: int, limit: int = 0, hours: int = 24) -> str:
     wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
     win = _setup_audit_window_summary(rows)
     row_span_txt = f"{html.escape(str(win.get('start_txt') or '-'))} → {html.escape(str(win.get('end_txt') or '-'))}"
-    policy_rank = {'KEEP': 0, 'WATCH': 1, 'OFF': 2, 'DISABLE': 2, 'BLOCK': 2, 'PAUSE': 2, '-': 9}
-    display_rows = [row for _i, row in sorted(enumerate(table_rows), key=lambda kv: (policy_rank.get(str(kv[1][4]).upper().strip(), 9), kv[0]))]
+    # ver12: strict time order (newest first). Do not group KEEP/WATCH/OFF before
+    # time, because the command is used to diagnose whether generation is alive.
+    display_rows = list(table_rows)
     table = tabulate(
         display_rows,
         headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
@@ -62312,24 +62312,28 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "6"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "12"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "28"))  # ver12: allow one live pool build to finish inside isolated alert worker
 EMAIL_SEND_TIMEOUT_SEC = max(6, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "8") or 8))
 # yver172: the alert pipeline runs in the background; killing it after 20–25s
 # prevented the session email pool from completing, so no setup emails were sent.
 # Keep Telegram command replies fast separately, but allow the email engine enough
 # time to finish one small owner/session cycle.
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "18"))  # ver5: shorter isolated budget prevents scheduler lag
+# ver12: the alert/email engine is isolated from Telegram commands, so it must be
+# given enough budget to actually build the current setup pool. 18-22s was causing
+# repeated budget-yields before new executable rows were generated, leaving
+# /setup_audit stale for hours and /screen/email/autotrade empty.
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "75"))
 SETUP_EMAIL_RECOVERY_JOB_ENABLED = env_bool("SETUP_EMAIL_RECOVERY_JOB_ENABLED", True)
 # ver03: recovery is a fallback lane, not the main scanner. Run it less often and
 # hard-time it so it cannot cause APScheduler max_instances warnings or UI lag.
 SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC", "180") or 180)  # ver11: reduce recovery-lane pressure
-SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "75") or 75)
-SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC", "8") or 8)  # ver11: never let recovery block scheduler
+SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC", "45") or 45)  # ver12: quicker recovery after deploy
+SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC = int(os.environ.get("SETUP_EMAIL_RECOVERY_JOB_TIMEOUT_SEC", "18") or 18)  # ver12: enough time to consume/email fresh KEEP audit rows
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
 AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "180") or 180)
-AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "120") or 120)
+AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "45") or 45)  # ver12: start setup generation quickly after deploy
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
 ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
 ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "1"))
@@ -63300,9 +63304,30 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
                 elif tf_cooling:
-                    setups = []
+                    # ver12: do not stop setup generation just because the OHLCV
+                    # rate-limit cooler is active and there is no cached pool. The
+                    # scanner already has stale/cached OHLCV fallbacks; skipping here
+                    # left /setup_audit stale for hours and /screen/email empty.
                     try:
-                        db_log_setup_pipeline_event(0, stage='email_pool_session_skip', status='rate_limit_cooldown_no_cache', session=str(sess_name or ''), mode='email', details={'reason': 'ohlcv_global_or_tf_cooling'})
+                        pool = await to_thread_email(
+                            _run_async_in_new_loop,
+                            build_priority_pool,
+                            best_fut,
+                            sess_name,
+                            mode="exec",
+                            scan_profile=str(EMAIL_SETUP_SCAN_PROFILE),
+                            uid=None,
+                            timeout=EMAIL_BUILD_POOL_TIMEOUT_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        db_log_setup_pipeline_event(0, stage='build_priority_pool_during_cooldown', status='timeout', session=str(sess_name or ''), mode='email', details={'timeout_sec': float(EMAIL_BUILD_POOL_TIMEOUT_SEC), 'cooldown': True})
+                        pool = {"setups": []}
+                    except Exception as e:
+                        db_log_setup_pipeline_event(0, stage='build_priority_pool_during_cooldown', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(e).__name__}: {e}', 'cooldown': True})
+                        pool = {"setups": []}
+                    setups = list((pool or {}).get("setups", []) or [])
+                    try:
+                        db_log_setup_pipeline_event(0, stage='email_pool_session_cooldown_build', status='ok' if setups else 'empty', session=str(sess_name or ''), mode='email', details={'setups': len(setups or []), 'cooldown': True})
                     except Exception:
                         pass
                 else:
@@ -66651,8 +66676,13 @@ async def _alert_job_background_runner(context: ContextTypes.DEFAULT_TYPE):
     # ver4: hard-cap the detached email engine, but treat timeout as a soft budget
     # yield, not as an email error. The DB-first recovery lane will retry.
     try:
-        base_budget = float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 25) or 25)
-        hard_timeout = max(8.0, min(22.0, base_budget + 4.0))
+        base_budget = float(globals().get('ALERT_JOB_MAX_RUNTIME_SEC', 75) or 75)
+        # ver12: do not cap the isolated setup/email engine at 22s. That cap kept
+        # aborting the live pool build before executable rows were produced. The
+        # whole job is already off the Telegram event loop and protected by its own
+        # thread lock, so a larger bounded budget is safe and required for setup
+        # generation, email, and AutoTrade sync.
+        hard_timeout = max(35.0, min(120.0, base_budget + 8.0))
         await asyncio.wait_for(_alert_job_async_internal(context), timeout=hard_timeout)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
@@ -67039,7 +67069,9 @@ def main():
         # max_instances=1 and coalesce=True.
         interval_sec = max(180, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 180), int(ALERT_JOB_MAX_RUNTIME_SEC or 35) + 120)
     
-        _alert_first_delay = max(300, min(interval_sec, int(os.getenv('ALERT_JOB_FIRST_RUN_DELAY_SEC', str(interval_sec)) or interval_sec)))
+        # ver12: do not wait 5 minutes after deploy before the first autonomous
+        # setup/email scan. The engine is isolated, so a quick first tick is safe.
+        _alert_first_delay = max(15, min(interval_sec, int(os.getenv('ALERT_JOB_FIRST_RUN_DELAY_SEC', str(globals().get('AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC', 45))) or globals().get('AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC', 45))))
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
@@ -67062,7 +67094,9 @@ def main():
                 # /setup_audit for many minutes without email. Keep it lightweight and
                 # run every ~3 minutes by default.
                 _rec_interval = max(180, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 180) or 180))
-                _rec_first_delay = max(300, min(_rec_interval, int(os.getenv('SETUP_EMAIL_RECOVERY_JOB_FIRST_DELAY_SEC', str(_rec_interval)) or _rec_interval)))
+                # ver12: start DB/audit recovery quickly after deploy; it is
+                # isolated and bounded, so the old 300s first delay only delayed emails.
+                _rec_first_delay = max(15, min(_rec_interval, int(os.getenv('SETUP_EMAIL_RECOVERY_JOB_FIRST_DELAY_SEC', str(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 45))) or globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 45))))
                 app.job_queue.run_repeating(
                     setup_email_recovery_job_runner,
                     interval=_rec_interval,
