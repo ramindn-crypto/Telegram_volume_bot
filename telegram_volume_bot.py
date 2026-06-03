@@ -1,5 +1,5 @@
-# ver5: hard isolation patch: alert_job + setup_email_recovery run in dedicated thread/event-loop executors, first startup tick is delayed, recent command defer is longer, fast-path commands mark activity, and /screen no longer forces fresh access DB checks.
-# ver4: full responsiveness patch: /setup_audit is ack-only/background, audit lifecycle checks are batched, alert job yields during admin commands, /autotrade_last avoids live network calls, and post-email AutoTrade always records/tries the exact emailed batch.
+# ver6: emergency responsiveness patch: admin bypasses DB guard, /screen is ack-first/background-only, /setup_audit uses lightweight cached audit, background alert jobs are delayed/deferred longer, and heavy report jobs start only after acknowledgement.
+# ver7: AutoTrade live-entry stability patch: post-email placement gets a real live-order budget, timeout rows are reconciled/queued instead of false SKIP, and Telegram responsiveness remains isolated.
 # ver3: responsiveness/dedup/audit-time fix: /setup_audit uses delivery/executable time, removes duplicate same-data rows, and admin reports run in parallel background workers.
 # ver2: emergency responsiveness/audit-time fix: /setup_audit uses original signal_created_ts instead of batch executable_ts, avoids live OHLCV fetches by default, and alert timeout is fail-soft so Telegram commands stay responsive.
 # ver32: /screen timeout hardening: full builder first returns recent actionable email/executable queue before heavy pool rebuild, and expected on-demand build timeouts fall back without Render WARNING noise.
@@ -5090,6 +5090,15 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 1) Trial/access lock (optimized)
         if cmd not in ACCESS_EXEMPT:
             uid = int(update.effective_user.id)
+
+            # ver6 emergency responsiveness: the owner/admin must never wait for
+            # SQLite access/pro checks in the global guard. A locked DB in this
+            # guard was enough to make /screen, /setup_audit and /equity look dead.
+            try:
+                if is_admin_user(int(uid)):
+                    return
+            except Exception:
+                pass
 
             now = time.time()
             ent = _cache.get(uid)
@@ -15157,7 +15166,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         open_order_result = ((open_res or {}).get('result') or {})
         open_order_id = str(open_order_result.get('orderId') or '')
         open_order_link_id = str(open_order_result.get('orderLinkId') or '')
-        live_conf = _autotrade_wait_live_entry_confirmation(sym, side=side, order_id=open_order_id, order_link_id=open_order_link_id, wait_sec=10.0, step_sec=0.4)
+        live_conf = _autotrade_wait_live_entry_confirmation(sym, side=side, order_id=open_order_id, order_link_id=open_order_link_id, wait_sec=float(os.getenv('AUTOTRADE_ENTRY_CONFIRM_WAIT_SEC', '6') or 6), step_sec=0.4)
         live_pos = live_conf.get('position')
         confirmed_filled = bool(live_conf.get('filled_confirmed'))
         filled_qty = abs(float((live_conf.get('filled_qty') or (_pos_size(live_pos) if live_pos else qty)) or 0.0))
@@ -15232,7 +15241,7 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
                     filled_entry = float((_pos_entry(live_pos) if live_pos else filled_entry) or filled_entry or price_ref)
 
 
-        final_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=5.0, step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
+        final_pos = _autotrade_wait_live_position(sym, side=side, wait_sec=float(os.getenv('AUTOTRADE_FINAL_POSITION_WAIT_SEC', '4') or 4), step_sec=0.25) or _autotrade_find_live_position(sym, side=side) or live_pos
         qty_for_db = abs(float((_pos_size(final_pos) if final_pos else filled_qty) or qty))
         if final_pos is not None:
             try:
@@ -15579,11 +15588,19 @@ ALERT_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
-AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "18") or 18)
+# ver07: live Bybit order placement cannot safely fit inside the old 18s budget.
+# A real market entry path may need: live price + filters + equity + open-risk scan +
+# leverage set + order create + fill/position confirmation + TP/SL verification.
+# Keep this in the isolated AutoTrade executor so Telegram commands remain instant,
+# but give the live placement enough time before calling it a timeout.
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "75") or 75)
+AUTOTRADE_AFTER_EMAIL_PLACE_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_AFTER_EMAIL_PLACE_TIMEOUT_SEC", str(max(75, AUTOTRADE_JOB_TIMEOUT_SEC))) or max(75, AUTOTRADE_JOB_TIMEOUT_SEC))
+AUTOTRADE_BIGMOVE_PLACE_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_BIGMOVE_PLACE_TIMEOUT_SEC", str(max(75, AUTOTRADE_JOB_TIMEOUT_SEC))) or max(75, AUTOTRADE_JOB_TIMEOUT_SEC))
+AUTOTRADE_TIMEOUT_RECONCILE_SEC = int(os.getenv("AUTOTRADE_TIMEOUT_RECONCILE_SEC", "25") or 25)
 # Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
 # Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
 AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "600") or 600)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "20") or 20)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "90") or 90)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
 AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", False)
@@ -21182,13 +21199,14 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                     'sl_model': str(getattr(cand, 'bigmove_sl_model', '') or ''),
                 }
                 try:
-                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(int(AUTOTRADE_JOB_TIMEOUT_SEC or 55), max(10, int(AUTOTRADE_JOB_TIMEOUT_SEC or 55))))
+                    _place_timeout = max(45, int(globals().get('AUTOTRADE_BIGMOVE_PLACE_TIMEOUT_SEC', AUTOTRADE_JOB_TIMEOUT_SEC) or AUTOTRADE_JOB_TIMEOUT_SEC or 75))
+                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=_place_timeout)
                 except asyncio.TimeoutError:
-                    _timeout_reason = 'autotrade_place_trade_timeout_after_bigmove_email'
+                    _timeout_reason = f'autotrade_place_trade_timeout_after_bigmove_email>{int(globals().get("AUTOTRADE_BIGMOVE_PLACE_TIMEOUT_SEC", AUTOTRADE_JOB_TIMEOUT_SEC) or AUTOTRADE_JOB_TIMEOUT_SEC or 75)}s'
                     try:
-                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, owner_uid, sess, cand, _timeout_reason, timeout=8)
+                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, owner_uid, sess, cand, _timeout_reason, timeout=max(10, int(globals().get('AUTOTRADE_TIMEOUT_RECONCILE_SEC', 25) or 25)))
                     except Exception:
-                        ok, reason = False, _timeout_reason
+                        ok, reason = False, 'autotrade_place_trade_pending_after_bigmove_recheck_next_tick'
                 except Exception as e:
                     ok, reason = False, f'{type(e).__name__}: {e}'
                 last_reason = '' if ok else str(reason or '')
@@ -21197,7 +21215,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                 try:
                     detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
                     meta.update({
-                        'status': 'PLACED' if ok else 'SKIP',
+                        'status': 'PLACED' if ok else ('QUEUED' if ('pending_after' in str(reason or '').lower() or str(reason or '').lower().startswith('autotrade_place_trade_pending')) else 'SKIP'),
                         'reason': '' if ok else str(reason or ''),
                         'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
                         'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
@@ -21206,7 +21224,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                         'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
                         'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
                     })
-                    _autotrade_record_attempt(owner_uid, meta, detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
+                    _autotrade_record_attempt(owner_uid, meta, detail_snapshot, 'PLACED' if ok else ('QUEUED' if ('pending_after' in str(reason or '').lower() or str(reason or '').lower().startswith('autotrade_place_trade_pending')) else 'SKIP'), '' if ok else str(reason or ''))
                 except Exception:
                     pass
                 attempts_meta.append(meta)
@@ -21226,7 +21244,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                 'trigger': 'bigmove_email_immediate',
             }
             try:
-                db_log_setup_pipeline_event(owner_uid, stage='bigmove_autotrade_after_email', status='placed' if placed > 0 else 'skip', session=sess, mode='autotrade', details={'reason': last_reason, 'attempted': attempted, 'placed': placed, 'tag': str(tag or ''), 'candidates': attempts_meta[:8]})
+                db_log_setup_pipeline_event(owner_uid, stage='bigmove_autotrade_after_email', status='placed' if placed > 0 else ('queued' if ('_bigmove_pending_reason' in locals() and _bigmove_pending_reason) else 'skip'), session=sess, mode='autotrade', details={'reason': last_reason, 'attempted': attempted, 'placed': placed, 'tag': str(tag or ''), 'candidates': attempts_meta[:8]})
             except Exception:
                 pass
     except Exception as e:
@@ -47459,6 +47477,155 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
+def _setup_audit_text_light(uid: int, limit: int = 0, hours: int = 24) -> str:
+    """ver6 lightweight /setup_audit.
+
+    This command is for live operations, so it must never recalculate historical
+    candles, live Bybit state, or current final policy for every row. It reads the
+    stored/cached setup rows and cached audit result only. Deep recalculation can be
+    enabled later with the heavy audit helpers, but the Telegram command stays safe.
+    """
+    limit = max(0, int(limit or 0))
+    hours = max(1, min(8760, int(hours or 24)))
+    result_horizon = _setup_audit_result_horizon_hours()
+    now_ts = float(time.time())
+    requested_start_ts = max(0.0, now_ts - float(hours) * 3600.0)
+
+    def _audit_ts_txt(ts_val: float) -> str:
+        try:
+            return datetime.fromtimestamp(float(ts_val or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            return '-'
+
+    requested_start_txt = _audit_ts_txt(requested_start_ts)
+    requested_end_txt = _audit_ts_txt(now_ts)
+    min_vol_m = _setup_min_volume_floor_usd() / 1e6
+
+    try:
+        rows = _setup_audit_load_rows(int(uid), hours=None, start_ts=requested_start_ts, limit=limit, dedup=True)
+    except Exception as e:
+        return (
+            f"🧪 <b>Setup Audit</b>\n{HDR}\n"
+            f"Window: <b>last {hours}h</b> | Requested: <b>{html.escape(requested_start_txt)}</b> → <b>{html.escape(requested_end_txt)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>\n"
+            f"⚠️ Fast audit could not read setup rows: <code>{html.escape(type(e).__name__)}</code>. Try again shortly."
+        )
+
+    if not rows:
+        return (
+            f"🧪 <b>Setup Audit</b>\n{HDR}\n"
+            f"Window: <b>last {hours}h</b> | Requested: <b>{html.escape(requested_start_txt)}</b> → <b>{html.escape(requested_end_txt)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>\n"
+            f"No stored setup rows above ${min_vol_m:.0f}M volume survived the audit lane filters in this requested window.\n"
+            f"This is an analytics-data message only; it does not mean setup generation is blocked. "
+            f"Check <code>/email_decision</code>, <code>/why</code>, and <code>/screen</code> for current live scan status.\n\n"
+            f"Use <code>/setup_audit h</code> for the guide."
+        )
+
+    try:
+        lifecycle_maps = _setup_audit_collect_lifecycle_maps(int(uid), rows, start_ts=requested_start_ts, end_ts=now_ts + 3600.0)
+    except Exception:
+        lifecycle_maps = {}
+
+    table_rows = []
+    tp_n = sl_n = nohit_n = open_n = 0
+    for r in list(rows or []):
+        try:
+            sid = str(r.get('setup_id') or '').strip()
+            side = str(r.get('side') or '').upper().strip()
+            sym = str(r.get('symbol') or '').upper().strip()
+            if sym.endswith('USDT'):
+                sym = sym[:-4]
+            family_code = _setup_audit_family_code(r)
+            sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+            ts = _setup_audit_row_ts(r)
+            try:
+                ttxt = datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if ts > 0 else '-'
+            except Exception:
+                ttxt = '-'
+            try:
+                volm = float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0) / 1e6
+            except Exception:
+                volm = 0.0
+            combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
+
+            # Result: cached DB / cached price-move only. No OHLCV/network recalc here.
+            result = 'OPEN'
+            try:
+                cached = _setup_audit_cached_result(sid, int(result_horizon), allow_open_fresh_sec=3600) if sid else {}
+                result = _setup_audit_result_label((cached or {}).get('result'))
+            except Exception:
+                result = 'OPEN'
+            if result == 'OPEN':
+                try:
+                    fast = str(_setup_audit_result_from_cached_price_moves(r, int(result_horizon)) or '').upper().strip()
+                    if fast in {'WIN', 'TP'}:
+                        result = 'TP'
+                    elif fast in {'LOSE', 'LOSS', 'SL'}:
+                        result = 'SL'
+                    elif fast in {'NOHIT', 'NH'}:
+                        result = 'NOHIT'
+                except Exception:
+                    pass
+
+            if result == 'TP':
+                tp_n += 1
+            elif result == 'SL':
+                sl_n += 1
+            elif result == 'NOHIT':
+                nohit_n += 1
+            else:
+                open_n += 1
+
+            # Read only row-embedded frozen policy. Do not call _setup_frozen_policy_label()
+            # here because it may query emailed_setups per row and recreate the lag we are fixing.
+            try:
+                snap = _setup_policy_snapshot_from_row(r)
+                frozen = str((snap or {}).get('policy_at_creation') or '').upper().strip()
+            except Exception:
+                frozen = ''
+            policy_label = frozen if frozen in {'KEEP','WATCH','OFF'} else str(r.get('policy_at_creation') or r.get('delivery_policy') or r.get('policy') or '-').upper().strip()
+            if policy_label not in {'KEEP','WATCH','OFF'}:
+                policy_label = '-'
+            try:
+                at_state = _setup_audit_autotrade_state_label_fast(r, uid=int(uid), session_name=sess_row, maps=lifecycle_maps)
+            except Exception:
+                at_state = '-'
+            entry_v = float(r.get('entry') or 0.0)
+            sl_v = float(r.get('sl') or 0.0)
+            tp_v = float(_resolve_single_tp(entry_v, sl_v, r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)
+            table_rows.append([
+                ttxt, sym, side, combo_key, policy_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}",
+                fmt_price(entry_v) if entry_v > 0 else '-',
+                fmt_price(sl_v) if sl_v > 0 else '-',
+                fmt_price(tp_v) if entry_v > 0 and sl_v > 0 and tp_v > 0 else '-',
+                result,
+            ])
+        except Exception:
+            continue
+
+    decided = tp_n + sl_n
+    wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
+    win = _setup_audit_window_summary(rows)
+    row_span_txt = f"{html.escape(str(win.get('start_txt') or '-'))} → {html.escape(str(win.get('end_txt') or '-'))}"
+    policy_rank = {'KEEP': 0, 'WATCH': 1, 'OFF': 2, 'DISABLE': 2, 'BLOCK': 2, 'PAUSE': 2, '-': 9}
+    display_rows = [row for _i, row in sorted(enumerate(table_rows), key=lambda kv: (policy_rank.get(str(kv[1][4]).upper().strip(), 9), kv[0]))]
+    table = tabulate(
+        display_rows,
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        tablefmt='plain',
+        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
+    )
+    header_lines = [
+        "🧪 <b>Setup Audit</b>",
+        HDR,
+        f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | Now: <b>{html.escape(requested_end_txt)}</b>",
+        f"Requested: <b>{html.escape(requested_start_txt)}</b> → <b>{html.escape(requested_end_txt)}</b> | Row span: <b>{row_span_txt}</b>",
+        f"Result horizon: <b>{result_horizon}h</b> | TF: <b>cached-fast</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
+        "Source: cached setup price path / stored AutoTrade lifecycle only. This fast command does not fetch live OHLCV or Bybit positions.",
+        "Policy = frozen creation/delivery policy where available. WR = TP/(TP+SL), excluding NOHIT and OPEN.",
+        f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).",
+    ]
+    return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
+
 
 def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
     """Multi-window summary for current KEEP policy lanes only.
@@ -52317,7 +52484,20 @@ async def _queue_admin_report_ack_only(
     except Exception:
         pass
     started = _admin_report_bg_try_start(cache_key)
+    # ver6: ACK FIRST, then start heavy work. In ver04/ver05 the background task
+    # was created before the acknowledgement; under Render CPU/SQLite pressure the
+    # worker could start competing before Telegram had even received the ACK.
+    await _telegram_reply_text_fast(
+        update.message,
+        f"⏳ Building full {title_s} now. I will post the complete result when ready." if started else f"⏳ Full {title_s} is already building. I will post the complete result when ready.",
+        parse_mode=None,
+        disable_web_page_preview=True,
+    )
     if started:
+        try:
+            await asyncio.sleep(float(os.getenv('ADMIN_REPORT_START_DELAY_SEC', '0.05') or 0.05))
+        except Exception:
+            pass
         _safe_create_task(
             _admin_report_background_refresh(
                 update,
@@ -52332,12 +52512,6 @@ async def _queue_admin_report_ack_only(
             ),
             label=f"admin-report-refresh:{cache_key}",
         )
-    await _telegram_reply_text_fast(
-        update.message,
-        f"⏳ Building full {title_s} now. I will post the complete result when ready." if started else f"⏳ Full {title_s} is already building. I will post the complete result when ready.",
-        parse_mode=None,
-        disable_web_page_preview=True,
-    )
 
 async def _send_cached_or_queue_admin_report(
     update: Update,
@@ -52522,11 +52696,11 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _queue_admin_report_ack_only(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:ver4:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}:{int(time.time() // 30)}",
-        _setup_audit_text,
+        f"admin:bg:ver6:setup_audit_light:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}:{int(time.time() // 15)}",
+        _setup_audit_text_light,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
-        background_timeout=120,
+        background_timeout=45,
     )
 
 
@@ -59695,13 +59869,20 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                         logger.warning('screen full builder failed uid=%s session=%s: %s: %s', uid, scan_session, type(_build_e).__name__, _build_e)
                 except Exception:
                     pass
-                body, kb, shown_setups = _screen_recent_db_body_and_kb(
-                    int(uid or 0),
-                    str(scan_session or '').upper(),
-                    best_fut or {},
-                    max_age_min=int(_screen_actionable_fallback_max_age_min()),
-                    include_email_source=bool(_screen_user_can_see_email_source(int(uid or 0), user or {})),
-                )
+                # ver6: fallback DB lookup must also run off the event loop.
+                # A SQLite lock here used to freeze every other command after /screen.
+                try:
+                    body, kb, shown_setups = await to_thread_fast(
+                        _screen_recent_db_body_and_kb,
+                        int(uid or 0),
+                        str(scan_session or '').upper(),
+                        best_fut or {},
+                        max_age_min=int(_screen_actionable_fallback_max_age_min()),
+                        include_email_source=bool(_screen_user_can_see_email_source(int(uid or 0), user or {})),
+                        timeout=2,
+                    )
+                except Exception:
+                    body, kb, shown_setups = '', [], []
                 if not body:
                     body, kb, shown_setups = _screen_quick_ticker_snapshot_body(best_fut or {}, str(scan_session or '').upper())
                 # ver33: after serving fallback, queue a non-blocking cache refresh so the
@@ -59832,10 +60013,58 @@ def _schedule_screen_full_delivery(update: Update, context: ContextTypes.DEFAULT
     except Exception:
         return False
 
+async def _screen_ack_first_background(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int) -> None:
+    """ver6: fetch user/access and build /screen outside the command path."""
+    try:
+        user = await get_user_cached_fast_async(int(uid), ttl=60)
+    except Exception:
+        user = {}
+    try:
+        if (not is_admin_user(int(uid))) and (not has_active_access(int(uid), user)):
+            await _telegram_reply_text_fast(
+                update.message,
+                "⛔️ Trial finished.\n\nYour 7-day trial is over — you need to pay to keep using PulseFutures.\n\n👉 /billing",
+            )
+            return
+    except Exception:
+        pass
+    try:
+        live_session = current_session_utc()
+        scan_session = str(scan_session_name_utc() or '').upper()
+    except Exception:
+        live_session, scan_session = 'NONE', ''
+    try:
+        await _deliver_screen_full_scan_when_ready(update, context, int(uid), dict(user or {}), str(live_session or ''), str(scan_session or '').upper())
+    except Exception as e:
+        try:
+            logger.debug('screen ack-first background failed uid=%s: %s: %s', uid, type(e).__name__, e)
+        except Exception:
+            pass
+
+
 async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _hb_touch('screen', ok=True, details='screen_cmd_invoked')
+    try:
+        _mark_user_activity()
+        _admin_report_mark_activity(90)
+    except Exception:
+        pass
 
-    uid = update.effective_user.id
+    uid = int(update.effective_user.id)
+
+    # ver6 emergency path: never touch SQLite/Bybit/OHLCV before the first reply.
+    # This is deliberately stronger than cached screen mode: commands must remain usable
+    # even while the DB is locked by audit/email/autotrade workers.
+    if env_bool('SCREEN_ACK_FIRST_MODE', True):
+        await _telegram_reply_text_fast(
+            update.message,
+            "⏳ Building /screen now. I will post the full result when ready.",
+            parse_mode=None,
+            disable_web_page_preview=True,
+        )
+        _safe_create_task(_screen_ack_first_background(update, context, uid), 'screen_ack_first_background')
+        return
+
     user = get_user(uid)
 
     if not has_active_access(uid, user):
@@ -61795,7 +62024,7 @@ ALERT_JOB_FAST_SCHEDULER_MODE = env_bool("ALERT_JOB_FAST_SCHEDULER_MODE", True)
 # ver4: user/admin commands must stay instant. If an admin command/report just
 # arrived, skip this alert tick and let the next scheduled/recovery tick continue.
 ALERT_JOB_SKIP_ON_RECENT_COMMAND = env_bool("ALERT_JOB_SKIP_ON_RECENT_COMMAND", True)
-ALERT_JOB_RECENT_COMMAND_DEFER_SEC = int(os.environ.get("ALERT_JOB_RECENT_COMMAND_DEFER_SEC", "90") or 90)
+ALERT_JOB_RECENT_COMMAND_DEFER_SEC = int(os.environ.get("ALERT_JOB_RECENT_COMMAND_DEFER_SEC", "300") or 300)
 EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED = env_bool("EMAIL_POOL_AGGRESSIVE_FALLBACK_ENABLED", False)
 SCREEN_CACHE_WARMUP_ENABLED = env_bool("SCREEN_CACHE_WARMUP_ENABLED", False)
 BIGMOVE_FIRE_AND_FORGET_ENABLED = env_bool("BIGMOVE_FIRE_AND_FORGET_ENABLED", True)
@@ -65316,8 +65545,8 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                     reason = f'autotrade_job_budget_exhausted>{int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40)}s'
                     break
                 attempted += 1
-                remaining_budget = max(3.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 40) - (time.time() - job_started_ts))
-                per_candidate_timeout = min(float(AUTOTRADE_JOB_TIMEOUT_SEC or 25), remaining_budget)
+                remaining_budget = max(10.0, float(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 90) - (time.time() - job_started_ts))
+                per_candidate_timeout = max(45.0, min(float(AUTOTRADE_JOB_TIMEOUT_SEC or 75), remaining_budget))
                 try:
                     ok, reason = await to_thread_autotrade(
                         _autotrade_place_trade,
@@ -65344,7 +65573,7 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
                             'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
                             'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
                         })
-                        _autotrade_record_attempt(uid, attempt_summaries[attempted - 1], detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
+                        _autotrade_record_attempt(uid, attempt_summaries[attempted - 1], detail_snapshot, 'PLACED' if ok else ('QUEUED' if ('pending_after' in str(reason or '').lower() or str(reason or '').lower().startswith('autotrade_place_trade_pending')) else 'SKIP'), '' if ok else str(reason or ''))
                 except Exception:
                     pass
                 if ok:
@@ -65580,19 +65809,24 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 except Exception:
                     pass
                 try:
-                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(int(AUTOTRADE_JOB_TIMEOUT_SEC or 55), max(10, int(AUTOTRADE_JOB_TIMEOUT_SEC or 55))))
+                    _place_timeout = max(45, int(globals().get('AUTOTRADE_AFTER_EMAIL_PLACE_TIMEOUT_SEC', AUTOTRADE_JOB_TIMEOUT_SEC) or AUTOTRADE_JOB_TIMEOUT_SEC or 75))
+                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=_place_timeout)
                 except asyncio.TimeoutError:
-                    _timeout_reason = 'autotrade_place_trade_timeout_after_email'
+                    # ver07: do not mark a just-emailed live order as a final SKIP after the
+                    # old small timeout. The worker thread may still be inside Bybit order
+                    # confirmation. Reconcile with a larger budget and leave the row QUEUED
+                    # if the exchange/journal cannot be verified yet.
+                    _timeout_reason = f'autotrade_place_trade_timeout_after_email>{int(globals().get("AUTOTRADE_AFTER_EMAIL_PLACE_TIMEOUT_SEC", AUTOTRADE_JOB_TIMEOUT_SEC) or AUTOTRADE_JOB_TIMEOUT_SEC or 75)}s'
                     try:
-                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, owner_uid, sess, cand, _timeout_reason, timeout=8)
+                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, owner_uid, sess, cand, _timeout_reason, timeout=max(10, int(globals().get('AUTOTRADE_TIMEOUT_RECONCILE_SEC', 25) or 25)))
                     except Exception:
-                        ok, reason = False, _timeout_reason
+                        ok, reason = False, 'autotrade_place_trade_pending_after_email_recheck_next_tick'
                 except Exception as e:
                     ok, reason = False, f'{type(e).__name__}: {e}'
                 try:
                     detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
                     attempts_meta[-1].update({
-                        'status': 'PLACED' if ok else 'SKIP',
+                        'status': 'PLACED' if ok else ('QUEUED' if ('pending_after' in str(reason or '').lower() or str(reason or '').lower().startswith('autotrade_place_trade_pending')) else 'SKIP'),
                         'reason': '' if ok else str(reason or ''),
                         'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
                         'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
@@ -65600,7 +65834,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                             'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
                             'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
                     })
-                    _autotrade_record_attempt(owner_uid, attempts_meta[-1], detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
+                    _autotrade_record_attempt(owner_uid, attempts_meta[-1], detail_snapshot, 'PLACED' if ok else ('QUEUED' if ('pending_after' in str(reason or '').lower() or str(reason or '').lower().startswith('autotrade_place_trade_pending')) else 'SKIP'), '' if ok else str(reason or ''))
                 except Exception:
                     pass
                 if ok:
@@ -65612,8 +65846,9 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                     continue
                 if not _autotrade_should_try_next_after_skip(reason):
                     break
+            _pending_reason = str(reason or '').lower().startswith('autotrade_place_trade_pending') or 'pending_after' in str(reason or '').lower()
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                'status': 'PLACED' if placed_count > 0 else 'SKIP',
+                'status': 'PLACED' if placed_count > 0 else ('QUEUED' if _pending_reason else 'SKIP'),
                 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                 'reason': (f'placed_{placed_count}_from_email_batch' if placed_count > 0 else str(reason or 'no_tradable_setup')),
                 'attempted': int(attempted),
@@ -65625,7 +65860,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                 'trigger': 'email_sent_immediate',
             }
             try:
-                db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email', status='placed' if placed_count > 0 else 'skip', session=sess, mode='autotrade', details={'reason': reason, 'attempted': attempted, 'placed': int(placed_count), 'candidates': attempts_meta[:5]})
+                db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email', status='placed' if placed_count > 0 else ('queued' if ('_pending_reason' in locals() and _pending_reason) else 'skip'), session=sess, mode='autotrade', details={'reason': reason, 'attempted': attempted, 'placed': int(placed_count), 'candidates': attempts_meta[:5]})
             except Exception:
                 pass
         finally:
@@ -66322,7 +66557,7 @@ def main():
     app.add_handler(CommandHandler("tz", tz_cmd, block=False))
     app.add_handler(CommandHandler("dayreset", dayreset_cmd, block=False))
     app.add_handler(CommandHandler("screen", screen_cmd, block=False))
-    app.add_handler(CommandHandler("equity", equity_cmd, block=False))
+    app.add_handler(CommandHandler("equity", _instant_equity_cmd, block=False))
     app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
     app.add_handler(CommandHandler("riskmode", riskmode_cmd, block=False))
     app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
@@ -66486,10 +66721,11 @@ def main():
         # max_instances=1 and coalesce=True.
         interval_sec = max(180, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 180), int(ALERT_JOB_MAX_RUNTIME_SEC or 35) + 120)
     
+        _alert_first_delay = max(300, min(interval_sec, int(os.getenv('ALERT_JOB_FIRST_RUN_DELAY_SEC', str(interval_sec)) or interval_sec)))
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
-            first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
+            first=_alert_first_delay,
             name="alert_job",
             job_kwargs={
                 "max_instances": 1,
@@ -66508,10 +66744,11 @@ def main():
                 # /setup_audit for many minutes without email. Keep it lightweight and
                 # run every ~3 minutes by default.
                 _rec_interval = max(180, int(globals().get('SETUP_EMAIL_RECOVERY_JOB_INTERVAL_SEC', 180) or 180))
+                _rec_first_delay = max(300, min(_rec_interval, int(os.getenv('SETUP_EMAIL_RECOVERY_JOB_FIRST_DELAY_SEC', str(_rec_interval)) or _rec_interval)))
                 app.job_queue.run_repeating(
                     setup_email_recovery_job_runner,
                     interval=_rec_interval,
-                    first=max(30, min(int(globals().get('SETUP_EMAIL_RECOVERY_JOB_FIRST_SEC', 45) or 45), _rec_interval // 2)),
+                    first=_rec_first_delay,
                     name="setup_email_recovery_job",
                     job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 300},
                 )
