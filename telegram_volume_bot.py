@@ -1,3 +1,4 @@
+# ver19: hard last-mile /screen/email recovery fix: direct audit KEEP loader now has a raw SQL generated/executable fallback and combo-policy KEEP fallback, so rows visible in /setup_audit (KEEP+OPEN+AT=-) cannot disappear from /screen when executable_setups is stale/empty.
 # ver18: fixes /screen last-mile display from /setup_audit KEEP+OPEN rows by adding a direct, no-live-refilter audit recovery renderer before quick ticker fallback; keeps session-gap email/AutoTrade blocked unless unlimited is enabled.
 # ver17: fixes session-gap recovery: /screen/email/autotrade now directly consumes fresh /setup_audit KEEP+OPEN rows from ALL audit sources even when current live session is NONE and scan bucket is NY.
 # ver16: fixes audit KEEP recovery crash: undefined _setup_audit_autotrade_state_for_row made /screen/email/AutoTrade ignore fresh KEEP OPEN rows visible in /setup_audit.
@@ -60286,7 +60287,7 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                     _best_cached_recovery or {},
                     max_age_min=int(_recovery_first_min),
                     limit=max(1, int(SETUPS_N)),
-                    timeout=int(os.getenv('SCREEN_DIRECT_AUDIT_RECOVERY_TIMEOUT_SEC', '4') or 4),
+                    timeout=int(os.getenv('SCREEN_DIRECT_AUDIT_RECOVERY_TIMEOUT_SEC', '12') or 12),
                 )
                 if not body:
                     body, kb, shown_setups = await to_thread_fast(
@@ -68770,6 +68771,291 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 
 # ==========================================================
 # END SIGNAL QUALITY GATE ENGINE
+# ==========================================================
+
+
+
+# ==========================================================
+# ver19 HARD LAST-MILE AUDIT KEEP RECOVERY OVERRIDE
+# ==========================================================
+# This override intentionally replaces the earlier helper of the same name.
+# The bug observed at 09:38 was: /setup_audit showed fresh KEEP+OPEN+AT=- rows
+# (NEAR/ONDO/XPL/VVV), but /screen still fell back to "Executable scan is warming up"
+# because the executable queue was stale/empty and the audit bridge was too dependent
+# on the normal audit loader/policy recalculation.  This version first tries the
+# existing loader, then falls back to a raw SQL read from generated_setups and
+# executable_setups, and trusts the current combo-policy KEEP snapshot for frozen
+# display/recovery rows.  It still refuses resolved TP/SL rows, bad price geometry,
+# low volume, and already-consumed AutoTrade rows.
+
+def _ver19_setup_combo_keep_fallback(row: dict, session_name: str = '', user_id: int = 0) -> bool:
+    try:
+        rr = dict(row or {})
+        frozen = ''
+        try:
+            frozen = str(rr.get('policy_at_creation') or rr.get('delivery_policy') or rr.get('policy') or '').upper().strip()
+            if frozen not in {'KEEP', 'WATCH'}:
+                frozen = str(_setup_frozen_policy_label(rr) or '').upper().strip()
+        except Exception:
+            frozen = ''
+        if frozen == 'KEEP':
+            return True
+        sess = str(session_name or rr.get('session') or rr.get('source_session') or '').upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            sess = _setup_session_bucket_for_recovery(sess)
+        try:
+            info = _setup_combo_policy_lookup_for_setup(rr, session_name=sess, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or user_id or 0)) or {}
+            raw = str(info.get('status') or '').upper().strip()
+            found = bool(info.get('found'))
+            status = str(_setup_policy_effective_status(raw, found=found) or '').upper().strip()
+            try:
+                enabled = int(info.get('enabled') if info.get('enabled') is not None else (1 if not found else 0)) == 1
+            except Exception:
+                enabled = True if not found else False
+            return bool(enabled and status == 'KEEP')
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _ver19_fetch_raw_recent_setup_rows(uid: int, sess: str, max_age_min: int, limit: int = 240) -> list[dict]:
+    rows: list[dict] = []
+    try:
+        uid_i = int(uid or 0)
+        owner = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uids = []
+        for u in (uid_i, owner, 0):
+            try:
+                u = int(u or 0)
+                if u not in uids:
+                    uids.append(u)
+            except Exception:
+                pass
+        cutoff = float(time.time()) - float(max(1, int(max_age_min or 60))) * 60.0
+        sess_u = str(sess or '').upper().strip()
+        with sqlite3.connect(DB_PATH, timeout=2.0) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            # Newest generated rows first: this is where /setup_audit often sees KEEP rows
+            # before the executable email pool is rebuilt.
+            if 'generated_setups' in tables:
+                try:
+                    cols = {r[1] for r in cur.execute('PRAGMA table_info(generated_setups)').fetchall()}
+                    if cols:
+                        time_col = 'created_ts' if 'created_ts' in cols else ('ts' if 'ts' in cols else '')
+                        wh = []
+                        params = []
+                        if 'user_id' in cols and uids:
+                            wh.append('user_id IN (%s)' % ','.join(['?'] * len(uids)))
+                            params.extend(uids)
+                        if time_col:
+                            wh.append(f'COALESCE({time_col},0)>=?')
+                            params.append(cutoff)
+                        if 'session' in cols and sess_u in {'ASIA', 'LON', 'NY'}:
+                            # Allow blank legacy sessions as well; combo/policy can still prove NY/LON/ASIA.
+                            wh.append("(UPPER(COALESCE(session,'')) IN (?,''))")
+                            params.append(sess_u)
+                        where = ('WHERE ' + ' AND '.join(wh)) if wh else ''
+                        order = f'ORDER BY COALESCE({time_col},0) DESC' if time_col else ''
+                        q = f"SELECT * FROM generated_setups {where} {order} LIMIT ?"
+                        params.append(max(int(limit), 240))
+                        for r in cur.execute(q, tuple(params)).fetchall() or []:
+                            d = dict(r)
+                            d.setdefault('source', 'GEN_RAW_V19')
+                            if 'ts' not in d or not d.get('ts'):
+                                d['ts'] = d.get('created_ts') or d.get('signal_created_ts') or 0
+                            rows.append(d)
+                except Exception:
+                    pass
+            if 'executable_setups' in tables:
+                try:
+                    cols = {r[1] for r in cur.execute('PRAGMA table_info(executable_setups)').fetchall()}
+                    if cols:
+                        time_expr = "COALESCE(executable_ts,signal_created_ts,created_ts,ts,0)"
+                        # Build a safe expression only using available columns.
+                        tparts = [c for c in ('emailed_ts','executable_ts','signal_created_ts','created_ts','ts') if c in cols]
+                        if tparts:
+                            time_expr = 'COALESCE(' + ','.join(tparts + ['0']) + ')'
+                        wh = []
+                        params = []
+                        if 'user_id' in cols and uids:
+                            wh.append('user_id IN (%s)' % ','.join(['?'] * len(uids)))
+                            params.extend(uids)
+                        wh.append(f'{time_expr}>=?')
+                        params.append(cutoff)
+                        if 'session' in cols and sess_u in {'ASIA', 'LON', 'NY'}:
+                            wh.append("(UPPER(COALESCE(session,'')) IN (?,''))")
+                            params.append(sess_u)
+                        where = ('WHERE ' + ' AND '.join(wh)) if wh else ''
+                        q = f"SELECT * FROM executable_setups {where} ORDER BY {time_expr} DESC LIMIT ?"
+                        params.append(max(int(limit), 240))
+                        for r in cur.execute(q, tuple(params)).fetchall() or []:
+                            d = dict(r)
+                            d.setdefault('source', 'EXEC_RAW_V19')
+                            if 'ts' not in d or not d.get('ts'):
+                                d['ts'] = d.get('executable_ts') or d.get('signal_created_ts') or d.get('created_ts') or 0
+                            rows.append(d)
+                except Exception:
+                    pass
+    except Exception:
+        return list(rows or [])
+    return list(rows or [])
+
+
+def _setup_audit_direct_keep_open_recovery_candidates(user_id: int, session_name: str = '', *, max_age_min: int | None = None, limit: int = 48) -> list:
+    try:
+        uid = int(user_id or 0)
+        if uid <= 0:
+            return []
+        sess = _setup_session_bucket_for_recovery(session_name)
+        if max_age_min is None:
+            max_age_min = _setup_email_actionable_queue_window_min()
+        try:
+            max_age_min_i = max(1, int(max_age_min or 60))
+        except Exception:
+            max_age_min_i = 60
+        hours = max(1, int(math.ceil(float(max_age_min_i) / 60.0)) + 1)
+        rows = []
+        # First, use the official audit loader.
+        for u in [uid, int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), 0]:
+            try:
+                if int(u) < 0:
+                    continue
+                rows.extend(_setup_audit_load_rows(int(u), hours=hours, limit=max(240, int(limit or 48) * 8), dedup=False, apply_final_quality_gate=False, source_mode_override='ALL') or [])
+            except Exception:
+                continue
+        # Hard fallback: raw SQL from generated/executable tables.  This is the key
+        # ver19 fix for stale/empty executable pools.
+        try:
+            rows.extend(_ver19_fetch_raw_recent_setup_rows(uid, sess, max_age_min_i, limit=max(240, int(limit or 48) * 8)) or [])
+        except Exception:
+            pass
+
+        out_rows = []
+        reasons = Counter()
+        seen = set()
+        for raw in list(rows or []):
+            try:
+                r = _setup_audit_payload_from_row(dict(raw or {}))
+                sid = str(r.get('setup_id') or '').strip()
+                if not sid:
+                    sid = _setup_audit_unique_key(r)
+                    r['setup_id'] = sid
+                sym = str(_symbol_base(r.get('symbol') or '')).upper().strip()
+                side = str(r.get('side') or '').upper().strip()
+                if not sid or not sym or side not in {'BUY', 'SELL'}:
+                    reasons['missing_identity'] += 1
+                    continue
+                row_sess = str(r.get('session') or r.get('source_session') or sess or '').upper().strip()
+                if row_sess not in {'ASIA', 'LON', 'NY'}:
+                    row_sess = sess
+                # Do not let live Session:NONE hide a real NY/LON/ASIA setup; sess has
+                # already been normalised to the fallback scan bucket.
+                if sess in {'ASIA', 'LON', 'NY'} and row_sess in {'ASIA', 'LON', 'NY'} and row_sess != sess:
+                    reasons['session_mismatch'] += 1
+                    continue
+                if not _setup_audit_row_inside_delivery_window(r):
+                    reasons['outside_delivery_window'] += 1
+                    continue
+                still_open, open_state = _setup_audit_recovery_row_still_open(r)
+                if not still_open:
+                    reasons[f'already_resolved_{open_state}'] += 1
+                    continue
+                entry = float(r.get('entry') or 0.0)
+                sl = float(r.get('sl') or 0.0)
+                tp = float(r.get('tp') or 0.0)
+                if entry <= 0 or sl <= 0 or tp <= 0:
+                    reasons['bad_prices'] += 1
+                    continue
+                if side == 'BUY' and not (sl < entry < tp):
+                    reasons['bad_buy_geometry'] += 1
+                    continue
+                if side == 'SELL' and not (tp < entry < sl):
+                    reasons['bad_sell_geometry'] += 1
+                    continue
+                if not _setup_volume_ok(float(r.get('fut_vol_usd') or 0.0)):
+                    reasons['volume_below_floor'] += 1
+                    continue
+                # The important change: trust combo-policy KEEP if the frozen snapshot
+                # is missing.  Do NOT require the full volatile live delivery gate here;
+                # /setup_audit visible KEEP is the frozen truth for last-mile recovery.
+                if not _ver19_setup_combo_keep_fallback(r, session_name=row_sess or sess, user_id=uid):
+                    reasons['policy_not_keep'] += 1
+                    continue
+                try:
+                    at_state = str(_setup_audit_autotrade_state_label(r, uid=int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid), session_name=(row_sess or sess)) or '-').upper().strip()
+                    if at_state not in {'', '-', 'NONE'}:
+                        reasons[f'already_{at_state}'] += 1
+                        continue
+                except Exception:
+                    pass
+                key = _setup_audit_unique_key(r) or sid
+                if key in seen:
+                    continue
+                seen.add(key)
+                r['session'] = row_sess if row_sess in {'ASIA', 'LON', 'NY'} else sess
+                r['source_session'] = r['session']
+                r['policy_at_creation'] = 'KEEP'
+                r['delivery_policy'] = 'KEEP'
+                r['policy'] = 'KEEP'
+                r['source'] = str(r.get('source') or 'AUDIT_RAW_V19')
+                out_rows.append(r)
+            except Exception as exc:
+                reasons[f'direct_audit_exception:{type(exc).__name__}'] += 1
+                continue
+        # newest first, one per symbol to match /screen's action-card behavior
+        try:
+            out_rows.sort(key=lambda x: float(_setup_audit_row_ts(x) or 0.0), reverse=True)
+        except Exception:
+            pass
+        compact = []
+        seen_sym = set()
+        for r in out_rows:
+            try:
+                sym = str(_symbol_base((r or {}).get('symbol') or '')).upper().strip()
+                if sym and sym in seen_sym:
+                    continue
+                if sym:
+                    seen_sym.add(sym)
+                compact.append(r)
+                if len(compact) >= max(1, int(limit or 48)):
+                    break
+            except Exception:
+                compact.append(r)
+        objs = _setup_audit_rows_to_recovery_setup_objects(compact, session_name=sess, user_id=uid)
+        try:
+            for o in list(objs or []):
+                try:
+                    setattr(o, 'source_kind', 'setup_audit_recovery')
+                    setattr(o, 'setup_audit_recovery', True)
+                    setattr(o, 'delivery_lane_locked', True)
+                    setattr(o, 'frozen_keep_delivery_escape', True)
+                    setattr(o, 'frozen_keep_delivery_escape_reason', 'ver19_direct_audit_combo_keep')
+                    setattr(o, 'policy_at_creation', 'KEEP')
+                    setattr(o, 'delivery_policy', 'KEEP')
+                    setattr(o, 'policy', 'KEEP')
+                    setattr(o, 'source_session', str(getattr(o, 'source_session', '') or sess).upper().strip())
+                    setattr(o, 'session', str(getattr(o, 'session', '') or getattr(o, 'source_session', '') or sess).upper().strip())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            db_log_setup_pipeline_event(uid, stage='direct_audit_keep_open_recovery_candidates_v19', status='ok' if objs else 'empty', session=sess, mode='recovery', details={'input': len(rows or []), 'eligible': len(objs or []), 'top_reasons': _pipeline_top_reasons(reasons, 10)})
+        except Exception:
+            pass
+        return list(objs or [])[:max(1, int(limit or 48))]
+    except Exception as exc:
+        try:
+            db_log_setup_pipeline_event(int(user_id or 0), stage='direct_audit_keep_open_recovery_candidates_v19', status='error', session=str(session_name or ''), mode='recovery', details={'error': f'{type(exc).__name__}: {exc}'})
+        except Exception:
+            pass
+        return []
+
+# ==========================================================
+# END ver19 HARD LAST-MILE AUDIT KEEP RECOVERY OVERRIDE
 # ==========================================================
 
 if __name__ == "__main__":
