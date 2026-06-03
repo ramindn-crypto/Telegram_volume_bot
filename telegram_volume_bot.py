@@ -12855,7 +12855,20 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
             if conf < conf_floor:
                 return (False, "below_exec_conf")
             rr_final = float(rr_to_tp(entry, sl, final_tp)) if final_tp > 0 else 0.0
-            if rr_final < float(sess_rr):
+            # Ver26: F8/BigMove setup emails are deliberately generated at the
+            # configured BigMove/reverse RR (often 1.20R). They are authoritative
+            # emailed setups and should not be rejected by the normal session RR
+            # floor (usually 1.50R) before AutoTrade can apply its live TP RR cap.
+            fam_for_rr = str(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '').upper().strip()
+            sid_for_rr = str(getattr(s, 'setup_id', '') or '').upper().strip()
+            is_f8_rr = fam_for_rr in {'F8', 'BIGMOVE', 'BIGMOVE/F8'} or sid_for_rr.startswith(('BMAT-', 'BIGMOVE-'))
+            rr_floor = float(sess_rr)
+            if is_f8_rr:
+                try:
+                    rr_floor = min(rr_floor, max(1.0, float(getattr(s, 'bigmove_rr', 0.0) or globals().get('SETUP_REVERSE_TARGET_RR', 1.2) or 1.2)))
+                except Exception:
+                    rr_floor = min(rr_floor, 1.2)
+            if rr_final < float(rr_floor):
                 return (False, "below_exec_rr")
             return (True, "ok_emailed_authoritative")
 
@@ -20730,6 +20743,8 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
         side = str(plan.get('side') or '').upper().strip()
         conf = _bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, fut_vol, 0.0)
         conf = int(clamp(max(float(conf), 82.0), 68.0, 96.0))
+        # Ver26: build a provisional BigMove setup id only until routing is finished.
+        # The final delivered setup id must reflect the actual routed side shown to the user.
         setup_id = f"BMAT-{sym}-{side}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
         market_symbol = _bigmove_candidate_market_symbol(c, best_fut)
         s = Setup(
@@ -20799,6 +20814,16 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
             routed_strategy = str(_setup_strategy_label(s) or '').upper().strip()
             setattr(s, 'bigmove_routed_side', routed_side)
             setattr(s, 'bigmove_routed_strategy', routed_strategy)
+            # Ver26: after NOR->REV routing, keep the setup_id consistent with
+            # the delivered side. This prevents /screen showing BUY while the id
+            # says BMAT-...-SELL, and prevents duplicate/email/autotrade locks from
+            # keying the wrong direction.
+            if routed_side in {'BUY', 'SELL'}:
+                old_sid = str(getattr(s, 'setup_id', '') or '')
+                if old_sid.startswith(f"BMAT-{sym}-") and f"-{routed_side}-" not in old_sid:
+                    new_sid = f"BMAT-{sym}-{routed_side}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+                    setattr(s, 'original_setup_id', old_sid)
+                    setattr(s, 'setup_id', new_sid)
         except Exception:
             routed_side, routed_strategy = str(side or '').upper().strip(), ''
         setattr(s, 'why', f"Confirmed Big-Move alert {str(c.get('direction') or '').upper()} | Routed {routed_strategy or 'NOR'} {routed_side or str(side).upper()} | SL {float(plan.get('sl_pct') or 0.0):.2f}% ({plan.get('sl_model')}) | TP {float(plan.get('tp_pct') or 0.0):.2f}% (~{float(plan.get('rr') or BIGMOVE_AUTOTRADE_RR):.2f}R)")
