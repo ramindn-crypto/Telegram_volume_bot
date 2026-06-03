@@ -4320,6 +4320,86 @@ def _setup_frozen_policy_label(row: dict) -> str:
         pass
     return ''
 
+
+
+def _setup_snapshot_keep_delivery_escape(setup_or_row, session_name: str = '', *, max_age_min: int | None = None) -> tuple[bool, str]:
+    """Trust fresh frozen KEEP delivery snapshots for the last-mile email/screen/AT bridge.
+
+    Ver37: /setup_audit is the owner's visible truth for rows that have already been
+    stamped with a frozen creation/delivery policy.  A fresh row that says Policy=KEEP
+    must not be lost later because the live matrix/context gate moved while the email
+    loop was busy.  This escape is deliberately narrow:
+      - policy snapshot must be KEEP (or explicit setup_audit_recovery KEEP),
+      - setup must be inside AUTOTRADE_ENTRY_WINDOW_MIN,
+      - session/side/entry/SL/TP must be valid.
+    Cooldown, duplicate reservation, same-symbol conflict, open-position and risk gates
+    still run after this helper; it only bypasses the *current* combo/user-visible policy
+    relabel that caused KEEP audit rows to miss setup email/autotrade.
+    """
+    try:
+        obj = setup_or_row
+        sess = str(session_name or _autotrade_setup_attr(obj, 'session', '') or _autotrade_setup_attr(obj, 'source_session', '') or '').upper().strip()
+        if sess and sess not in {'ASIA', 'LON', 'NY'}:
+            return False, 'snapshot_bad_session'
+        pol = ''
+        for k in ('policy_at_creation', 'delivery_policy', 'policy', 'frozen_policy', 'policy_status_at_creation'):
+            try:
+                v = _autotrade_setup_attr(obj, k, '')
+                if v not in (None, ''):
+                    pol = str(v or '').upper().strip()
+                    break
+            except Exception:
+                pass
+        if not pol:
+            try:
+                if isinstance(obj, dict):
+                    pol = _setup_frozen_policy_label(dict(obj or {}))
+            except Exception:
+                pol = ''
+        src = str(_autotrade_setup_attr(obj, 'source_kind', '') or '').lower().strip()
+        if not pol and src == 'setup_audit_recovery' and bool(_autotrade_setup_attr(obj, 'delivery_lane_locked', False)):
+            # _setup_audit_recovery candidates are only created from current Policy=KEEP/WATCH rows.
+            # Require the explicit flag below to avoid opening the door for arbitrary objects.
+            pol = str(_autotrade_setup_attr(obj, 'policy_at_creation', '') or '').upper().strip()
+        if pol != 'KEEP':
+            return False, f'snapshot_policy_{pol or "missing"}'
+        side = str(_autotrade_setup_attr(obj, 'side', '') or '').upper().strip()
+        if side not in {'BUY', 'SELL'}:
+            return False, 'snapshot_bad_side'
+        try:
+            entry = float(_autotrade_setup_attr(obj, 'entry', 0.0) or 0.0)
+            sl = float(_autotrade_setup_attr(obj, 'sl', 0.0) or 0.0)
+            tp = float(_setup_target_tp(obj, 0.0) or _autotrade_setup_attr(obj, 'tp', 0.0) or 0.0)
+            if entry <= 0 or sl <= 0 or tp <= 0:
+                return False, 'snapshot_bad_prices'
+            if side == 'BUY' and not (sl < entry < tp):
+                return False, 'snapshot_bad_buy_geometry'
+            if side == 'SELL' and not (tp < entry < sl):
+                return False, 'snapshot_bad_sell_geometry'
+        except Exception:
+            return False, 'snapshot_price_exception'
+        now_ts = float(time.time())
+        ts_vals = []
+        for k in ('emailed_ts', 'email_logged_ts', 'executable_ts', 'created_ts', 'signal_created_ts', 'generated_logged_ts', 'ts'):
+            try:
+                vv = float(_autotrade_setup_attr(obj, k, 0.0) or 0.0)
+                if vv > 0:
+                    ts_vals.append(vv)
+            except Exception:
+                pass
+        if not ts_vals:
+            return False, 'snapshot_missing_ts'
+        row_ts = max(ts_vals)
+        try:
+            win_min = int(max_age_min if max_age_min is not None else _autotrade_entry_window_min())
+        except Exception:
+            win_min = 60
+        if (now_ts - row_ts) > max(60.0, float(win_min) * 60.0):
+            return False, 'snapshot_outside_entry_window'
+        return True, 'frozen_keep_snapshot_inside_entry_window'
+    except Exception as exc:
+        return False, f'snapshot_exception:{type(exc).__name__}'
+
 def _setup_policy_status_is_unknownish(status: str = '') -> bool:
     try:
         return str(status or '').upper().strip() in {'', 'UNKNOWN', 'UNSET', 'NONE', 'NULL', '-', 'MON', 'MONITOR', 'PROBATION', 'GATE'}
@@ -49531,6 +49611,13 @@ def _setup_combo_policy_allows_setup(setup_or_row, session_name: str = '', user_
     setup generation.
     """
     try:
+        _snap_ok, _snap_why = _setup_snapshot_keep_delivery_escape(setup_or_row, session_name=session_name)
+        if _snap_ok:
+            try:
+                db_log_setup_pipeline_event(int(user_id or 0), stage='combo_policy_final_gate', status='allow_frozen_keep', session=str(session_name or ''), mode='quality_gate', setup_id=str(_autotrade_setup_attr(setup_or_row, 'setup_id', '') or _autotrade_setup_attr(setup_or_row, 'id', '') or ''), symbol=str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or ''), side=str(_autotrade_setup_attr(setup_or_row, 'side', '') or ''), details={'reason': str(_snap_why or 'frozen_keep_snapshot')})
+            except Exception:
+                pass
+            return True
         if not bool(globals().get('SETUP_COMBO_POLICY_LIVE_ENFORCE', True)):
             return True
         ok, why, meta = _setup_final_quality_gate_allows_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
@@ -60379,6 +60466,10 @@ def _setup_audit_rows_to_recovery_setup_objects(rows: list, session_name: str = 
                     original_setup_id=str(rr.get('original_setup_id') or ''),
                     original_side=str(rr.get('original_side') or ''),
                     delivery_lane_locked=True,
+                    policy_at_creation=str(rr.get('policy_at_creation') or rr.get('policy') or 'KEEP').upper().strip() if str(rr.get('policy_at_creation') or rr.get('policy') or '').upper().strip() in {'KEEP','WATCH'} else 'KEEP',
+                    delivery_policy=str(rr.get('policy_at_creation') or rr.get('policy') or 'KEEP').upper().strip() if str(rr.get('policy_at_creation') or rr.get('policy') or '').upper().strip() in {'KEEP','WATCH'} else 'KEEP',
+                    policy=str(rr.get('policy_at_creation') or rr.get('policy') or 'KEEP').upper().strip() if str(rr.get('policy_at_creation') or rr.get('policy') or '').upper().strip() in {'KEEP','WATCH'} else 'KEEP',
+                    setup_audit_recovery=True,
                 )
                 try:
                     item = _research_finalize_setup(item, session_name=sess)
@@ -60616,47 +60707,62 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
                 continue
             keep_ok, keep_why, keep_meta = _setup_user_visible_keep_policy_allows(eff, session_name=sess, user_id=int(gate_uid or uid or 0), lane=str(lane or 'email'))
             if not keep_ok:
-                # Ver35: a confirmed Big-Move alert is already a user-visible market event.
-                # If it has been converted into a valid F8 setup (SL/TP/RR/executable OK),
-                # do not silently drop the paired setup email just because the generic
-                # lane policy is WATCH/GATE/OFF at that moment.  This fixes cases like
-                # WLD UP where the Big-Move alert email was delivered but no setup row/email
-                # appeared in /setup_audit, /screen, or AutoTrade.  Normal non-BigMove
-                # setup emails still require KEEP exactly as before.
-                try:
-                    _lane_l = str(lane or '').lower()
-                    _fam_l = str(getattr(eff, 'family_id', '') or getattr(eff, 'family', '') or '').upper()
-                    _sid_l = str(sid or '').upper()
-                    _is_bm = (_lane_l == 'bigmove_setup_email') and (_fam_l in {'F8', 'BIGMOVE', 'BIGMOVE/F8', 'F8_BIGMOVE_CONT'} or _sid_l.startswith(('BMAT-', 'BIGMOVE-')) or bool(getattr(eff, 'bigmove_signal', False)))
-                    _bm_conf = int(getattr(eff, 'conf', 0) or 0) >= 82
-                    _bm_side = str(getattr(eff, 'side', '') or '').upper() in {'BUY', 'SELL'}
-                    if _is_bm and _bm_conf and _bm_side:
-                        try:
-                            setattr(eff, 'policy_at_creation', 'KEEP')
-                            setattr(eff, 'delivery_policy', 'KEEP')
-                            setattr(eff, 'policy', 'KEEP')
-                            setattr(eff, 'bigmove_policy_escape', True)
-                            setattr(eff, 'bigmove_policy_escape_reason', str(keep_why or 'bigmove_confirmed_setup_policy_escape'))
-                        except Exception:
-                            pass
-                        try:
-                            db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='allow_bigmove_escape', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
-                        except Exception:
-                            pass
-                    else:
+                _snap_ok, _snap_why = _setup_snapshot_keep_delivery_escape(eff, session_name=sess)
+                if _snap_ok:
+                    try:
+                        setattr(eff, 'policy_at_creation', 'KEEP')
+                        setattr(eff, 'delivery_policy', 'KEEP')
+                        setattr(eff, 'policy', 'KEEP')
+                        setattr(eff, 'frozen_keep_delivery_escape', True)
+                        setattr(eff, 'frozen_keep_delivery_escape_reason', str(keep_why or _snap_why or 'frozen_keep_snapshot'))
+                    except Exception:
+                        pass
+                    try:
+                        db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='allow_frozen_keep', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or _snap_why or 'frozen_keep_snapshot'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
+                    except Exception:
+                        pass
+                else:
+                    # Ver35: a confirmed Big-Move alert is already a user-visible market event.
+                    # If it has been converted into a valid F8 setup (SL/TP/RR/executable OK),
+                    # do not silently drop the paired setup email just because the generic
+                    # lane policy is WATCH/GATE/OFF at that moment.  This fixes cases like
+                    # WLD UP where the Big-Move alert email was delivered but no setup row/email
+                    # appeared in /setup_audit, /screen, or AutoTrade.  Normal non-BigMove
+                    # setup emails still require KEEP exactly as before.
+                    try:
+                        _lane_l = str(lane or '').lower()
+                        _fam_l = str(getattr(eff, 'family_id', '') or getattr(eff, 'family', '') or '').upper()
+                        _sid_l = str(sid or '').upper()
+                        _is_bm = (_lane_l == 'bigmove_setup_email') and (_fam_l in {'F8', 'BIGMOVE', 'BIGMOVE/F8', 'F8_BIGMOVE_CONT'} or _sid_l.startswith(('BMAT-', 'BIGMOVE-')) or bool(getattr(eff, 'bigmove_signal', False)))
+                        _bm_conf = int(getattr(eff, 'conf', 0) or 0) >= 82
+                        _bm_side = str(getattr(eff, 'side', '') or '').upper() in {'BUY', 'SELL'}
+                        if _is_bm and _bm_conf and _bm_side:
+                            try:
+                                setattr(eff, 'policy_at_creation', 'KEEP')
+                                setattr(eff, 'delivery_policy', 'KEEP')
+                                setattr(eff, 'policy', 'KEEP')
+                                setattr(eff, 'bigmove_policy_escape', True)
+                                setattr(eff, 'bigmove_policy_escape_reason', str(keep_why or 'bigmove_confirmed_setup_policy_escape'))
+                            except Exception:
+                                pass
+                            try:
+                                db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='allow_bigmove_escape', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
+                            except Exception:
+                                pass
+                        else:
+                            reasons[str(keep_why or 'email_policy_not_keep')] += 1
+                            try:
+                                db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
+                            except Exception:
+                                pass
+                            continue
+                    except Exception:
                         reasons[str(keep_why or 'email_policy_not_keep')] += 1
                         try:
                             db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
                         except Exception:
                             pass
                         continue
-                except Exception:
-                    reasons[str(keep_why or 'email_policy_not_keep')] += 1
-                    try:
-                        db_log_setup_pipeline_event(int(uid or 0), stage='setup_email_keep_policy_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=sid, symbol=sym, side=side, details={'reason': str(keep_why or 'email_policy_not_keep'), 'gate_uid': int(gate_uid or 0), 'policy': keep_meta})
-                    except Exception:
-                        pass
-                    continue
             # yver159: keep setup email /screen /AutoTrade aligned when normal and
             # Big-Move/F8 create the same symbol at the same time.  Do not send a
             # weaker same-symbol setup if a stronger exact-lane setup was already
@@ -62599,30 +62705,50 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 _seen_setup_keys.add(_k)
                 sess_name = str(sess["name"])
 
-                try:
-                    if not _setup_combo_policy_allows_setup(s, sess_name, user_id=int(uid)):
+                _snap_delivery_ok, _snap_delivery_why = _setup_snapshot_keep_delivery_escape(s, session_name=sess_name)
+                if not _snap_delivery_ok:
+                    try:
+                        if not _setup_combo_policy_allows_setup(s, sess_name, user_id=int(uid)):
+                            combo_policy_blocked += 1
+                            continue
+                    except Exception:
                         combo_policy_blocked += 1
                         continue
-                except Exception:
-                    combo_policy_blocked += 1
-                    continue
+                else:
+                    try:
+                        setattr(s, 'policy_at_creation', 'KEEP')
+                        setattr(s, 'delivery_policy', 'KEEP')
+                        setattr(s, 'policy', 'KEEP')
+                        setattr(s, 'frozen_keep_delivery_escape', True)
+                    except Exception:
+                        pass
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_combo_policy_gate', status='allow_frozen_keep', session=str(sess_name or ''), mode='email', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=sym, side=side, details={'reason': str(_snap_delivery_why or 'frozen_keep_snapshot')})
+                    except Exception:
+                        pass
 
                 # yver139: apply the same subscriber/email KEEP + context gate before
                 # choosing the candidate, not only inside send_email_alert_multi().
                 # Otherwise the top candidate can be chosen then removed by presend,
                 # causing the whole email batch to fail instead of trying the next valid setup.
-                try:
-                    _vis_ok, _vis_why, _vis_meta = _setup_user_visible_keep_policy_allows(s, session_name=sess_name, user_id=int(uid), lane='email')
-                    if not _vis_ok:
+                if not _snap_delivery_ok:
+                    try:
+                        _vis_ok, _vis_why, _vis_meta = _setup_user_visible_keep_policy_allows(s, session_name=sess_name, user_id=int(uid), lane='email')
+                        if not _vis_ok:
+                            combo_policy_blocked += 1
+                            try:
+                                db_log_setup_pipeline_event(int(uid), stage='email_user_visible_policy_gate', status='skip', session=str(sess_name or ''), mode='email', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=sym, side=side, details={'reason': str(_vis_why or 'email_policy_not_allowed'), 'policy': dict(_vis_meta or {})})
+                            except Exception:
+                                pass
+                            continue
+                    except Exception:
                         combo_policy_blocked += 1
-                        try:
-                            db_log_setup_pipeline_event(int(uid), stage='email_user_visible_policy_gate', status='skip', session=str(sess_name or ''), mode='email', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=sym, side=side, details={'reason': str(_vis_why or 'email_policy_not_allowed'), 'policy': dict(_vis_meta or {})})
-                        except Exception:
-                            pass
                         continue
-                except Exception:
-                    combo_policy_blocked += 1
-                    continue
+                else:
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_user_visible_policy_gate', status='allow_frozen_keep', session=str(sess_name or ''), mode='email', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=sym, side=side, details={'reason': str(_snap_delivery_why or 'frozen_keep_snapshot')})
+                    except Exception:
+                        pass
 
                 if symbol_flip_guard_active(uid, sym, side, sess_name):
                     flip_blocked += 1
