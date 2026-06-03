@@ -1,3 +1,4 @@
+# ver17: fixes session-gap recovery: /screen/email/autotrade now directly consumes fresh /setup_audit KEEP+OPEN rows from ALL audit sources even when current live session is NONE and scan bucket is NY.
 # ver16: fixes audit KEEP recovery crash: undefined _setup_audit_autotrade_state_for_row made /screen/email/AutoTrade ignore fresh KEEP OPEN rows visible in /setup_audit.
 # ver15: fixes /setup_audit KEEP rows missing from /screen/email/AutoTrade when the row exists only in generated_setups by making audit-recovery load ALL audit sources, not executable-only.
 # ver14: fixes /screen empty while /setup_audit has fresh KEEP rows by adding pre-heavy audit-recovery display, longer recovery fallback, and frozen KEEP audit-recovery email/screen-sync bypass.
@@ -43659,6 +43660,13 @@ async def sessions_on_unlimited_cmd(update: Update, context: ContextTypes.DEFAUL
     uid = update.effective_user.id
     update_user(uid, sessions_unlimited=1)
     await update.message.reply_text("✅ Sessions: UNLIMITED (24h emailing enabled).")
+    # ver17: immediately kick the DB/audit recovery lane.  Without this, turning
+    # unlimited on during the 09:00-10:00 gap waits for the next scheduler tick and
+    # fresh KEEP rows can expire before email/AutoTrade sees them.
+    try:
+        _safe_create_task(setup_email_recovery_job_runner(context), 'sessions_unlimited_immediate_recovery')
+    except Exception:
+        pass
 
 async def sessions_off_unlimited_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -59223,7 +59231,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         if max_age_min is None:
             max_age_min = _screen_actionable_fallback_max_age_min()
         max_age_min = max(1, int(max_age_min or _screen_actionable_fallback_max_age_min()))
-        sess = str(session or '').upper().strip()
+        sess = _setup_session_bucket_for_recovery(session)
         out = []
         seen = set()
 
@@ -59257,11 +59265,15 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
             sources.append(('executable', _executable_rows_to_setup_objects(rows, session_name=sess) or []))
         except Exception:
             sources.append(('executable', []))
-        # ver10: if /setup_audit shows fresh KEEP rows with AT='-' but the normal
-        # executable/email fan-out missed them, /screen must still surface the same
-        # audit recovery lane instead of showing an empty scan. This source is only
-        # built from current actionable KEEP/WATCH audit rows and still passes
-        # basic price/volume/policy checks below.
+        # ver17: direct /setup_audit visible truth first.  This catches fresh
+        # KEEP + OPEN + AT='-' rows that exist in generated/audit storage even when
+        # executable_setups is empty or the live session display is NONE.
+        try:
+            audit_direct = _setup_audit_direct_keep_open_recovery_candidates(int(uid), session_name=sess, max_age_min=max_age_min, limit=120)
+            sources.append(('audit_direct', list(audit_direct or [])))
+        except Exception:
+            sources.append(('audit_direct', []))
+        # ver10 legacy audit-recovery bridge retained as a secondary source.
         try:
             audit_rows = _setup_recent_audit_actionable_recovery_candidates(int(uid), session_name=sess, max_age_min=max_age_min, limit=120)
             sources.append(('audit_recovery', list(audit_rows or [])))
@@ -59288,7 +59300,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     if not _screen_setup_within_actionable_window(item, max_age_min=max_age_min):
                         continue
                     try:
-                        if source_name in {'emailed', 'audit_recovery'}:
+                        if source_name in {'emailed', 'audit_recovery', 'audit_direct'}:
                             # ver08/ver10: delivered rows and audit-recovery rows are already
                             # frozen/actionable lane snapshots. Do not re-run volatile live
                             # final-quality gates here because they can flip minutes later and
@@ -59301,7 +59313,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     if not ok_exec:
                         continue
                     keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=sess, user_id=int(uid), lane='screen')
-                    if not keep_ok and source_name == 'audit_recovery':
+                    if not keep_ok and source_name in {'audit_recovery', 'audit_direct'}:
                         try:
                             snap_ok, snap_why = _setup_snapshot_keep_delivery_escape(item, session_name=sess)
                             pol_snap = str(getattr(item, 'policy_at_creation', '') or getattr(item, 'delivery_policy', '') or getattr(item, 'policy', '') or '').upper().strip()
@@ -59316,7 +59328,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                             pass
                     if not keep_ok:
                         continue
-                    if source_name not in {'emailed', 'audit_recovery'} and not _screen_attach_email_delivery_or_skip(int(uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
+                    if source_name not in {'emailed', 'audit_recovery', 'audit_direct'} and not _screen_attach_email_delivery_or_skip(int(uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
                         continue
                     if not used_source_name:
                         used_source_name = str(source_name or '')
@@ -59340,7 +59352,10 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         except Exception:
             up_list, dn_list = [], []
         market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
-        source_note = '_Showing recent emailed setup queue while the live scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else ('_Showing latest sent setup email while the live scan refreshes._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue while the live scan refreshes._')
+        if used_source_name in {'audit_direct', 'audit_recovery'}:
+            source_note = '_Showing fresh /setup_audit KEEP recovery queue while the email/AutoTrade lane catches up._'
+        else:
+            source_note = '_Showing recent emailed setup queue while the live scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else ('_Showing latest sent setup email while the live scan refreshes._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue while the live scan refreshes._')
         body = "\n".join([
             "",
             "*Top Trade Setups*",
@@ -59415,9 +59430,12 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                 sources.append(('executable', _executable_rows_to_setup_objects(rows, session_name=req_session_u) or []))
             except Exception:
                 sources.append(('executable', []))
-            # ver10: bridge fresh /setup_audit KEEP rows (AT='-') into /screen while
-            # the email/autotrade lane catches up. This keeps screen, audit, email,
-            # and AutoTrade synced instead of showing "no confirmed setup".
+            # ver17: direct /setup_audit KEEP+OPEN recovery before the legacy bridge.
+            try:
+                audit_direct = _setup_audit_direct_keep_open_recovery_candidates(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(96, int(limit * 16)))
+                sources.append(('audit_direct', list(audit_direct or [])))
+            except Exception:
+                sources.append(('audit_direct', []))
             try:
                 audit_recovery = _setup_recent_audit_actionable_recovery_candidates(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(96, int(limit * 16)))
                 sources.append(('audit_recovery', list(audit_recovery or [])))
@@ -59440,7 +59458,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                             continue
                         if not _screen_setup_within_actionable_window(item, max_age_min=max_age_min):
                             continue
-                        if source_name in {'emailed', 'audit_recovery'}:
+                        if source_name in {'emailed', 'audit_recovery', 'audit_direct'}:
                             ok_exec = _basic_valid(item)
                         else:
                             try:
@@ -59449,7 +59467,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                                 ok_exec, _why_exec = False, 'screen_lane_exec_gate_exception'
                         if ok_exec:
                             keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=(req_session_u or src_session_u or _session), user_id=int(_uid), lane='screen')
-                            if not keep_ok and source_name == 'audit_recovery':
+                            if not keep_ok and source_name in {'audit_recovery', 'audit_direct'}:
                                 # ver11: /setup_audit recovery rows carry a frozen
                                 # delivery policy. A later live policy recalculation
                                 # must not make /screen hide rows that /setup_audit
@@ -59468,7 +59486,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                                     pass
                             if not keep_ok:
                                 continue
-                            if source_name not in {'emailed', 'audit_recovery'} and not _screen_attach_email_delivery_or_skip(int(_uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
+                            if source_name not in {'emailed', 'audit_recovery', 'audit_direct'} and not _screen_attach_email_delivery_or_skip(int(_uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
                                 continue
                             out.append(item)
                             seen.add(dedupe_key)
@@ -61476,6 +61494,148 @@ def _setup_merge_unique_candidates(primary: list, extra: list, session_name: str
             break
     return out
 
+
+
+def _setup_session_bucket_for_recovery(session_name: str = '') -> str:
+    """Return the real ASIA/LON/NY bucket to use for recovery reads.
+
+    During the 09:00-10:00 Melbourne live-session gap current_session is NONE,
+    but generated/audit rows are still stored under the scan bucket (normally NY).
+    Recovery must therefore search that bucket instead of literal NONE.
+    """
+    try:
+        sess = str(session_name or '').upper().strip()
+        if sess in {'ASIA', 'LON', 'NY'}:
+            return sess
+        fb = str(scan_session_name_utc(datetime.now(timezone.utc)) or '').upper().strip()
+        return fb if fb in {'ASIA', 'LON', 'NY'} else 'NY'
+    except Exception:
+        return 'NY'
+
+
+def _setup_audit_direct_keep_open_recovery_candidates(user_id: int, session_name: str = '', *, max_age_min: int | None = None, limit: int = 48) -> list:
+    """Direct bridge from the exact /setup_audit visible truth to screen/email/AT.
+
+    This is the hard last-mile fix for the case seen at 09:17 where /setup_audit
+    showed fresh rows such as ONDO/XPL/VVV/NEAR as KEEP + OPEN + AT='-', while
+    /screen and the setup-email executable pool stayed empty.  It deliberately
+    uses ALL audit sources (EXEC + GENERATED), freezes only current KEEP rows, and
+    refuses already-resolved TP/SL/NOHIT rows.
+    """
+    try:
+        uid = int(user_id or 0)
+        if uid <= 0:
+            return []
+        sess = _setup_session_bucket_for_recovery(session_name)
+        if max_age_min is None:
+            max_age_min = _setup_email_actionable_queue_window_min()
+        try:
+            max_age_min_i = max(1, int(max_age_min or 60))
+        except Exception:
+            max_age_min_i = 60
+        hours = max(1, int(math.ceil(float(max_age_min_i) / 60.0)) + 1)
+        rows = []
+        for u in [uid, int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), 0]:
+            try:
+                if int(u) < 0:
+                    continue
+                rows.extend(_setup_audit_load_rows(int(u), hours=hours, limit=max(240, int(limit or 48) * 4), dedup=True, apply_final_quality_gate=False, source_mode_override='ALL') or [])
+            except Exception:
+                continue
+        out_rows = []
+        reasons = Counter()
+        seen = set()
+        for raw in list(rows or []):
+            try:
+                r = _setup_audit_payload_from_row(dict(raw or {}))
+                sid = str(r.get('setup_id') or '').strip()
+                sym = str(_symbol_base(r.get('symbol') or '')).upper().strip()
+                side = str(r.get('side') or '').upper().strip()
+                if not sid or not sym or side not in {'BUY', 'SELL'}:
+                    reasons['missing_identity'] += 1
+                    continue
+                row_sess = str(r.get('session') or r.get('source_session') or sess or '').upper().strip()
+                if sess in {'ASIA', 'LON', 'NY'} and row_sess in {'ASIA', 'LON', 'NY'} and row_sess != sess:
+                    reasons['session_mismatch'] += 1
+                    continue
+                if not _setup_audit_row_inside_delivery_window(r):
+                    reasons['outside_delivery_window'] += 1
+                    continue
+                still_open, open_state = _setup_audit_recovery_row_still_open(r)
+                if not still_open:
+                    reasons[f'already_resolved_{open_state}'] += 1
+                    continue
+                entry = float(r.get('entry') or 0.0)
+                sl = float(r.get('sl') or 0.0)
+                tp = float(r.get('tp') or 0.0)
+                if entry <= 0 or sl <= 0 or tp <= 0:
+                    reasons['bad_prices'] += 1
+                    continue
+                if side == 'BUY' and not (sl < entry < tp):
+                    reasons['bad_buy_geometry'] += 1
+                    continue
+                if side == 'SELL' and not (tp < entry < sl):
+                    reasons['bad_sell_geometry'] += 1
+                    continue
+                if not _setup_volume_ok(float(r.get('fut_vol_usd') or 0.0)):
+                    reasons['volume_below_floor'] += 1
+                    continue
+                pol = ''
+                try:
+                    pol = str(r.get('policy_at_creation') or r.get('delivery_policy') or r.get('policy') or '').upper().strip()
+                    if pol not in {'KEEP', 'WATCH'}:
+                        pol = str(_setup_frozen_policy_label(dict(r or {})) or '').upper().strip()
+                    if pol not in {'KEEP', 'WATCH'}:
+                        pol = str(_setup_audit_policy_label(r, uid=uid, session_name=(row_sess or sess), side=side) or '').upper().strip()
+                except Exception:
+                    pol = ''
+                if pol != 'KEEP':
+                    reasons[f'policy_{pol or "OFF"}'] += 1
+                    continue
+                at_state = str(_setup_audit_autotrade_state_label(r, uid=int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid), session_name=(row_sess or sess)) or '-').upper().strip()
+                if at_state not in {'', '-', 'NONE'}:
+                    reasons[f'already_{at_state}'] += 1
+                    continue
+                key = _setup_audit_unique_key(r) or sid
+                if key in seen:
+                    continue
+                seen.add(key)
+                r['session'] = row_sess if row_sess in {'ASIA', 'LON', 'NY'} else sess
+                r['source_session'] = r['session']
+                r['policy_at_creation'] = 'KEEP'
+                r['delivery_policy'] = 'KEEP'
+                r['policy'] = 'KEEP'
+                out_rows.append(r)
+            except Exception as exc:
+                reasons[f'direct_audit_exception:{type(exc).__name__}'] += 1
+                continue
+        objs = _setup_audit_rows_to_recovery_setup_objects(out_rows, session_name=sess, user_id=uid)
+        try:
+            for o in list(objs or []):
+                try:
+                    setattr(o, 'source_kind', 'setup_audit_recovery')
+                    setattr(o, 'setup_audit_recovery', True)
+                    setattr(o, 'delivery_lane_locked', True)
+                    setattr(o, 'policy_at_creation', 'KEEP')
+                    setattr(o, 'delivery_policy', 'KEEP')
+                    setattr(o, 'policy', 'KEEP')
+                    setattr(o, 'source_session', str(getattr(o, 'source_session', '') or sess).upper().strip())
+                    setattr(o, 'session', str(getattr(o, 'session', '') or getattr(o, 'source_session', '') or sess).upper().strip())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            db_log_setup_pipeline_event(uid, stage='direct_audit_keep_open_recovery_candidates', status='ok' if objs else 'empty', session=sess, mode='recovery', details={'input': len(rows or []), 'eligible': len(objs or []), 'top_reasons': _pipeline_top_reasons(reasons, 8)})
+        except Exception:
+            pass
+        return list(objs or [])[:max(1, int(limit or 48))]
+    except Exception as exc:
+        try:
+            db_log_setup_pipeline_event(int(user_id or 0), stage='direct_audit_keep_open_recovery_candidates', status='error', session=str(session_name or ''), mode='recovery', details={'error': f'{type(exc).__name__}: {exc}'})
+        except Exception:
+            pass
+        return []
 
 
 def _setup_audit_rows_to_recovery_setup_objects(rows: list, session_name: str = '', user_id: int = 0) -> list:
@@ -66674,9 +66834,12 @@ async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             sess = None
         if not sess:
+            # Normal session mode: do not email/trade during the live-session gap.
+            # /screen can still display the audit recovery queue, but actual delivery
+            # waits for /sessions_on_unlimited or the next live session.
             _LAST_EMAIL_DECISION[uid] = {
                 'status': 'SKIP',
-                'reasons': ['recovery_not_in_enabled_session'],
+                'reasons': ['recovery_not_in_enabled_session', f'fallback_scan_bucket={_setup_session_bucket_for_recovery("")}'],
                 'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             }
             return
@@ -66738,6 +66901,12 @@ async def setup_email_recovery_job(context: ContextTypes.DEFAULT_TYPE):
         candidates = []
         try:
             candidates = _setup_merge_unique_candidates(candidates, _setup_recent_actionable_recovery_candidates(uid, session_name=sess_name, max_age_min=_setup_email_actionable_queue_window_min(), limit=max(int(EMAIL_SETUPS_N) * 24, 120)), session_name=sess_name, user_id=uid, limit=120)
+        except Exception:
+            pass
+        # ver17: consume the same fresh KEEP+OPEN /setup_audit rows that the user sees,
+        # even if executable_setups is empty.
+        try:
+            candidates = _setup_merge_unique_candidates(candidates, _setup_audit_direct_keep_open_recovery_candidates(uid, session_name=sess_name, max_age_min=_setup_email_actionable_queue_window_min(), limit=max(int(EMAIL_SETUPS_N) * 24, 120)), session_name=sess_name, user_id=uid, limit=120)
         except Exception:
             pass
         try:
