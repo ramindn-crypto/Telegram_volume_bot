@@ -59095,14 +59095,14 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                     best_fut,
                     str(scan_session or '').upper(),
                     int(uid or 0),
-                    timeout=int(os.getenv('SCREEN_ONDEMAND_BUILD_TIMEOUT_SEC', '45') or 45),
+                    timeout=int(os.getenv('SCREEN_ONDEMAND_BUILD_TIMEOUT_SEC', '18') or 18),
                 )
             except Exception as _build_e:
                 # Ver07: if the full OHLCV executable builder fails/times out, /screen must
                 # still return a useful result and must not poison the bot with a failure loop.
                 try:
                     if isinstance(_build_e, (asyncio.TimeoutError, TimeoutError)):
-                        logger.info('screen full builder timed out uid=%s session=%s; using recent DB/market fallback', uid, scan_session)
+                        logger.info('screen full builder timed out uid=%s session=%s; fallback served; dedicated scan will refresh cache later', uid, scan_session)
                     else:
                         logger.warning('screen full builder failed uid=%s session=%s: %s: %s', uid, scan_session, type(_build_e).__name__, _build_e)
                 except Exception:
@@ -59116,6 +59116,12 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 )
                 if not body:
                     body, kb, shown_setups = _screen_quick_ticker_snapshot_body(best_fut or {}, str(scan_session or '').upper())
+                # ver33: after serving fallback, queue a non-blocking cache refresh so the
+                # next /screen and email/autotrade lanes have a fresh executable pool.
+                try:
+                    _schedule_screen_cache_refresh(int(uid or 0), str(scan_session or '').upper())
+                except Exception:
+                    pass
             if not body:
                 body = "*Top Trade Setups*\n━━━━━━━━━━━━━━━━━━━━\n_No high-quality setups right now._"
                 kb, shown_setups = [], []
