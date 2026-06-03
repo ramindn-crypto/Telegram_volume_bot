@@ -1,3 +1,4 @@
+# ver29: /screen hard-stale guard caps emailed setup cards to AutoTrade entry window; BigMove alert now always records generated F8 setup candidates and exposes gate reasons when paired setup email is blocked.
 # ver27: setup generation sync hardening: frozen audit Policy now recovers KEEP/WATCH from emailed_setups for legacy sent rows; /screen emailed fallback expires at the AutoTrade entry window; F8/BigMove 1.20R is accepted in DB/executable AutoTrade selector.
 # ver24: hard setup-email send reservation/dedup: atomic DB lock before SMTP by setup_id and identity prevents duplicate NEAR emails during rapid deploy/recovery/screen jobs.
 # ver22: setup-audit AT lifecycle attribution fix: AT_OPEN is tied to the exact latest OPEN setup_id for the live symbol/side, preventing older same-symbol OFF rows from inheriting a newer open position.
@@ -5280,6 +5281,42 @@ def _screen_actionable_fallback_max_age_min() -> int:
     except Exception:
         return 60
 
+
+
+
+def _screen_setup_within_actionable_window(setup: Any, max_age_min: int | None = None) -> bool:
+    """Hard /screen stale guard for emailed setup cards.
+
+    /screen is an action dashboard. If a setup email is older than the
+    AutoTrade entry window (normally 60m), it must not keep appearing just
+    because it still exists in emailed/executable DB rows or cache.
+    """
+    try:
+        if max_age_min is None:
+            max_age_min = _screen_actionable_fallback_max_age_min()
+        max_age_min = max(1, int(max_age_min or _screen_actionable_fallback_max_age_min()))
+    except Exception:
+        max_age_min = 60
+    ts = 0.0
+    try:
+        ts = max(ts, float(getattr(setup, 'emailed_ts', 0.0) or 0.0))
+    except Exception:
+        pass
+    try:
+        ts = max(ts, float(getattr(setup, 'email_logged_ts', 0.0) or 0.0))
+    except Exception:
+        pass
+    try:
+        ts = max(ts, float(getattr(setup, 'executable_ts', 0.0) or 0.0))
+    except Exception:
+        pass
+    # If no delivery timestamp is available, do not block here; other gates decide.
+    if ts <= 0:
+        return True
+    try:
+        return (float(time.time()) - float(ts)) <= (float(max_age_min) * 60.0 + 5.0)
+    except Exception:
+        return False
 
 def _setup_delivery_actionable_window_sec() -> float:
     """Single delivery/actionability window for setup email, /screen and AutoTrade."""
@@ -58194,7 +58231,7 @@ def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
             return "🟡"
         return "🟢" if p >= 0 else "🔴"
 
-    visible_setups = [s for s in list(setups or []) if _setup_volume_ok(s)]
+    visible_setups = [s for s in list(setups or []) if _setup_volume_ok(s) and _screen_setup_within_actionable_window(s)]
     visible_setups = _filter_user_visible_keep_setups(visible_setups, session_name=session, user_id=int(uid or 0), lane='screen')
     if not visible_setups:
         if _user_visible_require_keep_policy('screen'):
@@ -58321,6 +58358,8 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                         continue
                     src_session_u = str(getattr(item, 'source_session', '') or getattr(item, 'session', '') or '').upper().strip()
                     if sess and src_session_u and src_session_u not in {'', sess}:
+                        continue
+                    if not _screen_setup_within_actionable_window(item, max_age_min=max_age_min):
                         continue
                     try:
                         if source_name == 'emailed':
@@ -58449,6 +58488,8 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                             continue
                         src_session_u = str(getattr(item, 'source_session', '') or '').upper().strip()
                         if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
+                            continue
+                        if not _screen_setup_within_actionable_window(item, max_age_min=max_age_min):
                             continue
                         if source_name == 'emailed':
                             ok_exec = _basic_valid(item)
@@ -58989,7 +59030,7 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                     int(uid or 0),
                     str(scan_session or '').upper(),
                     best_fut or {},
-                    max_age_min=max(int(_screen_actionable_fallback_max_age_min()), 180),
+                    max_age_min=int(_screen_actionable_fallback_max_age_min()),
                     include_email_source=bool(_screen_user_can_see_email_source(int(uid or 0), user or {})),
                 )
                 if not body:
@@ -61416,6 +61457,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             sess_u = str(session_name or _bigmove_autotrade_session_name()).upper().strip()
             if sess_u not in {'ASIA', 'LON', 'NY'}:
                 sess_u = _bigmove_autotrade_session_name()
+            generated_only = str(tag or '').lower().endswith('generated_only')
             setups = []
             try:
                 setups = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(filtered or []), best_fut_snapshot or {}, sess_u, timeout=8)
@@ -61455,27 +61497,31 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     pass
                 for stp in list(setups or []):
                     sid = str(getattr(stp, 'setup_id', '') or getattr(stp, 'id', '') or '')
+                    if not generated_only:
+                        try:
+                            db_mark_emailed_setup(int(tuid), sid, sess_u, now_ts)
+                        except Exception:
+                            pass
+                        try:
+                            db_mark_executable_setup(int(tuid), sid, sess_u, now_ts, s=stp, source_kind='emailed_setups', state='executable_pending')
+                        except Exception:
+                            pass
                     try:
-                        db_mark_emailed_setup(int(tuid), sid, sess_u, now_ts)
+                        db_log_generated_setup(int(tuid), 'bigmove_email_generated' if generated_only else 'bigmove_email', sess_u, stp)
                     except Exception:
                         pass
-                    try:
-                        db_mark_executable_setup(int(tuid), sid, sess_u, now_ts, s=stp, source_kind='emailed_setups', state='executable_pending')
-                    except Exception:
-                        pass
-                    try:
-                        db_log_generated_setup(int(tuid), 'bigmove_email', sess_u, stp)
-                    except Exception:
-                        pass
-                    try:
-                        _cache_recent_emailed_setup(int(tuid), stp, session=sess_u, emailed_ts=now_ts, source_kind='recent_email_cache')
-                    except Exception:
-                        pass
-                    try:
-                        _mark_emailed_setup_identity(int(tuid), stp, emailed_ts=now_ts)
-                    except Exception:
-                        pass
+                    if not generated_only:
+                        try:
+                            _cache_recent_emailed_setup(int(tuid), stp, session=sess_u, emailed_ts=now_ts, source_kind='recent_email_cache')
+                        except Exception:
+                            pass
+                        try:
+                            _mark_emailed_setup_identity(int(tuid), stp, emailed_ts=now_ts)
+                        except Exception:
+                            pass
                 try:
+                    if generated_only:
+                        continue
                     up_list, dn_list = compute_directional_lists(best_fut_snapshot or {})
                     market_txt = _screen_market_context_table(best_fut_snapshot or {}, leaders=up_list, losers=dn_list)
                     screen_body = "\n".join([
@@ -61493,7 +61539,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
             try:
-                db_log_setup_pipeline_event(int(uid), stage='bigmove_email_delivery_side_effects', status='ok', session=sess_u, mode='bigmove', details={'setups': len(setups or []), 'target_uids': target_uids, 'tag': str(tag or '')})
+                db_log_setup_pipeline_event(int(uid), stage='bigmove_email_delivery_side_effects', status='ok', session=sess_u, mode='bigmove', details={'setups': len(setups or []), 'target_uids': target_uids, 'tag': str(tag or ''), 'generated_only': bool(generated_only)})
             except Exception:
                 pass
             return list(setups or [])
@@ -61545,6 +61591,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
+            # Ver29: even if the paired setup email is later blocked by policy/final gate,
+            # record the generated F8 candidates for audit/debug visibility. The actual
+            # email/autotrade lane below still requires the executable KEEP gate.
+            try:
+                await _record_bigmove_email_delivery_side_effects(int(uid), sess_u, list(setups or []), best_fut_snapshot or {}, tag=f'{str(tag or "bigmove")}_generated_only')
+            except Exception:
+                pass
+
             # Ver46: BigMove/F8 setup emails must obey the same executable gate as
             # normal setup emails and AutoTrade.  The market-event BigMove alert may
             # still be sent independently, but the tradable F8 setup email is blocked
@@ -61555,7 +61609,20 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 setups, _bm_gate_reasons = [], Counter({'bigmove_presend_gate_exception': 1})
             if not setups:
                 try:
-                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', status='empty', session=sess_u, mode='bigmove_setup_email', details={'tag': str(tag or ''), 'top_reasons': _pipeline_top_reasons(_bm_gate_reasons, 8)})
+                    _bm_top = _pipeline_top_reasons(_bm_gate_reasons, 8)
+                except Exception:
+                    _bm_top = []
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', status='empty', session=sess_u, mode='bigmove_setup_email', details={'tag': str(tag or ''), 'top_reasons': _bm_top})
+                except Exception:
+                    pass
+                try:
+                    _LAST_EMAIL_DECISION[int(uid)] = {
+                        'status': 'SKIP',
+                        'picked': '',
+                        'when': datetime.now(_zoneinfo_or_default((get_user(int(uid)) or {}).get('tz'))[0]).isoformat(timespec='seconds'),
+                        'reasons': ['bigmove_f8_setup_email_blocked_by_presend_gate'] + [str(x) for x in list(_bm_top or [])[:8]],
+                    }
                 except Exception:
                     pass
                 return [], False
