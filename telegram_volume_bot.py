@@ -1,5 +1,5 @@
 # ver6: emergency responsiveness patch: admin bypasses DB guard, /screen is ack-first/background-only, /setup_audit uses lightweight cached audit, background alert jobs are delayed/deferred longer, and heavy report jobs start only after acknowledgement.
-# ver7: AutoTrade live-entry stability patch: post-email placement gets a real live-order budget, timeout rows are reconciled/queued instead of false SKIP, and Telegram responsiveness remains isolated.
+# ver8: /screen email-sync hardening: latest Gmail/emailed_setups row wins over stale screen cache; emailed rows are not re-gated live; keeps ver7 AutoTrade placement stability.
 # ver3: responsiveness/dedup/audit-time fix: /setup_audit uses delivery/executable time, removes duplicate same-data rows, and admin reports run in parallel background workers.
 # ver2: emergency responsiveness/audit-time fix: /setup_audit uses original signal_created_ts instead of batch executable_ts, avoids live OHLCV fetches by default, and alert timeout is fail-soft so Telegram commands stay responsive.
 # ver32: /screen timeout hardening: full builder first returns recent actionable email/executable queue before heavy pool rebuild, and expected on-demand build timeouts fall back without Render WARNING noise.
@@ -25779,38 +25779,82 @@ def _db_recent_emailed_setup_objects(user_id: int, session_name: str = '', max_a
 
 
 def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int | None = None, limit: int = 3) -> list:
-    """Return recent emailed/executable setups with cache -> DB fallback order."""
+    """Return recent delivered setups from cache + DB, newest-email first.
+
+    ver08: /screen must be synced to the latest actual setup email.  Older builds
+    read the in-memory cache first and returned immediately; if the cache missed
+    the newest email but still had the prior email, /screen showed APR while Gmail
+    and /setup_audit showed the newer BEAT setup.  This function now merges the
+    durable DB lane and memory cache, deduplicates, and sorts by emailed_ts so the
+    latest delivered setup always wins.
+    """
     try:
         if max_age_min is None:
             max_age_min = _screen_actionable_fallback_max_age_min()
         max_age_min = max(1, int(max_age_min or _screen_actionable_fallback_max_age_min()))
     except Exception:
         max_age_min = _screen_actionable_fallback_max_age_min()
-    out = []
-    seen = set()
+    try:
+        lim = max(1, int(limit or 3))
+    except Exception:
+        lim = 3
+
+    candidates = []
+    # DB first because it is the durable source of actual sent emails after deploy/restart.
     for getter in (
-        lambda: _recent_cached_emailed_setups(user_id, session_name=session_name, max_age_min=max_age_min, limit=limit),
-        lambda: _db_recent_emailed_setup_objects(user_id, session_name=session_name, max_age_min=max_age_min, limit=limit),
+        lambda: _db_recent_emailed_setup_objects(user_id, session_name=session_name, max_age_min=max_age_min, limit=max(lim * 4, 12)),
+        lambda: _recent_cached_emailed_setups(user_id, session_name=session_name, max_age_min=max_age_min, limit=max(lim * 4, 12)),
     ):
         try:
-            rows = getter() or []
+            rows = list(getter() or [])
         except Exception:
             rows = []
         for item in rows:
             try:
                 sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
-                ident = _setup_identity_from_obj(item)
+                if not sid:
+                    continue
+                ts = 0.0
+                for attr in ('email_logged_ts', 'emailed_ts', 'executable_ts', 'created_ts', 'signal_created_ts'):
+                    try:
+                        ts = max(ts, float(getattr(item, attr, 0.0) or 0.0))
+                    except Exception:
+                        pass
+                candidates.append((float(ts or 0.0), item))
             except Exception:
-                sid = ''
+                continue
+
+    # Newest first before dedupe, so the latest email wins for the same symbol/identity.
+    candidates.sort(key=lambda x: (float(x[0] or 0.0), str(getattr(x[1], 'setup_id', '') or '')), reverse=True)
+
+    out = []
+    seen = set()
+    for ts, item in candidates:
+        try:
+            sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+            ident = ''
+            try:
+                ident = str(_setup_identity_from_obj(item) or '').strip()
+            except Exception:
                 ident = ''
             dedupe_key = ident or sid
             if not sid or dedupe_key in seen:
                 continue
+            try:
+                # Normalize source markers so the renderer labels it as emailed.
+                setattr(item, 'email_logged_ts', float(ts or getattr(item, 'email_logged_ts', 0.0) or getattr(item, 'emailed_ts', 0.0) or 0.0))
+                setattr(item, 'emailed_ts', float(getattr(item, 'email_logged_ts', 0.0) or 0.0))
+                if not str(getattr(item, 'source_kind', '') or '').strip():
+                    setattr(item, 'source_kind', 'emailed_setups')
+            except Exception:
+                pass
             seen.add(dedupe_key)
             out.append(item)
-            if len(out) >= int(limit):
-                return out[:int(limit)]
-    return out[:int(limit)]
+            if len(out) >= lim:
+                break
+        except Exception:
+            continue
+    return out[:lim]
 
 
 
@@ -59128,9 +59172,12 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                         continue
                     try:
                         if source_name == 'emailed':
-                            ok_basic = _basic_valid(item)
-                            ok_final, _why_final, _meta_final = _setup_final_quality_gate_allows_setup(item, session_name=sess, user_id=int(uid)) if ok_basic else (False, 'screen_emailed_basic_invalid', {})
-                            ok_exec = bool(ok_basic and ok_final)
+                            # ver08: the email row is the source of truth for /screen.
+                            # Do not re-run live final-quality/context gates here because they can
+                            # change minutes after delivery and make /screen show an older email
+                            # (APR) instead of the latest sent setup (BEAT). Basic price/volume
+                            # structure + frozen KEEP/WATCH policy is enough for display.
+                            ok_exec = bool(_basic_valid(item))
                         else:
                             ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=sess)
                     except Exception:
@@ -59820,6 +59867,80 @@ async def _deliver_screen_full_scan_when_ready(update: Update, context: ContextT
                 except Exception:
                     pass
                 return
+        try:
+            # ver08: latest setup email is the authoritative /screen source.
+            # Before any ticker/OHLCV/full-builder work, show the newest delivered email lane.
+            # This keeps /screen synced with Gmail + /setup_audit and prevents an older
+            # in-memory/cache row from appearing after a newer setup email.
+            try:
+                _email_first_min = int(_screen_actionable_fallback_max_age_min())
+            except Exception:
+                _email_first_min = 60
+            try:
+                _latest_email_ts = _latest_recent_delivery_ts(int(uid or 0), str(scan_session or '').upper(), max_age_min=_email_first_min) if _screen_user_can_see_email_source(int(uid or 0), user or {}) else 0.0
+            except Exception:
+                _latest_email_ts = 0.0
+            if _latest_email_ts > 0:
+                try:
+                    _best_cached_email = get_cached_futures_tickers() or {}
+                except Exception:
+                    _best_cached_email = {}
+                try:
+                    body, kb, shown_setups = await to_thread_fast(
+                        _screen_recent_db_body_and_kb,
+                        int(uid or 0),
+                        str(scan_session or '').upper(),
+                        _best_cached_email or {},
+                        max_age_min=int(_email_first_min),
+                        include_email_source=True,
+                        timeout=2,
+                    )
+                except Exception:
+                    body, kb, shown_setups = '', [], []
+                if body and shown_setups:
+                    try:
+                        _screen_cache_put(f"uid:{int(uid or 0)}::{str(scan_session or '').upper()}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=False)
+                        _screen_cache_put(f"global::{str(scan_session or '').upper()}", body, list(kb or []), ts=time.time(), allow_empty_overwrite=False)
+                    except Exception:
+                        pass
+                    try:
+                        _SCREEN_LOCK.release()
+                    except Exception:
+                        pass
+                    try:
+                        loc_label, loc_time = user_location_and_time(user or {})
+                    except Exception:
+                        loc_label, loc_time = "Melbourne (Australia)", _fmt_dt_local(datetime.now(timezone.utc), "%Y-%m-%d %H:%M")
+                    header = (
+                        f"✅ Fresh result ready: /screen\n"
+                        f"{HDR}\n"
+                        f"*PulseFutures — Market Scan*\n"
+                        f"{HDR}\n"
+                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                        f"{_screen_when_line('Synced email queue built', time.time())}"
+                    )
+                    keyboard = [
+                        [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                        for (sym, sid) in (kb or [])
+                    ]
+                    await send_long_message(
+                        update,
+                        _screen_markdown_to_html((header + "\n" + str(body or '')).strip()),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+                    )
+                    try:
+                        _schedule_screen_cache_refresh(int(uid or 0), str(scan_session or '').upper())
+                    except Exception:
+                        pass
+                    return
+        except Exception as _email_first_e:
+            try:
+                logger.debug('screen email-first fallback skipped uid=%s session=%s: %s', uid, scan_session, _email_first_e)
+            except Exception:
+                pass
+
         try:
             # ver36: the fast ticker snapshot is allowed to time out under Render load.
             # Treat this as normal fallback behaviour, not an ERROR/traceback.  The
