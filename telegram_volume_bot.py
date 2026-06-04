@@ -1,3 +1,4 @@
+# yver163: sorts /setup_audit detailed rows strictly by setup time ascending (earliest to latest) instead of Policy priority; bumps setup-audit cache key.
 # yver162: fixes AutoTrade email-match lookup for shared/global emailed/executable rows, adds emailed_setups session migration, and bumps selector cache so emailed KEEP setups inside the 60m entry window are retried.
 # yver161: fixes AutoTrade consuming shared/global executable rows already shown on /screen and emailed; keeps final recent-email gate before Bybit placement.
 # yver160: aligns AutoTrade selector with WR-first KEEP policy so setups shown/emailed under Policy=KEEP are not blocked by legacy strict KEEP edge thresholds.
@@ -46053,6 +46054,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
 
     table_rows = []
+    table_sort_ts = []  # yver163: hidden sort key for chronological /setup_audit display
     tp_n = sl_n = nohit_n = open_n = 0
     for r in rows:
         sid = str(r.get('setup_id') or '').strip()
@@ -46086,7 +46088,12 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         policy_label = _setup_audit_combo_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
         gate_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
         at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
-        table_rows.append([ttxt, sym, side, combo_key, policy_label, gate_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
+        row_vals = [ttxt, sym, side, combo_key, policy_label, gate_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result]
+        table_rows.append(row_vals)
+        try:
+            table_sort_ts.append(float(ts or 0.0))
+        except Exception:
+            table_sort_ts.append(0.0)
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -46099,11 +46106,10 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
 
     # Ver16: show all rows. send_long_message now chunks <pre> tables safely,
     # so there is no need to hide audit rows for Telegram length limits.
-    # yver157: Sort by combo Policy priority for readability: KEEP, WATCH, then disabled/OFF.
-    policy_rank = {'KEEP': 0, 'WATCH': 1, 'OFF': 2, 'DISABLE': 2, 'BLOCK': 2, 'PAUSE': 2}
-    display_rows = [row for _i, row in sorted(
-        enumerate(table_rows),
-        key=lambda kv: (policy_rank.get(str(kv[1][4]).upper().strip(), 9), kv[0])
+    # yver163: sort by setup time ascending (earliest to latest), not Policy priority.
+    display_rows = [row for _ts, _i, row in sorted(
+        zip(table_sort_ts, range(len(table_rows)), table_rows),
+        key=lambda item: (float(item[0] or 0.0), int(item[1]))
     )]
     hidden_rows = 0
     table = tabulate(
@@ -50720,7 +50726,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v159sync:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v163sort:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
