@@ -1,3 +1,4 @@
+# yver165: completes canonical KEEP lane sync: /setup_audit Gate=KEEP rows bypass secondary email-only flip/diversification cooldown blockers, so they are emailed, shown on /screen, and immediately queued for AutoTrade from the same setup_id.
 # yver164: locks /screen, setup-email and AutoTrade to one canonical current KEEP executable lane; AutoTrade no longer consumes BigMove/recent-email rows outside /setup_audit Gate=KEEP; email recovers unemailed KEEP rows from executable_setups.
 # yver163: sorts /setup_audit detailed rows strictly by setup time ascending (earliest to latest) instead of Policy priority; bumps setup-audit cache key.
 # yver162: fixes AutoTrade email-match lookup for shared/global emailed/executable rows, adds emailed_setups session migration, and bumps selector cache so emailed KEEP setups inside the 60m entry window are retried.
@@ -12801,7 +12802,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v164:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v165:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -20314,6 +20315,28 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             }
             return
 
+        # yver165: BigMove/BMAT rows may be emailed as market alerts, but AutoTrade
+        # must still consume only the canonical current setup lane.  If the synthetic
+        # BigMove setup is not also present as /setup_audit Gate=KEEP, do not try it
+        # or show it as the main /autotrade_last attempt.
+        _canon_bigmove = []
+        for _bm_s in list(setup_list or []):
+            try:
+                _bm_sid = str(getattr(_bm_s, 'setup_id', '') or getattr(_bm_s, 'id', '') or '').strip()
+                if _bm_sid and _canonical_setup_id_gate_keep(owner_uid, _bm_sid, sess):
+                    setattr(_bm_s, 'canonical_gate_keep', True)
+                    _canon_bigmove.append(_bm_s)
+            except Exception:
+                continue
+        setup_list = list(_canon_bigmove or [])
+        if not setup_list:
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': 'bigmove_not_in_canonical_gate_keep_lane', 'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
+            }
+            return
+
         async with AUTOTRADE_EXEC_LOCK:
             now_ts = float(time.time())
             for _s in list(setup_list or []):
@@ -20329,7 +20352,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v164:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v165:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -60670,19 +60693,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     combo_policy_blocked += 1
                     continue
 
-                if symbol_flip_guard_active(uid, sym, side, sess_name):
-                    flip_blocked += 1
-                    continue
-
-                ok_div, why_div = _email_diversification_guard(s, chosen_list, best_fut, sess_name)
-                if not ok_div:
-                    diversify_blocked[str(why_div)] += 1
-                    continue
-
-                # yver164: canonical Gate=KEEP rows have already passed the same
-                # delivery/actionability gate shown by /setup_audit.  Do not let
-                # a second, older cooldown check make email diverge from /setup_audit.
-                # Still avoid re-sending the exact same setup_id.
+                # yver165: /setup_audit Gate=KEEP is the canonical delivery lane.
+                # If a setup is already Gate=KEEP there, do not let secondary email-only
+                # flip/diversification/symbol cooldown guards make /screen, setup email
+                # and AutoTrade diverge.  Still never re-send the exact same setup_id.
+                _canonical_gate_keep = bool(getattr(s, 'canonical_gate_keep', False))
                 try:
                     _sid_for_email = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
                     _already_emailed_exact = bool(_sid_for_email and db_has_emailed_setup(int(uid), _sid_for_email, lookback_hours=max(1, int(math.ceil(float(_autotrade_entry_window_min() or 60) / 60.0)))))
@@ -60691,14 +60706,28 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 if _already_emailed_exact:
                     cooldown_blocked += 1
                     continue
-                _canonical_gate_keep = bool(getattr(s, 'canonical_gate_keep', False))
+
                 if not _canonical_gate_keep:
+                    if symbol_flip_guard_active(uid, sym, side, sess_name):
+                        flip_blocked += 1
+                        continue
+
+                    ok_div, why_div = _email_diversification_guard(s, chosen_list, best_fut, sess_name)
+                    if not ok_div:
+                        diversify_blocked[str(why_div)] += 1
+                        continue
+
                     if _email_setup_identity_recently_sent(uid, s):
                         cooldown_blocked += 1
                         continue
                     if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
                         cooldown_blocked += 1
                         continue
+                else:
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_canonical_gate_keep_bypass', status='ok', session=str(sess_name or ''), mode='email', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=sym, side=side, details={'bypassed': 'flip_diversification_symbol_cooldown', 'reason': 'setup_audit_gate_keep'})
+                    except Exception:
+                        pass
 
                 if int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(_autotrade_runtime_mode()).lower() == 'live':
                     try:
@@ -62843,7 +62872,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v164:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v165:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
