@@ -1,8 +1,9 @@
-# yver158: output-cleaning only; removes verbose explanatory lines from /setup_audit_compare, /setup_matrix policy, and /autotrade_debug.
+# yver159: version-number correction after yver158; keeps the output-cleaning and pipeline-sync fixes, with refreshed background cache keys.
 # yver155: Render scheduler hardening: prevents alert/autotrade job overlap warnings with safer intervals, caps pre-session BigMove work so session setup pools are not starved, downgrades transient Telegram timeout log noise, and shortens daily-safety INFO logs.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
 # yver156: Universal instant command ACK/background dispatcher; /screen now ACKs immediately and publishes its snapshot from the dedicated screen thread so heavy work cannot delay /equity or other commands.
+# yver159 output-clean + pipeline sync: removes /screen warm-up text, lets /screen show current executable queue, shares executable queue between uid+global lanes for email/AT/audit, and makes /setup_audit rolling view prefer latest setup per key.
 # yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
 # yver144: fixes final audit/report sync: /setup_audit AT no longer shows stale AT_OPEN after a position is no longer live, and /setup_audit_compare recovers setup matches from the AutoTrade journal when Bybit Closed-PnL rows lose setup_id/open-time metadata.
 # yver143: adds setup-audit AutoTrade lifecycle visibility and final live-entry user-visible gate so already-open trades (e.g. INJ) are not confused with fresh actionable setups.
@@ -24043,32 +24044,53 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
 def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: float = 0.0, limit: int = 10) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
-    params = [int(user_id), float(ts_from)]
+    uid_i = int(user_id or 0)
+    # Placeholder order: emailed_setups user_id, executable_setups user_id filter, ts_from, optional session, order-priority user_id, limit.
+    params = [uid_i]
+    if uid_i > 0:
+        uid_where = "x.user_id IN (?, 0)"
+        params.append(uid_i)
+    else:
+        uid_where = "x.user_id=?"
+        params.append(0)
+    params.append(float(ts_from))
     where_session = ''
     sess = str(session_name or '').upper().strip()
     if sess:
         where_session = ' AND UPPER(COALESCE(x.session, "")) = ? '
         params.append(sess)
-    fetch_limit = max(int(limit or 10), min(max(int(limit or 10) * 6, int(limit or 10) + 30), 250))
-    params.append(int(fetch_limit))
+    fetch_limit = max(int(limit or 10), min(max(int(limit or 10) * 8, int(limit or 10) + 40), 300))
+    params.extend([uid_i, int(fetch_limit)])
     cur.execute(
         f"""
         SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
         FROM executable_setups x
         LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-        LEFT JOIN emailed_setups e ON e.user_id = x.user_id AND e.setup_id = x.setup_id
-        WHERE x.user_id=?
+        LEFT JOIN emailed_setups e ON e.user_id = ? AND e.setup_id = x.setup_id
+        WHERE {uid_where}
           AND x.executable_ts>=?
           {where_session}
           AND COALESCE(o.outcome, 'OPEN')='OPEN'
         GROUP BY x.user_id, x.setup_id
-        ORDER BY x.executable_ts DESC, x.setup_id DESC
+        ORDER BY CASE WHEN x.user_id=? THEN 0 ELSE 1 END, x.executable_ts DESC, x.setup_id DESC
         LIMIT ?
         """,
         tuple(params),
     )
-    rows = [dict(r) for r in (cur.fetchall() or [])]
+    raw_rows = [dict(r) for r in (cur.fetchall() or [])]
     con.close()
+    rows = []
+    seen_sid = set()
+    for _r in raw_rows:
+        try:
+            _sid = str(_r.get('setup_id') or '').strip()
+            if _sid and _sid in seen_sid:
+                continue
+            if _sid:
+                seen_sid.add(_sid)
+            rows.append(_r)
+        except Exception:
+            rows.append(_r)
     # Filter already-persisted stale/old rows before email/autotrade consume them.
     # Ver32 uses the same final gate as live generation, so old low-confidence rows
     # from pre-patch deployments no longer leak into email or AutoTrade.
@@ -41026,7 +41048,7 @@ def _screen_snapshot_payload_sync(uid: int) -> dict:
                         f"{HDR}\n"
                         f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                         f"{_screen_when_line('Displayed setup source', source_ts)}"
-                        f"{('_Showing recent emailed setup queue while full scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else '_Showing recent executable setup queue while full scan refreshes._')}\n"
+                        f"{('_Showing recent emailed setup queue._' if _screen_requires_emailed_delivery_for_setup() else '_Showing recent executable setup queue._')}\n"
                     )
                     return {"text": _screen_markdown_to_html((header + "\n" + body).strip()), "parse_mode": ParseMode.HTML, "kb": [(sym, sid) for (sym, sid) in (kb or [])]}
             except Exception:
@@ -41038,12 +41060,11 @@ def _screen_snapshot_payload_sync(uid: int) -> dict:
                     f"{HDR}\n"
                     f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                     f"{_screen_when_line('Ticker snapshot', time.time())}"
-                    f"_Showing instant ticker snapshot while full executable scan warms up._\n"
                 )
                 return {"text": _screen_markdown_to_html((header + "\n" + body).strip()), "parse_mode": ParseMode.HTML, "kb": [(sym, sid) for (sym, sid) in (kb or [])]}
             except Exception:
                 pass
-        return {"text": "🔎 /screen cache is warming up. Fresh scan is queued in the dedicated screen lane.", "parse_mode": None, "kb": []}
+        return {"text": "🔎 /screen snapshot is not ready yet. I’ll send the result when available.", "parse_mode": None, "kb": []}
     except Exception as e:
         return {"text": f"🔎 /screen is refreshing in the background. Current snapshot could not be built instantly ({type(e).__name__}).", "parse_mode": None, "kb": []}
 
@@ -45451,7 +45472,7 @@ def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts
     return out
 
 
-def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None) -> list[dict]:
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None, dedup_keep: str = 'earliest') -> list[dict]:
     """Load setup rows for audit.
 
     Default source is executable_setups only. Raw generated_setups can be enabled with
@@ -45493,8 +45514,12 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                 cur = con.cursor()
                 if include_exec:
                     try:
-                        params = [int(uid)]
-                        where = "WHERE user_id=?"
+                        if int(uid or 0) > 0:
+                            params = [int(uid)]
+                            where = "WHERE user_id IN (?,0)"
+                        else:
+                            params = [0]
+                            where = "WHERE user_id=?"
                         if cutoff > 0:
                             where += " AND executable_ts>=?"
                             params.append(float(cutoff))
@@ -45583,9 +45608,12 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
     cleaned = sorted(cleaned, key=lambda x: _setup_audit_row_ts(x), reverse=True)
     if bool(dedup):
         deduped: dict[str, dict] = {}
-        # Keep the earliest actionable row within the practical setup key. Keeping
-        # the newest row turns repeated snapshots into fake OPENs and inflates counts.
-        for r in sorted(cleaned, key=lambda x: _setup_audit_row_ts(x)):
+        keep_mode = str(dedup_keep or 'earliest').lower().strip()
+        # Reports/overall keep the earliest practical setup to avoid inflating WR.
+        # The rolling /setup_audit command uses latest so users can see that setup
+        # generation is still alive when the same symbol/side/family refreshes later.
+        source_iter = cleaned if keep_mode in {'latest', 'newest', 'recent'} else sorted(cleaned, key=lambda x: _setup_audit_row_ts(x))
+        for r in source_iter:
             key = _setup_audit_unique_key(r)
             if key not in deduped:
                 deduped[key] = r
@@ -45910,7 +45938,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     limit = max(0, int(limit or 0))
     hours = max(1, min(8760, int(hours or 24)))
     result_horizon = _setup_audit_result_horizon_hours()
-    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit, dedup=True)
+    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit, dedup=True, dedup_keep='latest')
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not rows:
         return (
@@ -50099,7 +50127,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v158:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v159sync:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50562,7 +50590,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v158:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v159sync:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -50593,7 +50621,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v149:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v159sync:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51135,7 +51163,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v158:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v159sync:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -56384,16 +56412,15 @@ def _screen_quick_ticker_snapshot_body(best_fut: Dict[str, MarketVol], session: 
         body = []
         body.append("*Top Trade Setups*")
         body.append("━━━━━━━━━━━━━━━━━━━━")
-        body.append("_Executable scan is warming up. No confirmed setup shown from the quick ticker snapshot._")
+        body.append("_No confirmed setup right now._")
         body.append("")
         market_txt = _screen_market_context_table(best_fut, leaders=leaders, losers=losers)
         if market_txt:
             body.append(market_txt)
         body.append("")
-        body.append("_A full executable-family refresh has been queued in the dedicated /screen lane._")
         return "\n".join(body), [], []
     except Exception:
-        return "_Screen cache is warming up. A fresh scan has been queued._", [], []
+        return "_No confirmed setup right now._", [], []
 
 async def _refresh_screen_cache_async():
     """Refreshes _SCREEN_CACHE in the background (best effort)."""
@@ -56738,16 +56765,17 @@ def _screen_display_limit() -> int:
 
 
 def _screen_requires_emailed_delivery_for_setup() -> bool:
-    """User-facing sync rule for /screen.
+    """Whether /screen must hide executable setups until an email is logged.
 
-    /screen is a subscriber-facing surface, so it must not expose a raw executable
-    setup that the email lane did not actually deliver/log. AutoTrade may still
-    consume the executable queue directly; this helper is only for /screen UX.
+    yver159: default is OFF. /screen may show the current executable queue, then
+    _screen_sync_pipeline_async emails the same shown setups and queues AutoTrade.
+    This keeps /screen, setup email, and AutoTrade in one lane without showing a
+    warm-up placeholder when executable rows already exist.
     """
     try:
-        return str(os.environ.get('SCREEN_REQUIRE_EMAILED_SETUP', '1') or '1').strip().lower() not in {'0', 'false', 'no', 'off'}
+        return str(os.environ.get('SCREEN_REQUIRE_EMAILED_SETUP', '0') or '0').strip().lower() in {'1', 'true', 'yes', 'on'}
     except Exception:
-        return True
+        return False
 
 
 def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: float | None = None) -> float:
@@ -57005,7 +57033,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         except Exception:
             up_list, dn_list = [], []
         market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
-        source_note = '_Showing recent emailed setup queue while the live scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else ('_Showing latest sent setup email while the live scan refreshes._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue while the live scan refreshes._')
+        source_note = '_Showing recent emailed setup queue._' if _screen_requires_emailed_delivery_for_setup() else ('_Showing latest sent setup email._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue._')
         body = "\n".join([
             "",
             "*Top Trade Setups*",
@@ -57638,11 +57666,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             _body_is_latest_email = False
                         _source_note_e = (
-                            "_Showing recent emailed setup queue while the live scan refreshes._\n"
+                            "_Showing recent emailed setup queue._\n"
                             if _screen_requires_emailed_delivery_for_setup() else
-                            ("_Showing latest sent setup email while the live scan refreshes._\n"
+                            ("_Showing latest sent setup email._\n"
                              if _body_is_latest_email else
-                             "_Showing recent executable setup queue while the live scan refreshes._\n")
+                             "_Showing recent executable setup queue._\n")
                         )
                         header_e = (
                             f"*PulseFutures — Market Scan*\n"
@@ -57720,7 +57748,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"{HDR}\n"
                         f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                         f"{_screen_when_line('Displayed setup source', source_ts)}"
-                        f"{('_Showing recent emailed setup queue while full scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else '_Showing recent executable setup queue while full scan refreshes._')}\n"
+                        f"{('_Showing recent emailed setup queue._' if _screen_requires_emailed_delivery_for_setup() else '_Showing recent executable setup queue._')}\n"
                     )
                     keyboard = [
                         [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
@@ -57763,7 +57791,6 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"{HDR}\n"
                     f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                     f"{_screen_when_line('Ticker snapshot', time.time())}"
-                    f"_Showing instant ticker snapshot while full executable scan warms up._\n"
                 )
                 await send_long_message(
                     update,
@@ -57774,7 +57801,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception:
             pass
-        await update.message.reply_text("🔎 /screen cache is warming up. Fresh scan is queued in the dedicated screen lane — run /screen again shortly.")
+        await update.message.reply_text("🔎 /screen snapshot is not ready yet. I’ll send the result when available.")
         return
     except Exception as e:
         try:
@@ -58409,7 +58436,7 @@ def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, s
             for tuid in target_uids:
                 screen_body = "\n".join([
                     "", "*Top Trade Setups*", SEP,
-                    "_Showing latest sent setup email while the live scan refreshes._",
+                    "_Showing latest sent setup email._",
                     _screen_format_setup_cards(list(setups or []), int(tuid), sess_u),
                     "", market_txt or "",
                 ]).strip()
@@ -58688,7 +58715,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         "",
                         "*Top Trade Setups*",
                         SEP,
-                        "_Showing latest sent setup email while the live scan refreshes._",
+                        "_Showing latest sent setup email._",
                         _screen_format_setup_cards(list(setups or []), int(_target_uid), str(display_session or '')),
                         "",
                         market_txt or "",
