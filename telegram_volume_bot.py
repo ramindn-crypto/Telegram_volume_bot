@@ -1,3 +1,4 @@
+# yver160: aligns AutoTrade selector with WR-first KEEP policy so setups shown/emailed under Policy=KEEP are not blocked by legacy strict KEEP edge thresholds.
 # yver159: version-number correction after yver158; keeps the output-cleaning and pipeline-sync fixes, with refreshed background cache keys.
 # yver155: Render scheduler hardening: prevents alert/autotrade job overlap warnings with safer intervals, caps pre-session BigMove work so session setup pools are not starved, downgrades transient Telegram timeout log noise, and shortens daily-safety INFO logs.
 # yver149: fixes /setup_audit_compare pre-window open matching.
@@ -5443,23 +5444,30 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         hours = _overall_report_effective_hours(int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
         data = _setup_edge_guard_build(owner_uid, hours=hours, force=False) or {}
 
-        # yver147: real-money AutoTrade should not use every KEEP lane while the
-        # target WR is >50%.  A lane can be KEEP because of broader/older policy,
-        # but live entries now require the exact lane evidence to remain strong.
-        # Default: decided>=5, WR>=60%, AvgR>=+0.25. This blocks recent weak KEEP
-        # lanes such as F1-LON-NOR-BUY/F2-NY-NOR-BUY while keeping stronger lanes
-        # like F2-ASIA-NOR-BUY and F1-LON-REV-BUY.
+        # yver160: AutoTrade must consume the same WR-first KEEP lane that
+        # /setup_matrix policy, /screen, and setup email use. The older strict
+        # AutoTrade-only KEEP edge rule (decided>=5, WR>=60, AvgR>=+0.25) can
+        # no longer block a current Policy=KEEP setup when the exact lane has
+        # at least one decided TP/SL result and WR is above the configured
+        # WR-first KEEP cutoff. Example fixed: F2-ASIA-NOR-BUY WR50.0 n2.
         try:
             if bool(apply_strict_keep_edge) and pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
                 m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
                 dec = int(m.get('decided') or 0)
                 wr = float(m.get('wr') or 0.0)
                 avg = float(m.get('avg_r') or 0.0)
-                min_dec = int(_autotrade_strict_keep_edge_min_decided())
-                min_wr = float(_autotrade_strict_keep_edge_min_wr())
-                min_avg = float(_autotrade_strict_keep_edge_min_avgr())
-                if dec < min_dec or wr < min_wr or avg < min_avg:
-                    return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
+                wr_first_cutoff = float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0)
+                # If the exact lane is KEEP by the WR-first policy, do not apply
+                # the legacy stricter AutoTrade-only floor. This keeps screen,
+                # email, and AutoTrade synced on the same setup.
+                if dec > 0 and wr > wr_first_cutoff:
+                    pass
+                else:
+                    min_dec = int(_autotrade_strict_keep_edge_min_decided())
+                    min_wr = float(_autotrade_strict_keep_edge_min_wr())
+                    min_avg = float(_autotrade_strict_keep_edge_min_avgr())
+                    if dec < min_dec or wr < min_wr or avg < min_avg:
+                        return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
         except Exception as _strict_exc:
             return False, f'autotrade_strict_keep_edge_error:{type(_strict_exc).__name__}'
 
