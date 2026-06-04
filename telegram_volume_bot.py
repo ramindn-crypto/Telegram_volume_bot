@@ -1,3 +1,4 @@
+# yver161: fixes AutoTrade consuming shared/global executable rows already shown on /screen and emailed; keeps final recent-email gate before Bybit placement.
 # yver160: aligns AutoTrade selector with WR-first KEEP policy so setups shown/emailed under Policy=KEEP are not blocked by legacy strict KEEP edge thresholds.
 # yver159: version-number correction after yver158; keeps the output-cleaning and pipeline-sync fixes, with refreshed background cache keys.
 # yver155: Render scheduler hardening: prevents alert/autotrade job overlap warnings with safer intervals, caps pre-session BigMove work so session setup pools are not starved, downgrades transient Telegram timeout log noise, and shortens daily-safety INFO logs.
@@ -12376,23 +12377,37 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         # were never delivered to the subscriber/admin.
         require_email_entry = bool(_autotrade_require_setup_email_for_entry())
         email_cutoff = float(time.time()) - float(max(60, int(_autotrade_entry_window_min()) * 60))
+        # yver161: consume both owner-specific and shared/global executable rows.
+        # /screen and /email_decision count user_id IN (owner, 0); AutoTrade must
+        # read the same lane, otherwise a setup can be shown/emailed (e.g. HYPE)
+        # while /autotrade_last says no_setups.  The email join is keyed by
+        # setup_id and accepts owner email rows even when the executable row is
+        # stored under user_id=0.  Final _autotrade_place_trade still re-checks
+        # the exact recent email gate before any Bybit order is placed.
         cur.execute(
             """
-            SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts
+            SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
             FROM executable_setups x
             LEFT JOIN emailed_setups e
-                   ON e.user_id = x.user_id
-                  AND e.setup_id = x.setup_id
+                   ON e.setup_id = x.setup_id
+                  AND e.emailed_ts >= ?
+                  AND (e.user_id = ? OR e.user_id = x.user_id OR x.user_id = 0)
+                  AND (? = '' OR UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
             LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-            WHERE x.user_id = ?
+            WHERE x.user_id IN (?, 0)
               AND x.executable_ts >= ?
               AND (? = '' OR UPPER(COALESCE(x.session, '')) = ?)
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
               AND (? = 0 OR COALESCE(e.emailed_ts, 0) >= ?)
-            ORDER BY COALESCE(e.emailed_ts, x.executable_ts) DESC, x.executable_ts DESC, x.setup_id DESC
+            GROUP BY x.rowid
+            ORDER BY COALESCE(MAX(e.emailed_ts), x.executable_ts) DESC, x.executable_ts DESC, x.setup_id DESC
             LIMIT ?
             """,
-            (int(uid), float(cutoff), req_session_u, req_session_u, 1 if require_email_entry else 0, float(email_cutoff), int(max(limit * 20, 80))),
+            (
+                float(email_cutoff), int(uid), req_session_u, req_session_u,
+                int(uid), float(cutoff), req_session_u, req_session_u,
+                1 if require_email_entry else 0, float(email_cutoff), int(max(limit * 20, 80)),
+            ),
         )
         rows = [dict(r) for r in (cur.fetchall() or [])]
         con.close()
@@ -12619,14 +12634,14 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
     sess = str(session_label or '').upper().strip()
     if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
         return []
-    # yver129: when AutoTrade is synced to subscriber delivery, the broad fresh
-    # executable queue is not an entry source. The normal DB selector already
-    # returns recent emailed setup_ids only.
+    # yver161: this helper is allowed to read the same fresh shared executable lane
+    # used by /screen and email. If email-matched entry is required, candidates are
+    # still filtered by a recent emailed_setups row and then re-checked by the final
+    # email gate inside _autotrade_place_trade.
     try:
-        if _autotrade_require_setup_email_for_entry():
-            return []
+        require_email_entry = bool(_autotrade_require_setup_email_for_entry())
     except Exception:
-        return []
+        require_email_entry = True
     if not bool(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_ENABLED', True)):
         return []
     try:
@@ -12645,22 +12660,31 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
+        email_cutoff = float(time.time()) - float(max(60, int(_autotrade_entry_window_min()) * 60))
         cur.execute(
             """
-            SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts
+            SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
             FROM executable_setups x
             LEFT JOIN emailed_setups e
-                   ON e.user_id = x.user_id
-                  AND e.setup_id = x.setup_id
+                   ON e.setup_id = x.setup_id
+                  AND e.emailed_ts >= ?
+                  AND (e.user_id = ? OR e.user_id = x.user_id OR x.user_id = 0)
+                  AND (UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
             LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-            WHERE x.user_id = ?
+            WHERE x.user_id IN (?, 0)
               AND x.executable_ts >= ?
               AND UPPER(COALESCE(x.session, '')) = ?
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-            ORDER BY x.executable_ts DESC, x.setup_id DESC
+              AND (? = 0 OR COALESCE(e.emailed_ts, 0) >= ?)
+            GROUP BY x.rowid
+            ORDER BY COALESCE(MAX(e.emailed_ts), x.executable_ts) DESC, x.executable_ts DESC, x.setup_id DESC
             LIMIT ?
             """,
-            (int(owner_uid), float(cutoff), sess, int(lim * 2)),
+            (
+                float(email_cutoff), int(owner_uid), sess,
+                int(owner_uid), float(cutoff), sess,
+                1 if require_email_entry else 0, float(email_cutoff), int(lim * 2),
+            ),
         )
         rows = [dict(r) for r in (cur.fetchall() or [])]
         con.close()
@@ -12696,7 +12720,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v129:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v161:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
