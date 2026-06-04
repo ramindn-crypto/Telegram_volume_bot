@@ -13,12 +13,12 @@
 # yver135: fixes setup-audit/email/autotrade sync gap by letting setup emails consume executable rows for the full AUTOTRADE_ENTRY_WINDOW_MIN instead of only MAX_STALE_SCAN_SEC; /screen fallback age now follows the same entry window.
 # yver134: adds Policy column to /setup_audit detailed table, showing current enforceable KEEP/WATCH/OFF lane for each setup.
 # yver146: hardens AutoTrade closed/report metadata sync: canonical Bybit Closed-PnL enrichment now rejects future-open candidates, syncs /setup_matrix WR basis with setup-audit, shares v146 cache namespace, and keeps strategy recommendations as guidance only (no trading config auto-change).
-# yver153: fixes yver152 Render SyntaxError by removing nested-quote f-string risk; keeps /setup_matrix policy WR-first KEEP promotion and no ExecNow column.
+# yver154: fixes WR-first policy lock so Policy=KEEP is allowed only when the current/displayed decided WR is strictly >49%; old persisted KEEP rows below/equal 49% are downgraded to WATCH, and /setup_matrix policy cache is bumped.
 # yver151: sorts setup audit/policy tables by Policy priority (KEEP, WATCH, then disabled/OFF) without changing trading logic.
 # yver132: explains KEEP selection in /setup_matrix policy (KEEP requires more than 50% WR: sample + AvgR/payoff + no safety disable); no trading-policy loosening.
 # yver130: startup fix for yver129: imports typing.Any before the early AutoTrade email-gate helper so Render does not crash on NameError.
 from typing import Any  # yver130 early import required before early helper annotations
-PULSEFUTURES_CODE_VERSION = "yver153"  # deploy sanity marker
+PULSEFUTURES_CODE_VERSION = "yver154"  # deploy sanity marker
 # yver129: locks AutoTrade to the same delivered KEEP+WATCH lane as subscribers: future AutoTrade entries require an actual recent setup email/delivery within AUTOTRADE_ENTRY_WINDOW_MIN, remove broad executable/fresh-queue fallbacks from email-triggered AutoTrade, and keep the setting Telegram-configurable.
 # yver126: fixes /dayrisk_reset so AutoTrade debug uses the reset credit from the same realised-PnL/open-risk basis, and fixes /setup_audit_keep_watch multi-window table to use full historical generated+executable rows rather than the short executable-only slice.
 # yver124: /setup_audit_keep_watch now renders a multi-window table (Last 24h, 7d, 14d, Overall from database) with Keep/Watch combo counts and WR=TP/(TP+SL).
@@ -3078,13 +3078,13 @@ SETUP_COMBO_POLICY_DISABLE_WR = min(float(os.environ.get("SETUP_COMBO_POLICY_DIS
 SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "0.00") or 0.00)
 SETUP_COMBO_POLICY_WATCH_WR = float(os.environ.get("SETUP_COMBO_POLICY_WATCH_WR", "50") or 50)
 SETUP_COMBO_POLICY_PROMOTE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_PROMOTE_AVG_R", "0.35") or 0.35)
-# yver153: owner requested WR-first policy promotion.
+# yver154: owner requested WR-first policy promotion.
 # Any lane with at least one decided TP/SL result and WR > 49% becomes KEEP,
 # regardless of Set/Dec sample count. This intentionally loosens yver132 safety wording.
 SETUP_COMBO_POLICY_KEEP_ANY_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_ANY_WR", "49") or 49)
 
 def _setup_combo_wr_first_keep(decided: int | float | str = 0, win_rate: int | float | str = 0.0) -> bool:
-    """yver153 WR-first promotion: WR > 49% with any decided evidence is KEEP."""
+    """yver154 WR-first promotion: KEEP is allowed only when decided WR is strictly > cutoff."""
     try:
         return int(float(decided or 0)) > 0 and float(win_rate or 0.0) > float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0)
     except Exception:
@@ -47446,13 +47446,30 @@ def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', u
                 status = str(pol.get('status') or 'WATCH').upper().strip()
                 enabled = 1 if int(pol.get('enabled') if pol.get('enabled') is not None else 1) == 1 else 0
                 pol_out = dict(pol or {})
-                # yver153: apply the same WR-first KEEP promotion in the live setup gate,
-                # not just in the /setup_matrix policy display.
-                if _setup_combo_wr_first_keep(pol_out.get('last_decided'), pol_out.get('last_win_rate')):
+                # yver154: strict WR lock. Policy=KEEP is allowed only when the
+                # stored/current policy evidence has at least one decided TP/SL and
+                # WR is strictly above SETUP_COMBO_POLICY_KEEP_ANY_WR (default 49%).
+                # This prevents old persisted KEEP rows with WR <= 49% from staying
+                # executable after the owner requested the WR cutoff to be enforced.
+                _wr_first_ok = _setup_combo_wr_first_keep(pol_out.get('last_decided'), pol_out.get('last_win_rate'))
+                if _wr_first_ok:
                     status = 'KEEP'
                     enabled = 1
                     pol_out['status'] = 'KEEP'
                     pol_out['enabled'] = 1
+                elif status == 'KEEP':
+                    status = 'WATCH'
+                    enabled = 1
+                    pol_out['status'] = 'WATCH'
+                    pol_out['enabled'] = 1
+                    try:
+                        prior_note = str(pol_out.get('notes') or '').strip()
+                        _wr_first_last = float(pol_out.get("last_win_rate") or 0.0)
+                        _wr_first_cutoff = float(globals().get("SETUP_COMBO_POLICY_KEEP_ANY_WR", 49.0) or 49.0)
+                        add_note = f"yver154 KEEP downgraded to WATCH: last WR {_wr_first_last:.1f}% is not > {_wr_first_cutoff:.1f}%"
+                        pol_out['notes'] = (prior_note + '; ' if prior_note else '') + add_note
+                    except Exception:
+                        pass
                 out.update({'found': True, 'policy': pol_out, 'status': status, 'enabled': enabled,
                             'strategy': k_strat if k_strat != 'ALL' else strat, 'side': k_side if k_side != 'BOTH' else side})
                 return out
@@ -48651,18 +48668,31 @@ def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
                     combo = _setup_combo_strategy_key(str(fam), str(sess), strat)
                 else:
                     combo = f"{str(fam).upper().strip()}-{str(sess).upper().strip()}"
-                # yver153: even if the DB row was written by an older policy build as WATCH/OFF,
-                # expose/enforce it as KEEP when its stored decided WR is over 49%.
+                # yver154: enforce the owner's strict cutoff both ways:
+                # - WR > 49% with decided evidence promotes to KEEP.
+                # - Old persisted KEEP rows with WR <= 49% are downgraded to WATCH.
                 pol_out = dict(pol or {})
-                if _setup_combo_wr_first_keep(pol_out.get('last_decided'), pol_out.get('last_win_rate')):
+                _wr_first_ok = _setup_combo_wr_first_keep(pol_out.get('last_decided'), pol_out.get('last_win_rate'))
+                if _wr_first_ok:
                     pol_out['status'] = 'KEEP'
                     pol_out['enabled'] = 1
                     try:
                         prior_note = str(pol_out.get('notes') or '').strip()
                         _wr_first_last = float(pol_out.get("last_win_rate") or 0.0)
                         _wr_first_cutoff = float(globals().get("SETUP_COMBO_POLICY_KEEP_ANY_WR", 49.0) or 49.0)
-                        _wr_first_note = f"yver153 WR-first KEEP: last WR {_wr_first_last:.1f}% > {_wr_first_cutoff:.1f}%"
+                        _wr_first_note = f"yver154 WR-first KEEP: last WR {_wr_first_last:.1f}% > {_wr_first_cutoff:.1f}%"
                         add_note = _wr_first_note
+                        pol_out['notes'] = (prior_note + '; ' if prior_note else '') + add_note
+                    except Exception:
+                        pass
+                elif str(pol_out.get('status') or '').upper().strip() == 'KEEP':
+                    pol_out['status'] = 'WATCH'
+                    pol_out['enabled'] = 1
+                    try:
+                        prior_note = str(pol_out.get('notes') or '').strip()
+                        _wr_first_last = float(pol_out.get("last_win_rate") or 0.0)
+                        _wr_first_cutoff = float(globals().get("SETUP_COMBO_POLICY_KEEP_ANY_WR", 49.0) or 49.0)
+                        add_note = f"yver154 KEEP downgraded to WATCH: last WR {_wr_first_last:.1f}% is not > {_wr_first_cutoff:.1f}%"
                         pol_out['notes'] = (prior_note + '; ' if prior_note else '') + add_note
                     except Exception:
                         pass
@@ -48834,7 +48864,7 @@ def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int
 
         score = (wr - 50.0) * 1.20 + avg_r * 22.0 + min(20, decided) * 0.45 - ((op / max(1, total)) * 4.0)
 
-        # yver153: owner requested more KEEP lanes. If WR is over 49%, promote to
+        # yver154: owner requested more KEEP lanes. If WR is over 49%, promote to
         # KEEP immediately, regardless of setup/sample count, AvgR, or TP/SL balance.
         if _setup_combo_wr_first_keep(decided, wr):
             return 'KEEP', 1, f"WR-first promotion: WR > {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.1f}% regardless of setup count", float(score)
@@ -48849,12 +48879,12 @@ def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int
             return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'Insufficient decided results ({decided}/{min_decided}); keep collecting data', float(score)
 
         # Strong normal promotion.
-        if wr >= float(SETUP_COMBO_POLICY_KEEP_WR) and avg_r >= float(SETUP_COMBO_POLICY_KEEP_AVG_R) and tp >= max(1, sl):
+        if _setup_combo_wr_first_keep(decided, wr) and wr >= float(SETUP_COMBO_POLICY_KEEP_WR) and avg_r >= float(SETUP_COMBO_POLICY_KEEP_AVG_R) and tp >= max(1, sl):
             return 'KEEP', 1, 'Positive edge: WR/AvgR above keep threshold', float(score)
 
         # Quality promotion for lanes just under 55% WR but with strong payoff profile.
         # Example: 54.5% WR with AvgR +0.66 should be eligible for KEEP, not DISABLE.
-        if wr >= float(SETUP_COMBO_POLICY_WATCH_WR) and avg_r >= float(SETUP_COMBO_POLICY_PROMOTE_AVG_R) and tp > sl:
+        if _setup_combo_wr_first_keep(decided, wr) and wr >= float(SETUP_COMBO_POLICY_WATCH_WR) and avg_r >= float(SETUP_COMBO_POLICY_PROMOTE_AVG_R) and tp > sl:
             return 'KEEP', 1, 'Positive edge: WR >=50% with strong AvgR/payoff profile', float(score)
 
         # Borderline/profitable lanes remain WATCH. They are not subscriber-facing while
@@ -49698,6 +49728,10 @@ def _setup_combo_policy_text(uid: int) -> str:
             wr_first_keep = _setup_combo_wr_first_keep(dec_v, wr_v)
             if wr_first_keep:
                 adv = 'KEEP'
+            elif adv == 'KEEP':
+                # yver154: the displayed recommendation must not show KEEP unless
+                # the displayed/current WR is strictly above the owner cutoff.
+                adv = 'WATCH'
 
             full_disabled = False
             if pol:
@@ -49710,7 +49744,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             # Family-Session-Side diagnostics are mapped to NOR only so a weak NOR
             # side does not make the paired REV side look blocked before REV has data.
             side_block = (full_combo in side_blocks) or (strat == 'NOR' and f'{base_combo}-{side}' in legacy_side_blocks)
-            # yver153: WR-first KEEP overrides old WATCH/OFF/PART display state when the
+            # yver154: WR-first KEEP overrides old WATCH/OFF/PART display state when the
             # lane has any decided evidence and WR > 49%, regardless of Set count.
             if wr_first_keep:
                 exec_state = 'KEEP'; live_state = 'KEEP'; active_count += 1
@@ -49721,7 +49755,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             else:
                 pol_status = str((pol or raw_pol or {}).get('status') or '').upper().strip()
                 adv_status = str(score.get('action') or '').upper().strip()
-                if pol_status == 'KEEP' or (not pol and adv_status == 'KEEP'):
+                if wr_first_keep:
                     exec_state = 'KEEP'; live_state = 'KEEP'
                 elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
                     exec_state = 'GATE'; live_state = 'WATCH'
@@ -49734,7 +49768,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             avg_txt = f'{avg_v:+.2f}' if dec_v > 0 else '-'
             table_rows.append([full_combo, live_state, set_v, dec_v, wr_txt, avg_txt, adv])
 
-        # yver153: Sort by enforced Policy first and remove the display-only ExecNow column.
+        # yver154: Sort by enforced Policy first and remove the display-only ExecNow column.
         policy_order_rank = {'KEEP': 0, 'WATCH': 1, 'TIGHTEN': 2, 'DISABLE': 3, 'OFF': 3, 'BLOCK': 3, 'PAUSE': 3}
         def _row_key(row):
             combo = str(row[0])
@@ -49763,8 +49797,8 @@ def _setup_combo_policy_text(uid: int) -> str:
             f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
-            f"KEEP rule: <b>WR &gt; {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.0f}%</b> with at least one decided TP/SL result is now <b>KEEP</b>, regardless of Set/Dec sample count. Legacy AvgR/payoff rules are only fallback rules for rows not passing this WR-first threshold.\n"
-            f"Why a row can still be WATCH/OFF: no decided TP/SL yet, WR ≤ {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.0f}%, or another non-policy final gate/micro-edge guard blocks a specific symbol/hour. Policy=the enforced state; Reco=this window's recommendation only.\n"
+            f"KEEP rule: <b>WR &gt; {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.1f}%</b> with at least one decided TP/SL result is now <b>KEEP</b>, regardless of Set/Dec sample count. Rows with WR ≤ {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.1f}% cannot remain KEEP, even if an older cached/persisted policy said KEEP.\n"
+            f"Why a row can still be WATCH/OFF: no decided TP/SL yet, WR ≤ {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.1f}%, or another non-policy final gate/micro-edge guard blocks a specific symbol/hour. Policy=the enforced state; Reco=this window's recommendation only.\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
             f"{guard_txt}\n{html.escape(_setup_nor_rev_router_note(int(owner_uid), []))}\n{note}\n"
@@ -49785,7 +49819,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v153:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v154:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
