@@ -1,4 +1,4 @@
-# yver157: synchronizes report wording: /setup_audit separates combo Policy from current live Gate, /autotrade_debug separates current executable window from 12h history, and /email_decision shows executable-window freshness.
+# yver158: output-cleaning only; removes verbose explanatory lines from /setup_audit_compare, /setup_matrix policy, and /autotrade_debug.
 # yver155: Render scheduler hardening: prevents alert/autotrade job overlap warnings with safer intervals, caps pre-session BigMove work so session setup pools are not starved, downgrades transient Telegram timeout log noise, and shortens daily-safety INFO logs.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
@@ -46737,11 +46737,6 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         "🔎 <b>Setup Audit ↔ AutoTrade Compare</b>",
         HDR,
         f"Window: <b>last {hours}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
-        "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
-        "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
-        "AT = actual realised AutoTrade close from Bybit/journal. Audit = independent matched setup price-path result.",
-        "yver149 matching: setup_id/open-time must fit the AutoTrade entry deadline. Trades opened before the selected compare window but closed inside it can still match their original setup when journal/open-time evidence is reliable; close-only legacy rows remain guarded.",
-        "Precision: mismatched TP/SL rows are rechecked with targeted 1m candles before DIFF is shown.",
         f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
     ]
     if not rows:
@@ -50080,21 +50075,14 @@ def _setup_combo_policy_text(uid: int) -> str:
         info = _setup_combo_latest_policy_update_info(int(owner_uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid), _overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168))))
-        note = (
-            f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL). <b>Policy</b> is the enforced policy state. <b>Reco</b> is this window's recommendation only. <b>PART</b>=this exact lane is tightened by its own evidence. <b>OFF</b>=this exact lane is disabled by scheduled/daily safety policy. No-evidence lanes show '-' metrics."
-        )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
             f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
-            f"KEEP rule: <b>WR &gt; {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.1f}%</b> with at least one decided TP/SL result is now <b>KEEP</b>, regardless of Set/Dec sample count. Rows with WR ≤ {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.1f}% cannot remain KEEP, even if an older cached/persisted policy said KEEP.\n"
-            f"Why a row can still be WATCH/OFF: no decided TP/SL yet, WR ≤ {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.1f}%, or another non-policy final gate/micro-edge guard blocks a specific symbol/hour. Policy=the enforced state; Reco=this window's recommendation only.\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
-            f"{guard_txt}\n{html.escape(_setup_nor_rev_router_note(int(owner_uid), []))}\n{note}\n"
-            f"Self-improvement flow: /setup_audit_overall and /setup_matrix policy now use the same fixed 15 May setup-result evidence; /setup_matrix policy refreshes the enforceable lane policy first, then the optimizer bridge mirrors those policy rows into runtime family/session gates. Side/session context is now fed into lane policy; weak symbol/hour evidence is enforced through the micro-edge/final gate because policy rows are not symbol/hour-specific. Manual /setup_matrix rows remain advisory; scheduled/baseline policy rows, daily safety rows, micro-edge guard, final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately.\n"
+            f"{guard_txt}\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -50111,7 +50099,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v157:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v158:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50574,7 +50562,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v149:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v158:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -51147,7 +51135,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v149:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v158:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -54744,8 +54732,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         SEP,
         'Email / AutoTrade entry gate',
         f"AutoTrade lane filter: {('KEEP+WATCH policy ON' if _autotrade_allow_watch_policy() else 'KEEP-only policy ON') if _autotrade_require_keep_policy() else 'policy filter OFF'}",
-        f"AutoTrade capital guard: daily loss stop {'ON' if _autotrade_daily_realized_loss_stop_enabled() else 'OFF'} {_autotrade_daily_realized_loss_stop_pct():.1f}% | realised-combo {'ON' if _autotrade_require_realized_combo_edge() else 'OFF'} | context feed {'ON' if _autotrade_context_feed_guard_enabled() else 'OFF'}",
-        f"AutoTrade capital gate: {'OPEN' if _autotrade_daily_realized_loss_stop_allows(int(owner))[0] else 'BLOCKED'} | {_autotrade_daily_realized_loss_stop_allows(int(owner))[1]}",
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
         f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
         f"Session email cap: {session_cap_txt} (configured)",
