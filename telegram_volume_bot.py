@@ -1,3 +1,4 @@
+# yver157: synchronizes report wording: /setup_audit separates combo Policy from current live Gate, /autotrade_debug separates current executable window from 12h history, and /email_decision shows executable-window freshness.
 # yver155: Render scheduler hardening: prevents alert/autotrade job overlap warnings with safer intervals, caps pre-session BigMove work so session setup pools are not starved, downgrades transient Telegram timeout log noise, and shortens daily-safety INFO logs.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
@@ -45749,6 +45750,40 @@ def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: st
     except Exception:
         return '-'
 
+
+def _setup_audit_combo_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
+    """Return the current combo policy only, matching /setup_matrix policy.
+
+    yver157: /setup_audit previously used "Policy" to mean current live
+    delivery/actionability. That made historical rows look inconsistent with
+    /setup_matrix policy. This helper reports the combo policy lane (KEEP/WATCH/
+    DISABLE) while _setup_audit_policy_label remains the live Gate.
+    """
+    try:
+        rr = dict(row or {})
+        sess = str(session_name or rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
+        side_u = str(side or rr.get('side') or '').upper().strip()
+        if side_u in {'BUY', 'SELL'}:
+            rr['side'] = side_u
+        policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        info = _setup_combo_policy_lookup_for_setup(rr, session_name=sess, user_id=policy_uid) or {}
+        found = bool(info.get('found'))
+        raw_status = str(info.get('status') or '').upper().strip()
+        try:
+            enabled = int(info.get('enabled') if info.get('enabled') is not None else (1 if not found else 0)) == 1
+        except Exception:
+            enabled = True if not found else False
+        status = _setup_policy_effective_status(raw_status, found=found)
+        if (not enabled) or status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}:
+            return 'DISABLE'
+        if status == 'KEEP':
+            return 'KEEP'
+        if status == 'WATCH':
+            return 'WATCH'
+        return 'WATCH' if not found else 'OFF'
+    except Exception:
+        return 'OFF'
+
 def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
     """Final actionable policy label for one /setup_audit row.
 
@@ -45921,9 +45956,10 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         except Exception:
             volm = 0.0
         combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
-        policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
+        policy_label = _setup_audit_combo_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
+        gate_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
         at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
-        table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, gate_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -45936,7 +45972,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
 
     # Ver16: show all rows. send_long_message now chunks <pre> tables safely,
     # so there is no need to hide audit rows for Telegram length limits.
-    # yver151: Sort by Policy priority for readability: KEEP, WATCH, then OFF/disabled.
+    # yver157: Sort by combo Policy priority for readability: KEEP, WATCH, then disabled/OFF.
     policy_rank = {'KEEP': 0, 'WATCH': 1, 'OFF': 2, 'DISABLE': 2, 'BLOCK': 2, 'PAUSE': 2}
     display_rows = [row for _i, row in sorted(
         enumerate(table_rows),
@@ -45945,9 +45981,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'Gate', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
@@ -45956,7 +45992,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "Policy = fresh-current delivery/actionability gate only. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions, so stale open journal rows no longer look live after closure.",
+        "Policy = combo policy from /setup_matrix policy. Gate = current live delivery/actionability gate for /screen, setup email, and AutoTrade; old rows can be Policy=KEEP but Gate=OFF after the entry window/cooldown/session changes. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
@@ -50075,7 +50111,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v154:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v157:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -54588,10 +54624,15 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     gap_remaining = int(email_gate.get('gap_remaining_sec', 0) or 0)
     gate_reason = ', '.join([str(r) for r in (email_gate.get('gate_reasons') or [])[:3]])
 
+    exec_current = 0
     exec_recent = 0
     emailed_recent = 0
     sent_email_batches_recent = 0
     since_ts = time.time() - 12 * 3600
+    try:
+        current_exec_since_ts = time.time() - max(60, int(_autotrade_entry_window_min()) * 60)
+    except Exception:
+        current_exec_since_ts = time.time() - 60 * 60
     try:
         con = db_connect()
         cur = con.cursor()
@@ -54599,6 +54640,16 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Raw row counts can be huge because equivalent executable opportunities
         # are refreshed repeatedly during background scans.
         min_vol = float(_setup_min_volume_floor_usd())
+        try:
+            cur.execute("""
+                SELECT COUNT(DISTINCT UPPER(COALESCE(NULLIF(symbol,''), setup_id)) || ':' || UPPER(COALESCE(NULLIF(side,''),'?'))) AS n
+                FROM executable_setups
+                WHERE user_id IN (?,0) AND executable_ts>=? AND COALESCE(fut_vol_usd,0)>=?
+            """, (int(owner), float(current_exec_since_ts), float(min_vol)))
+            row_cur = cur.fetchone()
+            exec_current = int(row_cur['n'] if hasattr(row_cur, 'keys') and 'n' in row_cur.keys() else row_cur[0])
+        except Exception:
+            exec_current = 0
         try:
             cur.execute("""
                 SELECT COUNT(DISTINCT UPPER(COALESCE(NULLIF(symbol,''), setup_id)) || ':' || UPPER(COALESCE(NULLIF(side,''),'?'))) AS n
@@ -54704,7 +54755,8 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
         f"Email/AutoTrade gate: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
         f"Recent emailed setups (unique, 12h): {emailed_recent}",
-        f"Recent executable setups (unique sym/side, 12h): {exec_recent}",
+        f"Current executable setups (unique sym/side, entry window): {exec_current}",
+        f"Stored executable setups (unique sym/side, 12h history): {exec_recent}",
     ]
     try:
         lines.append(f"Recent sent setup-email batches (12h): {int(sent_email_batches_recent or 0)}")
@@ -60699,6 +60751,29 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 lines.append(f"Current session: {sess_now or '-'}")
             lines.append(f"Configured build timeout: {float(EMAIL_BUILD_POOL_TIMEOUT_SEC):.1f}s")
+            try:
+                _entry_win_sec = max(60, int(_autotrade_entry_window_min()) * 60)
+                _cur_exec_count = 0
+                _last_exec_age_txt = '-'
+                with sqlite3.connect(DB_PATH) as _ec:
+                    _ec.row_factory = sqlite3.Row
+                    _cu = _ec.cursor()
+                    _min_vol = float(_setup_min_volume_floor_usd())
+                    _since = float(time.time()) - float(_entry_win_sec)
+                    _cu.execute("""
+                        SELECT COUNT(DISTINCT UPPER(COALESCE(NULLIF(symbol,''), setup_id)) || ':' || UPPER(COALESCE(NULLIF(side,''),'?'))) AS n,
+                               MAX(executable_ts) AS last_ts
+                        FROM executable_setups
+                        WHERE user_id IN (?,0) AND executable_ts>=? AND COALESCE(fut_vol_usd,0)>=?
+                    """, (int(uid), float(_since), float(_min_vol)))
+                    _er = _cu.fetchone()
+                    _cur_exec_count = int(_er['n'] if _er and 'n' in _er.keys() else 0)
+                    _last_ts = float(_er['last_ts'] if _er and _er['last_ts'] is not None else 0.0)
+                    if _last_ts > 0:
+                        _last_exec_age_txt = _fmt_dur(max(0, int(time.time() - _last_ts))) + ' ago'
+                lines.append(f"Current executable rows: {_cur_exec_count} inside {int(_entry_win_sec/60)}m entry window | last: {_last_exec_age_txt}")
+            except Exception:
+                pass
             if pipe_build:
                 lines.append("Build pool: " + _pipe_summary(pipe_build))
             if pipe_exec:
