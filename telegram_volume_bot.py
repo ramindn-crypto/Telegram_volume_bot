@@ -1,3 +1,4 @@
+# yver155: Render scheduler hardening: prevents alert/autotrade job overlap warnings with safer intervals, caps pre-session BigMove work so session setup pools are not starved, downgrades transient Telegram timeout log noise, and shortens daily-safety INFO logs.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
 # yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
@@ -14648,11 +14649,12 @@ ALERT_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
-AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "55") or 55)
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "35") or 35)
 # Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
 # Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
-AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "60") or 60)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "115") or 115)
+AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "180") or 180)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "75") or 75)
+AUTOTRADE_JOB_RENDER_SAFE_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_RENDER_SAFE_INTERVAL_SEC", "300") or 300)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
 AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", True)
@@ -27393,7 +27395,7 @@ async def send_long_message(
                             pass
                 except (TimedOut, NetworkError) as e:
                     try:
-                        logger.warning('Telegram send failed (pre-table network): %s', e)
+                        logger.info('Telegram send transient network issue ignored/retried (pre-table): %s', e)
                     except Exception:
                         pass
                     await asyncio.sleep(1)
@@ -27536,7 +27538,7 @@ async def send_long_message(
                 except Exception as e2:
                     logger.warning("Telegram plain fallback failed: %s", e2)
             else:
-                logger.warning("Telegram send failed (network): %s", e)
+                logger.info("Telegram send transient network issue ignored/retried: %s", e)
                 await asyncio.sleep(2)
                 try:
                     await _send(parse_mode)
@@ -27547,7 +27549,7 @@ async def send_long_message(
                         except Exception as e3:
                             logger.warning("Telegram plain fallback after network retry failed: %s", e3)
                     else:
-                        logger.warning("Telegram retry failed (network): %s", e2)
+                        logger.info("Telegram retry failed after transient network issue: %s", e2)
 
         except Exception as e:
             if _is_parse_entity_error(e):
@@ -47288,7 +47290,7 @@ def _setup_combo_run_daily_safety_policy(uid: int, start_ts: float | None = None
             bridge_report = {}
         out.update({'ok': True, 'disabled': [_setup_combo_strategy_side_key(str((r or {}).get('family') or ''), str((r or {}).get('session') or ''), str((r or {}).get('strategy') or 'NOR'), str((r or {}).get('side') or '')) for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'bridge_report': bridge_report, 'reason': 'ok', 'window_hours': int(hours), 'start_ts': float(fixed_start_ts or 0.0), 'source_label': str((res or {}).get('source_label') or 'EXECUTABLE')})
         try:
-            logger.info('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
+            logger.info('setup_combo_daily_safety_complete run_id=%s disabled_count=%s expires=%s', run_id, len(out.get('disabled') or []), _setup_combo_format_policy_ts(expires_ts))
         except Exception:
             pass
         return out
@@ -58649,14 +58651,18 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
+# yver155: Render-safe bounded alert loop. Keep a strict default budget and run less frequently
+# than the worst-case runtime so APScheduler does not spam max_instances skipped-run warnings.
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "75"))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
-AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "60") or 60)
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "180") or 180)
 AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "2"))
+ALERT_JOB_RENDER_SAFE_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_RENDER_SAFE_INTERVAL_SEC", "300") or 300)
+ALERT_JOB_BIGMOVE_PER_USER_MAX_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_PER_USER_MAX_SEC", "22") or 22)
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
 ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "2"))
 ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC", "12"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
@@ -58664,7 +58670,7 @@ ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
-BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "60") or 60)
+BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "18") or 18)
 # Ver22: autonomous setup discovery must stay hot. A 10-minute rebuild floor made /screen
 # look like the trigger because manual /screen used the dedicated screen lane while the
 # email lane waited on stale/empty pools. Keep it short by default.
@@ -59415,10 +59421,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Ver110: Big-Move is important, but it must not consume the entire
             # alert_job runtime and starve the normal session setup/email/autotrade pool.
             if _bigmove_session_reserve_hit():
-                logger.warning("alert_job bigmove queue reserved session budget after %.1fs", time.time() - job_started_ts)
+                logger.info("alert_job bigmove queue reserved session budget after %.1fs", time.time() - job_started_ts)
                 break
             if _job_budget_exhausted():
-                logger.warning("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
+                logger.info("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
                 break
             try:
                 uid = int(u.get("user_id") or u.get("id") or 0)
@@ -59444,7 +59450,24 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     "reasons": ["pre_session_bigmove_budget_exhausted"],
                 }
                 continue
-            await _send_bigmove_payload_for_user(int(uid), tz, tag='pre_session')
+            # yver155: hard-cap each pre-session BigMove pass. One slow SMTP/Telegram/network
+            # call must not consume the whole alert_job budget and starve the normal session
+            # setup/email pool (Render log: "runtime budget exhausted before session pools").
+            try:
+                _bm_elapsed = float(time.time() - job_started_ts)
+                _bm_remaining = max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 75) - _bm_elapsed)
+                _bm_cap = max(3.0, min(float(ALERT_JOB_BIGMOVE_PER_USER_MAX_SEC or 22), _bm_remaining, max(3.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 75) * 0.30)))
+                await asyncio.wait_for(_send_bigmove_payload_for_user(int(uid), tz, tag='pre_session'), timeout=_bm_cap)
+            except asyncio.TimeoutError:
+                try:
+                    _LAST_BIGMOVE_DECISION[int(uid)] = {
+                        "status": "SKIP",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": [f"pre_session_bigmove_timeout>{int(_bm_cap)}s_deferred_to_next_tick"],
+                    }
+                except Exception:
+                    pass
+                continue
 
 
         # -----------------------------------------------------
@@ -59453,7 +59476,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # even when no user is currently inside those sessions.
         # -----------------------------------------------------
         if _job_budget_exhausted():
-            logger.warning("alert_job runtime budget exhausted before session pools after %.1fs", time.time() - job_started_ts)
+            logger.info("alert_job runtime budget exhausted before session pools after %.1fs", time.time() - job_started_ts)
             return
 
         notify_runtime = []
@@ -59660,7 +59683,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             notify_runtime = notify_runtime[:_notify_max]
         for meta in notify_runtime:
             if _job_budget_exhausted():
-                logger.warning("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
+                logger.info("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
                 return
             user = dict(meta.get("user") or {})
             uid = int(meta.get("uid") or 0)
@@ -62643,7 +62666,16 @@ def main():
         # the pipeline alive.
         # Ver110: schedule interval must be longer than the allowed runtime to avoid
         # APScheduler max_instances skipped-run warnings on Render.
-        interval_sec = max(90, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 30)
+        # yver155: Render-safe interval. A 2-minute alert_job interval was still
+        # overlapping when ticker/email/network calls ran long, causing repeated
+        # APScheduler max_instances warnings and starving setup generation.
+        interval_sec = max(
+            int(globals().get('ALERT_JOB_RENDER_SAFE_INTERVAL_SEC', 300) or 300),
+            90,
+            int(CHECK_INTERVAL_MIN * 60),
+            int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 180),
+            int(ALERT_JOB_MAX_RUNTIME_SEC or 75) + 120,
+        )
     
         app.job_queue.run_repeating(
             alert_job,
@@ -62818,7 +62850,13 @@ def main():
         # AutoTrade loop (owner-only)
         app.job_queue.run_repeating(
             autotrade_job,
-            interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 10),
+            # yver155: avoid Render/APScheduler max_instances skipped-run warnings
+            # by scheduling AutoTrade slower than its maximum execution budget.
+            interval=max(
+                int(globals().get('AUTOTRADE_JOB_RENDER_SAFE_INTERVAL_SEC', 300) or 300),
+                int(AUTOTRADE_JOB_INTERVAL_SEC or 180),
+                int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 75) + 120,
+            ),
             first=45,
             name="autotrade_job",
             job_kwargs={
