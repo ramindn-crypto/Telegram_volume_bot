@@ -1,3 +1,4 @@
+# yver21: force-KEEP any combo with decided WR >49%, clean /setup_matrix policy and /setup_audit outputs, and sort policy table by KEEP then WR.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
 # yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
@@ -3075,6 +3076,15 @@ SETUP_COMBO_POLICY_DISABLE_WR = min(float(os.environ.get("SETUP_COMBO_POLICY_DIS
 SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "0.00") or 0.00)
 SETUP_COMBO_POLICY_WATCH_WR = float(os.environ.get("SETUP_COMBO_POLICY_WATCH_WR", "50") or 50)
 SETUP_COMBO_POLICY_PROMOTE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_PROMOTE_AVG_R", "0.35") or 0.35)
+# yver21: Ramin rule — any lane with decided WR >49% is KEEP, regardless of sample/payoff.
+SETUP_COMBO_POLICY_FORCE_KEEP_WR = float(os.environ.get("SETUP_COMBO_POLICY_FORCE_KEEP_WR", "49") or 49)
+
+
+def _setup_combo_force_keep_by_wr(decided: int, wr: float) -> bool:
+    try:
+        return int(decided or 0) > 0 and float(wr or 0.0) > float(globals().get('SETUP_COMBO_POLICY_FORCE_KEEP_WR', 49.0) or 49.0)
+    except Exception:
+        return False
 
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
 # matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
@@ -45677,12 +45687,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         HDR,
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
-        f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "Policy = fresh-current delivery/actionability gate only. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions, so stale open journal rows no longer look live after closure.",
-        "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
-    header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
@@ -48790,6 +48795,11 @@ def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int
 
         score = (wr - 50.0) * 1.20 + avg_r * 22.0 + min(20, decided) * 0.45 - ((op / max(1, total)) * 4.0)
 
+        # yver21 Ramin rule: any combo/lane with a decided win rate above 49% is KEEP.
+        # This intentionally overrides the older sample-size/AvgR/payoff promotion rules.
+        if _setup_combo_force_keep_by_wr(decided, wr):
+            return 'KEEP', 1, f'Ramin force-KEEP rule: WR {wr:.1f}% > {float(globals().get("SETUP_COMBO_POLICY_FORCE_KEEP_WR", 49.0) or 49.0):.0f}%', float(score)
+
         # No/low decided evidence is probation, not a hard block. This is why 100% WR
         # from 1-3 decided rows should show WATCH, not DISABLE.
         if decided < min_decided:
@@ -49641,6 +49651,13 @@ def _setup_combo_policy_text(uid: int) -> str:
             raw_pol = dict(rows_by_combo.get(full_combo) or rows_by_combo.get(strat_combo) or rows_by_combo.get(base_combo) or {})
             score = dict(latest_scores.get(full_combo) or latest_scores.get(strat_combo) or latest_scores.get(base_combo) or {})
 
+            set_v = int(score.get('setups') if score.get('setups') is not None else (pol.get('last_setups') or raw_pol.get('last_setups') or 0))
+            dec_v = int(score.get('decided') if score.get('decided') is not None else (pol.get('last_decided') or raw_pol.get('last_decided') or 0))
+            wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
+            avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
+            adv = str(score.get('action') or '-').upper().strip() or '-'
+            force_keep = _setup_combo_force_keep_by_wr(dec_v, wr_v)
+
             full_disabled = False
             if pol:
                 st = str(pol.get('status') or '').upper().strip()
@@ -49652,7 +49669,10 @@ def _setup_combo_policy_text(uid: int) -> str:
             # Family-Session-Side diagnostics are mapped to NOR only so a weak NOR
             # side does not make the paired REV side look blocked before REV has data.
             side_block = (full_combo in side_blocks) or (strat == 'NOR' and f'{base_combo}-{side}' in legacy_side_blocks)
-            if full_disabled:
+            if force_keep:
+                # yver21: WR >49% wins. Display and enforce the row as KEEP in both columns.
+                exec_state = 'KEEP'; live_state = 'KEEP'; adv = 'KEEP'; active_count += 1
+            elif full_disabled:
                 exec_state = 'OFF'; live_state = 'DISABLE'; disabled_count += 1
             elif side_block:
                 exec_state = 'PART'; live_state = 'TIGHTEN'; partial_count += 1
@@ -49666,52 +49686,32 @@ def _setup_combo_policy_text(uid: int) -> str:
                 else:
                     exec_state = 'ON'; live_state = 'WATCH'
                 active_count += 1
-
-            set_v = int(score.get('setups') if score.get('setups') is not None else (pol.get('last_setups') or raw_pol.get('last_setups') or 0))
-            dec_v = int(score.get('decided') if score.get('decided') is not None else (pol.get('last_decided') or raw_pol.get('last_decided') or 0))
-            wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
-            avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
-            adv = str(score.get('action') or '-').upper().strip() or '-'
             # yver67: keep policy table focused. Row-level Kind was confusing and
             # duplicated the header policy-kind summary; no-evidence lanes show '-' metrics.
             wr_txt = f'{wr_v:.1f}%' if dec_v > 0 else '-'
             avg_txt = f'{avg_v:+.2f}' if dec_v > 0 else '-'
             table_rows.append([full_combo, exec_state, live_state, set_v, dec_v, wr_txt, avg_txt, adv])
 
-        order_rank = {'OFF': 0, 'PART': 1, 'GATE': 2, 'KEEP': 3, 'ON': 4}
+        policy_rank = {'KEEP': 0, 'WATCH': 1, 'TIGHTEN': 2, 'DISABLE': 3, 'OFF': 4, '-': 5}
         def _row_key(row):
             combo = str(row[0])
-            parts = combo.split('-')
-            fam = parts[0] if parts else combo
-            sess = parts[1] if len(parts) > 1 else ''
-            strat = parts[2] if len(parts) > 2 else 'NOR'
-            side = parts[3] if len(parts) > 3 else 'BUY'
-            fam_n = int(fam[1:]) if re.fullmatch(r'F\d+', fam) else 99
-            sess_n = sess_order.index(sess) if sess in sess_order else 99
-            strat_n = 0 if strat == 'NOR' else 1
-            side_n = 0 if side == 'BUY' else 1
-            return (order_rank.get(str(row[1]), 9), fam_n, sess_n, strat_n, side_n, combo)
+            try:
+                wr_num = float(str(row[5] or '0').replace('%', '').replace('-', '0') or 0.0)
+            except Exception:
+                wr_num = -1.0
+            try:
+                dec_num = int(row[4] or 0)
+            except Exception:
+                dec_num = 0
+            return (policy_rank.get(str(row[2] or '').upper().strip(), 9), -wr_num, -dec_num, combo)
         table_rows = sorted(table_rows, key=_row_key)
         table = tabulate(table_rows, headers=['Combo','ExecNow','Policy','Set','Dec','WR','AvgR','Reco'], tablefmt='plain')
 
-        info = _setup_combo_latest_policy_update_info(int(owner_uid))
-        next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
-        guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid), _overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168))))
-        note = (
-            f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
-            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL). <b>ExecNow</b> is the actual executable state now. <b>Policy</b> is the enforced policy state. <b>Reco</b> is this window's recommendation only. <b>PART</b>=this exact lane is tightened by its own evidence. <b>OFF</b>=this exact lane is disabled by scheduled/daily safety policy. No-evidence lanes show '-' metrics."
-        )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
             f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
-            f"KEEP rule: <b>Decided ≥ {int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY)}</b> and either <b>WR ≥ {float(SETUP_COMBO_POLICY_KEEP_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_POLICY_KEEP_AVG_R):+.2f} + TP≥SL</b>, or <b>WR ≥ {float(SETUP_COMBO_POLICY_WATCH_WR):.0f}% + strong AvgR ≥ {float(SETUP_COMBO_POLICY_PROMOTE_AVG_R):+.2f} + TP&gt;SL</b>. 50% WR alone remains WATCH for real-money safety.\n"
-            f"Why a 50% row can be WATCH: sample/Dec is too small, AvgR/payoff is not strong enough, or a daily/intraday safety row temporarily disabled/tightened it. Policy=the enforced state; Reco=this window's recommendation only.\n"
-            f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
-            + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
-            f"{guard_txt}\n{html.escape(_setup_nor_rev_router_note(int(owner_uid), []))}\n{note}\n"
-            f"Self-improvement flow: /setup_audit_overall and /setup_matrix policy now use the same fixed 15 May setup-result evidence; /setup_matrix policy refreshes the enforceable lane policy first, then the optimizer bridge mirrors those policy rows into runtime family/session gates. Side/session context is now fed into lane policy; weak symbol/hour evidence is enforced through the micro-edge/final gate because policy rows are not symbol/hour-specific. Manual /setup_matrix rows remain advisory; scheduled/baseline policy rows, daily safety rows, micro-edge guard, final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately.\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -49728,7 +49728,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v149:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v21:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50222,7 +50222,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v149:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v21:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
