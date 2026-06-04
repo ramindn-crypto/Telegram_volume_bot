@@ -1,6 +1,7 @@
 # yver155: Render scheduler hardening: prevents alert/autotrade job overlap warnings with safer intervals, caps pre-session BigMove work so session setup pools are not starved, downgrades transient Telegram timeout log noise, and shortens daily-safety INFO logs.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
+# yver156: Universal instant command ACK/background dispatcher; /screen now ACKs immediately and publishes its snapshot from the dedicated screen thread so heavy work cannot delay /equity or other commands.
 # yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
 # yver144: fixes final audit/report sync: /setup_audit AT no longer shows stale AT_OPEN after a position is no longer live, and /setup_audit_compare recovers setup matches from the AutoTrade journal when Bybit Closed-PnL rows lose setup_id/open-time metadata.
 # yver143: adds setup-audit AutoTrade lifecycle visibility and final live-entry user-visible gate so already-open trades (e.g. INJ) are not confused with fresh actionable setups.
@@ -4668,9 +4669,9 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Commands that should always work even if user is locked (no access check)
         ACCESS_EXEMPT = {"start", "help", "commands", "billing", "guide_full"}
 
-        # Commands that should force a fresh access check (never use cache)
-        # (/screen is the only one you said can be slow; we keep it strict/fresh here)
-        FORCE_FRESH = {"screen"}
+        # yver156: no command should force a slow fresh access check in the foreground.
+        # Access still refreshes via the short TTL cache; command work itself is ACKed and moved to background.
+        FORCE_FRESH = set()
 
         # 0) Channel subscription gate (optional)
         if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
@@ -40885,6 +40886,259 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
     except Exception:
         return
 
+
+# =========================================================
+# UNIVERSAL INSTANT COMMAND ACK / BACKGROUND DISPATCH (yver156)
+# =========================================================
+# Goal: Telegram must acknowledge every known command immediately.  The command's
+# real work is then posted back to the same chat when ready.  This prevents a cold
+# /screen, setup report, Bybit call, or DB/report rebuild from making the bot look
+# unresponsive to the next command.
+_COMMAND_HANDLER_REGISTRY: dict[str, Any] = {}
+_COMMAND_BACKGROUND_TASKS: dict[str, asyncio.Task] = {}
+_COMMAND_BACKGROUND_SEMAPHORE: asyncio.Semaphore | None = None
+_COMMAND_ACK_EXEMPT = set(FAST_PATH_COMMANDS) | {"start", "guide_full"}
+_COMMAND_ACK_PREFIX = "⏳"
+
+
+def _register_command_handler(app, command, callback, **kwargs):
+    """Register the normal CommandHandler and remember it for the instant ACK router."""
+    try:
+        names = command if isinstance(command, (list, tuple, set)) else [command]
+        for name in names:
+            _COMMAND_HANDLER_REGISTRY[str(name or "").strip().lower()] = callback
+    except Exception:
+        pass
+    return app.add_handler(CommandHandler(command, callback, **kwargs))
+
+
+def _register_background_command_alias(command: str, callback) -> None:
+    try:
+        _COMMAND_HANDLER_REGISTRY[str(command or "").strip().lower()] = callback
+    except Exception:
+        pass
+
+
+def _command_bg_semaphore() -> asyncio.Semaphore:
+    global _COMMAND_BACKGROUND_SEMAPHORE
+    if _COMMAND_BACKGROUND_SEMAPHORE is None:
+        try:
+            n = max(1, int(os.getenv("COMMAND_BACKGROUND_MAX_CONCURRENT", "3") or 3))
+        except Exception:
+            n = 3
+        _COMMAND_BACKGROUND_SEMAPHORE = asyncio.Semaphore(n)
+    return _COMMAND_BACKGROUND_SEMAPHORE
+
+
+def _parse_command_text(update: Update) -> tuple[str, list[str]]:
+    try:
+        txt = str(getattr(getattr(update, "message", None), "text", "") or "").strip()
+        if not txt.startswith("/"):
+            return "", []
+        parts = txt.split()
+        cmd = parts[0][1:].split("@")[0].strip().lower()
+        return cmd, parts[1:]
+    except Exception:
+        return "", []
+
+
+def _command_ack_text(cmd: str) -> str:
+    c = str(cmd or "command").strip().lstrip("/") or "command"
+    return (
+        f"{_COMMAND_ACK_PREFIX} /{c} is working in the background.\n"
+        "I’ll send the result here when it is ready."
+    )
+
+
+async def _send_text_chunks_bot(bot: Bot, chat_id: int, text: str, *, parse_mode=None, reply_markup=None, disable_web_page_preview=True, max_len: int = 3900) -> None:
+    s = str(text or "")
+    if not s:
+        return
+    chunks = [s[i:i+max_len] for i in range(0, len(s), max_len)] or [s]
+    for idx, chunk in enumerate(chunks):
+        await bot.send_message(
+            chat_id=int(chat_id),
+            text=chunk,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+            reply_markup=reply_markup if idx == 0 else None,
+        )
+
+
+def _screen_snapshot_payload_sync(uid: int) -> dict:
+    """Build a /screen reply payload in the screen worker thread, never on the Telegram loop."""
+    try:
+        user = get_user(int(uid)) or {}
+        if not has_active_access(int(uid), user):
+            return {
+                "text": "⛔️ Trial finished.\n\nYour 7-day trial is over — you need to pay to keep using PulseFutures.\n\n👉 /billing",
+                "parse_mode": None,
+                "kb": [],
+            }
+        live_session = current_session_utc()
+        scan_session = str(scan_session_name_utc() or "").upper()
+        loc_label, loc_time = user_location_and_time(user)
+        try:
+            screen_fallback_min = int(_screen_actionable_fallback_max_age_min())
+        except Exception:
+            screen_fallback_min = 60
+        can_show_email_source = _screen_user_can_see_email_source(int(uid), user)
+
+        cache_keys = [f"uid:{int(uid)}::{scan_session}", f"global::{scan_session}"]
+        try:
+            for _k, _v in list(_SCREEN_CACHE.items()):
+                if str(_k).startswith((f"uid:{int(uid)}::", "global::")) and (_v or {}).get("body"):
+                    cache_keys.append(_k)
+        except Exception:
+            pass
+        cache_entry, age = _screen_choose_best_cache(cache_keys)
+        cache_ts = float((cache_entry or {}).get("ts", 0.0) or 0.0)
+        if (cache_entry or {}).get("body") and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
+            note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
+            if age <= float(SCREEN_CACHE_TTL_SEC):
+                note = "_Showing latest cached scan._\n"
+            header = (
+                f"*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{_screen_when_line('Cached scan built', cache_ts)}"
+                f"{note}"
+            )
+            kb = [(sym, sid) for (sym, sid) in ((cache_entry or {}).get("kb") or [])]
+            return {"text": _screen_markdown_to_html((header + "\n" + str((cache_entry or {}).get("body") or "")).strip()), "parse_mode": ParseMode.HTML, "kb": kb}
+
+        quick_best = get_cached_futures_tickers() or {}
+        if quick_best:
+            try:
+                body, kb, shown_setups = _screen_recent_db_body_and_kb(
+                    int(uid), scan_session, quick_best,
+                    max_age_min=screen_fallback_min,
+                    include_email_source=bool(can_show_email_source),
+                )
+                if body:
+                    try:
+                        source_ts = max([float(getattr(x, 'email_logged_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0) for x in (shown_setups or [])] or [0.0])
+                    except Exception:
+                        source_ts = 0.0
+                    header = (
+                        f"*PulseFutures — Market Scan*\n"
+                        f"{HDR}\n"
+                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                        f"{_screen_when_line('Displayed setup source', source_ts)}"
+                        f"{('_Showing recent emailed setup queue while full scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else '_Showing recent executable setup queue while full scan refreshes._')}\n"
+                    )
+                    return {"text": _screen_markdown_to_html((header + "\n" + body).strip()), "parse_mode": ParseMode.HTML, "kb": [(sym, sid) for (sym, sid) in (kb or [])]}
+            except Exception:
+                pass
+            try:
+                body, kb, _ = _screen_quick_ticker_snapshot_body(quick_best, scan_session)
+                header = (
+                    f"*PulseFutures — Market Scan*\n"
+                    f"{HDR}\n"
+                    f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                    f"{_screen_when_line('Ticker snapshot', time.time())}"
+                    f"_Showing instant ticker snapshot while full executable scan warms up._\n"
+                )
+                return {"text": _screen_markdown_to_html((header + "\n" + body).strip()), "parse_mode": ParseMode.HTML, "kb": [(sym, sid) for (sym, sid) in (kb or [])]}
+            except Exception:
+                pass
+        return {"text": "🔎 /screen cache is warming up. Fresh scan is queued in the dedicated screen lane.", "parse_mode": None, "kb": []}
+    except Exception as e:
+        return {"text": f"🔎 /screen is refreshing in the background. Current snapshot could not be built instantly ({type(e).__name__}).", "parse_mode": None, "kb": []}
+
+
+async def _screen_background_publish(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, chat_id: int) -> None:
+    try:
+        try:
+            _schedule_screen_cache_refresh(int(uid), str(scan_session_name_utc() or "").upper())
+        except Exception:
+            pass
+        payload = await to_thread_screen(_screen_snapshot_payload_sync, int(uid), timeout=float(os.getenv("SCREEN_COMMAND_PUBLISH_TIMEOUT_SEC", "30") or 30))
+        kb_rows = []
+        try:
+            kb_rows = [[InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))] for (sym, sid) in (payload.get("kb") or [])]
+        except Exception:
+            kb_rows = []
+        await _send_text_chunks_bot(
+            context.bot,
+            int(chat_id),
+            str(payload.get("text") or ""),
+            parse_mode=payload.get("parse_mode"),
+            reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
+        )
+    except asyncio.TimeoutError:
+        try:
+            await context.bot.send_message(chat_id=int(chat_id), text="🔎 /screen refresh is still running. I’ll keep the cache refresh in the background — run /screen again shortly for the latest snapshot.")
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            await context.bot.send_message(chat_id=int(chat_id), text=f"⚠️ /screen background result failed: {type(e).__name__}. Please try /screen again shortly.")
+        except Exception:
+            pass
+
+
+async def _command_background_runner(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str, args: list[str], callback) -> None:
+    async with _command_bg_semaphore():
+        try:
+            await asyncio.sleep(float(os.getenv("COMMAND_BACKGROUND_START_DELAY_SEC", "0.05") or 0.05))
+            try:
+                context.args = list(args or [])
+            except Exception:
+                pass
+            await callback(update, context)
+        except ApplicationHandlerStop:
+            return
+        except Exception as e:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(update.effective_chat.id),
+                    text=f"⚠️ /{cmd} background task failed: {type(e).__name__}: {str(e)[:300]}",
+                )
+            except Exception:
+                pass
+
+
+async def _universal_background_command_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ACK every known non-fast command immediately, then run it in the background."""
+    try:
+        if not getattr(update, "message", None):
+            return
+        cmd, args = _parse_command_text(update)
+        if not cmd or cmd in _COMMAND_ACK_EXEMPT:
+            return
+        callback = _COMMAND_HANDLER_REGISTRY.get(cmd)
+        if not callback:
+            return
+        try:
+            context.args = list(args or [])
+        except Exception:
+            pass
+
+        # Always acknowledge first.  Telegram users see this instantly even when the
+        # real command is a cold scan, Bybit query, or long policy/report rebuild.
+        try:
+            await update.message.reply_text(_command_ack_text(cmd))
+        except Exception:
+            pass
+
+        try:
+            uid = int(update.effective_user.id)
+            chat_id = int(update.effective_chat.id)
+        except Exception:
+            uid = 0
+            chat_id = 0
+
+        if cmd == "screen":
+            _safe_create_task(_screen_background_publish(update, context, uid, chat_id), f"cmd_bg_screen_{uid}")
+        else:
+            _safe_create_task(_command_background_runner(update, context, cmd, list(args or []), callback), f"cmd_bg_{cmd}_{uid}")
+        raise ApplicationHandlerStop
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        return
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Plain text help (no tables, no HTML builder)
     await send_long_message(
@@ -62494,166 +62748,171 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=-1)
     app.add_error_handler(error_handler)
 
+    # yver156: Known commands are ACKed instantly here, then dispatched in background.
+    # Fast-path commands above can still stop earlier; unknown commands fall through.
+    app.add_handler(MessageHandler(filters.COMMAND, _universal_background_command_router), group=0)
+
     # ================= Handlers =================
-    app.add_handler(CommandHandler("help", cmd_help, block=False))
-    app.add_handler(CommandHandler("commands", commands_cmd, block=False))
-    app.add_handler(CommandHandler("guide_full", guide_full_cmd, block=False))
-    app.add_handler(CommandHandler("start", cmd_start, block=False))
-    app.add_handler(CommandHandler("help_admin", cmd_help_admin, block=False))
-    app.add_handler(CommandHandler("manage", manage_cmd, block=False))
-    app.add_handler(CommandHandler("myplan", myplan_cmd, block=False))
-    app.add_handler(CommandHandler("support", support_cmd, block=False))
-    app.add_handler(CommandHandler("support_status", support_status_cmd, block=False))
-    app.add_handler(CommandHandler("support_open", admin_support_open_cmd, block=False))
-    app.add_handler(CommandHandler("support_close", admin_support_close_cmd, block=False))
-    app.add_handler(CommandHandler("tz", tz_cmd, block=False))
-    app.add_handler(CommandHandler("dayreset", dayreset_cmd, block=False))
-    app.add_handler(CommandHandler("screen", screen_cmd, block=False))
-    app.add_handler(CommandHandler("equity", equity_cmd, block=False))
-    app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
-    app.add_handler(CommandHandler("riskmode", riskmode_cmd, block=False))
-    app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
-    app.add_handler(CommandHandler("dailycapAT", dailycapAT_cmd, block=False))
-    app.add_handler(CommandHandler("dailycapat", dailycapAT_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_config", autotrade_config_cmd, block=False))
-    app.add_handler(CommandHandler("autotradecfg", autotrade_config_cmd, block=False))
-    app.add_handler(CommandHandler("dayrisk_reset", dayrisk_reset_cmd, block=False))
-    app.add_handler(CommandHandler("limits", limits_cmd, block=False))
+    _register_command_handler(app, "help", cmd_help, block=False)
+    _register_command_handler(app, "commands", commands_cmd, block=False)
+    _register_command_handler(app, "guide_full", guide_full_cmd, block=False)
+    _register_command_handler(app, "start", cmd_start, block=False)
+    _register_command_handler(app, "help_admin", cmd_help_admin, block=False)
+    _register_command_handler(app, "manage", manage_cmd, block=False)
+    _register_command_handler(app, "myplan", myplan_cmd, block=False)
+    _register_command_handler(app, "support", support_cmd, block=False)
+    _register_command_handler(app, "support_status", support_status_cmd, block=False)
+    _register_command_handler(app, "support_open", admin_support_open_cmd, block=False)
+    _register_command_handler(app, "support_close", admin_support_close_cmd, block=False)
+    _register_command_handler(app, "tz", tz_cmd, block=False)
+    _register_command_handler(app, "dayreset", dayreset_cmd, block=False)
+    _register_command_handler(app, "screen", screen_cmd, block=False)
+    _register_command_handler(app, "equity", equity_cmd, block=False)
+    _register_command_handler(app, "equity_reset", equity_reset_cmd, block=False)
+    _register_command_handler(app, "riskmode", riskmode_cmd, block=False)
+    _register_command_handler(app, "dailycap", dailycap_cmd, block=False)
+    _register_command_handler(app, "dailycapAT", dailycapAT_cmd, block=False)
+    _register_command_handler(app, "dailycapat", dailycapAT_cmd, block=False)
+    _register_command_handler(app, "autotrade_config", autotrade_config_cmd, block=False)
+    _register_command_handler(app, "autotradecfg", autotrade_config_cmd, block=False)
+    _register_command_handler(app, "dayrisk_reset", dayrisk_reset_cmd, block=False)
+    _register_command_handler(app, "limits", limits_cmd, block=False)
 
-    app.add_handler(CommandHandler("trade_sl", trade_sl_cmd, block=False))
-    app.add_handler(CommandHandler("trade_rf", trade_rf_cmd, block=False))
+    _register_command_handler(app, "trade_sl", trade_sl_cmd, block=False)
+    _register_command_handler(app, "trade_rf", trade_rf_cmd, block=False)
     
-    app.add_handler(CommandHandler("sessions", sessions_cmd, block=False))
-    app.add_handler(CommandHandler("sessions_on", sessions_on_cmd, block=False))
-    app.add_handler(CommandHandler("sessions_off", sessions_off_cmd, block=False))
-    app.add_handler(CommandHandler("sessions_on_unlimited", sessions_on_unlimited_cmd, block=False))
-    app.add_handler(CommandHandler("sessions_unlimited_on", sessions_unlimited_on_cmd, block=False))
-    app.add_handler(CommandHandler("sessions_off_unlimited", sessions_off_unlimited_cmd, block=False))
-    app.add_handler(CommandHandler("sessions_unlimited_off", sessions_unlimited_off_cmd, block=False))
+    _register_command_handler(app, "sessions", sessions_cmd, block=False)
+    _register_command_handler(app, "sessions_on", sessions_on_cmd, block=False)
+    _register_command_handler(app, "sessions_off", sessions_off_cmd, block=False)
+    _register_command_handler(app, "sessions_on_unlimited", sessions_on_unlimited_cmd, block=False)
+    _register_command_handler(app, "sessions_unlimited_on", sessions_unlimited_on_cmd, block=False)
+    _register_command_handler(app, "sessions_off_unlimited", sessions_off_unlimited_cmd, block=False)
+    _register_command_handler(app, "sessions_unlimited_off", sessions_unlimited_off_cmd, block=False)
 
-    app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd, block=False))
-    app.add_handler(CommandHandler("notify_on", notify_on, block=False))
-    app.add_handler(CommandHandler("notify_off", notify_off, block=False))
+    _register_command_handler(app, "bigmove_alert", bigmove_alert_cmd, block=False)
+    _register_command_handler(app, "notify_on", notify_on, block=False)
+    _register_command_handler(app, "notify_off", notify_off, block=False)
     # Fallback: pasted "invisible-prefix" /size from mobile email clients
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _size_paste_fallback_router), group=-2)
-    app.add_handler(CommandHandler("size", size_cmd, block=False))
-    app.add_handler(CommandHandler("trade_open", trade_open_cmd, block=False))
-    app.add_handler(CommandHandler("trade_close", trade_close_cmd, block=False))
-    app.add_handler(CommandHandler("trade_id_reset", trade_id_reset_cmd, block=False))
-    app.add_handler(CommandHandler("status", status_cmd, block=False))
-    app.add_handler(CommandHandler("open_trades", open_trades_cmd, block=False))
-    app.add_handler(CommandHandler("cooldowns", cooldowns_cmd, block=False))
-    app.add_handler(CommandHandler("cooldown", cooldown_cmd, block=False))
-    app.add_handler(CommandHandler("cooldown_clear", cooldown_clear_cmd, block=False))
-    app.add_handler(CommandHandler("cooldown_clear_all", cooldown_clear_all_cmd, block=False))
-    app.add_handler(CommandHandler("report_daily", report_daily_cmd, block=False))
-    app.add_handler(CommandHandler("report_overall", report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("report_weekly", report_weekly_cmd, block=False))
-    app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
-    app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
-    app.add_handler(CommandHandler("health", health_cmd, block=False))
-    app.add_handler(CommandHandler("reset", reset_cmd, block=False))
-    app.add_handler(CommandHandler("restore", restore_cmd, block=False))
-    app.add_handler(CommandHandler("health_sys", health_sys_cmd, block=False))
-    app.add_handler(CommandHandler("dev_status", dev_status_cmd, block=False))
-    app.add_handler(CommandHandler("framework_status", dev_status_cmd, block=False))
-    app.add_handler(CommandHandler("billing", billing_cmd, block=False))
-    app.add_handler(CommandHandler("email_on_off", email_on_off_cmd, block=False))
-    app.add_handler(CommandHandler("upgrade", upgrade_cmd, block=False))
-    app.add_handler(CommandHandler("trade_window", trade_window_cmd, block=False))
-    app.add_handler(CommandHandler("email", email_cmd, block=False))
-    app.add_handler(CommandHandler("email_on", email_on_cmd, block=False))
-    app.add_handler(CommandHandler("email_off", email_off_cmd, block=False))
-    app.add_handler(CommandHandler("email_test", email_test_cmd, block=False))
-    app.add_handler(CommandHandler("email_decision", email_decision_cmd, block=False))
-    app.add_handler(CommandHandler("email_pipeline_status", email_pipeline_status_cmd, block=False))
-    app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
-    app.add_handler(CommandHandler("setup_audit", setup_audit_cmd, block=False))
-    app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
-    app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
-    app.add_handler(CommandHandler("setup_audit_keep_watch", setup_audit_keep_watch_cmd, block=False))
-    app.add_handler(CommandHandler("setup_audit_keep", setup_audit_keep_cmd, block=False))
-    app.add_handler(CommandHandler("setup_keep_watch_summary", setup_audit_keep_watch_cmd, block=False))
-    app.add_handler(CommandHandler("setup_audit_compare", setup_audit_compare_cmd, block=False))
-    app.add_handler(CommandHandler("setup_audit_reconcile", setup_audit_compare_cmd, block=False))
-    app.add_handler(CommandHandler("setup_matrix", setup_matrix_cmd, block=False))
-    app.add_handler(CommandHandler("setup_edge_matrix", setup_matrix_cmd, block=False))
-    app.add_handler(CommandHandler("setup_deep_analysis", setup_deep_analysis_cmd, block=False))
-    app.add_handler(CommandHandler("setup_edge_deep", setup_deep_analysis_cmd, block=False))
-    app.add_handler(CommandHandler("setup_matrix_deep", setup_deep_analysis_cmd, block=False))
+    _register_command_handler(app, "size", size_cmd, block=False)
+    _register_command_handler(app, "trade_open", trade_open_cmd, block=False)
+    _register_command_handler(app, "trade_close", trade_close_cmd, block=False)
+    _register_command_handler(app, "trade_id_reset", trade_id_reset_cmd, block=False)
+    _register_command_handler(app, "status", status_cmd, block=False)
+    _register_command_handler(app, "open_trades", open_trades_cmd, block=False)
+    _register_command_handler(app, "cooldowns", cooldowns_cmd, block=False)
+    _register_command_handler(app, "cooldown", cooldown_cmd, block=False)
+    _register_command_handler(app, "cooldown_clear", cooldown_clear_cmd, block=False)
+    _register_command_handler(app, "cooldown_clear_all", cooldown_clear_all_cmd, block=False)
+    _register_command_handler(app, "report_daily", report_daily_cmd, block=False)
+    _register_command_handler(app, "report_overall", report_overall_cmd, block=False)
+    _register_command_handler(app, "report_weekly", report_weekly_cmd, block=False)
+    _register_command_handler(app, "signals_daily", signals_daily_cmd, block=False)
+    _register_command_handler(app, "signals_weekly", signals_weekly_cmd, block=False)
+    _register_command_handler(app, "health", health_cmd, block=False)
+    _register_command_handler(app, "reset", reset_cmd, block=False)
+    _register_command_handler(app, "restore", restore_cmd, block=False)
+    _register_command_handler(app, "health_sys", health_sys_cmd, block=False)
+    _register_command_handler(app, "dev_status", dev_status_cmd, block=False)
+    _register_command_handler(app, "framework_status", dev_status_cmd, block=False)
+    _register_command_handler(app, "billing", billing_cmd, block=False)
+    _register_command_handler(app, "email_on_off", email_on_off_cmd, block=False)
+    _register_command_handler(app, "upgrade", upgrade_cmd, block=False)
+    _register_command_handler(app, "trade_window", trade_window_cmd, block=False)
+    _register_command_handler(app, "email", email_cmd, block=False)
+    _register_command_handler(app, "email_on", email_on_cmd, block=False)
+    _register_command_handler(app, "email_off", email_off_cmd, block=False)
+    _register_command_handler(app, "email_test", email_test_cmd, block=False)
+    _register_command_handler(app, "email_decision", email_decision_cmd, block=False)
+    _register_command_handler(app, "email_pipeline_status", email_pipeline_status_cmd, block=False)
+    _register_command_handler(app, "setups_log", setups_log_cmd, block=False)
+    _register_command_handler(app, "setup_audit", setup_audit_cmd, block=False)
+    _register_command_handler(app, "setup_quality", setup_audit_cmd, block=False)
+    _register_command_handler(app, "setup_audit_overall", setup_audit_overall_cmd, block=False)
+    _register_command_handler(app, "setup_audit_keep_watch", setup_audit_keep_watch_cmd, block=False)
+    _register_command_handler(app, "setup_audit_keep", setup_audit_keep_cmd, block=False)
+    _register_command_handler(app, "setup_keep_watch_summary", setup_audit_keep_watch_cmd, block=False)
+    _register_command_handler(app, "setup_audit_compare", setup_audit_compare_cmd, block=False)
+    _register_command_handler(app, "setup_audit_reconcile", setup_audit_compare_cmd, block=False)
+    _register_command_handler(app, "setup_matrix", setup_matrix_cmd, block=False)
+    _register_command_handler(app, "setup_edge_matrix", setup_matrix_cmd, block=False)
+    _register_command_handler(app, "setup_deep_analysis", setup_deep_analysis_cmd, block=False)
+    _register_command_handler(app, "setup_edge_deep", setup_deep_analysis_cmd, block=False)
+    _register_command_handler(app, "setup_matrix_deep", setup_deep_analysis_cmd, block=False)
 
-    app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
+    _register_command_handler(app, "why", why_no_setups_cmd, block=False)
     # ================= USDT (semi-auto) =================
-    app.add_handler(CommandHandler("usdt", usdt_info_cmd, block=False))
-    app.add_handler(CommandHandler("usdt_paid", usdt_paid_cmd, block=False))
+    _register_command_handler(app, "usdt", usdt_info_cmd, block=False)
+    _register_command_handler(app, "usdt_paid", usdt_paid_cmd, block=False)
     
     # ================= Admin: access & payments =================
     
-    app.add_handler(CommandHandler("admin_user", admin_user_cmd, block=False))
-    app.add_handler(CommandHandler("admin_users", admin_users_cmd, block=False))
-    app.add_handler(CommandHandler("admin_grant", admin_grant_cmd, block=False))
-    app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd, block=False))
-    app.add_handler(CommandHandler("admin_reset_report", admin_reset_report_cmd, block=False))
-    app.add_handler(CommandHandler("admin_reset_test_data", admin_reset_test_data_cmd, block=False))
-    app.add_handler(CommandHandler("admin_reset_signal_reports", admin_reset_signal_reports_cmd, block=False))
-    app.add_handler(CommandHandler("admin_payments", admin_payments_cmd, block=False))
+    _register_command_handler(app, "admin_user", admin_user_cmd, block=False)
+    _register_command_handler(app, "admin_users", admin_users_cmd, block=False)
+    _register_command_handler(app, "admin_grant", admin_grant_cmd, block=False)
+    _register_command_handler(app, "admin_revoke", admin_revoke_cmd, block=False)
+    _register_command_handler(app, "admin_reset_report", admin_reset_report_cmd, block=False)
+    _register_command_handler(app, "admin_reset_test_data", admin_reset_test_data_cmd, block=False)
+    _register_command_handler(app, "admin_reset_signal_reports", admin_reset_signal_reports_cmd, block=False)
+    _register_command_handler(app, "admin_payments", admin_payments_cmd, block=False)
 
     # Admin: approve Stripe/USDT payments and grant access
-    app.add_handler(CommandHandler("payment_approve", payment_approve_cmd, block=False))
+    _register_command_handler(app, "payment_approve", payment_approve_cmd, block=False)
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     
-    app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_closed", autotrade_closed_cmd, block=False))
-    app.add_handler(CommandHandler("autotradeclosed", autotrade_closed_cmd, block=False))
+    _register_command_handler(app, "autotrade_sessions", autotrade_sessions_cmd, block=False)
+    _register_command_handler(app, "autotrade_report", autotrade_report_cmd, block=False)
+    _register_command_handler(app, "autotrade_closed", autotrade_closed_cmd, block=False)
+    _register_command_handler(app, "autotradeclosed", autotrade_closed_cmd, block=False)
+    _register_background_command_alias("autotrade/closed", autotrade_closed_cmd)
     app.add_handler(MessageHandler(filters.Regex(r"^/autotrade/closed(?:@\w+)?(?:\s|$)"), autotrade_closed_cmd, block=False))
-    app.add_handler(CommandHandler("performance_report", performance_report_cmd, block=False))
-    app.add_handler(CommandHandler("trade_lifecycle", trade_lifecycle_cmd, block=False))
-    app.add_handler(CommandHandler("trade_lifecycle_detail", trade_lifecycle_detail_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_fix_exits", autotrade_fix_exits_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_flat_now", autotrade_flat_now_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_on", autotrade_on_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_off", autotrade_off_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
-    app.add_handler(CommandHandler("autoytrade_report_overall", autoytrade_report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("autoytrade_report_overal", autoytrade_report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_report_matrix", autoytrade_report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("autotrade_report_overal", autotrade_report_overall_cmd, block=False))
-    app.add_handler(CommandHandler("edge_status", edge_status_cmd, block=False))
-    app.add_handler(CommandHandler("optimizer_status", learning_status_cmd, block=False))
-    app.add_handler(CommandHandler("learning_status", learning_status_cmd, block=False))
-    app.add_handler(CommandHandler("winrate", winrate_cmd, block=False))
-    app.add_handler(CommandHandler("ny_winrate", ny_winrate_cmd, block=False))
-    app.add_handler(CommandHandler("nywinrate", ny_winrate_cmd, block=False))
-    app.add_handler(CommandHandler("lessons_learned", lessons_learned_cmd, block=False))
+    _register_command_handler(app, "performance_report", performance_report_cmd, block=False)
+    _register_command_handler(app, "trade_lifecycle", trade_lifecycle_cmd, block=False)
+    _register_command_handler(app, "trade_lifecycle_detail", trade_lifecycle_detail_cmd, block=False)
+    _register_command_handler(app, "autotrade_last", autotrade_last_cmd, block=False)
+    _register_command_handler(app, "autotrade_fix_exits", autotrade_fix_exits_cmd, block=False)
+    _register_command_handler(app, "autotrade_flat_now", autotrade_flat_now_cmd, block=False)
+    _register_command_handler(app, "autotrade_on", autotrade_on_cmd, block=False)
+    _register_command_handler(app, "autotrade_off", autotrade_off_cmd, block=False)
+    _register_command_handler(app, "autotrade_debug", autotrade_debug_cmd, block=False)
+    _register_command_handler(app, "autotrade_debug_reset", autotrade_debug_reset_cmd)
+    _register_command_handler(app, "autoytrade_report_overall", autoytrade_report_overall_cmd, block=False)
+    _register_command_handler(app, "autoytrade_report_overal", autoytrade_report_overall_cmd, block=False)
+    _register_command_handler(app, "autotrade_report_matrix", autoytrade_report_overall_cmd, block=False)
+    _register_command_handler(app, "autotrade_report_overall", autotrade_report_overall_cmd, block=False)
+    _register_command_handler(app, "autotrade_report_overal", autotrade_report_overall_cmd, block=False)
+    _register_command_handler(app, "edge_status", edge_status_cmd, block=False)
+    _register_command_handler(app, "optimizer_status", learning_status_cmd, block=False)
+    _register_command_handler(app, "learning_status", learning_status_cmd, block=False)
+    _register_command_handler(app, "winrate", winrate_cmd, block=False)
+    _register_command_handler(app, "ny_winrate", ny_winrate_cmd, block=False)
+    _register_command_handler(app, "nywinrate", ny_winrate_cmd, block=False)
+    _register_command_handler(app, "lessons_learned", lessons_learned_cmd, block=False)
     
     # Strategy parameterization + optimization (admin)
-    app.add_handler(CommandHandler("params_show", cmd_params_show, block=False))
-    app.add_handler(CommandHandler("params_set", cmd_params_set, block=False))
-    app.add_handler(CommandHandler("params_reset", cmd_params_reset, block=False))
-    app.add_handler(CommandHandler("optimize", cmd_optimize, block=False))
-    app.add_handler(CommandHandler("optimize_report", cmd_optimize_report, block=False))
-    app.add_handler(CommandHandler("self_optimize", cmd_self_optimize, block=False))
-    app.add_handler(CommandHandler("self_optimize_stop", cmd_self_optimize_stop, block=False))
-    app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
-    app.add_handler(CommandHandler("autopilot_report", cmd_self_optimize_report, block=False))
-    app.add_handler(CommandHandler("autopilot_status", learning_status_cmd, block=False))
-    app.add_handler(CommandHandler("adaptive_status", market_adaptive_status_cmd, block=False))
-    app.add_handler(CommandHandler("adaptive_run", market_adaptive_run_cmd, block=False))
-    app.add_handler(CommandHandler("goal_status", goal_profile_status_cmd, block=False))
-    app.add_handler(CommandHandler("goal_run", goal_profile_run_cmd, block=False))
-    app.add_handler(CommandHandler("goal_set", goal_profile_set_cmd, block=False))
-    app.add_handler(CommandHandler("goal_abort", goal_profile_abort_cmd, block=False))
-    app.add_handler(CommandHandler("goalstatus", goal_profile_status_cmd, block=False))
-    app.add_handler(CommandHandler("goalrun", goal_profile_run_cmd, block=False))
-    app.add_handler(CommandHandler("goalset", goal_profile_set_cmd, block=False))
-    app.add_handler(CommandHandler("goalabort", goal_profile_abort_cmd, block=False))
-    app.add_handler(CommandHandler("backtest", cmd_backtest, block=False))
-    app.add_handler(CommandHandler("universe_backtest", cmd_universe_backtest, block=False))
+    _register_command_handler(app, "params_show", cmd_params_show, block=False)
+    _register_command_handler(app, "params_set", cmd_params_set, block=False)
+    _register_command_handler(app, "params_reset", cmd_params_reset, block=False)
+    _register_command_handler(app, "optimize", cmd_optimize, block=False)
+    _register_command_handler(app, "optimize_report", cmd_optimize_report, block=False)
+    _register_command_handler(app, "self_optimize", cmd_self_optimize, block=False)
+    _register_command_handler(app, "self_optimize_stop", cmd_self_optimize_stop, block=False)
+    _register_command_handler(app, "self_optimize_report", cmd_self_optimize_report, block=False)
+    _register_command_handler(app, "autopilot_report", cmd_self_optimize_report, block=False)
+    _register_command_handler(app, "autopilot_status", learning_status_cmd, block=False)
+    _register_command_handler(app, "adaptive_status", market_adaptive_status_cmd, block=False)
+    _register_command_handler(app, "adaptive_run", market_adaptive_run_cmd, block=False)
+    _register_command_handler(app, "goal_status", goal_profile_status_cmd, block=False)
+    _register_command_handler(app, "goal_run", goal_profile_run_cmd, block=False)
+    _register_command_handler(app, "goal_set", goal_profile_set_cmd, block=False)
+    _register_command_handler(app, "goal_abort", goal_profile_abort_cmd, block=False)
+    _register_command_handler(app, "goalstatus", goal_profile_status_cmd, block=False)
+    _register_command_handler(app, "goalrun", goal_profile_run_cmd, block=False)
+    _register_command_handler(app, "goalset", goal_profile_set_cmd, block=False)
+    _register_command_handler(app, "goalabort", goal_profile_abort_cmd, block=False)
+    _register_command_handler(app, "backtest", cmd_backtest, block=False)
+    _register_command_handler(app, "universe_backtest", cmd_universe_backtest, block=False)
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
