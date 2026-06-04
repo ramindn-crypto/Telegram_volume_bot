@@ -1,4 +1,5 @@
-# yver167: final one-lane execution sync: screen/email can send all current Gate=KEEP setups, canonical Gate=KEEP rows bypass screen-sync cooldown/flip guards (except exact already-emailed setup_id), and AutoTrade context/strict-edge blockers are bypassed for setup_ids currently in the canonical Gate=KEEP lane.
+# yver168: hard final sync: manual /screen displayed Gate=KEEP setups now always queue screen-sync email and immediate AutoTrade retry; AutoTrade prioritizes current emailed canonical Gate=KEEP rows and cache keys are bumped/cleared on email delivery.
+# yver168: final one-lane execution sync: screen/email can send all current Gate=KEEP setups, canonical Gate=KEEP rows bypass screen-sync cooldown/flip guards (except exact already-emailed setup_id), and AutoTrade context/strict-edge blockers are bypassed for setup_ids currently in the canonical Gate=KEEP lane.
 # yver166: syncs AutoTrade with delivered KEEP setup lane by disabling the legacy strict KEEP-edge blocker for setups already accepted by /screen/setup-email/canonical Gate=KEEP; prevents emailed setups from being skipped with autotrade_strict_keep_edge_block.
 # yver165: completes canonical KEEP lane sync: /setup_audit Gate=KEEP rows bypass secondary email-only flip/diversification cooldown blockers, so they are emailed, shown on /screen, and immediately queued for AutoTrade from the same setup_id.
 # yver164: locks /screen, setup-email and AutoTrade to one canonical current KEEP executable lane; AutoTrade no longer consumes BigMove/recent-email rows outside /setup_audit Gate=KEEP; email recovers unemailed KEEP rows from executable_setups.
@@ -5426,7 +5427,7 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or user_id or 0)
         sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
         combo = _autotrade_setup_exact_combo_key(setup_or_row, sess)
-        # yver167: the canonical Gate=KEEP executable lane is the single source of truth
+        # yver168: the canonical Gate=KEEP executable lane is the single source of truth
         # for /screen, setup email and AutoTrade.  If the exact setup_id is still
         # current Gate=KEEP, do not re-block it with legacy AutoTrade-only context
         # filters such as strict_keep_edge/symbol/hour.  Safety checks still run later
@@ -12837,7 +12838,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v167:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v168:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -20387,7 +20388,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v167:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v168:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -24697,6 +24698,92 @@ def _canonical_setup_id_gate_keep(user_id: int, setup_id: str, session_name: str
         return any(str((r or {}).get('setup_id') or '').strip() == sid for r in (rows or []))
     except Exception:
         return False
+
+
+def _mark_setup_batch_canonical_keep(setups: list, user_id: int, session_name: str) -> list:
+    """Mark exact setup objects that are currently in the canonical Gate=KEEP lane.
+
+    yver168: this is used by /screen email-sync and immediate AutoTrade so the
+    same setup shown to the user is not lost behind a second selector cache or
+    legacy strict-edge gate. It does not place trades; Bybit/risk checks still
+    happen inside _autotrade_place_trade.
+    """
+    out = []
+    try:
+        uid_i = int(user_id or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid_i = 0
+    sess_u = str(session_name or '').upper().strip()
+    for _s in list(setups or []):
+        try:
+            sid = str(getattr(_s, 'setup_id', '') or getattr(_s, 'id', '') or '').strip()
+            if not sid:
+                continue
+            if bool(getattr(_s, 'canonical_gate_keep', False)) or _canonical_setup_id_gate_keep(uid_i, sid, sess_u):
+                try:
+                    setattr(_s, 'canonical_gate_keep', True)
+                    setattr(_s, 'source_session', sess_u or str(getattr(_s, 'source_session', '') or ''))
+                    setattr(_s, 'delivery_lane_locked', True)
+                except Exception:
+                    pass
+                out.append(_s)
+        except Exception:
+            continue
+    return out
+
+
+async def _screen_trigger_autotrade_for_visible_setups(uid: int, session_name: str, shown_setups: list, reason: str = 'screen_visible_gate_keep'):
+    """Best-effort immediate AutoTrade retry for setups currently visible on /screen.
+
+    This is intentionally narrow: only setup_ids still in canonical Gate=KEEP and
+    with a recent email can get through _autotrade_place_trade. It prevents the
+    previous failure mode where /screen and email were correct but AutoTrade waited
+    for a stale selector cache and reported no_setups.
+    """
+    try:
+        owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+        if owner_uid <= 0 or not _autotrade_ready() or not _autotrade_entry_enabled():
+            return
+        try:
+            if int(uid or 0) != owner_uid and not is_admin_user(int(uid or 0)):
+                return
+        except Exception:
+            return
+        sess_u = str(session_name or '').upper().strip()
+        if sess_u not in {'ASIA', 'LON', 'NY'}:
+            return
+        canonical = _mark_setup_batch_canonical_keep(list(shown_setups or []), owner_uid, sess_u)
+        ready = []
+        for _s in canonical:
+            try:
+                ok, _why = _autotrade_recent_email_gate_allows_setup(owner_uid, _s, session_label=sess_u)
+                if ok:
+                    ready.append(_s)
+            except Exception:
+                continue
+        if not ready:
+            return
+        try:
+            for _s in ready:
+                setattr(_s, 'source_kind', 'emailed_setups')
+                setattr(_s, 'delivery_lane_locked', True)
+        except Exception:
+            pass
+        _LAST_AUTOTRADE_DECISION[owner_uid] = {
+            'status': 'QUEUED',
+            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'reason': str(reason or 'screen_visible_gate_keep'),
+            'session': sess_u,
+            'mode': str(_autotrade_runtime_mode()).lower(),
+            'trigger': 'screen_visible_gate_keep',
+            'attempted_candidates': [
+                {'setup_id': str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or ''), 'symbol': str(getattr(x, 'symbol', '') or ''), 'side': str(getattr(x, 'side', '') or '')}
+                for x in ready[:8]
+            ],
+        }
+        _safe_create_task(_trigger_autotrade_after_email_async(owner_uid, sess_u, list(ready)), 'autotrade_after_screen_visible_gate_keep')
+    except Exception:
+        pass
 
 
 # =========================================================
@@ -57864,7 +57951,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
                 continue
             sym = str(getattr(s, 'symbol', '') or '').upper()
             side = str(getattr(s, 'side', '') or '').upper()
-            # yver167: when /screen is displaying the current canonical Gate=KEEP
+            # yver168: when /screen is displaying the current canonical Gate=KEEP
             # setup lane, screen-sync must not apply extra email-only cooldown/flip
             # guards that make it diverge from /setup_audit Gate=KEEP.  Only the
             # exact already-emailed setup_id remains blocked to prevent duplicate sends.
@@ -57903,7 +57990,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
         if not actionable:
             return {"status": "skip", "reason": f"no_actionable_screen_setups ({','.join(skipped[:3])})"}
 
-        # yver167: /screen may show multiple current Gate=KEEP setups; email all
+        # yver168: /screen may show multiple current Gate=KEEP setups; email all
         # unemailed canonical setups shown on /screen in one batch, not only EMAIL_SETUPS_N=1.
         try:
             _canonical_actionable_n = sum(1 for _x in (actionable or []) if bool(getattr(_x, 'canonical_gate_keep', False)))
@@ -58061,6 +58148,23 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             disable_web_page_preview=True,
                             reply_markup=InlineKeyboardMarkup(keyboard_e) if keyboard_e else None,
                         )
+                        # yver168: even when /screen displays the latest email/cache branch,
+                        # keep email/autotrade synced for every visible Gate=KEEP setup.
+                        # This fixes the case where ZEC was emailed but AutoTrade did not retry,
+                        # and MAGMA was visible beside ZEC but had not been emailed.
+                        try:
+                            if MANUAL_SCREEN_SYNC_ENABLED and shown_e:
+                                _safe_create_task(
+                                    _screen_sync_pipeline_async(int(uid), user, str(live_session or ''), str(scan_session or '').upper(), quick_best_email, list(shown_e or [])),
+                                    'screen_cmd_latest_email_sync',
+                                )
+                            if shown_e:
+                                _safe_create_task(
+                                    _screen_trigger_autotrade_for_visible_setups(int(uid), str(scan_session or '').upper(), list(shown_e or []), reason='screen_latest_email_visible_retry'),
+                                    'screen_latest_email_visible_autotrade',
+                                )
+                        except Exception:
+                            pass
                         return
             except Exception:
                 pass
@@ -58101,6 +58205,21 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         disable_web_page_preview=True,
                         reply_markup=InlineKeyboardMarkup(keyboard_c) if keyboard_c else None,
                     )
+                    # yver168: visible canonical Gate=KEEP setups must immediately feed
+                    # the email lane and then AutoTrade. Do this even if a cached scan exists.
+                    try:
+                        if MANUAL_SCREEN_SYNC_ENABLED and shown_c:
+                            _safe_create_task(
+                                _screen_sync_pipeline_async(int(uid), user, str(live_session or ''), str(scan_session or '').upper(), quick_best_canon, list(shown_c or [])),
+                                'screen_cmd_canonical_sync',
+                            )
+                        if shown_c:
+                            _safe_create_task(
+                                _screen_trigger_autotrade_for_visible_setups(int(uid), str(scan_session or '').upper(), list(shown_c or []), reason='screen_canonical_visible_retry'),
+                                'screen_canonical_visible_autotrade',
+                            )
+                    except Exception:
+                        pass
                     return
         except Exception:
             pass
@@ -59117,6 +59236,10 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         pass
                     try:
                         _mark_emailed_setup_identity(int(_target_uid), s, emailed_ts=float(now_ts))
+                    except Exception:
+                        pass
+                    try:
+                        cache_delete(f"autotrade_db_setups_v168:{int(_target_uid)}:{str(display_session or '').upper()}:24:30")
                     except Exception:
                         pass
                 try:
@@ -60700,7 +60823,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             owner_manual_same_symbol_blocked = 0
             combo_policy_blocked = 0
 
-            # yver167: if the canonical Gate=KEEP lane contains multiple fresh setups,
+            # yver168: if the canonical Gate=KEEP lane contains multiple fresh setups,
             # send all unemailed current KEEP rows in one email batch (bounded) so /screen,
             # setup email, and AutoTrade do not split into different sources.
             try:
@@ -62691,6 +62814,25 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             if fresh_db_setups:
                 db_setups = _autotrade_merge_candidate_lists_fresh_first(fresh_db_setups, db_setups, limit=60)
 
+            # yver168: the scheduled AutoTrade loop must prioritize the same current
+            # emailed canonical Gate=KEEP lane that /screen and setup email show.
+            # This prevents stale selector caches from returning no_setups while
+            # /screen shows a valid emailed setup inside the 60m entry window.
+            try:
+                canonical_emailed_setups = await to_thread_autotrade(
+                    _canonical_current_keep_executable_setup_objects,
+                    uid,
+                    sess,
+                    max_age_sec=max(60, int(_autotrade_entry_window_min()) * 60),
+                    limit=30,
+                    require_recent_email=True,
+                    timeout=6,
+                )
+            except Exception:
+                canonical_emailed_setups = []
+            if canonical_emailed_setups:
+                db_setups = _autotrade_merge_candidate_lists_fresh_first(canonical_emailed_setups, db_setups, limit=60)
+
             tf_cooling = _ohlcv_timeframe_cooling('15m', '1h', '4h')
             if not db_setups and tf_cooling:
                 reason = 'autotrade_refresh_deferred_rate_limit_cooldown'
@@ -62908,33 +63050,42 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                                 setattr(_s, 'created_ts', time.time())
                         except Exception:
                             pass
-                    try:
-                        _valid_for_at, _at_gate_reasons = _setup_email_presend_executable_filter(owner_uid, sess, list(chosen_list or []), lane='autotrade_after_email')
-                    except Exception:
-                        _valid_for_at, _at_gate_reasons = [], Counter({'autotrade_after_email_presend_exception': 1})
-                    if not _valid_for_at:
-                        try:
-                            _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                                'status': 'SKIP',
-                                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                                'reason': 'emailed_setups_failed_final_gate_before_autotrade_trying_keep_queue',
-                                'session': sess,
-                                'mode': str(_autotrade_runtime_mode()).lower(),
-                                'top_reasons': dict((_at_gate_reasons or Counter()).most_common(5)),
-                                'trigger': 'email_sent_immediate',
-                            }
-                        except Exception:
-                            pass
-                        try:
-                            db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email_presend_gate', status='empty', session=sess, mode='autotrade', details={'top_reasons': _pipeline_top_reasons(_at_gate_reasons, 8), 'input': len(list(chosen_list or []))})
-                        except Exception:
-                            pass
-                        chosen_list = []
+                    # yver168: if the exact emailed setup is already in the canonical Gate=KEEP
+                    # lane, do not run a second pre-send selector that can diverge from /screen/email.
+                    # The final _autotrade_place_trade path still checks recent email, canonical gate,
+                    # Entry/SL/TP/RR, drift, risk caps, leverage, duplicate guards and Bybit placement.
+                    _canonical_for_at = _mark_setup_batch_canonical_keep(list(chosen_list or []), owner_uid, sess)
+                    if _canonical_for_at:
+                        chosen_list = list(_canonical_for_at or [])
+                        _at_gate_reasons = Counter()
                     else:
-                        chosen_list = list(_valid_for_at or [])
+                        try:
+                            _valid_for_at, _at_gate_reasons = _setup_email_presend_executable_filter(owner_uid, sess, list(chosen_list or []), lane='autotrade_after_email')
+                        except Exception:
+                            _valid_for_at, _at_gate_reasons = [], Counter({'autotrade_after_email_presend_exception': 1})
+                        if not _valid_for_at:
+                            try:
+                                _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                                    'status': 'SKIP',
+                                    'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                    'reason': 'emailed_setups_failed_final_gate_before_autotrade_trying_keep_queue',
+                                    'session': sess,
+                                    'mode': str(_autotrade_runtime_mode()).lower(),
+                                    'top_reasons': dict((_at_gate_reasons or Counter()).most_common(5)),
+                                    'trigger': 'email_sent_immediate',
+                                }
+                            except Exception:
+                                pass
+                            try:
+                                db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email_presend_gate', status='empty', session=sess, mode='autotrade', details={'top_reasons': _pipeline_top_reasons(_at_gate_reasons, 8), 'input': len(list(chosen_list or []))})
+                            except Exception:
+                                pass
+                            chosen_list = []
+                        else:
+                            chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v167:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v168:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
@@ -62949,6 +63100,19 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             for _s in list(chosen_list or []):
                 try:
                     _s_eff = _setup_route_unless_delivery_locked(_s, sess, owner_uid, source_kind=str(getattr(_s, 'source_kind', '') or 'emailed_setups'))
+                    try:
+                        _sid_eff = str(getattr(_s_eff, 'setup_id', '') or getattr(_s_eff, 'id', '') or '').strip()
+                        _is_canonical_eff = bool(getattr(_s_eff, 'canonical_gate_keep', False)) or bool(_canonical_setup_id_gate_keep(owner_uid, _sid_eff, sess))
+                    except Exception:
+                        _is_canonical_eff = False
+                    if _is_canonical_eff:
+                        try:
+                            setattr(_s_eff, 'canonical_gate_keep', True)
+                            setattr(_s_eff, 'delivery_lane_locked', True)
+                        except Exception:
+                            pass
+                        db_setups.append(_s_eff)
+                        continue
                     ok_s, _why_s = is_executable_setup_eligible(_s_eff, session_name=sess)
                     if ok_s:
                         try:
