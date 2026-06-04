@@ -1,3 +1,4 @@
+# yver162: fixes AutoTrade email-match lookup for shared/global emailed/executable rows, adds emailed_setups session migration, and bumps selector cache so emailed KEEP setups inside the 60m entry window are retried.
 # yver161: fixes AutoTrade consuming shared/global executable rows already shown on /screen and emailed; keeps final recent-email gate before Bybit placement.
 # yver160: aligns AutoTrade selector with WR-first KEEP policy so setups shown/emailed under Policy=KEEP are not blocked by legacy strict KEEP edge thresholds.
 # yver159: version-number correction after yver158; keeps the output-cleaning and pipeline-sync fixes, with refreshed background cache keys.
@@ -1694,14 +1695,14 @@ def _autotrade_recent_email_gate_allows_setup(uid: int, s: Any, session_label: s
                     """
                     SELECT MAX(emailed_ts)
                     FROM emailed_setups
-                    WHERE user_id=? AND setup_id=? AND emailed_ts>=?
+                    WHERE user_id IN (?, 0) AND setup_id=? AND emailed_ts>=?
                       AND (UPPER(COALESCE(session,''))=? OR COALESCE(session,'')='')
                     """,
                     (uid_i, sid, float(cutoff), sess),
                 ).fetchone()
             else:
                 row = cur.execute(
-                    "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND setup_id=? AND emailed_ts>=?",
+                    "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id IN (?, 0) AND setup_id=? AND emailed_ts>=?",
                     (uid_i, sid, float(cutoff)),
                 ).fetchone()
         ts = float((row[0] if row else 0.0) or 0.0)
@@ -12391,7 +12392,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             LEFT JOIN emailed_setups e
                    ON e.setup_id = x.setup_id
                   AND e.emailed_ts >= ?
-                  AND (e.user_id = ? OR e.user_id = x.user_id OR x.user_id = 0)
+                  AND (e.user_id = ? OR e.user_id = x.user_id OR e.user_id = 0 OR x.user_id = 0)
                   AND (? = '' OR UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
             LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
             WHERE x.user_id IN (?, 0)
@@ -12410,6 +12411,38 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             ),
         )
         rows = [dict(r) for r in (cur.fetchall() or [])]
+        # yver162 fallback: if the executable/email join returns no rows but a setup
+        # email was sent inside the entry window, rebuild candidates directly from
+        # emailed_setups -> executable_setups using both owner and shared user_id.
+        # This keeps /screen/email/autotrade synced for setups such as HYPE that are
+        # visible and emailed but were missed by the primary owner-specific selector.
+        if not rows and bool(require_email_entry):
+            try:
+                cur.execute(
+                    """
+                    SELECT x.*, e.emailed_ts AS emailed_ts
+                    FROM emailed_setups e
+                    JOIN executable_setups x ON x.setup_id = e.setup_id
+                    LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
+                    WHERE e.user_id IN (?, 0)
+                      AND x.user_id IN (?, 0)
+                      AND e.emailed_ts >= ?
+                      AND x.executable_ts >= ?
+                      AND (? = '' OR UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
+                      AND (? = '' OR UPPER(COALESCE(x.session, '')) = ?)
+                      AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+                    ORDER BY e.emailed_ts DESC, x.executable_ts DESC, x.setup_id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        int(uid), int(uid), float(email_cutoff), float(cutoff),
+                        req_session_u, req_session_u, req_session_u, req_session_u,
+                        int(max(limit * 20, 80)),
+                    ),
+                )
+                rows = [dict(r) for r in (cur.fetchall() or [])]
+            except Exception:
+                rows = rows or []
         con.close()
 
         out = []
@@ -12668,7 +12701,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
             LEFT JOIN emailed_setups e
                    ON e.setup_id = x.setup_id
                   AND e.emailed_ts >= ?
-                  AND (e.user_id = ? OR e.user_id = x.user_id OR x.user_id = 0)
+                  AND (e.user_id = ? OR e.user_id = x.user_id OR e.user_id = 0 OR x.user_id = 0)
                   AND (UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
             LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
             WHERE x.user_id IN (?, 0)
@@ -12687,6 +12720,29 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
             ),
         )
         rows = [dict(r) for r in (cur.fetchall() or [])]
+        if not rows and bool(require_email_entry):
+            try:
+                cur.execute(
+                    """
+                    SELECT x.*, e.emailed_ts AS emailed_ts
+                    FROM emailed_setups e
+                    JOIN executable_setups x ON x.setup_id = e.setup_id
+                    LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
+                    WHERE e.user_id IN (?, 0)
+                      AND x.user_id IN (?, 0)
+                      AND e.emailed_ts >= ?
+                      AND x.executable_ts >= ?
+                      AND (UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
+                      AND UPPER(COALESCE(x.session, '')) = ?
+                      AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+                    ORDER BY e.emailed_ts DESC, x.executable_ts DESC, x.setup_id DESC
+                    LIMIT ?
+                    """,
+                    (int(owner_uid), int(owner_uid), float(email_cutoff), float(cutoff), sess, sess, int(lim * 2)),
+                )
+                rows = [dict(r) for r in (cur.fetchall() or [])]
+            except Exception:
+                rows = rows or []
         con.close()
     except Exception as e:
         try:
@@ -12720,7 +12776,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v161:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v162:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -17970,6 +18026,17 @@ def db_init():
         PRIMARY KEY (user_id, setup_id)
     )
     """)
+
+    # yver162: older production DBs may have emailed_setups without a session column.
+    # AutoTrade/email matching now joins on session, so ensure the column exists
+    # instead of letting the selector silently return no_setups after a valid email.
+    try:
+        cur.execute("PRAGMA table_info(emailed_setups)")
+        _es_cols = {r[1] for r in cur.fetchall()}
+        if 'session' not in _es_cols:
+            cur.execute("ALTER TABLE emailed_setups ADD COLUMN session TEXT NOT NULL DEFAULT ''")
+    except Exception:
+        pass
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS executable_setups (
@@ -56844,7 +56911,7 @@ def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: flo
             cur = conn.cursor()
             if sid:
                 row = cur.execute(
-                    "SELECT emailed_ts FROM emailed_setups WHERE user_id=? AND setup_id=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
+                    "SELECT emailed_ts FROM emailed_setups WHERE user_id IN (?, 0) AND setup_id=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
                     (uid, sid, float(cutoff)),
                 ).fetchone()
                 if row and row[0] is not None:
@@ -56860,7 +56927,7 @@ def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: flo
                     PRIMARY KEY(user_id, identity_key)
                 )""")
                 row = cur.execute(
-                    "SELECT emailed_ts FROM emailed_setup_identities WHERE user_id=? AND identity_key=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
+                    "SELECT emailed_ts FROM emailed_setup_identities WHERE user_id IN (?, 0) AND identity_key=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
                     (uid, ident, float(cutoff)),
                 ).fetchone()
                 if row and row[0] is not None:
