@@ -1,3 +1,4 @@
+# yver164: locks /screen, setup-email and AutoTrade to one canonical current KEEP executable lane; AutoTrade no longer consumes BigMove/recent-email rows outside /setup_audit Gate=KEEP; email recovers unemailed KEEP rows from executable_setups.
 # yver163: sorts /setup_audit detailed rows strictly by setup time ascending (earliest to latest) instead of Policy priority; bumps setup-audit cache key.
 # yver162: fixes AutoTrade email-match lookup for shared/global emailed/executable rows, adds emailed_setups session migration, and bumps selector cache so emailed KEEP setups inside the 60m entry window are retried.
 # yver161: fixes AutoTrade consuming shared/global executable rows already shown on /screen and emailed; keeps final recent-email gate before Bybit placement.
@@ -12472,6 +12473,17 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 if not item:
                     continue
                 obj = item[0]
+                # yver164: AutoTrade must consume the same /setup_audit Gate=KEEP
+                # executable lane as /screen and setup email.  Do not even list
+                # non-canonical/BigMove/recent-email rejects in /autotrade_last.
+                try:
+                    _row_sess_u = str(row.get('session') or req_session_u or session_label or '').upper().strip()
+                    _row_side_u = str(row.get('side') or getattr(obj, 'side', '') or '').upper().strip()
+                    if _setup_audit_policy_label(row, uid=int(uid), session_name=_row_sess_u, side=_row_side_u) != 'KEEP':
+                        continue
+                    setattr(obj, 'canonical_gate_keep', True)
+                except Exception:
+                    continue
                 src_session_u = str(getattr(obj, 'source_session', '') or '').upper().strip()
                 if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                     try:
@@ -12515,11 +12527,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 continue
 
         if not out:
+            # yver164: no recent-email/BigMove fallback here. AutoTrade must only
+            # consume rows that are present in executable_setups and currently show
+            # Gate=KEEP in /setup_audit. This prevents NEAR/BMAT-style rows that are
+            # not in the setup audit lane from appearing in /autotrade_last.
             fallback_items = []
-            try:
-                fallback_items = _recent_delivery_lane_setup_objects(int(uid), session_name=req_session_u, max_age_min=max(20, int(_autotrade_entry_window_min())), limit=max(1, int(limit * 4))) or []
-            except Exception:
-                fallback_items = []
             for obj in (fallback_items or []):
                 try:
                     src_session_u = str(getattr(obj, 'source_session', '') or '').upper().strip()
@@ -12756,10 +12768,22 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
     rejects = Counter()
     for row in rows:
         try:
+            # yver164: fresh-session AutoTrade queue must also be exactly
+            # /setup_audit Gate=KEEP; otherwise it is not a real trade setup lane.
+            try:
+                _row_side = str(row.get('side') or '').upper().strip()
+                if _setup_audit_policy_label(row, uid=int(owner_uid), session_name=sess, side=_row_side) != 'KEEP':
+                    continue
+            except Exception:
+                continue
             objs = _executable_rows_to_setup_objects([row], session_name=sess)
             if not objs:
                 continue
             obj = objs[0]
+            try:
+                setattr(obj, 'canonical_gate_keep', True)
+            except Exception:
+                pass
             ok, why = _autotrade_db_signal_structurally_valid(obj, session_name=sess)
             if ok:
                 out.append(obj)
@@ -12777,7 +12801,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v162:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v164:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -13597,6 +13621,18 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return (False, str(_email_why or 'missing_recent_setup_email'))
     except Exception:
         return (False, 'setup_email_gate_exception')
+
+    # yver164: final hard sync lock. A setup can only reach Bybit if it is the
+    # same current executable row that /setup_audit would show as Gate=KEEP.
+    try:
+        if not bool(getattr(s, 'canonical_gate_keep', False)) and not _canonical_setup_id_gate_keep(int(uid), setup_id, session_label):
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_canonical_gate_not_keep'), last_reason='autotrade_canonical_gate_not_keep')
+            except Exception:
+                pass
+            return (False, 'autotrade_canonical_gate_not_keep')
+    except Exception:
+        return (False, 'autotrade_canonical_gate_check_exception')
 
     # yver143: final live entry must still pass the same user-visible KEEP/context
     # delivery gate used by setup email and /screen.  This prevents any fallback or
@@ -20293,7 +20329,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v129:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v164:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -24459,6 +24495,150 @@ def _executable_rows_to_setup_objects(rows: List[dict], session_name: str = '') 
         except Exception:
             continue
     return out
+
+
+
+def _canonical_current_keep_executable_rows(user_id: int, session_name: str = '', max_age_sec: int | float | None = None, limit: int = 50, require_recent_email: bool = False, require_unemailed: bool = False) -> list[dict]:
+    """Authoritative current setup lane for /screen, setup email and AutoTrade.
+
+    A row is returned only when it exists in executable_setups, is inside the
+    current entry/actionability window, and the same live gate shown by
+    /setup_audit says Gate=KEEP. This prevents /screen/email/AutoTrade from
+    consuming different sources such as stale emailed BigMove rows or raw scans.
+    """
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    try:
+        age_sec = float(max_age_sec if max_age_sec is not None else max(60, int(_autotrade_entry_window_min()) * 60))
+    except Exception:
+        age_sec = 3600.0
+    age_sec = max(60.0, float(age_sec or 3600.0))
+    cutoff = float(time.time()) - age_sec
+    email_cutoff = float(time.time()) - max(60.0, float(max(60, int(_autotrade_entry_window_min()) * 60)))
+    req_session_u = str(session_name or '').upper().strip()
+    out: list[dict] = []
+    seen = set()
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            con.row_factory = sqlite3.Row
+            cur = con.cursor()
+            uid_params = [uid, 0] if uid > 0 else [0]
+            # Preserve order and avoid duplicate placeholders when uid==0.
+            uid_params = list(dict.fromkeys([int(x) for x in uid_params if int(x) >= 0])) or [0]
+            uid_ph = ','.join(['?'] * len(uid_params))
+            sess_clause = ''
+            params = [uid, float(email_cutoff)] + list(uid_params) + [float(cutoff)]
+            if req_session_u:
+                sess_clause = " AND UPPER(COALESCE(x.session,''))=? "
+                params.append(req_session_u)
+            params.append(int(max(int(limit or 50) * 6, int(limit or 50), 80)))
+            rows = cur.execute(f"""
+                SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
+                FROM executable_setups x
+                LEFT JOIN emailed_setups e
+                       ON e.setup_id = x.setup_id
+                      AND e.user_id IN (?,0)
+                      AND e.emailed_ts >= ?
+                LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
+                WHERE x.user_id IN ({uid_ph})
+                  AND x.executable_ts >= ?
+                  {sess_clause}
+                  AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+                GROUP BY x.rowid
+                ORDER BY x.executable_ts ASC, x.setup_id ASC
+                LIMIT ?
+            """, tuple(params)).fetchall() or []
+    except Exception:
+        rows = []
+    for raw in rows:
+        try:
+            r = dict(raw)
+            sid = str(r.get('setup_id') or '').strip()
+            if not sid:
+                continue
+            sess = str(r.get('session') or req_session_u or '').upper().strip()
+            if req_session_u and sess and sess != req_session_u:
+                continue
+            if bool(require_recent_email) and float(r.get('emailed_ts') or 0.0) < email_cutoff:
+                continue
+            if bool(require_unemailed) and float(r.get('emailed_ts') or 0.0) >= email_cutoff:
+                continue
+            ident = _setup_identity_from_obj(r) or sid
+            if ident in seen:
+                continue
+            side = str(r.get('side') or '').upper().strip()
+            # This is the single source-of-truth gate displayed by /setup_audit.
+            try:
+                gate = _setup_audit_policy_label(r, uid=int(uid), session_name=sess, side=side)
+            except Exception:
+                gate = 'OFF'
+            if str(gate or '').upper().strip() != 'KEEP':
+                continue
+            objs = _executable_rows_to_setup_objects([r], session_name=sess)
+            if not objs:
+                continue
+            obj = objs[0]
+            try:
+                ok_basic = bool(_setup_volume_ok(obj))
+                if ok_basic:
+                    entry = float(getattr(obj, 'entry', 0.0) or 0.0)
+                    sl = float(getattr(obj, 'sl', 0.0) or 0.0)
+                    tp = float(_setup_target_tp(obj, 0.0) or 0.0)
+                    sd = str(getattr(obj, 'side', '') or '').upper().strip()
+                    ok_basic = sd in {'BUY','SELL'} and entry > 0 and sl > 0 and tp > 0 and ((sd == 'BUY' and sl < entry < tp) or (sd == 'SELL' and tp < entry < sl))
+                if not ok_basic:
+                    continue
+            except Exception:
+                continue
+            try:
+                setattr(obj, 'canonical_gate_keep', True)
+                setattr(obj, 'source_kind', str(getattr(obj, 'source_kind', '') or 'executable_setups'))
+                if float(r.get('emailed_ts') or 0.0) > 0:
+                    setattr(obj, 'email_logged_ts', float(r.get('emailed_ts') or 0.0))
+                    setattr(obj, 'emailed_ts', float(r.get('emailed_ts') or 0.0))
+                r['_obj'] = obj
+                r['_canonical_gate_keep'] = 1
+            except Exception:
+                pass
+            seen.add(ident)
+            out.append(r)
+            if len(out) >= int(limit or 50):
+                break
+        except Exception:
+            continue
+    return out[:int(limit or 50)]
+
+
+def _canonical_current_keep_executable_setup_objects(user_id: int, session_name: str = '', max_age_sec: int | float | None = None, limit: int = 10, require_recent_email: bool = False, require_unemailed: bool = False) -> list:
+    rows = _canonical_current_keep_executable_rows(user_id, session_name=session_name, max_age_sec=max_age_sec, limit=limit, require_recent_email=require_recent_email, require_unemailed=require_unemailed)
+    out = []
+    for r in rows:
+        try:
+            obj = r.get('_obj') if isinstance(r, dict) else None
+            if obj is None:
+                obj = (_executable_rows_to_setup_objects([dict(r)], session_name=session_name) or [None])[0]
+            if obj is not None:
+                try:
+                    setattr(obj, 'canonical_gate_keep', True)
+                except Exception:
+                    pass
+                out.append(obj)
+        except Exception:
+            continue
+    return out[:int(limit or 10)]
+
+
+def _canonical_setup_id_gate_keep(user_id: int, setup_id: str, session_name: str = '') -> bool:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return False
+    try:
+        rows = _canonical_current_keep_executable_rows(int(user_id or 0), session_name=session_name, max_age_sec=max(60, int(_autotrade_entry_window_min()) * 60), limit=100)
+        return any(str((r or {}).get('setup_id') or '').strip() == sid for r in (rows or []))
+    except Exception:
+        return False
 
 
 # =========================================================
@@ -57075,6 +57255,10 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                 return False
 
         sources = []
+        try:
+            sources.append(('canonical', _canonical_current_keep_executable_setup_objects(int(uid), session_name=sess, max_age_sec=max_age_min * 60, limit=20) or []))
+        except Exception:
+            sources.append(('canonical', []))
         if include_email_source:
             try:
                 sources.append(('emailed', _recent_delivery_lane_setup_objects(int(uid), session_name=sess, max_age_min=max_age_min, limit=20) or []))
@@ -57105,10 +57289,13 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     if sess and src_session_u and src_session_u not in {'', sess}:
                         continue
                     try:
-                        if source_name == 'emailed':
+                        if source_name in {'emailed', 'canonical'}:
                             ok_basic = _basic_valid(item)
-                            ok_final, _why_final, _meta_final = _setup_final_quality_gate_allows_setup(item, session_name=sess, user_id=int(uid)) if ok_basic else (False, 'screen_emailed_basic_invalid', {})
-                            ok_exec = bool(ok_basic and ok_final)
+                            if source_name == 'canonical':
+                                ok_exec = bool(ok_basic)
+                            else:
+                                ok_final, _why_final, _meta_final = _setup_final_quality_gate_allows_setup(item, session_name=sess, user_id=int(uid)) if ok_basic else (False, 'screen_emailed_basic_invalid', {})
+                                ok_exec = bool(ok_basic and ok_final)
                         else:
                             ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=sess)
                     except Exception:
@@ -57138,7 +57325,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         except Exception:
             up_list, dn_list = [], []
         market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
-        source_note = '_Showing recent emailed setup queue._' if _screen_requires_emailed_delivery_for_setup() else ('_Showing latest sent setup email._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue._')
+        source_note = '_Showing recent emailed setup queue._' if _screen_requires_emailed_delivery_for_setup() else ('_Showing latest sent setup email._' if include_email_source and used_source_name == 'emailed' else '_Showing current KEEP executable setup queue._')
         body = "\n".join([
             "",
             "*Top Trade Setups*",
@@ -57202,6 +57389,10 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                     return False
 
             sources = []
+            try:
+                sources.append(('canonical', _canonical_current_keep_executable_setup_objects(int(_uid), session_name=req_session_u, max_age_sec=max_age_min * 60, limit=max(1, int(limit * 4))) or []))
+            except Exception:
+                sources.append(('canonical', []))
             if _screen_user_can_see_email_source(int(_uid)):
                 try:
                     sources.append(('emailed', _recent_delivery_lane_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 3))) or []))
@@ -57228,7 +57419,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                         src_session_u = str(getattr(item, 'source_session', '') or '').upper().strip()
                         if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                             continue
-                        if source_name == 'emailed':
+                        if source_name in {'emailed', 'canonical'}:
                             ok_exec = _basic_valid(item)
                         else:
                             try:
@@ -57797,6 +57988,46 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return
             except Exception:
                 pass
+
+        # yver164: current canonical KEEP executable rows beat stale cached screens,
+        # even when they have not been emailed yet. This keeps /screen aligned with
+        # /setup_audit Gate=KEEP and the email/autotrade lane.
+        try:
+            quick_best_canon = get_cached_futures_tickers() or {}
+            if quick_best_canon:
+                body_c, kb_c, shown_c = _screen_recent_db_body_and_kb(
+                    int(uid),
+                    str(scan_session or '').upper(),
+                    quick_best_canon,
+                    max_age_min=screen_fallback_min,
+                    include_email_source=bool(can_show_email_source),
+                )
+                if body_c and _screen_body_has_trade_setups(str(body_c or '')):
+                    try:
+                        source_ts_c = max([float(getattr(x, 'email_logged_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0) for x in (shown_c or [])] or [0.0])
+                    except Exception:
+                        source_ts_c = 0.0
+                    header_c = (
+                        f"*PulseFutures — Market Scan*\n"
+                        f"{HDR}\n"
+                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                        f"{_screen_when_line('Displayed setup source', source_ts_c)}"
+                        f"_Showing current KEEP executable setup queue._\n"
+                    )
+                    keyboard_c = [
+                        [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                        for (sym, sid) in (kb_c or [])
+                    ]
+                    await send_long_message(
+                        update,
+                        _screen_markdown_to_html((header_c + "\n" + body_c).strip()),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                        reply_markup=InlineKeyboardMarkup(keyboard_c) if keyboard_c else None,
+                    )
+                    return
+        except Exception:
+            pass
 
         if cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
             note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
@@ -60259,7 +60490,38 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 hydrated = []
             eligible_db = [s for s in (hydrated or []) if s is not None]
-            if eligible_db:
+            # yver164: recover the exact current /setup_audit Gate=KEEP lane.
+            # This is the source of truth for /screen + setup email + AutoTrade.
+            try:
+                canonical_keep = _canonical_current_keep_executable_setup_objects(
+                    int(uid),
+                    session_name=str(sess_name or ''),
+                    max_age_sec=max(60, int(_autotrade_entry_window_min()) * 60),
+                    limit=max(int(EMAIL_SETUPS_N) * 12, 36),
+                    require_unemailed=False,
+                )
+            except Exception:
+                canonical_keep = []
+            if canonical_keep:
+                # Put canonical KEEP rows first and keep any existing eligible rows after them.
+                merged = []
+                seen_merge = set()
+                for _s0 in list(canonical_keep or []) + list(eligible_db or []) + list(eligible_from_pool or []):
+                    try:
+                        _sid0 = str(getattr(_s0, 'setup_id', '') or getattr(_s0, 'id', '') or '')
+                        _ident0 = _setup_identity_from_obj(_s0) or _sid0
+                        if not _ident0 or _ident0 in seen_merge:
+                            continue
+                        seen_merge.add(_ident0)
+                        merged.append(_s0)
+                    except Exception:
+                        continue
+                eligible = list(merged)
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='email_canonical_keep_lane', status='ok', session=str(sess_name or ''), mode='email', details={'canonical_keep': len(canonical_keep or []), 'eligible_total': len(eligible or [])})
+                except Exception:
+                    pass
+            elif eligible_db:
                 eligible = list(eligible_db)
             elif eligible_from_pool:
                 eligible = list(eligible_from_pool)
@@ -60417,12 +60679,26 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     diversify_blocked[str(why_div)] += 1
                     continue
 
-                if _email_setup_identity_recently_sent(uid, s):
+                # yver164: canonical Gate=KEEP rows have already passed the same
+                # delivery/actionability gate shown by /setup_audit.  Do not let
+                # a second, older cooldown check make email diverge from /setup_audit.
+                # Still avoid re-sending the exact same setup_id.
+                try:
+                    _sid_for_email = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+                    _already_emailed_exact = bool(_sid_for_email and db_has_emailed_setup(int(uid), _sid_for_email, lookback_hours=max(1, int(math.ceil(float(_autotrade_entry_window_min() or 60) / 60.0)))))
+                except Exception:
+                    _already_emailed_exact = False
+                if _already_emailed_exact:
                     cooldown_blocked += 1
                     continue
-                if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
-                    cooldown_blocked += 1
-                    continue
+                _canonical_gate_keep = bool(getattr(s, 'canonical_gate_keep', False))
+                if not _canonical_gate_keep:
+                    if _email_setup_identity_recently_sent(uid, s):
+                        cooldown_blocked += 1
+                        continue
+                    if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
+                        cooldown_blocked += 1
+                        continue
 
                 if int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(_autotrade_runtime_mode()).lower() == 'live':
                     try:
@@ -62567,7 +62843,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v129:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v164:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
@@ -62584,6 +62860,13 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                     _s_eff = _setup_route_unless_delivery_locked(_s, sess, owner_uid, source_kind=str(getattr(_s, 'source_kind', '') or 'emailed_setups'))
                     ok_s, _why_s = is_executable_setup_eligible(_s_eff, session_name=sess)
                     if ok_s:
+                        try:
+                            _sid_eff = str(getattr(_s_eff, 'setup_id', '') or getattr(_s_eff, 'id', '') or '').strip()
+                            if not _canonical_setup_id_gate_keep(owner_uid, _sid_eff, sess):
+                                continue
+                            setattr(_s_eff, 'canonical_gate_keep', True)
+                        except Exception:
+                            continue
                         db_setups.append(_s_eff)
                 except Exception:
                     continue
