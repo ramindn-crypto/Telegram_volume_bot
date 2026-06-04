@@ -1,3 +1,4 @@
+# yver167: final one-lane execution sync: screen/email can send all current Gate=KEEP setups, canonical Gate=KEEP rows bypass screen-sync cooldown/flip guards (except exact already-emailed setup_id), and AutoTrade context/strict-edge blockers are bypassed for setup_ids currently in the canonical Gate=KEEP lane.
 # yver166: syncs AutoTrade with delivered KEEP setup lane by disabling the legacy strict KEEP-edge blocker for setups already accepted by /screen/setup-email/canonical Gate=KEEP; prevents emailed setups from being skipped with autotrade_strict_keep_edge_block.
 # yver165: completes canonical KEEP lane sync: /setup_audit Gate=KEEP rows bypass secondary email-only flip/diversification cooldown blockers, so they are emailed, shown on /screen, and immediately queued for AutoTrade from the same setup_id.
 # yver164: locks /screen, setup-email and AutoTrade to one canonical current KEEP executable lane; AutoTrade no longer consumes BigMove/recent-email rows outside /setup_audit Gate=KEEP; email recovers unemailed KEEP rows from executable_setups.
@@ -5425,6 +5426,23 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or user_id or 0)
         sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
         combo = _autotrade_setup_exact_combo_key(setup_or_row, sess)
+        # yver167: the canonical Gate=KEEP executable lane is the single source of truth
+        # for /screen, setup email and AutoTrade.  If the exact setup_id is still
+        # current Gate=KEEP, do not re-block it with legacy AutoTrade-only context
+        # filters such as strict_keep_edge/symbol/hour.  Safety checks still run later
+        # in _autotrade_place_trade: recent email, structure, drift, leverage, risk caps,
+        # duplicate guards and Bybit order placement.
+        if bool(apply_strict_keep_edge):
+            try:
+                _sid_ctx = str(
+                    (setup_or_row.get('setup_id') if isinstance(setup_or_row, dict) else getattr(setup_or_row, 'setup_id', ''))
+                    or (setup_or_row.get('id') if isinstance(setup_or_row, dict) else getattr(setup_or_row, 'id', ''))
+                    or ''
+                ).strip()
+                if _sid_ctx and _canonical_setup_id_gate_keep(owner_uid, _sid_ctx, sess):
+                    return True, 'canonical_gate_keep_context_ok'
+            except Exception:
+                pass
         pstatus_exec = ''
         try:
             _pinfo_exec = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=owner_uid)
@@ -5457,7 +5475,7 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         # at least one decided TP/SL result and WR is above the configured
         # WR-first KEEP cutoff. Example fixed: F2-ASIA-NOR-BUY WR50.0 n2.
         try:
-            if bool(apply_strict_keep_edge) and pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
+            if False and bool(apply_strict_keep_edge) and pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
                 m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
                 dec = int(m.get('decided') or 0)
                 wr = float(m.get('wr') or 0.0)
@@ -12819,7 +12837,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v165:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v167:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -20369,7 +20387,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v165:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v167:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -57846,15 +57864,26 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
                 continue
             sym = str(getattr(s, 'symbol', '') or '').upper()
             side = str(getattr(s, 'side', '') or '').upper()
-            if symbol_flip_guard_active(int(uid), sym, side, target_session):
-                skipped.append('flip_guard_blocked')
-                continue
-            if _email_setup_identity_recently_sent(int(uid), s):
-                skipped.append('duplicate_setup_identity')
-                continue
-            if _email_symbol_recently_sent(int(uid), sym, side, target_session, setup_id=sid):
-                skipped.append('cooldown_blocked')
-                continue
+            # yver167: when /screen is displaying the current canonical Gate=KEEP
+            # setup lane, screen-sync must not apply extra email-only cooldown/flip
+            # guards that make it diverge from /setup_audit Gate=KEEP.  Only the
+            # exact already-emailed setup_id remains blocked to prevent duplicate sends.
+            try:
+                _screen_canonical_keep = bool(getattr(s, 'canonical_gate_keep', False)) or bool(_canonical_setup_id_gate_keep(int(uid), sid, target_session))
+                if _screen_canonical_keep:
+                    setattr(s, 'canonical_gate_keep', True)
+            except Exception:
+                _screen_canonical_keep = bool(getattr(s, 'canonical_gate_keep', False))
+            if not _screen_canonical_keep:
+                if symbol_flip_guard_active(int(uid), sym, side, target_session):
+                    skipped.append('flip_guard_blocked')
+                    continue
+                if _email_setup_identity_recently_sent(int(uid), s):
+                    skipped.append('duplicate_setup_identity')
+                    continue
+                if _email_symbol_recently_sent(int(uid), sym, side, target_session, setup_id=sid):
+                    skipped.append('cooldown_blocked')
+                    continue
             try:
                 dedupe_key = (
                     sym,
@@ -57874,7 +57903,14 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
         if not actionable:
             return {"status": "skip", "reason": f"no_actionable_screen_setups ({','.join(skipped[:3])})"}
 
-        actionable = list(actionable[:max(1, int(EMAIL_SETUPS_N))])
+        # yver167: /screen may show multiple current Gate=KEEP setups; email all
+        # unemailed canonical setups shown on /screen in one batch, not only EMAIL_SETUPS_N=1.
+        try:
+            _canonical_actionable_n = sum(1 for _x in (actionable or []) if bool(getattr(_x, 'canonical_gate_keep', False)))
+        except Exception:
+            _canonical_actionable_n = 0
+        _screen_sync_send_cap = max(1, min(8, max(int(EMAIL_SETUPS_N), int(_canonical_actionable_n or 0))))
+        actionable = list(actionable[:_screen_sync_send_cap])
         sent = await to_thread_heavy(
             send_email_alert_multi,
             dict(user or {}),
@@ -60664,8 +60700,17 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             owner_manual_same_symbol_blocked = 0
             combo_policy_blocked = 0
 
+            # yver167: if the canonical Gate=KEEP lane contains multiple fresh setups,
+            # send all unemailed current KEEP rows in one email batch (bounded) so /screen,
+            # setup email, and AutoTrade do not split into different sources.
+            try:
+                _canonical_pick_cap = sum(1 for _x in (picks or []) if bool(getattr(_x, 'canonical_gate_keep', False)))
+            except Exception:
+                _canonical_pick_cap = 0
+            _email_batch_cap = max(1, min(8, max(int(EMAIL_SETUPS_N), int(_canonical_pick_cap or 0))))
+
             for s in picks:
-                if len(chosen_list) >= int(EMAIL_SETUPS_N):
+                if len(chosen_list) >= int(_email_batch_cap):
                     break
 
                 sym = str(getattr(s, "symbol", "")).upper()
@@ -62889,7 +62934,7 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                         chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v165:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v167:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
