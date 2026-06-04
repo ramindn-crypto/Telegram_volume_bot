@@ -1,18 +1,5 @@
-# yver168: hard final sync: manual /screen displayed Gate=KEEP setups now always queue screen-sync email and immediate AutoTrade retry; AutoTrade prioritizes current emailed canonical Gate=KEEP rows and cache keys are bumped/cleared on email delivery.
-# yver168: final one-lane execution sync: screen/email can send all current Gate=KEEP setups, canonical Gate=KEEP rows bypass screen-sync cooldown/flip guards (except exact already-emailed setup_id), and AutoTrade context/strict-edge blockers are bypassed for setup_ids currently in the canonical Gate=KEEP lane.
-# yver166: syncs AutoTrade with delivered KEEP setup lane by disabling the legacy strict KEEP-edge blocker for setups already accepted by /screen/setup-email/canonical Gate=KEEP; prevents emailed setups from being skipped with autotrade_strict_keep_edge_block.
-# yver165: completes canonical KEEP lane sync: /setup_audit Gate=KEEP rows bypass secondary email-only flip/diversification cooldown blockers, so they are emailed, shown on /screen, and immediately queued for AutoTrade from the same setup_id.
-# yver164: locks /screen, setup-email and AutoTrade to one canonical current KEEP executable lane; AutoTrade no longer consumes BigMove/recent-email rows outside /setup_audit Gate=KEEP; email recovers unemailed KEEP rows from executable_setups.
-# yver163: sorts /setup_audit detailed rows strictly by setup time ascending (earliest to latest) instead of Policy priority; bumps setup-audit cache key.
-# yver162: fixes AutoTrade email-match lookup for shared/global emailed/executable rows, adds emailed_setups session migration, and bumps selector cache so emailed KEEP setups inside the 60m entry window are retried.
-# yver161: fixes AutoTrade consuming shared/global executable rows already shown on /screen and emailed; keeps final recent-email gate before Bybit placement.
-# yver160: aligns AutoTrade selector with WR-first KEEP policy so setups shown/emailed under Policy=KEEP are not blocked by legacy strict KEEP edge thresholds.
-# yver159: version-number correction after yver158; keeps the output-cleaning and pipeline-sync fixes, with refreshed background cache keys.
-# yver155: Render scheduler hardening: prevents alert/autotrade job overlap warnings with safer intervals, caps pre-session BigMove work so session setup pools are not starved, downgrades transient Telegram timeout log noise, and shortens daily-safety INFO logs.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
-# yver156: Universal instant command ACK/background dispatcher; /screen now ACKs immediately and publishes its snapshot from the dedicated screen thread so heavy work cannot delay /equity or other commands.
-# yver159 output-clean + pipeline sync: removes /screen warm-up text, lets /screen show current executable queue, shares executable queue between uid+global lanes for email/AT/audit, and makes /setup_audit rolling view prefer latest setup per key.
 # yver145: Non-blocking admin report runner: heavy commands immediately return latest cached snapshot or queue a background rebuild, preventing Telegram TimeoutError when multiple reports are pressed together.
 # yver144: fixes final audit/report sync: /setup_audit AT no longer shows stale AT_OPEN after a position is no longer live, and /setup_audit_compare recovers setup matches from the AutoTrade journal when Bybit Closed-PnL rows lose setup_id/open-time metadata.
 # yver143: adds setup-audit AutoTrade lifecycle visibility and final live-entry user-visible gate so already-open trades (e.g. INJ) are not confused with fresh actionable setups.
@@ -26,12 +13,9 @@
 # yver135: fixes setup-audit/email/autotrade sync gap by letting setup emails consume executable rows for the full AUTOTRADE_ENTRY_WINDOW_MIN instead of only MAX_STALE_SCAN_SEC; /screen fallback age now follows the same entry window.
 # yver134: adds Policy column to /setup_audit detailed table, showing current enforceable KEEP/WATCH/OFF lane for each setup.
 # yver146: hardens AutoTrade closed/report metadata sync: canonical Bybit Closed-PnL enrichment now rejects future-open candidates, syncs /setup_matrix WR basis with setup-audit, shares v146 cache namespace, and keeps strategy recommendations as guidance only (no trading config auto-change).
-# yver154: fixes WR-first policy lock so Policy=KEEP is allowed only when the current/displayed decided WR is strictly >49%; old persisted KEEP rows below/equal 49% are downgraded to WATCH, and /setup_matrix policy cache is bumped.
-# yver151: sorts setup audit/policy tables by Policy priority (KEEP, WATCH, then disabled/OFF) without changing trading logic.
 # yver132: explains KEEP selection in /setup_matrix policy (KEEP requires more than 50% WR: sample + AvgR/payoff + no safety disable); no trading-policy loosening.
 # yver130: startup fix for yver129: imports typing.Any before the early AutoTrade email-gate helper so Render does not crash on NameError.
 from typing import Any  # yver130 early import required before early helper annotations
-PULSEFUTURES_CODE_VERSION = "yver154"  # deploy sanity marker
 # yver129: locks AutoTrade to the same delivered KEEP+WATCH lane as subscribers: future AutoTrade entries require an actual recent setup email/delivery within AUTOTRADE_ENTRY_WINDOW_MIN, remove broad executable/fresh-queue fallbacks from email-triggered AutoTrade, and keep the setting Telegram-configurable.
 # yver126: fixes /dayrisk_reset so AutoTrade debug uses the reset credit from the same realised-PnL/open-risk basis, and fixes /setup_audit_keep_watch multi-window table to use full historical generated+executable rows rather than the short executable-only slice.
 # yver124: /setup_audit_keep_watch now renders a multi-window table (Last 24h, 7d, 14d, Overall from database) with Keep/Watch combo counts and WR=TP/(TP+SL).
@@ -1701,14 +1685,14 @@ def _autotrade_recent_email_gate_allows_setup(uid: int, s: Any, session_label: s
                     """
                     SELECT MAX(emailed_ts)
                     FROM emailed_setups
-                    WHERE user_id IN (?, 0) AND setup_id=? AND emailed_ts>=?
+                    WHERE user_id=? AND setup_id=? AND emailed_ts>=?
                       AND (UPPER(COALESCE(session,''))=? OR COALESCE(session,'')='')
                     """,
                     (uid_i, sid, float(cutoff), sess),
                 ).fetchone()
             else:
                 row = cur.execute(
-                    "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id IN (?, 0) AND setup_id=? AND emailed_ts>=?",
+                    "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND setup_id=? AND emailed_ts>=?",
                     (uid_i, sid, float(cutoff)),
                 ).fetchone()
         ts = float((row[0] if row else 0.0) or 0.0)
@@ -3091,17 +3075,6 @@ SETUP_COMBO_POLICY_DISABLE_WR = min(float(os.environ.get("SETUP_COMBO_POLICY_DIS
 SETUP_COMBO_POLICY_DISABLE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_DISABLE_AVG_R", "0.00") or 0.00)
 SETUP_COMBO_POLICY_WATCH_WR = float(os.environ.get("SETUP_COMBO_POLICY_WATCH_WR", "50") or 50)
 SETUP_COMBO_POLICY_PROMOTE_AVG_R = float(os.environ.get("SETUP_COMBO_POLICY_PROMOTE_AVG_R", "0.35") or 0.35)
-# yver154: owner requested WR-first policy promotion.
-# Any lane with at least one decided TP/SL result and WR > 49% becomes KEEP,
-# regardless of Set/Dec sample count. This intentionally loosens yver132 safety wording.
-SETUP_COMBO_POLICY_KEEP_ANY_WR = float(os.environ.get("SETUP_COMBO_POLICY_KEEP_ANY_WR", "49") or 49)
-
-def _setup_combo_wr_first_keep(decided: int | float | str = 0, win_rate: int | float | str = 0.0) -> bool:
-    """yver154 WR-first promotion: KEEP is allowed only when decided WR is strictly > cutoff."""
-    try:
-        return int(float(decided or 0)) > 0 and float(win_rate or 0.0) > float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0)
-    except Exception:
-        return False
 
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
 # matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
@@ -4680,9 +4653,9 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Commands that should always work even if user is locked (no access check)
         ACCESS_EXEMPT = {"start", "help", "commands", "billing", "guide_full"}
 
-        # yver156: no command should force a slow fresh access check in the foreground.
-        # Access still refreshes via the short TTL cache; command work itself is ACKed and moved to background.
-        FORCE_FRESH = set()
+        # Commands that should force a fresh access check (never use cache)
+        # (/screen is the only one you said can be slow; we keep it strict/fresh here)
+        FORCE_FRESH = {"screen"}
 
         # 0) Channel subscription gate (optional)
         if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
@@ -5175,12 +5148,10 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
                         return False, f'{l}_watch_final_gate:{final_why or "blocked"}', meta
                 except Exception as _final_exc:
                     return False, f'{l}_watch_final_gate_exception:{type(_final_exc).__name__}', meta
-            # Subscriber-facing setup exposure must match the shared context layer
-            # for symbol/hour/session/side blocks, but yver150 keeps the extra
-            # strict KEEP-edge risk filter AutoTrade-only so setup emails/screen do
-            # not disappear while background evidence is still being collected.
+            # Subscriber-facing setup exposure must also match the real AutoTrade
+            # context layer: weak symbol/hour/session/side blocks hide the setup.
             try:
-                ctx_ok, ctx_why = _autotrade_policy_context_execution_allows(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0), apply_strict_keep_edge=False)
+                ctx_ok, ctx_why = _autotrade_policy_context_execution_allows(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0))
                 meta['context_gate_reason'] = str(ctx_why or '')
                 if not ctx_ok:
                     return False, f'{l}_{ctx_why or "context_guard_block"}', meta
@@ -5419,7 +5390,7 @@ def _autotrade_exact_lane_watch_escape_from_setup_audit(data: dict, combo: str) 
     except Exception as exc:
         return False, f'exact_watch_escape_error:{type(exc).__name__}'
 
-def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0, *, apply_strict_keep_edge: bool = True) -> tuple[bool, str]:
+def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
     """Final real-money filter: policy KEEP + realised AutoTrade edge + setup-audit context."""
     try:
         if not _autotrade_context_feed_guard_enabled() and not _autotrade_require_realized_combo_edge():
@@ -5427,23 +5398,6 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or user_id or 0)
         sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
         combo = _autotrade_setup_exact_combo_key(setup_or_row, sess)
-        # yver168: the canonical Gate=KEEP executable lane is the single source of truth
-        # for /screen, setup email and AutoTrade.  If the exact setup_id is still
-        # current Gate=KEEP, do not re-block it with legacy AutoTrade-only context
-        # filters such as strict_keep_edge/symbol/hour.  Safety checks still run later
-        # in _autotrade_place_trade: recent email, structure, drift, leverage, risk caps,
-        # duplicate guards and Bybit order placement.
-        if bool(apply_strict_keep_edge):
-            try:
-                _sid_ctx = str(
-                    (setup_or_row.get('setup_id') if isinstance(setup_or_row, dict) else getattr(setup_or_row, 'setup_id', ''))
-                    or (setup_or_row.get('id') if isinstance(setup_or_row, dict) else getattr(setup_or_row, 'id', ''))
-                    or ''
-                ).strip()
-                if _sid_ctx and _canonical_setup_id_gate_keep(owner_uid, _sid_ctx, sess):
-                    return True, 'canonical_gate_keep_context_ok'
-            except Exception:
-                pass
         pstatus_exec = ''
         try:
             _pinfo_exec = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=owner_uid)
@@ -5469,46 +5423,23 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         hours = _overall_report_effective_hours(int(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168) or 168))
         data = _setup_edge_guard_build(owner_uid, hours=hours, force=False) or {}
 
-        # yver160: AutoTrade must consume the same WR-first KEEP lane that
-        # /setup_matrix policy, /screen, and setup email use. The older strict
-        # AutoTrade-only KEEP edge rule (decided>=5, WR>=60, AvgR>=+0.25) can
-        # no longer block a current Policy=KEEP setup when the exact lane has
-        # at least one decided TP/SL result and WR is above the configured
-        # WR-first KEEP cutoff. Example fixed: F2-ASIA-NOR-BUY WR50.0 n2.
+        # yver147: real-money AutoTrade should not use every KEEP lane while the
+        # target WR is >50%.  A lane can be KEEP because of broader/older policy,
+        # but live entries now require the exact lane evidence to remain strong.
+        # Default: decided>=5, WR>=60%, AvgR>=+0.25. This blocks recent weak KEEP
+        # lanes such as F1-LON-NOR-BUY/F2-NY-NOR-BUY while keeping stronger lanes
+        # like F2-ASIA-NOR-BUY and F1-LON-REV-BUY.
         try:
-            if False and bool(apply_strict_keep_edge) and pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
+            if pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
                 m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
                 dec = int(m.get('decided') or 0)
                 wr = float(m.get('wr') or 0.0)
                 avg = float(m.get('avg_r') or 0.0)
-                wr_first_cutoff = float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0)
-                # yver166: once a setup has already passed the canonical
-                # /screen + setup-email delivery lane, AutoTrade must not apply
-                # the legacy stricter AutoTrade-only floor (Dec>=5 / WR>=60 /
-                # AvgR>=+0.25). That old extra blocker was the reason an emailed
-                # setup such as ZEC could be displayed and delivered but then
-                # skipped with autotrade_strict_keep_edge_block.  The true live
-                # safety checks still run later: recent setup email, canonical
-                # Gate=KEEP, structural prices/RR, leverage, risk caps and Bybit
-                # order placement guards.
-                delivered_keep_lane = bool(getattr(setup_or_row, 'canonical_gate_keep', False))
-                try:
-                    delivered_keep_lane = delivered_keep_lane or bool(float(getattr(setup_or_row, 'email_logged_ts', 0.0) or getattr(setup_or_row, 'emailed_ts', 0.0) or 0.0) > 0.0)
-                except Exception:
-                    pass
-                if delivered_keep_lane:
-                    pass
-                # If the exact lane is KEEP by the WR-first policy, do not apply
-                # the legacy stricter AutoTrade-only floor. This keeps screen,
-                # email, and AutoTrade synced on the same setup.
-                elif dec > 0 and wr > wr_first_cutoff:
-                    pass
-                else:
-                    min_dec = int(_autotrade_strict_keep_edge_min_decided())
-                    min_wr = float(_autotrade_strict_keep_edge_min_wr())
-                    min_avg = float(_autotrade_strict_keep_edge_min_avgr())
-                    if dec < min_dec or wr < min_wr or avg < min_avg:
-                        return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
+                min_dec = int(_autotrade_strict_keep_edge_min_decided())
+                min_wr = float(_autotrade_strict_keep_edge_min_wr())
+                min_avg = float(_autotrade_strict_keep_edge_min_avgr())
+                if dec < min_dec or wr < min_wr or avg < min_avg:
+                    return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
         except Exception as _strict_exc:
             return False, f'autotrade_strict_keep_edge_error:{type(_strict_exc).__name__}'
 
@@ -12417,71 +12348,25 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
         # were never delivered to the subscriber/admin.
         require_email_entry = bool(_autotrade_require_setup_email_for_entry())
         email_cutoff = float(time.time()) - float(max(60, int(_autotrade_entry_window_min()) * 60))
-        # yver161: consume both owner-specific and shared/global executable rows.
-        # /screen and /email_decision count user_id IN (owner, 0); AutoTrade must
-        # read the same lane, otherwise a setup can be shown/emailed (e.g. HYPE)
-        # while /autotrade_last says no_setups.  The email join is keyed by
-        # setup_id and accepts owner email rows even when the executable row is
-        # stored under user_id=0.  Final _autotrade_place_trade still re-checks
-        # the exact recent email gate before any Bybit order is placed.
         cur.execute(
             """
-            SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
+            SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts
             FROM executable_setups x
             LEFT JOIN emailed_setups e
-                   ON e.setup_id = x.setup_id
-                  AND e.emailed_ts >= ?
-                  AND (e.user_id = ? OR e.user_id = x.user_id OR e.user_id = 0 OR x.user_id = 0)
-                  AND (? = '' OR UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
+                   ON e.user_id = x.user_id
+                  AND e.setup_id = x.setup_id
             LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-            WHERE x.user_id IN (?, 0)
+            WHERE x.user_id = ?
               AND x.executable_ts >= ?
               AND (? = '' OR UPPER(COALESCE(x.session, '')) = ?)
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
               AND (? = 0 OR COALESCE(e.emailed_ts, 0) >= ?)
-            GROUP BY x.rowid
-            ORDER BY COALESCE(MAX(e.emailed_ts), x.executable_ts) DESC, x.executable_ts DESC, x.setup_id DESC
+            ORDER BY COALESCE(e.emailed_ts, x.executable_ts) DESC, x.executable_ts DESC, x.setup_id DESC
             LIMIT ?
             """,
-            (
-                float(email_cutoff), int(uid), req_session_u, req_session_u,
-                int(uid), float(cutoff), req_session_u, req_session_u,
-                1 if require_email_entry else 0, float(email_cutoff), int(max(limit * 20, 80)),
-            ),
+            (int(uid), float(cutoff), req_session_u, req_session_u, 1 if require_email_entry else 0, float(email_cutoff), int(max(limit * 20, 80))),
         )
         rows = [dict(r) for r in (cur.fetchall() or [])]
-        # yver162 fallback: if the executable/email join returns no rows but a setup
-        # email was sent inside the entry window, rebuild candidates directly from
-        # emailed_setups -> executable_setups using both owner and shared user_id.
-        # This keeps /screen/email/autotrade synced for setups such as HYPE that are
-        # visible and emailed but were missed by the primary owner-specific selector.
-        if not rows and bool(require_email_entry):
-            try:
-                cur.execute(
-                    """
-                    SELECT x.*, e.emailed_ts AS emailed_ts
-                    FROM emailed_setups e
-                    JOIN executable_setups x ON x.setup_id = e.setup_id
-                    LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-                    WHERE e.user_id IN (?, 0)
-                      AND x.user_id IN (?, 0)
-                      AND e.emailed_ts >= ?
-                      AND x.executable_ts >= ?
-                      AND (? = '' OR UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
-                      AND (? = '' OR UPPER(COALESCE(x.session, '')) = ?)
-                      AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-                    ORDER BY e.emailed_ts DESC, x.executable_ts DESC, x.setup_id DESC
-                    LIMIT ?
-                    """,
-                    (
-                        int(uid), int(uid), float(email_cutoff), float(cutoff),
-                        req_session_u, req_session_u, req_session_u, req_session_u,
-                        int(max(limit * 20, 80)),
-                    ),
-                )
-                rows = [dict(r) for r in (cur.fetchall() or [])]
-            except Exception:
-                rows = rows or []
         con.close()
 
         out = []
@@ -12510,17 +12395,6 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 if not item:
                     continue
                 obj = item[0]
-                # yver164: AutoTrade must consume the same /setup_audit Gate=KEEP
-                # executable lane as /screen and setup email.  Do not even list
-                # non-canonical/BigMove/recent-email rejects in /autotrade_last.
-                try:
-                    _row_sess_u = str(row.get('session') or req_session_u or session_label or '').upper().strip()
-                    _row_side_u = str(row.get('side') or getattr(obj, 'side', '') or '').upper().strip()
-                    if _setup_audit_policy_label(row, uid=int(uid), session_name=_row_sess_u, side=_row_side_u) != 'KEEP':
-                        continue
-                    setattr(obj, 'canonical_gate_keep', True)
-                except Exception:
-                    continue
                 src_session_u = str(getattr(obj, 'source_session', '') or '').upper().strip()
                 if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                     try:
@@ -12564,11 +12438,11 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                 continue
 
         if not out:
-            # yver164: no recent-email/BigMove fallback here. AutoTrade must only
-            # consume rows that are present in executable_setups and currently show
-            # Gate=KEEP in /setup_audit. This prevents NEAR/BMAT-style rows that are
-            # not in the setup audit lane from appearing in /autotrade_last.
             fallback_items = []
+            try:
+                fallback_items = _recent_delivery_lane_setup_objects(int(uid), session_name=req_session_u, max_age_min=max(20, int(_autotrade_entry_window_min())), limit=max(1, int(limit * 4))) or []
+            except Exception:
+                fallback_items = []
             for obj in (fallback_items or []):
                 try:
                     src_session_u = str(getattr(obj, 'source_session', '') or '').upper().strip()
@@ -12717,14 +12591,14 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
     sess = str(session_label or '').upper().strip()
     if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
         return []
-    # yver161: this helper is allowed to read the same fresh shared executable lane
-    # used by /screen and email. If email-matched entry is required, candidates are
-    # still filtered by a recent emailed_setups row and then re-checked by the final
-    # email gate inside _autotrade_place_trade.
+    # yver129: when AutoTrade is synced to subscriber delivery, the broad fresh
+    # executable queue is not an entry source. The normal DB selector already
+    # returns recent emailed setup_ids only.
     try:
-        require_email_entry = bool(_autotrade_require_setup_email_for_entry())
+        if _autotrade_require_setup_email_for_entry():
+            return []
     except Exception:
-        require_email_entry = True
+        return []
     if not bool(globals().get('AUTOTRADE_FRESH_SESSION_QUEUE_ENABLED', True)):
         return []
     try:
@@ -12743,56 +12617,24 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
-        email_cutoff = float(time.time()) - float(max(60, int(_autotrade_entry_window_min()) * 60))
         cur.execute(
             """
-            SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
+            SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts
             FROM executable_setups x
             LEFT JOIN emailed_setups e
-                   ON e.setup_id = x.setup_id
-                  AND e.emailed_ts >= ?
-                  AND (e.user_id = ? OR e.user_id = x.user_id OR e.user_id = 0 OR x.user_id = 0)
-                  AND (UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
+                   ON e.user_id = x.user_id
+                  AND e.setup_id = x.setup_id
             LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-            WHERE x.user_id IN (?, 0)
+            WHERE x.user_id = ?
               AND x.executable_ts >= ?
               AND UPPER(COALESCE(x.session, '')) = ?
               AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-              AND (? = 0 OR COALESCE(e.emailed_ts, 0) >= ?)
-            GROUP BY x.rowid
-            ORDER BY COALESCE(MAX(e.emailed_ts), x.executable_ts) DESC, x.executable_ts DESC, x.setup_id DESC
+            ORDER BY x.executable_ts DESC, x.setup_id DESC
             LIMIT ?
             """,
-            (
-                float(email_cutoff), int(owner_uid), sess,
-                int(owner_uid), float(cutoff), sess,
-                1 if require_email_entry else 0, float(email_cutoff), int(lim * 2),
-            ),
+            (int(owner_uid), float(cutoff), sess, int(lim * 2)),
         )
         rows = [dict(r) for r in (cur.fetchall() or [])]
-        if not rows and bool(require_email_entry):
-            try:
-                cur.execute(
-                    """
-                    SELECT x.*, e.emailed_ts AS emailed_ts
-                    FROM emailed_setups e
-                    JOIN executable_setups x ON x.setup_id = e.setup_id
-                    LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-                    WHERE e.user_id IN (?, 0)
-                      AND x.user_id IN (?, 0)
-                      AND e.emailed_ts >= ?
-                      AND x.executable_ts >= ?
-                      AND (UPPER(COALESCE(e.session, '')) = ? OR COALESCE(e.session, '') = '')
-                      AND UPPER(COALESCE(x.session, '')) = ?
-                      AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-                    ORDER BY e.emailed_ts DESC, x.executable_ts DESC, x.setup_id DESC
-                    LIMIT ?
-                    """,
-                    (int(owner_uid), int(owner_uid), float(email_cutoff), float(cutoff), sess, sess, int(lim * 2)),
-                )
-                rows = [dict(r) for r in (cur.fetchall() or [])]
-            except Exception:
-                rows = rows or []
         con.close()
     except Exception as e:
         try:
@@ -12805,22 +12647,10 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
     rejects = Counter()
     for row in rows:
         try:
-            # yver164: fresh-session AutoTrade queue must also be exactly
-            # /setup_audit Gate=KEEP; otherwise it is not a real trade setup lane.
-            try:
-                _row_side = str(row.get('side') or '').upper().strip()
-                if _setup_audit_policy_label(row, uid=int(owner_uid), session_name=sess, side=_row_side) != 'KEEP':
-                    continue
-            except Exception:
-                continue
             objs = _executable_rows_to_setup_objects([row], session_name=sess)
             if not objs:
                 continue
             obj = objs[0]
-            try:
-                setattr(obj, 'canonical_gate_keep', True)
-            except Exception:
-                pass
             ok, why = _autotrade_db_signal_structurally_valid(obj, session_name=sess)
             if ok:
                 out.append(obj)
@@ -12838,7 +12668,7 @@ def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: s
 
 def _autotrade_select_db_setups_cached(uid: int, session_label: str, lookback_hours: int = 12, limit: int = 1, ttl: int = 15, force_refresh: bool = False) -> list:
     lookback_hours = _autotrade_candidate_lookback_hours(float(lookback_hours or 12))
-    cache_key = f"autotrade_db_setups_v168:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
+    cache_key = f"autotrade_db_setups_v129:{int(uid)}:{str(session_label or '').upper().strip()}:{int(lookback_hours or 12)}:{int(limit or 1)}"
     ttl_i = max(3, int(ttl or 15))
     try:
         if (not force_refresh) and cache_valid(cache_key, ttl_i):
@@ -13658,18 +13488,6 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
             return (False, str(_email_why or 'missing_recent_setup_email'))
     except Exception:
         return (False, 'setup_email_gate_exception')
-
-    # yver164: final hard sync lock. A setup can only reach Bybit if it is the
-    # same current executable row that /setup_audit would show as Gate=KEEP.
-    try:
-        if not bool(getattr(s, 'canonical_gate_keep', False)) and not _canonical_setup_id_gate_keep(int(uid), setup_id, session_label):
-            try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_canonical_gate_not_keep'), last_reason='autotrade_canonical_gate_not_keep')
-            except Exception:
-                pass
-            return (False, 'autotrade_canonical_gate_not_keep')
-    except Exception:
-        return (False, 'autotrade_canonical_gate_check_exception')
 
     # yver143: final live entry must still pass the same user-visible KEEP/context
     # delivery gate used by setup email and /screen.  This prevents any fallback or
@@ -14814,12 +14632,11 @@ ALERT_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
-AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "35") or 35)
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "55") or 55)
 # Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
 # Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
-AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "180") or 180)
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "75") or 75)
-AUTOTRADE_JOB_RENDER_SAFE_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_RENDER_SAFE_INTERVAL_SEC", "300") or 300)
+AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "60") or 60)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "115") or 115)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
 AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", True)
@@ -18101,17 +17918,6 @@ def db_init():
     )
     """)
 
-    # yver162: older production DBs may have emailed_setups without a session column.
-    # AutoTrade/email matching now joins on session, so ensure the column exists
-    # instead of letting the selector silently return no_setups after a valid email.
-    try:
-        cur.execute("PRAGMA table_info(emailed_setups)")
-        _es_cols = {r[1] for r in cur.fetchall()}
-        if 'session' not in _es_cols:
-            cur.execute("ALTER TABLE emailed_setups ADD COLUMN session TEXT NOT NULL DEFAULT ''")
-    except Exception:
-        pass
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS executable_setups (
         user_id INTEGER NOT NULL,
@@ -20351,28 +20157,6 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             }
             return
 
-        # yver165: BigMove/BMAT rows may be emailed as market alerts, but AutoTrade
-        # must still consume only the canonical current setup lane.  If the synthetic
-        # BigMove setup is not also present as /setup_audit Gate=KEEP, do not try it
-        # or show it as the main /autotrade_last attempt.
-        _canon_bigmove = []
-        for _bm_s in list(setup_list or []):
-            try:
-                _bm_sid = str(getattr(_bm_s, 'setup_id', '') or getattr(_bm_s, 'id', '') or '').strip()
-                if _bm_sid and _canonical_setup_id_gate_keep(owner_uid, _bm_sid, sess):
-                    setattr(_bm_s, 'canonical_gate_keep', True)
-                    _canon_bigmove.append(_bm_s)
-            except Exception:
-                continue
-        setup_list = list(_canon_bigmove or [])
-        if not setup_list:
-            _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
-                'reason': 'bigmove_not_in_canonical_gate_keep_lane', 'session': sess,
-                'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
-            }
-            return
-
         async with AUTOTRADE_EXEC_LOCK:
             now_ts = float(time.time())
             for _s in list(setup_list or []):
@@ -20388,7 +20172,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             try:
                 await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(setup_list or []), 'emailed_setups', 'bigmove_email_autotrade_immediate', timeout=6)
                 try:
-                    cache_delete(f"autotrade_db_setups_v168:{owner_uid}:{sess}:24:30")
+                    cache_delete(f"autotrade_db_setups_v129:{owner_uid}:{sess}:24:30")
                 except Exception:
                     pass
             except Exception as e:
@@ -24239,53 +24023,32 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
 def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: float = 0.0, limit: int = 10) -> List[dict]:
     con = db_connect()
     cur = con.cursor()
-    uid_i = int(user_id or 0)
-    # Placeholder order: emailed_setups user_id, executable_setups user_id filter, ts_from, optional session, order-priority user_id, limit.
-    params = [uid_i]
-    if uid_i > 0:
-        uid_where = "x.user_id IN (?, 0)"
-        params.append(uid_i)
-    else:
-        uid_where = "x.user_id=?"
-        params.append(0)
-    params.append(float(ts_from))
+    params = [int(user_id), float(ts_from)]
     where_session = ''
     sess = str(session_name or '').upper().strip()
     if sess:
         where_session = ' AND UPPER(COALESCE(x.session, "")) = ? '
         params.append(sess)
-    fetch_limit = max(int(limit or 10), min(max(int(limit or 10) * 8, int(limit or 10) + 40), 300))
-    params.extend([uid_i, int(fetch_limit)])
+    fetch_limit = max(int(limit or 10), min(max(int(limit or 10) * 6, int(limit or 10) + 30), 250))
+    params.append(int(fetch_limit))
     cur.execute(
         f"""
         SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
         FROM executable_setups x
         LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-        LEFT JOIN emailed_setups e ON e.user_id = ? AND e.setup_id = x.setup_id
-        WHERE {uid_where}
+        LEFT JOIN emailed_setups e ON e.user_id = x.user_id AND e.setup_id = x.setup_id
+        WHERE x.user_id=?
           AND x.executable_ts>=?
           {where_session}
           AND COALESCE(o.outcome, 'OPEN')='OPEN'
         GROUP BY x.user_id, x.setup_id
-        ORDER BY CASE WHEN x.user_id=? THEN 0 ELSE 1 END, x.executable_ts DESC, x.setup_id DESC
+        ORDER BY x.executable_ts DESC, x.setup_id DESC
         LIMIT ?
         """,
         tuple(params),
     )
-    raw_rows = [dict(r) for r in (cur.fetchall() or [])]
+    rows = [dict(r) for r in (cur.fetchall() or [])]
     con.close()
-    rows = []
-    seen_sid = set()
-    for _r in raw_rows:
-        try:
-            _sid = str(_r.get('setup_id') or '').strip()
-            if _sid and _sid in seen_sid:
-                continue
-            if _sid:
-                seen_sid.add(_sid)
-            rows.append(_r)
-        except Exception:
-            rows.append(_r)
     # Filter already-persisted stale/old rows before email/autotrade consume them.
     # Ver32 uses the same final gate as live generation, so old low-confidence rows
     # from pre-patch deployments no longer leak into email or AutoTrade.
@@ -24554,236 +24317,6 @@ def _executable_rows_to_setup_objects(rows: List[dict], session_name: str = '') 
         except Exception:
             continue
     return out
-
-
-
-def _canonical_current_keep_executable_rows(user_id: int, session_name: str = '', max_age_sec: int | float | None = None, limit: int = 50, require_recent_email: bool = False, require_unemailed: bool = False) -> list[dict]:
-    """Authoritative current setup lane for /screen, setup email and AutoTrade.
-
-    A row is returned only when it exists in executable_setups, is inside the
-    current entry/actionability window, and the same live gate shown by
-    /setup_audit says Gate=KEEP. This prevents /screen/email/AutoTrade from
-    consuming different sources such as stale emailed BigMove rows or raw scans.
-    """
-    try:
-        uid = int(user_id or 0)
-    except Exception:
-        uid = 0
-    try:
-        age_sec = float(max_age_sec if max_age_sec is not None else max(60, int(_autotrade_entry_window_min()) * 60))
-    except Exception:
-        age_sec = 3600.0
-    age_sec = max(60.0, float(age_sec or 3600.0))
-    cutoff = float(time.time()) - age_sec
-    email_cutoff = float(time.time()) - max(60.0, float(max(60, int(_autotrade_entry_window_min()) * 60)))
-    req_session_u = str(session_name or '').upper().strip()
-    out: list[dict] = []
-    seen = set()
-    try:
-        with sqlite3.connect(DB_PATH) as con:
-            con.row_factory = sqlite3.Row
-            cur = con.cursor()
-            uid_params = [uid, 0] if uid > 0 else [0]
-            # Preserve order and avoid duplicate placeholders when uid==0.
-            uid_params = list(dict.fromkeys([int(x) for x in uid_params if int(x) >= 0])) or [0]
-            uid_ph = ','.join(['?'] * len(uid_params))
-            sess_clause = ''
-            params = [uid, float(email_cutoff)] + list(uid_params) + [float(cutoff)]
-            if req_session_u:
-                sess_clause = " AND UPPER(COALESCE(x.session,''))=? "
-                params.append(req_session_u)
-            params.append(int(max(int(limit or 50) * 6, int(limit or 50), 80)))
-            rows = cur.execute(f"""
-                SELECT x.*, COALESCE(MAX(e.emailed_ts), 0) AS emailed_ts
-                FROM executable_setups x
-                LEFT JOIN emailed_setups e
-                       ON e.setup_id = x.setup_id
-                      AND e.user_id IN (?,0)
-                      AND e.emailed_ts >= ?
-                LEFT JOIN signal_outcomes o ON o.setup_id = x.setup_id
-                WHERE x.user_id IN ({uid_ph})
-                  AND x.executable_ts >= ?
-                  {sess_clause}
-                  AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
-                GROUP BY x.rowid
-                ORDER BY x.executable_ts ASC, x.setup_id ASC
-                LIMIT ?
-            """, tuple(params)).fetchall() or []
-    except Exception:
-        rows = []
-    for raw in rows:
-        try:
-            r = dict(raw)
-            sid = str(r.get('setup_id') or '').strip()
-            if not sid:
-                continue
-            sess = str(r.get('session') or req_session_u or '').upper().strip()
-            if req_session_u and sess and sess != req_session_u:
-                continue
-            if bool(require_recent_email) and float(r.get('emailed_ts') or 0.0) < email_cutoff:
-                continue
-            if bool(require_unemailed) and float(r.get('emailed_ts') or 0.0) >= email_cutoff:
-                continue
-            ident = _setup_identity_from_obj(r) or sid
-            if ident in seen:
-                continue
-            side = str(r.get('side') or '').upper().strip()
-            # This is the single source-of-truth gate displayed by /setup_audit.
-            try:
-                gate = _setup_audit_policy_label(r, uid=int(uid), session_name=sess, side=side)
-            except Exception:
-                gate = 'OFF'
-            if str(gate or '').upper().strip() != 'KEEP':
-                continue
-            objs = _executable_rows_to_setup_objects([r], session_name=sess)
-            if not objs:
-                continue
-            obj = objs[0]
-            try:
-                ok_basic = bool(_setup_volume_ok(obj))
-                if ok_basic:
-                    entry = float(getattr(obj, 'entry', 0.0) or 0.0)
-                    sl = float(getattr(obj, 'sl', 0.0) or 0.0)
-                    tp = float(_setup_target_tp(obj, 0.0) or 0.0)
-                    sd = str(getattr(obj, 'side', '') or '').upper().strip()
-                    ok_basic = sd in {'BUY','SELL'} and entry > 0 and sl > 0 and tp > 0 and ((sd == 'BUY' and sl < entry < tp) or (sd == 'SELL' and tp < entry < sl))
-                if not ok_basic:
-                    continue
-            except Exception:
-                continue
-            try:
-                setattr(obj, 'canonical_gate_keep', True)
-                setattr(obj, 'source_kind', str(getattr(obj, 'source_kind', '') or 'executable_setups'))
-                if float(r.get('emailed_ts') or 0.0) > 0:
-                    setattr(obj, 'email_logged_ts', float(r.get('emailed_ts') or 0.0))
-                    setattr(obj, 'emailed_ts', float(r.get('emailed_ts') or 0.0))
-                r['_obj'] = obj
-                r['_canonical_gate_keep'] = 1
-            except Exception:
-                pass
-            seen.add(ident)
-            out.append(r)
-            if len(out) >= int(limit or 50):
-                break
-        except Exception:
-            continue
-    return out[:int(limit or 50)]
-
-
-def _canonical_current_keep_executable_setup_objects(user_id: int, session_name: str = '', max_age_sec: int | float | None = None, limit: int = 10, require_recent_email: bool = False, require_unemailed: bool = False) -> list:
-    rows = _canonical_current_keep_executable_rows(user_id, session_name=session_name, max_age_sec=max_age_sec, limit=limit, require_recent_email=require_recent_email, require_unemailed=require_unemailed)
-    out = []
-    for r in rows:
-        try:
-            obj = r.get('_obj') if isinstance(r, dict) else None
-            if obj is None:
-                obj = (_executable_rows_to_setup_objects([dict(r)], session_name=session_name) or [None])[0]
-            if obj is not None:
-                try:
-                    setattr(obj, 'canonical_gate_keep', True)
-                except Exception:
-                    pass
-                out.append(obj)
-        except Exception:
-            continue
-    return out[:int(limit or 10)]
-
-
-def _canonical_setup_id_gate_keep(user_id: int, setup_id: str, session_name: str = '') -> bool:
-    sid = str(setup_id or '').strip()
-    if not sid:
-        return False
-    try:
-        rows = _canonical_current_keep_executable_rows(int(user_id or 0), session_name=session_name, max_age_sec=max(60, int(_autotrade_entry_window_min()) * 60), limit=100)
-        return any(str((r or {}).get('setup_id') or '').strip() == sid for r in (rows or []))
-    except Exception:
-        return False
-
-
-def _mark_setup_batch_canonical_keep(setups: list, user_id: int, session_name: str) -> list:
-    """Mark exact setup objects that are currently in the canonical Gate=KEEP lane.
-
-    yver168: this is used by /screen email-sync and immediate AutoTrade so the
-    same setup shown to the user is not lost behind a second selector cache or
-    legacy strict-edge gate. It does not place trades; Bybit/risk checks still
-    happen inside _autotrade_place_trade.
-    """
-    out = []
-    try:
-        uid_i = int(user_id or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
-    except Exception:
-        uid_i = 0
-    sess_u = str(session_name or '').upper().strip()
-    for _s in list(setups or []):
-        try:
-            sid = str(getattr(_s, 'setup_id', '') or getattr(_s, 'id', '') or '').strip()
-            if not sid:
-                continue
-            if bool(getattr(_s, 'canonical_gate_keep', False)) or _canonical_setup_id_gate_keep(uid_i, sid, sess_u):
-                try:
-                    setattr(_s, 'canonical_gate_keep', True)
-                    setattr(_s, 'source_session', sess_u or str(getattr(_s, 'source_session', '') or ''))
-                    setattr(_s, 'delivery_lane_locked', True)
-                except Exception:
-                    pass
-                out.append(_s)
-        except Exception:
-            continue
-    return out
-
-
-async def _screen_trigger_autotrade_for_visible_setups(uid: int, session_name: str, shown_setups: list, reason: str = 'screen_visible_gate_keep'):
-    """Best-effort immediate AutoTrade retry for setups currently visible on /screen.
-
-    This is intentionally narrow: only setup_ids still in canonical Gate=KEEP and
-    with a recent email can get through _autotrade_place_trade. It prevents the
-    previous failure mode where /screen and email were correct but AutoTrade waited
-    for a stale selector cache and reported no_setups.
-    """
-    try:
-        owner_uid = int(AUTOTRADE_OWNER_UID or 0)
-        if owner_uid <= 0 or not _autotrade_ready() or not _autotrade_entry_enabled():
-            return
-        try:
-            if int(uid or 0) != owner_uid and not is_admin_user(int(uid or 0)):
-                return
-        except Exception:
-            return
-        sess_u = str(session_name or '').upper().strip()
-        if sess_u not in {'ASIA', 'LON', 'NY'}:
-            return
-        canonical = _mark_setup_batch_canonical_keep(list(shown_setups or []), owner_uid, sess_u)
-        ready = []
-        for _s in canonical:
-            try:
-                ok, _why = _autotrade_recent_email_gate_allows_setup(owner_uid, _s, session_label=sess_u)
-                if ok:
-                    ready.append(_s)
-            except Exception:
-                continue
-        if not ready:
-            return
-        try:
-            for _s in ready:
-                setattr(_s, 'source_kind', 'emailed_setups')
-                setattr(_s, 'delivery_lane_locked', True)
-        except Exception:
-            pass
-        _LAST_AUTOTRADE_DECISION[owner_uid] = {
-            'status': 'QUEUED',
-            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-            'reason': str(reason or 'screen_visible_gate_keep'),
-            'session': sess_u,
-            'mode': str(_autotrade_runtime_mode()).lower(),
-            'trigger': 'screen_visible_gate_keep',
-            'attempted_candidates': [
-                {'setup_id': str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or ''), 'symbol': str(getattr(x, 'symbol', '') or ''), 'side': str(getattr(x, 'side', '') or '')}
-                for x in ready[:8]
-            ],
-        }
-        _safe_create_task(_trigger_autotrade_after_email_async(owner_uid, sess_u, list(ready)), 'autotrade_after_screen_visible_gate_keep')
-    except Exception:
-        pass
 
 
 # =========================================================
@@ -27844,7 +27377,7 @@ async def send_long_message(
                             pass
                 except (TimedOut, NetworkError) as e:
                     try:
-                        logger.info('Telegram send transient network issue ignored/retried (pre-table): %s', e)
+                        logger.warning('Telegram send failed (pre-table network): %s', e)
                     except Exception:
                         pass
                     await asyncio.sleep(1)
@@ -27987,7 +27520,7 @@ async def send_long_message(
                 except Exception as e2:
                     logger.warning("Telegram plain fallback failed: %s", e2)
             else:
-                logger.info("Telegram send transient network issue ignored/retried: %s", e)
+                logger.warning("Telegram send failed (network): %s", e)
                 await asyncio.sleep(2)
                 try:
                     await _send(parse_mode)
@@ -27998,7 +27531,7 @@ async def send_long_message(
                         except Exception as e3:
                             logger.warning("Telegram plain fallback after network retry failed: %s", e3)
                     else:
-                        logger.info("Telegram retry failed after transient network issue: %s", e2)
+                        logger.warning("Telegram retry failed (network): %s", e2)
 
         except Exception as e:
             if _is_parse_entity_error(e):
@@ -41334,258 +40867,6 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
     except Exception:
         return
 
-
-# =========================================================
-# UNIVERSAL INSTANT COMMAND ACK / BACKGROUND DISPATCH (yver156)
-# =========================================================
-# Goal: Telegram must acknowledge every known command immediately.  The command's
-# real work is then posted back to the same chat when ready.  This prevents a cold
-# /screen, setup report, Bybit call, or DB/report rebuild from making the bot look
-# unresponsive to the next command.
-_COMMAND_HANDLER_REGISTRY: dict[str, Any] = {}
-_COMMAND_BACKGROUND_TASKS: dict[str, asyncio.Task] = {}
-_COMMAND_BACKGROUND_SEMAPHORE: asyncio.Semaphore | None = None
-_COMMAND_ACK_EXEMPT = set(FAST_PATH_COMMANDS) | {"start", "guide_full"}
-_COMMAND_ACK_PREFIX = "⏳"
-
-
-def _register_command_handler(app, command, callback, **kwargs):
-    """Register the normal CommandHandler and remember it for the instant ACK router."""
-    try:
-        names = command if isinstance(command, (list, tuple, set)) else [command]
-        for name in names:
-            _COMMAND_HANDLER_REGISTRY[str(name or "").strip().lower()] = callback
-    except Exception:
-        pass
-    return app.add_handler(CommandHandler(command, callback, **kwargs))
-
-
-def _register_background_command_alias(command: str, callback) -> None:
-    try:
-        _COMMAND_HANDLER_REGISTRY[str(command or "").strip().lower()] = callback
-    except Exception:
-        pass
-
-
-def _command_bg_semaphore() -> asyncio.Semaphore:
-    global _COMMAND_BACKGROUND_SEMAPHORE
-    if _COMMAND_BACKGROUND_SEMAPHORE is None:
-        try:
-            n = max(1, int(os.getenv("COMMAND_BACKGROUND_MAX_CONCURRENT", "3") or 3))
-        except Exception:
-            n = 3
-        _COMMAND_BACKGROUND_SEMAPHORE = asyncio.Semaphore(n)
-    return _COMMAND_BACKGROUND_SEMAPHORE
-
-
-def _parse_command_text(update: Update) -> tuple[str, list[str]]:
-    try:
-        txt = str(getattr(getattr(update, "message", None), "text", "") or "").strip()
-        if not txt.startswith("/"):
-            return "", []
-        parts = txt.split()
-        cmd = parts[0][1:].split("@")[0].strip().lower()
-        return cmd, parts[1:]
-    except Exception:
-        return "", []
-
-
-def _command_ack_text(cmd: str) -> str:
-    c = str(cmd or "command").strip().lstrip("/") or "command"
-    return (
-        f"{_COMMAND_ACK_PREFIX} /{c} is working in the background.\n"
-        "I’ll send the result here when it is ready."
-    )
-
-
-async def _send_text_chunks_bot(bot: Bot, chat_id: int, text: str, *, parse_mode=None, reply_markup=None, disable_web_page_preview=True, max_len: int = 3900) -> None:
-    s = str(text or "")
-    if not s:
-        return
-    chunks = [s[i:i+max_len] for i in range(0, len(s), max_len)] or [s]
-    for idx, chunk in enumerate(chunks):
-        await bot.send_message(
-            chat_id=int(chat_id),
-            text=chunk,
-            parse_mode=parse_mode,
-            disable_web_page_preview=disable_web_page_preview,
-            reply_markup=reply_markup if idx == 0 else None,
-        )
-
-
-def _screen_snapshot_payload_sync(uid: int) -> dict:
-    """Build a /screen reply payload in the screen worker thread, never on the Telegram loop."""
-    try:
-        user = get_user(int(uid)) or {}
-        if not has_active_access(int(uid), user):
-            return {
-                "text": "⛔️ Trial finished.\n\nYour 7-day trial is over — you need to pay to keep using PulseFutures.\n\n👉 /billing",
-                "parse_mode": None,
-                "kb": [],
-            }
-        live_session = current_session_utc()
-        scan_session = str(scan_session_name_utc() or "").upper()
-        loc_label, loc_time = user_location_and_time(user)
-        try:
-            screen_fallback_min = int(_screen_actionable_fallback_max_age_min())
-        except Exception:
-            screen_fallback_min = 60
-        can_show_email_source = _screen_user_can_see_email_source(int(uid), user)
-
-        cache_keys = [f"uid:{int(uid)}::{scan_session}", f"global::{scan_session}"]
-        try:
-            for _k, _v in list(_SCREEN_CACHE.items()):
-                if str(_k).startswith((f"uid:{int(uid)}::", "global::")) and (_v or {}).get("body"):
-                    cache_keys.append(_k)
-        except Exception:
-            pass
-        cache_entry, age = _screen_choose_best_cache(cache_keys)
-        cache_ts = float((cache_entry or {}).get("ts", 0.0) or 0.0)
-        if (cache_entry or {}).get("body") and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
-            note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
-            if age <= float(SCREEN_CACHE_TTL_SEC):
-                note = "_Showing latest cached scan._\n"
-            header = (
-                f"*PulseFutures — Market Scan*\n"
-                f"{HDR}\n"
-                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                f"{_screen_when_line('Cached scan built', cache_ts)}"
-                f"{note}"
-            )
-            kb = [(sym, sid) for (sym, sid) in ((cache_entry or {}).get("kb") or [])]
-            return {"text": _screen_markdown_to_html((header + "\n" + str((cache_entry or {}).get("body") or "")).strip()), "parse_mode": ParseMode.HTML, "kb": kb}
-
-        quick_best = get_cached_futures_tickers() or {}
-        if quick_best:
-            try:
-                body, kb, shown_setups = _screen_recent_db_body_and_kb(
-                    int(uid), scan_session, quick_best,
-                    max_age_min=screen_fallback_min,
-                    include_email_source=bool(can_show_email_source),
-                )
-                if body:
-                    try:
-                        source_ts = max([float(getattr(x, 'email_logged_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0) for x in (shown_setups or [])] or [0.0])
-                    except Exception:
-                        source_ts = 0.0
-                    header = (
-                        f"*PulseFutures — Market Scan*\n"
-                        f"{HDR}\n"
-                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                        f"{_screen_when_line('Displayed setup source', source_ts)}"
-                        f"{('_Showing recent emailed setup queue._' if _screen_requires_emailed_delivery_for_setup() else '_Showing recent executable setup queue._')}\n"
-                    )
-                    return {"text": _screen_markdown_to_html((header + "\n" + body).strip()), "parse_mode": ParseMode.HTML, "kb": [(sym, sid) for (sym, sid) in (kb or [])]}
-            except Exception:
-                pass
-            try:
-                body, kb, _ = _screen_quick_ticker_snapshot_body(quick_best, scan_session)
-                header = (
-                    f"*PulseFutures — Market Scan*\n"
-                    f"{HDR}\n"
-                    f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                    f"{_screen_when_line('Ticker snapshot', time.time())}"
-                )
-                return {"text": _screen_markdown_to_html((header + "\n" + body).strip()), "parse_mode": ParseMode.HTML, "kb": [(sym, sid) for (sym, sid) in (kb or [])]}
-            except Exception:
-                pass
-        return {"text": "🔎 /screen snapshot is not ready yet. I’ll send the result when available.", "parse_mode": None, "kb": []}
-    except Exception as e:
-        return {"text": f"🔎 /screen is refreshing in the background. Current snapshot could not be built instantly ({type(e).__name__}).", "parse_mode": None, "kb": []}
-
-
-async def _screen_background_publish(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, chat_id: int) -> None:
-    try:
-        try:
-            _schedule_screen_cache_refresh(int(uid), str(scan_session_name_utc() or "").upper())
-        except Exception:
-            pass
-        payload = await to_thread_screen(_screen_snapshot_payload_sync, int(uid), timeout=float(os.getenv("SCREEN_COMMAND_PUBLISH_TIMEOUT_SEC", "30") or 30))
-        kb_rows = []
-        try:
-            kb_rows = [[InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))] for (sym, sid) in (payload.get("kb") or [])]
-        except Exception:
-            kb_rows = []
-        await _send_text_chunks_bot(
-            context.bot,
-            int(chat_id),
-            str(payload.get("text") or ""),
-            parse_mode=payload.get("parse_mode"),
-            reply_markup=InlineKeyboardMarkup(kb_rows) if kb_rows else None,
-        )
-    except asyncio.TimeoutError:
-        try:
-            await context.bot.send_message(chat_id=int(chat_id), text="🔎 /screen refresh is still running. I’ll keep the cache refresh in the background — run /screen again shortly for the latest snapshot.")
-        except Exception:
-            pass
-    except Exception as e:
-        try:
-            await context.bot.send_message(chat_id=int(chat_id), text=f"⚠️ /screen background result failed: {type(e).__name__}. Please try /screen again shortly.")
-        except Exception:
-            pass
-
-
-async def _command_background_runner(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str, args: list[str], callback) -> None:
-    async with _command_bg_semaphore():
-        try:
-            await asyncio.sleep(float(os.getenv("COMMAND_BACKGROUND_START_DELAY_SEC", "0.05") or 0.05))
-            try:
-                context.args = list(args or [])
-            except Exception:
-                pass
-            await callback(update, context)
-        except ApplicationHandlerStop:
-            return
-        except Exception as e:
-            try:
-                await context.bot.send_message(
-                    chat_id=int(update.effective_chat.id),
-                    text=f"⚠️ /{cmd} background task failed: {type(e).__name__}: {str(e)[:300]}",
-                )
-            except Exception:
-                pass
-
-
-async def _universal_background_command_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ACK every known non-fast command immediately, then run it in the background."""
-    try:
-        if not getattr(update, "message", None):
-            return
-        cmd, args = _parse_command_text(update)
-        if not cmd or cmd in _COMMAND_ACK_EXEMPT:
-            return
-        callback = _COMMAND_HANDLER_REGISTRY.get(cmd)
-        if not callback:
-            return
-        try:
-            context.args = list(args or [])
-        except Exception:
-            pass
-
-        # Always acknowledge first.  Telegram users see this instantly even when the
-        # real command is a cold scan, Bybit query, or long policy/report rebuild.
-        try:
-            await update.message.reply_text(_command_ack_text(cmd))
-        except Exception:
-            pass
-
-        try:
-            uid = int(update.effective_user.id)
-            chat_id = int(update.effective_chat.id)
-        except Exception:
-            uid = 0
-            chat_id = 0
-
-        if cmd == "screen":
-            _safe_create_task(_screen_background_publish(update, context, uid, chat_id), f"cmd_bg_screen_{uid}")
-        else:
-            _safe_create_task(_command_background_runner(update, context, cmd, list(args or []), callback), f"cmd_bg_{cmd}_{uid}")
-        raise ApplicationHandlerStop
-    except ApplicationHandlerStop:
-        raise
-    except Exception:
-        return
-
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Plain text help (no tables, no HTML builder)
     await send_long_message(
@@ -45897,7 +45178,7 @@ def _setup_audit_actual_pnl_by_setup(user_id: int, start_ts: float = 0.0, end_ts
     return out
 
 
-def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None, dedup_keep: str = 'earliest') -> list[dict]:
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None) -> list[dict]:
     """Load setup rows for audit.
 
     Default source is executable_setups only. Raw generated_setups can be enabled with
@@ -45939,12 +45220,8 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
                 cur = con.cursor()
                 if include_exec:
                     try:
-                        if int(uid or 0) > 0:
-                            params = [int(uid)]
-                            where = "WHERE user_id IN (?,0)"
-                        else:
-                            params = [0]
-                            where = "WHERE user_id=?"
+                        params = [int(uid)]
+                        where = "WHERE user_id=?"
                         if cutoff > 0:
                             where += " AND executable_ts>=?"
                             params.append(float(cutoff))
@@ -46033,12 +45310,9 @@ def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, ded
     cleaned = sorted(cleaned, key=lambda x: _setup_audit_row_ts(x), reverse=True)
     if bool(dedup):
         deduped: dict[str, dict] = {}
-        keep_mode = str(dedup_keep or 'earliest').lower().strip()
-        # Reports/overall keep the earliest practical setup to avoid inflating WR.
-        # The rolling /setup_audit command uses latest so users can see that setup
-        # generation is still alive when the same symbol/side/family refreshes later.
-        source_iter = cleaned if keep_mode in {'latest', 'newest', 'recent'} else sorted(cleaned, key=lambda x: _setup_audit_row_ts(x))
-        for r in source_iter:
+        # Keep the earliest actionable row within the practical setup key. Keeping
+        # the newest row turns repeated snapshots into fake OPENs and inflates counts.
+        for r in sorted(cleaned, key=lambda x: _setup_audit_row_ts(x)):
             key = _setup_audit_unique_key(r)
             if key not in deduped:
                 deduped[key] = r
@@ -46203,40 +45477,6 @@ def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: st
     except Exception:
         return '-'
 
-
-def _setup_audit_combo_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
-    """Return the current combo policy only, matching /setup_matrix policy.
-
-    yver157: /setup_audit previously used "Policy" to mean current live
-    delivery/actionability. That made historical rows look inconsistent with
-    /setup_matrix policy. This helper reports the combo policy lane (KEEP/WATCH/
-    DISABLE) while _setup_audit_policy_label remains the live Gate.
-    """
-    try:
-        rr = dict(row or {})
-        sess = str(session_name or rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
-        side_u = str(side or rr.get('side') or '').upper().strip()
-        if side_u in {'BUY', 'SELL'}:
-            rr['side'] = side_u
-        policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
-        info = _setup_combo_policy_lookup_for_setup(rr, session_name=sess, user_id=policy_uid) or {}
-        found = bool(info.get('found'))
-        raw_status = str(info.get('status') or '').upper().strip()
-        try:
-            enabled = int(info.get('enabled') if info.get('enabled') is not None else (1 if not found else 0)) == 1
-        except Exception:
-            enabled = True if not found else False
-        status = _setup_policy_effective_status(raw_status, found=found)
-        if (not enabled) or status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}:
-            return 'DISABLE'
-        if status == 'KEEP':
-            return 'KEEP'
-        if status == 'WATCH':
-            return 'WATCH'
-        return 'WATCH' if not found else 'OFF'
-    except Exception:
-        return 'OFF'
-
 def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
     """Final actionable policy label for one /setup_audit row.
 
@@ -46363,7 +45603,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     limit = max(0, int(limit or 0))
     hours = max(1, min(8760, int(hours or 24)))
     result_horizon = _setup_audit_result_horizon_hours()
-    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit, dedup=True, dedup_keep='latest')
+    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit, dedup=True)
     min_vol_m = _setup_min_volume_floor_usd() / 1e6
     if not rows:
         return (
@@ -46379,7 +45619,6 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
 
     table_rows = []
-    table_sort_ts = []  # yver163: hidden sort key for chronological /setup_audit display
     tp_n = sl_n = nohit_n = open_n = 0
     for r in rows:
         sid = str(r.get('setup_id') or '').strip()
@@ -46410,15 +45649,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         except Exception:
             volm = 0.0
         combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
-        policy_label = _setup_audit_combo_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
-        gate_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
+        policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
         at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
-        row_vals = [ttxt, sym, side, combo_key, policy_label, gate_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result]
-        table_rows.append(row_vals)
-        try:
-            table_sort_ts.append(float(ts or 0.0))
-        except Exception:
-            table_sort_ts.append(0.0)
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -46431,17 +45664,13 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
 
     # Ver16: show all rows. send_long_message now chunks <pre> tables safely,
     # so there is no need to hide audit rows for Telegram length limits.
-    # yver163: sort by setup time ascending (earliest to latest), not Policy priority.
-    display_rows = [row for _ts, _i, row in sorted(
-        zip(table_sort_ts, range(len(table_rows)), table_rows),
-        key=lambda item: (float(item[0] or 0.0), int(item[1]))
-    )]
+    display_rows = list(table_rows)
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'Gate', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
@@ -46450,7 +45679,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
         f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | TP=<b>{tp_n}</b> | SL=<b>{sl_n}</b> | NOHIT=<b>{nohit_n}</b> | OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
         f"Source: post-setup price path; AutoTrade-independent. Rows: {str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()} lane.",
-        "Policy = combo policy from /setup_matrix policy. Gate = current live delivery/actionability gate for /screen, setup email, and AutoTrade; old rows can be Policy=KEEP but Gate=OFF after the entry window/cooldown/session changes. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions.",
+        "Policy = fresh-current delivery/actionability gate only. AT = lifecycle: SENT/AT_OPEN/AT_CLOSED/AT_TP/AT_SL; AT_OPEN is checked against live Bybit positions, so stale open journal rows no longer look live after closure.",
         "NOHIT = result horizon expired but neither TP nor SL was touched; OPEN = audit still pending/not hit by price path yet (not necessarily an open Bybit position). WR = TP/(TP+SL), excluding NOHIT and OPEN.",
     ]
     header_lines.append(f"Rows shown: <b>{len(display_rows)}</b> / <b>{len(table_rows)}</b> (full list).")
@@ -47195,6 +46424,11 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         "🔎 <b>Setup Audit ↔ AutoTrade Compare</b>",
         HDR,
         f"Window: <b>last {hours}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
+        "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
+        "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
+        "AT = actual realised AutoTrade close from Bybit/journal. Audit = independent matched setup price-path result.",
+        "yver149 matching: setup_id/open-time must fit the AutoTrade entry deadline. Trades opened before the selected compare window but closed inside it can still match their original setup when journal/open-time evidence is reliable; close-only legacy rows remain guarded.",
+        "Precision: mismatched TP/SL rows are rechecked with targeted 1m candles before DIFF is shown.",
         f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
     ]
     if not rows:
@@ -48033,7 +47267,7 @@ def _setup_combo_run_daily_safety_policy(uid: int, start_ts: float | None = None
             bridge_report = {}
         out.update({'ok': True, 'disabled': [_setup_combo_strategy_side_key(str((r or {}).get('family') or ''), str((r or {}).get('session') or ''), str((r or {}).get('strategy') or 'NOR'), str((r or {}).get('side') or '')) for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'bridge_report': bridge_report, 'reason': 'ok', 'window_hours': int(hours), 'start_ts': float(fixed_start_ts or 0.0), 'source_label': str((res or {}).get('source_label') or 'EXECUTABLE')})
         try:
-            logger.info('setup_combo_daily_safety_complete run_id=%s disabled_count=%s expires=%s', run_id, len(out.get('disabled') or []), _setup_combo_format_policy_ts(expires_ts))
+            logger.info('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
         except Exception:
             pass
         return out
@@ -48190,32 +47424,7 @@ def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', u
                     continue
                 status = str(pol.get('status') or 'WATCH').upper().strip()
                 enabled = 1 if int(pol.get('enabled') if pol.get('enabled') is not None else 1) == 1 else 0
-                pol_out = dict(pol or {})
-                # yver154: strict WR lock. Policy=KEEP is allowed only when the
-                # stored/current policy evidence has at least one decided TP/SL and
-                # WR is strictly above SETUP_COMBO_POLICY_KEEP_ANY_WR (default 49%).
-                # This prevents old persisted KEEP rows with WR <= 49% from staying
-                # executable after the owner requested the WR cutoff to be enforced.
-                _wr_first_ok = _setup_combo_wr_first_keep(pol_out.get('last_decided'), pol_out.get('last_win_rate'))
-                if _wr_first_ok:
-                    status = 'KEEP'
-                    enabled = 1
-                    pol_out['status'] = 'KEEP'
-                    pol_out['enabled'] = 1
-                elif status == 'KEEP':
-                    status = 'WATCH'
-                    enabled = 1
-                    pol_out['status'] = 'WATCH'
-                    pol_out['enabled'] = 1
-                    try:
-                        prior_note = str(pol_out.get('notes') or '').strip()
-                        _wr_first_last = float(pol_out.get("last_win_rate") or 0.0)
-                        _wr_first_cutoff = float(globals().get("SETUP_COMBO_POLICY_KEEP_ANY_WR", 49.0) or 49.0)
-                        add_note = f"yver154 KEEP downgraded to WATCH: last WR {_wr_first_last:.1f}% is not > {_wr_first_cutoff:.1f}%"
-                        pol_out['notes'] = (prior_note + '; ' if prior_note else '') + add_note
-                    except Exception:
-                        pass
-                out.update({'found': True, 'policy': pol_out, 'status': status, 'enabled': enabled,
+                out.update({'found': True, 'policy': dict(pol or {}), 'status': status, 'enabled': enabled,
                             'strategy': k_strat if k_strat != 'ALL' else strat, 'side': k_side if k_side != 'BOTH' else side})
                 return out
         return out
@@ -49413,37 +48622,9 @@ def _setup_combo_enforceable_policy_lookup(uid: int = 0) -> dict:
                     combo = _setup_combo_strategy_key(str(fam), str(sess), strat)
                 else:
                     combo = f"{str(fam).upper().strip()}-{str(sess).upper().strip()}"
-                # yver154: enforce the owner's strict cutoff both ways:
-                # - WR > 49% with decided evidence promotes to KEEP.
-                # - Old persisted KEEP rows with WR <= 49% are downgraded to WATCH.
-                pol_out = dict(pol or {})
-                _wr_first_ok = _setup_combo_wr_first_keep(pol_out.get('last_decided'), pol_out.get('last_win_rate'))
-                if _wr_first_ok:
-                    pol_out['status'] = 'KEEP'
-                    pol_out['enabled'] = 1
-                    try:
-                        prior_note = str(pol_out.get('notes') or '').strip()
-                        _wr_first_last = float(pol_out.get("last_win_rate") or 0.0)
-                        _wr_first_cutoff = float(globals().get("SETUP_COMBO_POLICY_KEEP_ANY_WR", 49.0) or 49.0)
-                        _wr_first_note = f"yver154 WR-first KEEP: last WR {_wr_first_last:.1f}% > {_wr_first_cutoff:.1f}%"
-                        add_note = _wr_first_note
-                        pol_out['notes'] = (prior_note + '; ' if prior_note else '') + add_note
-                    except Exception:
-                        pass
-                elif str(pol_out.get('status') or '').upper().strip() == 'KEEP':
-                    pol_out['status'] = 'WATCH'
-                    pol_out['enabled'] = 1
-                    try:
-                        prior_note = str(pol_out.get('notes') or '').strip()
-                        _wr_first_last = float(pol_out.get("last_win_rate") or 0.0)
-                        _wr_first_cutoff = float(globals().get("SETUP_COMBO_POLICY_KEEP_ANY_WR", 49.0) or 49.0)
-                        add_note = f"yver154 KEEP downgraded to WATCH: last WR {_wr_first_last:.1f}% is not > {_wr_first_cutoff:.1f}%"
-                        pol_out['notes'] = (prior_note + '; ' if prior_note else '') + add_note
-                    except Exception:
-                        pass
                 old = out.get(combo)
                 if old is None or (int(_uid or 0) != 0 and int(old.get('user_id') or 0) == 0):
-                    out[combo] = pol_out
+                    out[combo] = dict(pol or {})
             except Exception:
                 continue
         return out
@@ -49609,11 +48790,6 @@ def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int
 
         score = (wr - 50.0) * 1.20 + avg_r * 22.0 + min(20, decided) * 0.45 - ((op / max(1, total)) * 4.0)
 
-        # yver154: owner requested more KEEP lanes. If WR is over 49%, promote to
-        # KEEP immediately, regardless of setup/sample count, AvgR, or TP/SL balance.
-        if _setup_combo_wr_first_keep(decided, wr):
-            return 'KEEP', 1, f"WR-first promotion: WR > {float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0):.1f}% regardless of setup count", float(score)
-
         # No/low decided evidence is probation, not a hard block. This is why 100% WR
         # from 1-3 decided rows should show WATCH, not DISABLE.
         if decided < min_decided:
@@ -49624,12 +48800,12 @@ def _setup_combo_action_for_stats(st: dict, window_hours: int) -> tuple[str, int
             return 'WATCH', 1 if not SETUP_COMBO_POLICY_BLOCK_WATCH else 0, f'Insufficient decided results ({decided}/{min_decided}); keep collecting data', float(score)
 
         # Strong normal promotion.
-        if _setup_combo_wr_first_keep(decided, wr) and wr >= float(SETUP_COMBO_POLICY_KEEP_WR) and avg_r >= float(SETUP_COMBO_POLICY_KEEP_AVG_R) and tp >= max(1, sl):
+        if wr >= float(SETUP_COMBO_POLICY_KEEP_WR) and avg_r >= float(SETUP_COMBO_POLICY_KEEP_AVG_R) and tp >= max(1, sl):
             return 'KEEP', 1, 'Positive edge: WR/AvgR above keep threshold', float(score)
 
         # Quality promotion for lanes just under 55% WR but with strong payoff profile.
         # Example: 54.5% WR with AvgR +0.66 should be eligible for KEEP, not DISABLE.
-        if _setup_combo_wr_first_keep(decided, wr) and wr >= float(SETUP_COMBO_POLICY_WATCH_WR) and avg_r >= float(SETUP_COMBO_POLICY_PROMOTE_AVG_R) and tp > sl:
+        if wr >= float(SETUP_COMBO_POLICY_WATCH_WR) and avg_r >= float(SETUP_COMBO_POLICY_PROMOTE_AVG_R) and tp > sl:
             return 'KEEP', 1, 'Positive edge: WR >=50% with strong AvgR/payoff profile', float(score)
 
         # Borderline/profitable lanes remain WATCH. They are not subscriber-facing while
@@ -50465,19 +49641,6 @@ def _setup_combo_policy_text(uid: int) -> str:
             raw_pol = dict(rows_by_combo.get(full_combo) or rows_by_combo.get(strat_combo) or rows_by_combo.get(base_combo) or {})
             score = dict(latest_scores.get(full_combo) or latest_scores.get(strat_combo) or latest_scores.get(base_combo) or {})
 
-            set_v = int(score.get('setups') if score.get('setups') is not None else (pol.get('last_setups') or raw_pol.get('last_setups') or 0))
-            dec_v = int(score.get('decided') if score.get('decided') is not None else (pol.get('last_decided') or raw_pol.get('last_decided') or 0))
-            wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
-            avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
-            adv = str(score.get('action') or '-').upper().strip() or '-'
-            wr_first_keep = _setup_combo_wr_first_keep(dec_v, wr_v)
-            if wr_first_keep:
-                adv = 'KEEP'
-            elif adv == 'KEEP':
-                # yver154: the displayed recommendation must not show KEEP unless
-                # the displayed/current WR is strictly above the owner cutoff.
-                adv = 'WATCH'
-
             full_disabled = False
             if pol:
                 st = str(pol.get('status') or '').upper().strip()
@@ -50489,32 +49652,33 @@ def _setup_combo_policy_text(uid: int) -> str:
             # Family-Session-Side diagnostics are mapped to NOR only so a weak NOR
             # side does not make the paired REV side look blocked before REV has data.
             side_block = (full_combo in side_blocks) or (strat == 'NOR' and f'{base_combo}-{side}' in legacy_side_blocks)
-            # yver154: WR-first KEEP overrides old WATCH/OFF/PART display state when the
-            # lane has any decided evidence and WR > 49%, regardless of Set count.
-            if wr_first_keep:
-                exec_state = 'KEEP'; live_state = 'KEEP'; active_count += 1
-            elif full_disabled:
+            if full_disabled:
                 exec_state = 'OFF'; live_state = 'DISABLE'; disabled_count += 1
             elif side_block:
                 exec_state = 'PART'; live_state = 'TIGHTEN'; partial_count += 1
             else:
                 pol_status = str((pol or raw_pol or {}).get('status') or '').upper().strip()
                 adv_status = str(score.get('action') or '').upper().strip()
-                if wr_first_keep:
-                    exec_state = 'KEEP'; live_state = 'KEEP'
+                if pol_status == 'KEEP' or (not pol and adv_status == 'KEEP'):
+                    exec_state = 'KEEP'; live_state = 'KEEP' if pol_status == 'KEEP' else 'WATCH'
                 elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
                     exec_state = 'GATE'; live_state = 'WATCH'
                 else:
                     exec_state = 'ON'; live_state = 'WATCH'
                 active_count += 1
+
+            set_v = int(score.get('setups') if score.get('setups') is not None else (pol.get('last_setups') or raw_pol.get('last_setups') or 0))
+            dec_v = int(score.get('decided') if score.get('decided') is not None else (pol.get('last_decided') or raw_pol.get('last_decided') or 0))
+            wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
+            avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
+            adv = str(score.get('action') or '-').upper().strip() or '-'
             # yver67: keep policy table focused. Row-level Kind was confusing and
             # duplicated the header policy-kind summary; no-evidence lanes show '-' metrics.
             wr_txt = f'{wr_v:.1f}%' if dec_v > 0 else '-'
             avg_txt = f'{avg_v:+.2f}' if dec_v > 0 else '-'
-            table_rows.append([full_combo, live_state, set_v, dec_v, wr_txt, avg_txt, adv])
+            table_rows.append([full_combo, exec_state, live_state, set_v, dec_v, wr_txt, avg_txt, adv])
 
-        # yver154: Sort by enforced Policy first and remove the display-only ExecNow column.
-        policy_order_rank = {'KEEP': 0, 'WATCH': 1, 'TIGHTEN': 2, 'DISABLE': 3, 'OFF': 3, 'BLOCK': 3, 'PAUSE': 3}
+        order_rank = {'OFF': 0, 'PART': 1, 'GATE': 2, 'KEEP': 3, 'ON': 4}
         def _row_key(row):
             combo = str(row[0])
             parts = combo.split('-')
@@ -50526,21 +49690,28 @@ def _setup_combo_policy_text(uid: int) -> str:
             sess_n = sess_order.index(sess) if sess in sess_order else 99
             strat_n = 0 if strat == 'NOR' else 1
             side_n = 0 if side == 'BUY' else 1
-            return (policy_order_rank.get(str(row[1]).upper().strip(), 9), fam_n, sess_n, strat_n, side_n, combo)
+            return (order_rank.get(str(row[1]), 9), fam_n, sess_n, strat_n, side_n, combo)
         table_rows = sorted(table_rows, key=_row_key)
-        table = tabulate(table_rows, headers=['Combo','Policy','Set','Dec','WR','AvgR','Reco'], tablefmt='plain')
+        table = tabulate(table_rows, headers=['Combo','ExecNow','Policy','Set','Dec','WR','AvgR','Reco'], tablefmt='plain')
 
         info = _setup_combo_latest_policy_update_info(int(owner_uid))
         next_txt = _setup_combo_next_policy_review_dt().strftime('%Y-%m-%d %H:%M')
         guard_txt = html.escape(_setup_edge_guard_snapshot_text(int(owner_uid), _overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168))))
+        note = (
+            f"Visible combos: <b>{len(table_rows)}</b> | Probation/active: <b>{active_count}</b> | Partial/tightened: <b>{partial_count}</b> | Disabled: <b>{disabled_count}</b>\n"
+            f"Legend: <b>Combo</b>=Family-Session-Strategy-Side (e.g. F8-NY-REV-SELL). <b>ExecNow</b> is the actual executable state now. <b>Policy</b> is the enforced policy state. <b>Reco</b> is this window's recommendation only. <b>PART</b>=this exact lane is tightened by its own evidence. <b>OFF</b>=this exact lane is disabled by scheduled/daily safety policy. No-evidence lanes show '-' metrics."
+        )
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
             f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
             f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
+            f"KEEP rule: <b>Decided ≥ {int(SETUP_COMBO_POLICY_MIN_DECIDED_WEEKLY)}</b> and either <b>WR ≥ {float(SETUP_COMBO_POLICY_KEEP_WR):.0f}% + AvgR ≥ {float(SETUP_COMBO_POLICY_KEEP_AVG_R):+.2f} + TP≥SL</b>, or <b>WR ≥ {float(SETUP_COMBO_POLICY_WATCH_WR):.0f}% + strong AvgR ≥ {float(SETUP_COMBO_POLICY_PROMOTE_AVG_R):+.2f} + TP&gt;SL</b>. 50% WR alone remains WATCH for real-money safety.\n"
+            f"Why a 50% row can be WATCH: sample/Dec is too small, AvgR/payoff is not strong enough, or a daily/intraday safety row temporarily disabled/tightened it. Policy=the enforced state; Reco=this window's recommendation only.\n"
             f"Last enforceable policy: <b>{html.escape(str(info.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(info.get('kind') or '-'))}</b> | Expires: <b>{html.escape(str(info.get('expires_text') or '-'))}</b> | Next weekly review: <b>{html.escape(str(next_txt))}</b>\n"
             + ("Policy clean-start legacy filter: <b>ON</b> | Old DISABLE/OFF rows before the reset marker are ignored; fresh daily/intraday safety, micro-edge learning and the NOR/REV router remain active.\n" if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)) else "") +
-            f"{guard_txt}\n"
+            f"{guard_txt}\n{html.escape(_setup_nor_rev_router_note(int(owner_uid), []))}\n{note}\n"
+            f"Self-improvement flow: /setup_audit_overall and /setup_matrix policy now use the same fixed 15 May setup-result evidence; /setup_matrix policy refreshes the enforceable lane policy first, then the optimizer bridge mirrors those policy rows into runtime family/session gates. Side/session context is now fed into lane policy; weak symbol/hour evidence is enforced through the micro-edge/final gate because policy rows are not symbol/hour-specific. Manual /setup_matrix rows remain advisory; scheduled/baseline policy rows, daily safety rows, micro-edge guard, final WATCH quality gate, and the adaptive NORMAL/REVERSE strategy router are enforceable. Combo identity includes side, so F8-NY-NOR-BUY, F8-NY-NOR-SELL, F8-NY-REV-BUY and F8-NY-REV-SELL are tracked separately.\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -50557,7 +49728,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v159sync:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v149:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -51020,7 +50191,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v159sync:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v149:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -51051,7 +50222,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v163sort:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v149:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51593,7 +50764,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v159sync:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v149:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55070,15 +54241,10 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     gap_remaining = int(email_gate.get('gap_remaining_sec', 0) or 0)
     gate_reason = ', '.join([str(r) for r in (email_gate.get('gate_reasons') or [])[:3]])
 
-    exec_current = 0
     exec_recent = 0
     emailed_recent = 0
     sent_email_batches_recent = 0
     since_ts = time.time() - 12 * 3600
-    try:
-        current_exec_since_ts = time.time() - max(60, int(_autotrade_entry_window_min()) * 60)
-    except Exception:
-        current_exec_since_ts = time.time() - 60 * 60
     try:
         con = db_connect()
         cur = con.cursor()
@@ -55086,16 +54252,6 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Raw row counts can be huge because equivalent executable opportunities
         # are refreshed repeatedly during background scans.
         min_vol = float(_setup_min_volume_floor_usd())
-        try:
-            cur.execute("""
-                SELECT COUNT(DISTINCT UPPER(COALESCE(NULLIF(symbol,''), setup_id)) || ':' || UPPER(COALESCE(NULLIF(side,''),'?'))) AS n
-                FROM executable_setups
-                WHERE user_id IN (?,0) AND executable_ts>=? AND COALESCE(fut_vol_usd,0)>=?
-            """, (int(owner), float(current_exec_since_ts), float(min_vol)))
-            row_cur = cur.fetchone()
-            exec_current = int(row_cur['n'] if hasattr(row_cur, 'keys') and 'n' in row_cur.keys() else row_cur[0])
-        except Exception:
-            exec_current = 0
         try:
             cur.execute("""
                 SELECT COUNT(DISTINCT UPPER(COALESCE(NULLIF(symbol,''), setup_id)) || ':' || UPPER(COALESCE(NULLIF(side,''),'?'))) AS n
@@ -55190,6 +54346,8 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         SEP,
         'Email / AutoTrade entry gate',
         f"AutoTrade lane filter: {('KEEP+WATCH policy ON' if _autotrade_allow_watch_policy() else 'KEEP-only policy ON') if _autotrade_require_keep_policy() else 'policy filter OFF'}",
+        f"AutoTrade capital guard: daily loss stop {'ON' if _autotrade_daily_realized_loss_stop_enabled() else 'OFF'} {_autotrade_daily_realized_loss_stop_pct():.1f}% | realised-combo {'ON' if _autotrade_require_realized_combo_edge() else 'OFF'} | context feed {'ON' if _autotrade_context_feed_guard_enabled() else 'OFF'}",
+        f"AutoTrade capital gate: {'OPEN' if _autotrade_daily_realized_loss_stop_allows(int(owner))[0] else 'BLOCKED'} | {_autotrade_daily_realized_loss_stop_allows(int(owner))[1]}",
         f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
         f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
         f"Session email cap: {session_cap_txt} (configured)",
@@ -55199,8 +54357,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
         f"Email/AutoTrade gate: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
         f"Recent emailed setups (unique, 12h): {emailed_recent}",
-        f"Current executable setups (unique sym/side, entry window): {exec_current}",
-        f"Stored executable setups (unique sym/side, 12h history): {exec_recent}",
+        f"Recent executable setups (unique sym/side, 12h): {exec_recent}",
     ]
     try:
         lines.append(f"Recent sent setup-email batches (12h): {int(sent_email_batches_recent or 0)}")
@@ -56842,15 +55999,16 @@ def _screen_quick_ticker_snapshot_body(best_fut: Dict[str, MarketVol], session: 
         body = []
         body.append("*Top Trade Setups*")
         body.append("━━━━━━━━━━━━━━━━━━━━")
-        body.append("_No confirmed setup right now._")
+        body.append("_Executable scan is warming up. No confirmed setup shown from the quick ticker snapshot._")
         body.append("")
         market_txt = _screen_market_context_table(best_fut, leaders=leaders, losers=losers)
         if market_txt:
             body.append(market_txt)
         body.append("")
+        body.append("_A full executable-family refresh has been queued in the dedicated /screen lane._")
         return "\n".join(body), [], []
     except Exception:
-        return "_No confirmed setup right now._", [], []
+        return "_Screen cache is warming up. A fresh scan has been queued._", [], []
 
 async def _refresh_screen_cache_async():
     """Refreshes _SCREEN_CACHE in the background (best effort)."""
@@ -57195,17 +56353,16 @@ def _screen_display_limit() -> int:
 
 
 def _screen_requires_emailed_delivery_for_setup() -> bool:
-    """Whether /screen must hide executable setups until an email is logged.
+    """User-facing sync rule for /screen.
 
-    yver159: default is OFF. /screen may show the current executable queue, then
-    _screen_sync_pipeline_async emails the same shown setups and queues AutoTrade.
-    This keeps /screen, setup email, and AutoTrade in one lane without showing a
-    warm-up placeholder when executable rows already exist.
+    /screen is a subscriber-facing surface, so it must not expose a raw executable
+    setup that the email lane did not actually deliver/log. AutoTrade may still
+    consume the executable queue directly; this helper is only for /screen UX.
     """
     try:
-        return str(os.environ.get('SCREEN_REQUIRE_EMAILED_SETUP', '0') or '0').strip().lower() in {'1', 'true', 'yes', 'on'}
+        return str(os.environ.get('SCREEN_REQUIRE_EMAILED_SETUP', '1') or '1').strip().lower() not in {'0', 'false', 'no', 'off'}
     except Exception:
-        return False
+        return True
 
 
 def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: float | None = None) -> float:
@@ -57242,7 +56399,7 @@ def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: flo
             cur = conn.cursor()
             if sid:
                 row = cur.execute(
-                    "SELECT emailed_ts FROM emailed_setups WHERE user_id IN (?, 0) AND setup_id=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
+                    "SELECT emailed_ts FROM emailed_setups WHERE user_id=? AND setup_id=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
                     (uid, sid, float(cutoff)),
                 ).fetchone()
                 if row and row[0] is not None:
@@ -57258,7 +56415,7 @@ def _screen_recent_emailed_ts_for_setup(user_id: int, setup, lookback_hours: flo
                     PRIMARY KEY(user_id, identity_key)
                 )""")
                 row = cur.execute(
-                    "SELECT emailed_ts FROM emailed_setup_identities WHERE user_id IN (?, 0) AND identity_key=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
+                    "SELECT emailed_ts FROM emailed_setup_identities WHERE user_id=? AND identity_key=? AND emailed_ts>=? ORDER BY emailed_ts DESC LIMIT 1",
                     (uid, ident, float(cutoff)),
                 ).fetchone()
                 if row and row[0] is not None:
@@ -57400,10 +56557,6 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                 return False
 
         sources = []
-        try:
-            sources.append(('canonical', _canonical_current_keep_executable_setup_objects(int(uid), session_name=sess, max_age_sec=max_age_min * 60, limit=20) or []))
-        except Exception:
-            sources.append(('canonical', []))
         if include_email_source:
             try:
                 sources.append(('emailed', _recent_delivery_lane_setup_objects(int(uid), session_name=sess, max_age_min=max_age_min, limit=20) or []))
@@ -57434,13 +56587,10 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                     if sess and src_session_u and src_session_u not in {'', sess}:
                         continue
                     try:
-                        if source_name in {'emailed', 'canonical'}:
+                        if source_name == 'emailed':
                             ok_basic = _basic_valid(item)
-                            if source_name == 'canonical':
-                                ok_exec = bool(ok_basic)
-                            else:
-                                ok_final, _why_final, _meta_final = _setup_final_quality_gate_allows_setup(item, session_name=sess, user_id=int(uid)) if ok_basic else (False, 'screen_emailed_basic_invalid', {})
-                                ok_exec = bool(ok_basic and ok_final)
+                            ok_final, _why_final, _meta_final = _setup_final_quality_gate_allows_setup(item, session_name=sess, user_id=int(uid)) if ok_basic else (False, 'screen_emailed_basic_invalid', {})
+                            ok_exec = bool(ok_basic and ok_final)
                         else:
                             ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=sess)
                     except Exception:
@@ -57470,7 +56620,7 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
         except Exception:
             up_list, dn_list = [], []
         market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
-        source_note = '_Showing recent emailed setup queue._' if _screen_requires_emailed_delivery_for_setup() else ('_Showing latest sent setup email._' if include_email_source and used_source_name == 'emailed' else '_Showing current KEEP executable setup queue._')
+        source_note = '_Showing recent emailed setup queue while the live scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else ('_Showing latest sent setup email while the live scan refreshes._' if include_email_source and used_source_name == 'emailed' else '_Showing recent executable setup queue while the live scan refreshes._')
         body = "\n".join([
             "",
             "*Top Trade Setups*",
@@ -57534,10 +56684,6 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                     return False
 
             sources = []
-            try:
-                sources.append(('canonical', _canonical_current_keep_executable_setup_objects(int(_uid), session_name=req_session_u, max_age_sec=max_age_min * 60, limit=max(1, int(limit * 4))) or []))
-            except Exception:
-                sources.append(('canonical', []))
             if _screen_user_can_see_email_source(int(_uid)):
                 try:
                     sources.append(('emailed', _recent_delivery_lane_setup_objects(int(_uid), session_name=req_session_u, max_age_min=max_age_min, limit=max(1, int(limit * 3))) or []))
@@ -57564,7 +56710,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                         src_session_u = str(getattr(item, 'source_session', '') or '').upper().strip()
                         if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                             continue
-                        if source_name in {'emailed', 'canonical'}:
+                        if source_name == 'emailed':
                             ok_exec = _basic_valid(item)
                         else:
                             try:
@@ -57951,26 +57097,15 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
                 continue
             sym = str(getattr(s, 'symbol', '') or '').upper()
             side = str(getattr(s, 'side', '') or '').upper()
-            # yver168: when /screen is displaying the current canonical Gate=KEEP
-            # setup lane, screen-sync must not apply extra email-only cooldown/flip
-            # guards that make it diverge from /setup_audit Gate=KEEP.  Only the
-            # exact already-emailed setup_id remains blocked to prevent duplicate sends.
-            try:
-                _screen_canonical_keep = bool(getattr(s, 'canonical_gate_keep', False)) or bool(_canonical_setup_id_gate_keep(int(uid), sid, target_session))
-                if _screen_canonical_keep:
-                    setattr(s, 'canonical_gate_keep', True)
-            except Exception:
-                _screen_canonical_keep = bool(getattr(s, 'canonical_gate_keep', False))
-            if not _screen_canonical_keep:
-                if symbol_flip_guard_active(int(uid), sym, side, target_session):
-                    skipped.append('flip_guard_blocked')
-                    continue
-                if _email_setup_identity_recently_sent(int(uid), s):
-                    skipped.append('duplicate_setup_identity')
-                    continue
-                if _email_symbol_recently_sent(int(uid), sym, side, target_session, setup_id=sid):
-                    skipped.append('cooldown_blocked')
-                    continue
+            if symbol_flip_guard_active(int(uid), sym, side, target_session):
+                skipped.append('flip_guard_blocked')
+                continue
+            if _email_setup_identity_recently_sent(int(uid), s):
+                skipped.append('duplicate_setup_identity')
+                continue
+            if _email_symbol_recently_sent(int(uid), sym, side, target_session, setup_id=sid):
+                skipped.append('cooldown_blocked')
+                continue
             try:
                 dedupe_key = (
                     sym,
@@ -57990,14 +57125,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
         if not actionable:
             return {"status": "skip", "reason": f"no_actionable_screen_setups ({','.join(skipped[:3])})"}
 
-        # yver168: /screen may show multiple current Gate=KEEP setups; email all
-        # unemailed canonical setups shown on /screen in one batch, not only EMAIL_SETUPS_N=1.
-        try:
-            _canonical_actionable_n = sum(1 for _x in (actionable or []) if bool(getattr(_x, 'canonical_gate_keep', False)))
-        except Exception:
-            _canonical_actionable_n = 0
-        _screen_sync_send_cap = max(1, min(8, max(int(EMAIL_SETUPS_N), int(_canonical_actionable_n or 0))))
-        actionable = list(actionable[:_screen_sync_send_cap])
+        actionable = list(actionable[:max(1, int(EMAIL_SETUPS_N))])
         sent = await to_thread_heavy(
             send_email_alert_multi,
             dict(user or {}),
@@ -58125,11 +57253,11 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             _body_is_latest_email = False
                         _source_note_e = (
-                            "_Showing recent emailed setup queue._\n"
+                            "_Showing recent emailed setup queue while the live scan refreshes._\n"
                             if _screen_requires_emailed_delivery_for_setup() else
-                            ("_Showing latest sent setup email._\n"
+                            ("_Showing latest sent setup email while the live scan refreshes._\n"
                              if _body_is_latest_email else
-                             "_Showing recent executable setup queue._\n")
+                             "_Showing recent executable setup queue while the live scan refreshes._\n")
                         )
                         header_e = (
                             f"*PulseFutures — Market Scan*\n"
@@ -58148,81 +57276,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             disable_web_page_preview=True,
                             reply_markup=InlineKeyboardMarkup(keyboard_e) if keyboard_e else None,
                         )
-                        # yver168: even when /screen displays the latest email/cache branch,
-                        # keep email/autotrade synced for every visible Gate=KEEP setup.
-                        # This fixes the case where ZEC was emailed but AutoTrade did not retry,
-                        # and MAGMA was visible beside ZEC but had not been emailed.
-                        try:
-                            if MANUAL_SCREEN_SYNC_ENABLED and shown_e:
-                                _safe_create_task(
-                                    _screen_sync_pipeline_async(int(uid), user, str(live_session or ''), str(scan_session or '').upper(), quick_best_email, list(shown_e or [])),
-                                    'screen_cmd_latest_email_sync',
-                                )
-                            if shown_e:
-                                _safe_create_task(
-                                    _screen_trigger_autotrade_for_visible_setups(int(uid), str(scan_session or '').upper(), list(shown_e or []), reason='screen_latest_email_visible_retry'),
-                                    'screen_latest_email_visible_autotrade',
-                                )
-                        except Exception:
-                            pass
                         return
             except Exception:
                 pass
-
-        # yver164: current canonical KEEP executable rows beat stale cached screens,
-        # even when they have not been emailed yet. This keeps /screen aligned with
-        # /setup_audit Gate=KEEP and the email/autotrade lane.
-        try:
-            quick_best_canon = get_cached_futures_tickers() or {}
-            if quick_best_canon:
-                body_c, kb_c, shown_c = _screen_recent_db_body_and_kb(
-                    int(uid),
-                    str(scan_session or '').upper(),
-                    quick_best_canon,
-                    max_age_min=screen_fallback_min,
-                    include_email_source=bool(can_show_email_source),
-                )
-                if body_c and _screen_body_has_trade_setups(str(body_c or '')):
-                    try:
-                        source_ts_c = max([float(getattr(x, 'email_logged_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0) for x in (shown_c or [])] or [0.0])
-                    except Exception:
-                        source_ts_c = 0.0
-                    header_c = (
-                        f"*PulseFutures — Market Scan*\n"
-                        f"{HDR}\n"
-                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                        f"{_screen_when_line('Displayed setup source', source_ts_c)}"
-                        f"_Showing current KEEP executable setup queue._\n"
-                    )
-                    keyboard_c = [
-                        [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
-                        for (sym, sid) in (kb_c or [])
-                    ]
-                    await send_long_message(
-                        update,
-                        _screen_markdown_to_html((header_c + "\n" + body_c).strip()),
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                        reply_markup=InlineKeyboardMarkup(keyboard_c) if keyboard_c else None,
-                    )
-                    # yver168: visible canonical Gate=KEEP setups must immediately feed
-                    # the email lane and then AutoTrade. Do this even if a cached scan exists.
-                    try:
-                        if MANUAL_SCREEN_SYNC_ENABLED and shown_c:
-                            _safe_create_task(
-                                _screen_sync_pipeline_async(int(uid), user, str(live_session or ''), str(scan_session or '').upper(), quick_best_canon, list(shown_c or [])),
-                                'screen_cmd_canonical_sync',
-                            )
-                        if shown_c:
-                            _safe_create_task(
-                                _screen_trigger_autotrade_for_visible_setups(int(uid), str(scan_session or '').upper(), list(shown_c or []), reason='screen_canonical_visible_retry'),
-                                'screen_canonical_visible_autotrade',
-                            )
-                    except Exception:
-                        pass
-                    return
-        except Exception:
-            pass
 
         if cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
             note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
@@ -58279,7 +57335,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"{HDR}\n"
                         f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                         f"{_screen_when_line('Displayed setup source', source_ts)}"
-                        f"{('_Showing recent emailed setup queue._' if _screen_requires_emailed_delivery_for_setup() else '_Showing recent executable setup queue._')}\n"
+                        f"{('_Showing recent emailed setup queue while full scan refreshes._' if _screen_requires_emailed_delivery_for_setup() else '_Showing recent executable setup queue while full scan refreshes._')}\n"
                     )
                     keyboard = [
                         [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
@@ -58322,6 +57378,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"{HDR}\n"
                     f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                     f"{_screen_when_line('Ticker snapshot', time.time())}"
+                    f"_Showing instant ticker snapshot while full executable scan warms up._\n"
                 )
                 await send_long_message(
                     update,
@@ -58332,7 +57389,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception:
             pass
-        await update.message.reply_text("🔎 /screen snapshot is not ready yet. I’ll send the result when available.")
+        await update.message.reply_text("🔎 /screen cache is warming up. Fresh scan is queued in the dedicated screen lane — run /screen again shortly.")
         return
     except Exception as e:
         try:
@@ -58967,7 +58024,7 @@ def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, s
             for tuid in target_uids:
                 screen_body = "\n".join([
                     "", "*Top Trade Setups*", SEP,
-                    "_Showing latest sent setup email._",
+                    "_Showing latest sent setup email while the live scan refreshes._",
                     _screen_format_setup_cards(list(setups or []), int(tuid), sess_u),
                     "", market_txt or "",
                 ]).strip()
@@ -59238,10 +58295,6 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         _mark_emailed_setup_identity(int(_target_uid), s, emailed_ts=float(now_ts))
                     except Exception:
                         pass
-                    try:
-                        cache_delete(f"autotrade_db_setups_v168:{int(_target_uid)}:{str(display_session or '').upper()}:24:30")
-                    except Exception:
-                        pass
                 try:
                     # Keep /screen immediately aligned with the exact setup email just sent.
                     up_list, dn_list = compute_directional_lists(best_fut or {})
@@ -59250,7 +58303,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
                         "",
                         "*Top Trade Setups*",
                         SEP,
-                        "_Showing latest sent setup email._",
+                        "_Showing latest sent setup email while the live scan refreshes._",
                         _screen_format_setup_cards(list(setups or []), int(_target_uid), str(display_session or '')),
                         "",
                         market_txt or "",
@@ -59505,18 +58558,14 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
-# yver155: Render-safe bounded alert loop. Keep a strict default budget and run less frequently
-# than the worst-case runtime so APScheduler does not spam max_instances skipped-run warnings.
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "75"))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
-AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "180") or 180)
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "60") or 60)
 AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
-ALERT_JOB_RENDER_SAFE_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_RENDER_SAFE_INTERVAL_SEC", "300") or 300)
-ALERT_JOB_BIGMOVE_PER_USER_MAX_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_PER_USER_MAX_SEC", "22") or 22)
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "1"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "2"))
 ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "2"))
 ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC", "12"))
 ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
@@ -59524,7 +58573,7 @@ ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
-BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "18") or 18)
+BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "60") or 60)
 # Ver22: autonomous setup discovery must stay hot. A 10-minute rebuild floor made /screen
 # look like the trigger because manual /screen used the dedicated screen lane while the
 # email lane waited on stale/empty pools. Keep it short by default.
@@ -60275,10 +59324,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Ver110: Big-Move is important, but it must not consume the entire
             # alert_job runtime and starve the normal session setup/email/autotrade pool.
             if _bigmove_session_reserve_hit():
-                logger.info("alert_job bigmove queue reserved session budget after %.1fs", time.time() - job_started_ts)
+                logger.warning("alert_job bigmove queue reserved session budget after %.1fs", time.time() - job_started_ts)
                 break
             if _job_budget_exhausted():
-                logger.info("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
+                logger.warning("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
                 break
             try:
                 uid = int(u.get("user_id") or u.get("id") or 0)
@@ -60304,24 +59353,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     "reasons": ["pre_session_bigmove_budget_exhausted"],
                 }
                 continue
-            # yver155: hard-cap each pre-session BigMove pass. One slow SMTP/Telegram/network
-            # call must not consume the whole alert_job budget and starve the normal session
-            # setup/email pool (Render log: "runtime budget exhausted before session pools").
-            try:
-                _bm_elapsed = float(time.time() - job_started_ts)
-                _bm_remaining = max(1.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 75) - _bm_elapsed)
-                _bm_cap = max(3.0, min(float(ALERT_JOB_BIGMOVE_PER_USER_MAX_SEC or 22), _bm_remaining, max(3.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 75) * 0.30)))
-                await asyncio.wait_for(_send_bigmove_payload_for_user(int(uid), tz, tag='pre_session'), timeout=_bm_cap)
-            except asyncio.TimeoutError:
-                try:
-                    _LAST_BIGMOVE_DECISION[int(uid)] = {
-                        "status": "SKIP",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "reasons": [f"pre_session_bigmove_timeout>{int(_bm_cap)}s_deferred_to_next_tick"],
-                    }
-                except Exception:
-                    pass
-                continue
+            await _send_bigmove_payload_for_user(int(uid), tz, tag='pre_session')
 
 
         # -----------------------------------------------------
@@ -60330,7 +59362,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # even when no user is currently inside those sessions.
         # -----------------------------------------------------
         if _job_budget_exhausted():
-            logger.info("alert_job runtime budget exhausted before session pools after %.1fs", time.time() - job_started_ts)
+            logger.warning("alert_job runtime budget exhausted before session pools after %.1fs", time.time() - job_started_ts)
             return
 
         notify_runtime = []
@@ -60537,7 +59569,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             notify_runtime = notify_runtime[:_notify_max]
         for meta in notify_runtime:
             if _job_budget_exhausted():
-                logger.info("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
+                logger.warning("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
                 return
             user = dict(meta.get("user") or {})
             uid = int(meta.get("uid") or 0)
@@ -60689,38 +59721,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 hydrated = []
             eligible_db = [s for s in (hydrated or []) if s is not None]
-            # yver164: recover the exact current /setup_audit Gate=KEEP lane.
-            # This is the source of truth for /screen + setup email + AutoTrade.
-            try:
-                canonical_keep = _canonical_current_keep_executable_setup_objects(
-                    int(uid),
-                    session_name=str(sess_name or ''),
-                    max_age_sec=max(60, int(_autotrade_entry_window_min()) * 60),
-                    limit=max(int(EMAIL_SETUPS_N) * 12, 36),
-                    require_unemailed=False,
-                )
-            except Exception:
-                canonical_keep = []
-            if canonical_keep:
-                # Put canonical KEEP rows first and keep any existing eligible rows after them.
-                merged = []
-                seen_merge = set()
-                for _s0 in list(canonical_keep or []) + list(eligible_db or []) + list(eligible_from_pool or []):
-                    try:
-                        _sid0 = str(getattr(_s0, 'setup_id', '') or getattr(_s0, 'id', '') or '')
-                        _ident0 = _setup_identity_from_obj(_s0) or _sid0
-                        if not _ident0 or _ident0 in seen_merge:
-                            continue
-                        seen_merge.add(_ident0)
-                        merged.append(_s0)
-                    except Exception:
-                        continue
-                eligible = list(merged)
-                try:
-                    db_log_setup_pipeline_event(int(uid), stage='email_canonical_keep_lane', status='ok', session=str(sess_name or ''), mode='email', details={'canonical_keep': len(canonical_keep or []), 'eligible_total': len(eligible or [])})
-                except Exception:
-                    pass
-            elif eligible_db:
+            if eligible_db:
                 eligible = list(eligible_db)
             elif eligible_from_pool:
                 eligible = list(eligible_from_pool)
@@ -60823,17 +59824,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             owner_manual_same_symbol_blocked = 0
             combo_policy_blocked = 0
 
-            # yver168: if the canonical Gate=KEEP lane contains multiple fresh setups,
-            # send all unemailed current KEEP rows in one email batch (bounded) so /screen,
-            # setup email, and AutoTrade do not split into different sources.
-            try:
-                _canonical_pick_cap = sum(1 for _x in (picks or []) if bool(getattr(_x, 'canonical_gate_keep', False)))
-            except Exception:
-                _canonical_pick_cap = 0
-            _email_batch_cap = max(1, min(8, max(int(EMAIL_SETUPS_N), int(_canonical_pick_cap or 0))))
-
             for s in picks:
-                if len(chosen_list) >= int(_email_batch_cap):
+                if len(chosen_list) >= int(EMAIL_SETUPS_N):
                     break
 
                 sym = str(getattr(s, "symbol", "")).upper()
@@ -60878,41 +59870,21 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     combo_policy_blocked += 1
                     continue
 
-                # yver165: /setup_audit Gate=KEEP is the canonical delivery lane.
-                # If a setup is already Gate=KEEP there, do not let secondary email-only
-                # flip/diversification/symbol cooldown guards make /screen, setup email
-                # and AutoTrade diverge.  Still never re-send the exact same setup_id.
-                _canonical_gate_keep = bool(getattr(s, 'canonical_gate_keep', False))
-                try:
-                    _sid_for_email = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
-                    _already_emailed_exact = bool(_sid_for_email and db_has_emailed_setup(int(uid), _sid_for_email, lookback_hours=max(1, int(math.ceil(float(_autotrade_entry_window_min() or 60) / 60.0)))))
-                except Exception:
-                    _already_emailed_exact = False
-                if _already_emailed_exact:
-                    cooldown_blocked += 1
+                if symbol_flip_guard_active(uid, sym, side, sess_name):
+                    flip_blocked += 1
                     continue
 
-                if not _canonical_gate_keep:
-                    if symbol_flip_guard_active(uid, sym, side, sess_name):
-                        flip_blocked += 1
-                        continue
+                ok_div, why_div = _email_diversification_guard(s, chosen_list, best_fut, sess_name)
+                if not ok_div:
+                    diversify_blocked[str(why_div)] += 1
+                    continue
 
-                    ok_div, why_div = _email_diversification_guard(s, chosen_list, best_fut, sess_name)
-                    if not ok_div:
-                        diversify_blocked[str(why_div)] += 1
-                        continue
-
-                    if _email_setup_identity_recently_sent(uid, s):
-                        cooldown_blocked += 1
-                        continue
-                    if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
-                        cooldown_blocked += 1
-                        continue
-                else:
-                    try:
-                        db_log_setup_pipeline_event(int(uid), stage='email_canonical_gate_keep_bypass', status='ok', session=str(sess_name or ''), mode='email', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=sym, side=side, details={'bypassed': 'flip_diversification_symbol_cooldown', 'reason': 'setup_audit_gate_keep'})
-                    except Exception:
-                        pass
+                if _email_setup_identity_recently_sent(uid, s):
+                    cooldown_blocked += 1
+                    continue
+                if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
+                    cooldown_blocked += 1
+                    continue
 
                 if int(uid) == int(AUTOTRADE_OWNER_UID or 0) and str(_autotrade_runtime_mode()).lower() == 'live':
                     try:
@@ -61359,29 +60331,6 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 lines.append(f"Current session: {sess_now or '-'}")
             lines.append(f"Configured build timeout: {float(EMAIL_BUILD_POOL_TIMEOUT_SEC):.1f}s")
-            try:
-                _entry_win_sec = max(60, int(_autotrade_entry_window_min()) * 60)
-                _cur_exec_count = 0
-                _last_exec_age_txt = '-'
-                with sqlite3.connect(DB_PATH) as _ec:
-                    _ec.row_factory = sqlite3.Row
-                    _cu = _ec.cursor()
-                    _min_vol = float(_setup_min_volume_floor_usd())
-                    _since = float(time.time()) - float(_entry_win_sec)
-                    _cu.execute("""
-                        SELECT COUNT(DISTINCT UPPER(COALESCE(NULLIF(symbol,''), setup_id)) || ':' || UPPER(COALESCE(NULLIF(side,''),'?'))) AS n,
-                               MAX(executable_ts) AS last_ts
-                        FROM executable_setups
-                        WHERE user_id IN (?,0) AND executable_ts>=? AND COALESCE(fut_vol_usd,0)>=?
-                    """, (int(uid), float(_since), float(_min_vol)))
-                    _er = _cu.fetchone()
-                    _cur_exec_count = int(_er['n'] if _er and 'n' in _er.keys() else 0)
-                    _last_ts = float(_er['last_ts'] if _er and _er['last_ts'] is not None else 0.0)
-                    if _last_ts > 0:
-                        _last_exec_age_txt = _fmt_dur(max(0, int(time.time() - _last_ts))) + ' ago'
-                lines.append(f"Current executable rows: {_cur_exec_count} inside {int(_entry_win_sec/60)}m entry window | last: {_last_exec_age_txt}")
-            except Exception:
-                pass
             if pipe_build:
                 lines.append("Build pool: " + _pipe_summary(pipe_build))
             if pipe_exec:
@@ -62814,25 +61763,6 @@ async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
             if fresh_db_setups:
                 db_setups = _autotrade_merge_candidate_lists_fresh_first(fresh_db_setups, db_setups, limit=60)
 
-            # yver168: the scheduled AutoTrade loop must prioritize the same current
-            # emailed canonical Gate=KEEP lane that /screen and setup email show.
-            # This prevents stale selector caches from returning no_setups while
-            # /screen shows a valid emailed setup inside the 60m entry window.
-            try:
-                canonical_emailed_setups = await to_thread_autotrade(
-                    _canonical_current_keep_executable_setup_objects,
-                    uid,
-                    sess,
-                    max_age_sec=max(60, int(_autotrade_entry_window_min()) * 60),
-                    limit=30,
-                    require_recent_email=True,
-                    timeout=6,
-                )
-            except Exception:
-                canonical_emailed_setups = []
-            if canonical_emailed_setups:
-                db_setups = _autotrade_merge_candidate_lists_fresh_first(canonical_emailed_setups, db_setups, limit=60)
-
             tf_cooling = _ohlcv_timeframe_cooling('15m', '1h', '4h')
             if not db_setups and tf_cooling:
                 reason = 'autotrade_refresh_deferred_rate_limit_cooldown'
@@ -63050,42 +61980,33 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
                                 setattr(_s, 'created_ts', time.time())
                         except Exception:
                             pass
-                    # yver168: if the exact emailed setup is already in the canonical Gate=KEEP
-                    # lane, do not run a second pre-send selector that can diverge from /screen/email.
-                    # The final _autotrade_place_trade path still checks recent email, canonical gate,
-                    # Entry/SL/TP/RR, drift, risk caps, leverage, duplicate guards and Bybit placement.
-                    _canonical_for_at = _mark_setup_batch_canonical_keep(list(chosen_list or []), owner_uid, sess)
-                    if _canonical_for_at:
-                        chosen_list = list(_canonical_for_at or [])
-                        _at_gate_reasons = Counter()
-                    else:
+                    try:
+                        _valid_for_at, _at_gate_reasons = _setup_email_presend_executable_filter(owner_uid, sess, list(chosen_list or []), lane='autotrade_after_email')
+                    except Exception:
+                        _valid_for_at, _at_gate_reasons = [], Counter({'autotrade_after_email_presend_exception': 1})
+                    if not _valid_for_at:
                         try:
-                            _valid_for_at, _at_gate_reasons = _setup_email_presend_executable_filter(owner_uid, sess, list(chosen_list or []), lane='autotrade_after_email')
+                            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                                'status': 'SKIP',
+                                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                'reason': 'emailed_setups_failed_final_gate_before_autotrade_trying_keep_queue',
+                                'session': sess,
+                                'mode': str(_autotrade_runtime_mode()).lower(),
+                                'top_reasons': dict((_at_gate_reasons or Counter()).most_common(5)),
+                                'trigger': 'email_sent_immediate',
+                            }
                         except Exception:
-                            _valid_for_at, _at_gate_reasons = [], Counter({'autotrade_after_email_presend_exception': 1})
-                        if not _valid_for_at:
-                            try:
-                                _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                                    'status': 'SKIP',
-                                    'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                                    'reason': 'emailed_setups_failed_final_gate_before_autotrade_trying_keep_queue',
-                                    'session': sess,
-                                    'mode': str(_autotrade_runtime_mode()).lower(),
-                                    'top_reasons': dict((_at_gate_reasons or Counter()).most_common(5)),
-                                    'trigger': 'email_sent_immediate',
-                                }
-                            except Exception:
-                                pass
-                            try:
-                                db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email_presend_gate', status='empty', session=sess, mode='autotrade', details={'top_reasons': _pipeline_top_reasons(_at_gate_reasons, 8), 'input': len(list(chosen_list or []))})
-                            except Exception:
-                                pass
-                            chosen_list = []
-                        else:
-                            chosen_list = list(_valid_for_at or [])
+                            pass
+                        try:
+                            db_log_setup_pipeline_event(owner_uid, stage='autotrade_after_email_presend_gate', status='empty', session=sess, mode='autotrade', details={'top_reasons': _pipeline_top_reasons(_at_gate_reasons, 8), 'input': len(list(chosen_list or []))})
+                        except Exception:
+                            pass
+                        chosen_list = []
+                    else:
+                        chosen_list = list(_valid_for_at or [])
                     await to_thread_autotrade(_persist_executable_candidates, owner_uid, sess, list(chosen_list or []), 'emailed_setups', 'email_autotrade_immediate', timeout=5)
                     try:
-                        cache_delete(f"autotrade_db_setups_v168:{owner_uid}:{sess}:24:30")
+                        cache_delete(f"autotrade_db_setups_v129:{owner_uid}:{sess}:24:30")
                     except Exception:
                         pass
             except Exception as e:
@@ -63100,28 +62021,8 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             for _s in list(chosen_list or []):
                 try:
                     _s_eff = _setup_route_unless_delivery_locked(_s, sess, owner_uid, source_kind=str(getattr(_s, 'source_kind', '') or 'emailed_setups'))
-                    try:
-                        _sid_eff = str(getattr(_s_eff, 'setup_id', '') or getattr(_s_eff, 'id', '') or '').strip()
-                        _is_canonical_eff = bool(getattr(_s_eff, 'canonical_gate_keep', False)) or bool(_canonical_setup_id_gate_keep(owner_uid, _sid_eff, sess))
-                    except Exception:
-                        _is_canonical_eff = False
-                    if _is_canonical_eff:
-                        try:
-                            setattr(_s_eff, 'canonical_gate_keep', True)
-                            setattr(_s_eff, 'delivery_lane_locked', True)
-                        except Exception:
-                            pass
-                        db_setups.append(_s_eff)
-                        continue
                     ok_s, _why_s = is_executable_setup_eligible(_s_eff, session_name=sess)
                     if ok_s:
-                        try:
-                            _sid_eff = str(getattr(_s_eff, 'setup_id', '') or getattr(_s_eff, 'id', '') or '').strip()
-                            if not _canonical_setup_id_gate_keep(owner_uid, _sid_eff, sess):
-                                continue
-                            setattr(_s_eff, 'canonical_gate_keep', True)
-                        except Exception:
-                            continue
                         db_setups.append(_s_eff)
                 except Exception:
                     continue
@@ -63479,171 +62380,166 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=-1)
     app.add_error_handler(error_handler)
 
-    # yver156: Known commands are ACKed instantly here, then dispatched in background.
-    # Fast-path commands above can still stop earlier; unknown commands fall through.
-    app.add_handler(MessageHandler(filters.COMMAND, _universal_background_command_router), group=0)
-
     # ================= Handlers =================
-    _register_command_handler(app, "help", cmd_help, block=False)
-    _register_command_handler(app, "commands", commands_cmd, block=False)
-    _register_command_handler(app, "guide_full", guide_full_cmd, block=False)
-    _register_command_handler(app, "start", cmd_start, block=False)
-    _register_command_handler(app, "help_admin", cmd_help_admin, block=False)
-    _register_command_handler(app, "manage", manage_cmd, block=False)
-    _register_command_handler(app, "myplan", myplan_cmd, block=False)
-    _register_command_handler(app, "support", support_cmd, block=False)
-    _register_command_handler(app, "support_status", support_status_cmd, block=False)
-    _register_command_handler(app, "support_open", admin_support_open_cmd, block=False)
-    _register_command_handler(app, "support_close", admin_support_close_cmd, block=False)
-    _register_command_handler(app, "tz", tz_cmd, block=False)
-    _register_command_handler(app, "dayreset", dayreset_cmd, block=False)
-    _register_command_handler(app, "screen", screen_cmd, block=False)
-    _register_command_handler(app, "equity", equity_cmd, block=False)
-    _register_command_handler(app, "equity_reset", equity_reset_cmd, block=False)
-    _register_command_handler(app, "riskmode", riskmode_cmd, block=False)
-    _register_command_handler(app, "dailycap", dailycap_cmd, block=False)
-    _register_command_handler(app, "dailycapAT", dailycapAT_cmd, block=False)
-    _register_command_handler(app, "dailycapat", dailycapAT_cmd, block=False)
-    _register_command_handler(app, "autotrade_config", autotrade_config_cmd, block=False)
-    _register_command_handler(app, "autotradecfg", autotrade_config_cmd, block=False)
-    _register_command_handler(app, "dayrisk_reset", dayrisk_reset_cmd, block=False)
-    _register_command_handler(app, "limits", limits_cmd, block=False)
+    app.add_handler(CommandHandler("help", cmd_help, block=False))
+    app.add_handler(CommandHandler("commands", commands_cmd, block=False))
+    app.add_handler(CommandHandler("guide_full", guide_full_cmd, block=False))
+    app.add_handler(CommandHandler("start", cmd_start, block=False))
+    app.add_handler(CommandHandler("help_admin", cmd_help_admin, block=False))
+    app.add_handler(CommandHandler("manage", manage_cmd, block=False))
+    app.add_handler(CommandHandler("myplan", myplan_cmd, block=False))
+    app.add_handler(CommandHandler("support", support_cmd, block=False))
+    app.add_handler(CommandHandler("support_status", support_status_cmd, block=False))
+    app.add_handler(CommandHandler("support_open", admin_support_open_cmd, block=False))
+    app.add_handler(CommandHandler("support_close", admin_support_close_cmd, block=False))
+    app.add_handler(CommandHandler("tz", tz_cmd, block=False))
+    app.add_handler(CommandHandler("dayreset", dayreset_cmd, block=False))
+    app.add_handler(CommandHandler("screen", screen_cmd, block=False))
+    app.add_handler(CommandHandler("equity", equity_cmd, block=False))
+    app.add_handler(CommandHandler("equity_reset", equity_reset_cmd, block=False))
+    app.add_handler(CommandHandler("riskmode", riskmode_cmd, block=False))
+    app.add_handler(CommandHandler("dailycap", dailycap_cmd, block=False))
+    app.add_handler(CommandHandler("dailycapAT", dailycapAT_cmd, block=False))
+    app.add_handler(CommandHandler("dailycapat", dailycapAT_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_config", autotrade_config_cmd, block=False))
+    app.add_handler(CommandHandler("autotradecfg", autotrade_config_cmd, block=False))
+    app.add_handler(CommandHandler("dayrisk_reset", dayrisk_reset_cmd, block=False))
+    app.add_handler(CommandHandler("limits", limits_cmd, block=False))
 
-    _register_command_handler(app, "trade_sl", trade_sl_cmd, block=False)
-    _register_command_handler(app, "trade_rf", trade_rf_cmd, block=False)
+    app.add_handler(CommandHandler("trade_sl", trade_sl_cmd, block=False))
+    app.add_handler(CommandHandler("trade_rf", trade_rf_cmd, block=False))
     
-    _register_command_handler(app, "sessions", sessions_cmd, block=False)
-    _register_command_handler(app, "sessions_on", sessions_on_cmd, block=False)
-    _register_command_handler(app, "sessions_off", sessions_off_cmd, block=False)
-    _register_command_handler(app, "sessions_on_unlimited", sessions_on_unlimited_cmd, block=False)
-    _register_command_handler(app, "sessions_unlimited_on", sessions_unlimited_on_cmd, block=False)
-    _register_command_handler(app, "sessions_off_unlimited", sessions_off_unlimited_cmd, block=False)
-    _register_command_handler(app, "sessions_unlimited_off", sessions_unlimited_off_cmd, block=False)
+    app.add_handler(CommandHandler("sessions", sessions_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_on", sessions_on_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_off", sessions_off_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_on_unlimited", sessions_on_unlimited_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_unlimited_on", sessions_unlimited_on_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_off_unlimited", sessions_off_unlimited_cmd, block=False))
+    app.add_handler(CommandHandler("sessions_unlimited_off", sessions_unlimited_off_cmd, block=False))
 
-    _register_command_handler(app, "bigmove_alert", bigmove_alert_cmd, block=False)
-    _register_command_handler(app, "notify_on", notify_on, block=False)
-    _register_command_handler(app, "notify_off", notify_off, block=False)
+    app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd, block=False))
+    app.add_handler(CommandHandler("notify_on", notify_on, block=False))
+    app.add_handler(CommandHandler("notify_off", notify_off, block=False))
     # Fallback: pasted "invisible-prefix" /size from mobile email clients
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _size_paste_fallback_router), group=-2)
-    _register_command_handler(app, "size", size_cmd, block=False)
-    _register_command_handler(app, "trade_open", trade_open_cmd, block=False)
-    _register_command_handler(app, "trade_close", trade_close_cmd, block=False)
-    _register_command_handler(app, "trade_id_reset", trade_id_reset_cmd, block=False)
-    _register_command_handler(app, "status", status_cmd, block=False)
-    _register_command_handler(app, "open_trades", open_trades_cmd, block=False)
-    _register_command_handler(app, "cooldowns", cooldowns_cmd, block=False)
-    _register_command_handler(app, "cooldown", cooldown_cmd, block=False)
-    _register_command_handler(app, "cooldown_clear", cooldown_clear_cmd, block=False)
-    _register_command_handler(app, "cooldown_clear_all", cooldown_clear_all_cmd, block=False)
-    _register_command_handler(app, "report_daily", report_daily_cmd, block=False)
-    _register_command_handler(app, "report_overall", report_overall_cmd, block=False)
-    _register_command_handler(app, "report_weekly", report_weekly_cmd, block=False)
-    _register_command_handler(app, "signals_daily", signals_daily_cmd, block=False)
-    _register_command_handler(app, "signals_weekly", signals_weekly_cmd, block=False)
-    _register_command_handler(app, "health", health_cmd, block=False)
-    _register_command_handler(app, "reset", reset_cmd, block=False)
-    _register_command_handler(app, "restore", restore_cmd, block=False)
-    _register_command_handler(app, "health_sys", health_sys_cmd, block=False)
-    _register_command_handler(app, "dev_status", dev_status_cmd, block=False)
-    _register_command_handler(app, "framework_status", dev_status_cmd, block=False)
-    _register_command_handler(app, "billing", billing_cmd, block=False)
-    _register_command_handler(app, "email_on_off", email_on_off_cmd, block=False)
-    _register_command_handler(app, "upgrade", upgrade_cmd, block=False)
-    _register_command_handler(app, "trade_window", trade_window_cmd, block=False)
-    _register_command_handler(app, "email", email_cmd, block=False)
-    _register_command_handler(app, "email_on", email_on_cmd, block=False)
-    _register_command_handler(app, "email_off", email_off_cmd, block=False)
-    _register_command_handler(app, "email_test", email_test_cmd, block=False)
-    _register_command_handler(app, "email_decision", email_decision_cmd, block=False)
-    _register_command_handler(app, "email_pipeline_status", email_pipeline_status_cmd, block=False)
-    _register_command_handler(app, "setups_log", setups_log_cmd, block=False)
-    _register_command_handler(app, "setup_audit", setup_audit_cmd, block=False)
-    _register_command_handler(app, "setup_quality", setup_audit_cmd, block=False)
-    _register_command_handler(app, "setup_audit_overall", setup_audit_overall_cmd, block=False)
-    _register_command_handler(app, "setup_audit_keep_watch", setup_audit_keep_watch_cmd, block=False)
-    _register_command_handler(app, "setup_audit_keep", setup_audit_keep_cmd, block=False)
-    _register_command_handler(app, "setup_keep_watch_summary", setup_audit_keep_watch_cmd, block=False)
-    _register_command_handler(app, "setup_audit_compare", setup_audit_compare_cmd, block=False)
-    _register_command_handler(app, "setup_audit_reconcile", setup_audit_compare_cmd, block=False)
-    _register_command_handler(app, "setup_matrix", setup_matrix_cmd, block=False)
-    _register_command_handler(app, "setup_edge_matrix", setup_matrix_cmd, block=False)
-    _register_command_handler(app, "setup_deep_analysis", setup_deep_analysis_cmd, block=False)
-    _register_command_handler(app, "setup_edge_deep", setup_deep_analysis_cmd, block=False)
-    _register_command_handler(app, "setup_matrix_deep", setup_deep_analysis_cmd, block=False)
+    app.add_handler(CommandHandler("size", size_cmd, block=False))
+    app.add_handler(CommandHandler("trade_open", trade_open_cmd, block=False))
+    app.add_handler(CommandHandler("trade_close", trade_close_cmd, block=False))
+    app.add_handler(CommandHandler("trade_id_reset", trade_id_reset_cmd, block=False))
+    app.add_handler(CommandHandler("status", status_cmd, block=False))
+    app.add_handler(CommandHandler("open_trades", open_trades_cmd, block=False))
+    app.add_handler(CommandHandler("cooldowns", cooldowns_cmd, block=False))
+    app.add_handler(CommandHandler("cooldown", cooldown_cmd, block=False))
+    app.add_handler(CommandHandler("cooldown_clear", cooldown_clear_cmd, block=False))
+    app.add_handler(CommandHandler("cooldown_clear_all", cooldown_clear_all_cmd, block=False))
+    app.add_handler(CommandHandler("report_daily", report_daily_cmd, block=False))
+    app.add_handler(CommandHandler("report_overall", report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("report_weekly", report_weekly_cmd, block=False))
+    app.add_handler(CommandHandler("signals_daily", signals_daily_cmd, block=False))
+    app.add_handler(CommandHandler("signals_weekly", signals_weekly_cmd, block=False))
+    app.add_handler(CommandHandler("health", health_cmd, block=False))
+    app.add_handler(CommandHandler("reset", reset_cmd, block=False))
+    app.add_handler(CommandHandler("restore", restore_cmd, block=False))
+    app.add_handler(CommandHandler("health_sys", health_sys_cmd, block=False))
+    app.add_handler(CommandHandler("dev_status", dev_status_cmd, block=False))
+    app.add_handler(CommandHandler("framework_status", dev_status_cmd, block=False))
+    app.add_handler(CommandHandler("billing", billing_cmd, block=False))
+    app.add_handler(CommandHandler("email_on_off", email_on_off_cmd, block=False))
+    app.add_handler(CommandHandler("upgrade", upgrade_cmd, block=False))
+    app.add_handler(CommandHandler("trade_window", trade_window_cmd, block=False))
+    app.add_handler(CommandHandler("email", email_cmd, block=False))
+    app.add_handler(CommandHandler("email_on", email_on_cmd, block=False))
+    app.add_handler(CommandHandler("email_off", email_off_cmd, block=False))
+    app.add_handler(CommandHandler("email_test", email_test_cmd, block=False))
+    app.add_handler(CommandHandler("email_decision", email_decision_cmd, block=False))
+    app.add_handler(CommandHandler("email_pipeline_status", email_pipeline_status_cmd, block=False))
+    app.add_handler(CommandHandler("setups_log", setups_log_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit", setup_audit_cmd, block=False))
+    app.add_handler(CommandHandler("setup_quality", setup_audit_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_overall", setup_audit_overall_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_keep_watch", setup_audit_keep_watch_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_keep", setup_audit_keep_cmd, block=False))
+    app.add_handler(CommandHandler("setup_keep_watch_summary", setup_audit_keep_watch_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_compare", setup_audit_compare_cmd, block=False))
+    app.add_handler(CommandHandler("setup_audit_reconcile", setup_audit_compare_cmd, block=False))
+    app.add_handler(CommandHandler("setup_matrix", setup_matrix_cmd, block=False))
+    app.add_handler(CommandHandler("setup_edge_matrix", setup_matrix_cmd, block=False))
+    app.add_handler(CommandHandler("setup_deep_analysis", setup_deep_analysis_cmd, block=False))
+    app.add_handler(CommandHandler("setup_edge_deep", setup_deep_analysis_cmd, block=False))
+    app.add_handler(CommandHandler("setup_matrix_deep", setup_deep_analysis_cmd, block=False))
 
-    _register_command_handler(app, "why", why_no_setups_cmd, block=False)
+    app.add_handler(CommandHandler("why", why_no_setups_cmd, block=False))
     # ================= USDT (semi-auto) =================
-    _register_command_handler(app, "usdt", usdt_info_cmd, block=False)
-    _register_command_handler(app, "usdt_paid", usdt_paid_cmd, block=False)
+    app.add_handler(CommandHandler("usdt", usdt_info_cmd, block=False))
+    app.add_handler(CommandHandler("usdt_paid", usdt_paid_cmd, block=False))
     
     # ================= Admin: access & payments =================
     
-    _register_command_handler(app, "admin_user", admin_user_cmd, block=False)
-    _register_command_handler(app, "admin_users", admin_users_cmd, block=False)
-    _register_command_handler(app, "admin_grant", admin_grant_cmd, block=False)
-    _register_command_handler(app, "admin_revoke", admin_revoke_cmd, block=False)
-    _register_command_handler(app, "admin_reset_report", admin_reset_report_cmd, block=False)
-    _register_command_handler(app, "admin_reset_test_data", admin_reset_test_data_cmd, block=False)
-    _register_command_handler(app, "admin_reset_signal_reports", admin_reset_signal_reports_cmd, block=False)
-    _register_command_handler(app, "admin_payments", admin_payments_cmd, block=False)
+    app.add_handler(CommandHandler("admin_user", admin_user_cmd, block=False))
+    app.add_handler(CommandHandler("admin_users", admin_users_cmd, block=False))
+    app.add_handler(CommandHandler("admin_grant", admin_grant_cmd, block=False))
+    app.add_handler(CommandHandler("admin_revoke", admin_revoke_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_report", admin_reset_report_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_test_data", admin_reset_test_data_cmd, block=False))
+    app.add_handler(CommandHandler("admin_reset_signal_reports", admin_reset_signal_reports_cmd, block=False))
+    app.add_handler(CommandHandler("admin_payments", admin_payments_cmd, block=False))
 
     # Admin: approve Stripe/USDT payments and grant access
-    _register_command_handler(app, "payment_approve", payment_approve_cmd, block=False)
+    app.add_handler(CommandHandler("payment_approve", payment_approve_cmd, block=False))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     
-    _register_command_handler(app, "autotrade_sessions", autotrade_sessions_cmd, block=False)
-    _register_command_handler(app, "autotrade_report", autotrade_report_cmd, block=False)
-    _register_command_handler(app, "autotrade_closed", autotrade_closed_cmd, block=False)
-    _register_command_handler(app, "autotradeclosed", autotrade_closed_cmd, block=False)
-    _register_background_command_alias("autotrade/closed", autotrade_closed_cmd)
+    app.add_handler(CommandHandler("autotrade_sessions", autotrade_sessions_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report", autotrade_report_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_closed", autotrade_closed_cmd, block=False))
+    app.add_handler(CommandHandler("autotradeclosed", autotrade_closed_cmd, block=False))
     app.add_handler(MessageHandler(filters.Regex(r"^/autotrade/closed(?:@\w+)?(?:\s|$)"), autotrade_closed_cmd, block=False))
-    _register_command_handler(app, "performance_report", performance_report_cmd, block=False)
-    _register_command_handler(app, "trade_lifecycle", trade_lifecycle_cmd, block=False)
-    _register_command_handler(app, "trade_lifecycle_detail", trade_lifecycle_detail_cmd, block=False)
-    _register_command_handler(app, "autotrade_last", autotrade_last_cmd, block=False)
-    _register_command_handler(app, "autotrade_fix_exits", autotrade_fix_exits_cmd, block=False)
-    _register_command_handler(app, "autotrade_flat_now", autotrade_flat_now_cmd, block=False)
-    _register_command_handler(app, "autotrade_on", autotrade_on_cmd, block=False)
-    _register_command_handler(app, "autotrade_off", autotrade_off_cmd, block=False)
-    _register_command_handler(app, "autotrade_debug", autotrade_debug_cmd, block=False)
-    _register_command_handler(app, "autotrade_debug_reset", autotrade_debug_reset_cmd)
-    _register_command_handler(app, "autoytrade_report_overall", autoytrade_report_overall_cmd, block=False)
-    _register_command_handler(app, "autoytrade_report_overal", autoytrade_report_overall_cmd, block=False)
-    _register_command_handler(app, "autotrade_report_matrix", autoytrade_report_overall_cmd, block=False)
-    _register_command_handler(app, "autotrade_report_overall", autotrade_report_overall_cmd, block=False)
-    _register_command_handler(app, "autotrade_report_overal", autotrade_report_overall_cmd, block=False)
-    _register_command_handler(app, "edge_status", edge_status_cmd, block=False)
-    _register_command_handler(app, "optimizer_status", learning_status_cmd, block=False)
-    _register_command_handler(app, "learning_status", learning_status_cmd, block=False)
-    _register_command_handler(app, "winrate", winrate_cmd, block=False)
-    _register_command_handler(app, "ny_winrate", ny_winrate_cmd, block=False)
-    _register_command_handler(app, "nywinrate", ny_winrate_cmd, block=False)
-    _register_command_handler(app, "lessons_learned", lessons_learned_cmd, block=False)
+    app.add_handler(CommandHandler("performance_report", performance_report_cmd, block=False))
+    app.add_handler(CommandHandler("trade_lifecycle", trade_lifecycle_cmd, block=False))
+    app.add_handler(CommandHandler("trade_lifecycle_detail", trade_lifecycle_detail_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_last", autotrade_last_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_fix_exits", autotrade_fix_exits_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_flat_now", autotrade_flat_now_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_on", autotrade_on_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_off", autotrade_off_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_debug", autotrade_debug_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_debug_reset", autotrade_debug_reset_cmd))
+    app.add_handler(CommandHandler("autoytrade_report_overall", autoytrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("autoytrade_report_overal", autoytrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report_matrix", autoytrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report_overall", autotrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("autotrade_report_overal", autotrade_report_overall_cmd, block=False))
+    app.add_handler(CommandHandler("edge_status", edge_status_cmd, block=False))
+    app.add_handler(CommandHandler("optimizer_status", learning_status_cmd, block=False))
+    app.add_handler(CommandHandler("learning_status", learning_status_cmd, block=False))
+    app.add_handler(CommandHandler("winrate", winrate_cmd, block=False))
+    app.add_handler(CommandHandler("ny_winrate", ny_winrate_cmd, block=False))
+    app.add_handler(CommandHandler("nywinrate", ny_winrate_cmd, block=False))
+    app.add_handler(CommandHandler("lessons_learned", lessons_learned_cmd, block=False))
     
     # Strategy parameterization + optimization (admin)
-    _register_command_handler(app, "params_show", cmd_params_show, block=False)
-    _register_command_handler(app, "params_set", cmd_params_set, block=False)
-    _register_command_handler(app, "params_reset", cmd_params_reset, block=False)
-    _register_command_handler(app, "optimize", cmd_optimize, block=False)
-    _register_command_handler(app, "optimize_report", cmd_optimize_report, block=False)
-    _register_command_handler(app, "self_optimize", cmd_self_optimize, block=False)
-    _register_command_handler(app, "self_optimize_stop", cmd_self_optimize_stop, block=False)
-    _register_command_handler(app, "self_optimize_report", cmd_self_optimize_report, block=False)
-    _register_command_handler(app, "autopilot_report", cmd_self_optimize_report, block=False)
-    _register_command_handler(app, "autopilot_status", learning_status_cmd, block=False)
-    _register_command_handler(app, "adaptive_status", market_adaptive_status_cmd, block=False)
-    _register_command_handler(app, "adaptive_run", market_adaptive_run_cmd, block=False)
-    _register_command_handler(app, "goal_status", goal_profile_status_cmd, block=False)
-    _register_command_handler(app, "goal_run", goal_profile_run_cmd, block=False)
-    _register_command_handler(app, "goal_set", goal_profile_set_cmd, block=False)
-    _register_command_handler(app, "goal_abort", goal_profile_abort_cmd, block=False)
-    _register_command_handler(app, "goalstatus", goal_profile_status_cmd, block=False)
-    _register_command_handler(app, "goalrun", goal_profile_run_cmd, block=False)
-    _register_command_handler(app, "goalset", goal_profile_set_cmd, block=False)
-    _register_command_handler(app, "goalabort", goal_profile_abort_cmd, block=False)
-    _register_command_handler(app, "backtest", cmd_backtest, block=False)
-    _register_command_handler(app, "universe_backtest", cmd_universe_backtest, block=False)
+    app.add_handler(CommandHandler("params_show", cmd_params_show, block=False))
+    app.add_handler(CommandHandler("params_set", cmd_params_set, block=False))
+    app.add_handler(CommandHandler("params_reset", cmd_params_reset, block=False))
+    app.add_handler(CommandHandler("optimize", cmd_optimize, block=False))
+    app.add_handler(CommandHandler("optimize_report", cmd_optimize_report, block=False))
+    app.add_handler(CommandHandler("self_optimize", cmd_self_optimize, block=False))
+    app.add_handler(CommandHandler("self_optimize_stop", cmd_self_optimize_stop, block=False))
+    app.add_handler(CommandHandler("self_optimize_report", cmd_self_optimize_report, block=False))
+    app.add_handler(CommandHandler("autopilot_report", cmd_self_optimize_report, block=False))
+    app.add_handler(CommandHandler("autopilot_status", learning_status_cmd, block=False))
+    app.add_handler(CommandHandler("adaptive_status", market_adaptive_status_cmd, block=False))
+    app.add_handler(CommandHandler("adaptive_run", market_adaptive_run_cmd, block=False))
+    app.add_handler(CommandHandler("goal_status", goal_profile_status_cmd, block=False))
+    app.add_handler(CommandHandler("goal_run", goal_profile_run_cmd, block=False))
+    app.add_handler(CommandHandler("goal_set", goal_profile_set_cmd, block=False))
+    app.add_handler(CommandHandler("goal_abort", goal_profile_abort_cmd, block=False))
+    app.add_handler(CommandHandler("goalstatus", goal_profile_status_cmd, block=False))
+    app.add_handler(CommandHandler("goalrun", goal_profile_run_cmd, block=False))
+    app.add_handler(CommandHandler("goalset", goal_profile_set_cmd, block=False))
+    app.add_handler(CommandHandler("goalabort", goal_profile_abort_cmd, block=False))
+    app.add_handler(CommandHandler("backtest", cmd_backtest, block=False))
+    app.add_handler(CommandHandler("universe_backtest", cmd_universe_backtest, block=False))
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
@@ -63656,16 +62552,7 @@ def main():
         # the pipeline alive.
         # Ver110: schedule interval must be longer than the allowed runtime to avoid
         # APScheduler max_instances skipped-run warnings on Render.
-        # yver155: Render-safe interval. A 2-minute alert_job interval was still
-        # overlapping when ticker/email/network calls ran long, causing repeated
-        # APScheduler max_instances warnings and starving setup generation.
-        interval_sec = max(
-            int(globals().get('ALERT_JOB_RENDER_SAFE_INTERVAL_SEC', 300) or 300),
-            90,
-            int(CHECK_INTERVAL_MIN * 60),
-            int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 180),
-            int(ALERT_JOB_MAX_RUNTIME_SEC or 75) + 120,
-        )
+        interval_sec = max(90, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 30)
     
         app.job_queue.run_repeating(
             alert_job,
@@ -63840,13 +62727,7 @@ def main():
         # AutoTrade loop (owner-only)
         app.job_queue.run_repeating(
             autotrade_job,
-            # yver155: avoid Render/APScheduler max_instances skipped-run warnings
-            # by scheduling AutoTrade slower than its maximum execution budget.
-            interval=max(
-                int(globals().get('AUTOTRADE_JOB_RENDER_SAFE_INTERVAL_SEC', 300) or 300),
-                int(AUTOTRADE_JOB_INTERVAL_SEC or 180),
-                int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 75) + 120,
-            ),
+            interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 10),
             first=45,
             name="autotrade_job",
             job_kwargs={
