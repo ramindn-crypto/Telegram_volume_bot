@@ -1,3 +1,4 @@
+# yver166: syncs AutoTrade with delivered KEEP setup lane by disabling the legacy strict KEEP-edge blocker for setups already accepted by /screen/setup-email/canonical Gate=KEEP; prevents emailed setups from being skipped with autotrade_strict_keep_edge_block.
 # yver165: completes canonical KEEP lane sync: /setup_audit Gate=KEEP rows bypass secondary email-only flip/diversification cooldown blockers, so they are emailed, shown on /screen, and immediately queued for AutoTrade from the same setup_id.
 # yver164: locks /screen, setup-email and AutoTrade to one canonical current KEEP executable lane; AutoTrade no longer consumes BigMove/recent-email rows outside /setup_audit Gate=KEEP; email recovers unemailed KEEP rows from executable_setups.
 # yver163: sorts /setup_audit detailed rows strictly by setup time ascending (earliest to latest) instead of Policy priority; bumps setup-audit cache key.
@@ -5462,10 +5463,26 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
                 wr = float(m.get('wr') or 0.0)
                 avg = float(m.get('avg_r') or 0.0)
                 wr_first_cutoff = float(globals().get('SETUP_COMBO_POLICY_KEEP_ANY_WR', 49.0) or 49.0)
+                # yver166: once a setup has already passed the canonical
+                # /screen + setup-email delivery lane, AutoTrade must not apply
+                # the legacy stricter AutoTrade-only floor (Dec>=5 / WR>=60 /
+                # AvgR>=+0.25). That old extra blocker was the reason an emailed
+                # setup such as ZEC could be displayed and delivered but then
+                # skipped with autotrade_strict_keep_edge_block.  The true live
+                # safety checks still run later: recent setup email, canonical
+                # Gate=KEEP, structural prices/RR, leverage, risk caps and Bybit
+                # order placement guards.
+                delivered_keep_lane = bool(getattr(setup_or_row, 'canonical_gate_keep', False))
+                try:
+                    delivered_keep_lane = delivered_keep_lane or bool(float(getattr(setup_or_row, 'email_logged_ts', 0.0) or getattr(setup_or_row, 'emailed_ts', 0.0) or 0.0) > 0.0)
+                except Exception:
+                    pass
+                if delivered_keep_lane:
+                    pass
                 # If the exact lane is KEEP by the WR-first policy, do not apply
                 # the legacy stricter AutoTrade-only floor. This keeps screen,
                 # email, and AutoTrade synced on the same setup.
-                if dec > 0 and wr > wr_first_cutoff:
+                elif dec > 0 and wr > wr_first_cutoff:
                     pass
                 else:
                     min_dec = int(_autotrade_strict_keep_edge_min_decided())
