@@ -1,3 +1,4 @@
+# yver22: runtime-enforces Ramin WR>49 KEEP rule from latest setup_combo_scores, so /screen/setup email/AutoTrade use the same forced KEEP policy shown by /setup_matrix policy; bumps admin report cache keys to v22.
 # yver21: force-KEEP any combo with decided WR >49%, clean /setup_matrix policy and /setup_audit outputs, and sort policy table by KEEP then WR.
 # yver149: fixes /setup_audit_compare pre-window open matching.
 # yver148: makes strict AutoTrade KEEP edge runtime-configurable/visible in /autotrade_config, keeps setup-email/screen synced to the same strict edge gate, and clarifies evidence-based time-exit decision support without changing live TP/SL/trading logic.
@@ -3085,6 +3086,95 @@ def _setup_combo_force_keep_by_wr(decided: int, wr: float) -> bool:
         return int(decided or 0) > 0 and float(wr or 0.0) > float(globals().get('SETUP_COMBO_POLICY_FORCE_KEEP_WR', 49.0) or 49.0)
     except Exception:
         return False
+
+
+# yver22: /setup_matrix policy already displays WR>49 lanes as KEEP.  Runtime
+# gates must use the same rule immediately, without waiting for the scheduled
+# policy table writer.  This cache reads the latest setup_combo_scores snapshot
+# and lets the policy lookup override stale DISABLE/OFF rows when the exact lane
+# now has decided WR > SETUP_COMBO_POLICY_FORCE_KEEP_WR.
+_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE = {'ts': 0.0, 'user_id': 0, 'run_id': '', 'rows': {}}
+
+
+def _setup_combo_latest_score_rows_for_runtime(user_id: int = 0, ttl_sec: int = 60) -> dict:
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid = int(user_id or owner_uid or 0)
+        cache = globals().setdefault('_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE', {'ts': 0.0, 'user_id': 0, 'run_id': '', 'rows': {}})
+        now = float(time.time())
+        if cache.get('rows') and int(cache.get('user_id') or 0) == uid and (now - float(cache.get('ts') or 0.0)) <= max(5, int(ttl_sec or 60)):
+            return dict(cache.get('rows') or {})
+        rows_by_combo = {}
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                ids = [x for x in [uid, 0] if int(x or 0) >= 0]
+                ids = list(dict.fromkeys([int(x) for x in ids])) or [0]
+                qmarks = ','.join(['?'] * len(ids))
+                latest = cur.execute(
+                    f"SELECT run_id FROM setup_combo_scores WHERE user_id IN ({qmarks}) ORDER BY evaluated_ts DESC LIMIT 1",
+                    tuple(ids),
+                ).fetchone()
+                run_id = str(latest['run_id'] if latest else '' or '')
+                if run_id:
+                    for sr in cur.execute("SELECT * FROM setup_combo_scores WHERE run_id=?", (run_id,)).fetchall() or []:
+                        d = dict(sr)
+                        fam = str(d.get('family') or '').upper().strip()
+                        sess = str(d.get('session') or '').upper().strip()
+                        strat = _setup_strategy_suffix(value=str(d.get('strategy') or 'NOR'))
+                        side = _setup_side_suffix(value=str(d.get('side') or 'BOTH'))
+                        combo = str(d.get('combo') or '').upper().strip()
+                        if not combo and fam and sess:
+                            combo = _setup_combo_strategy_side_key(fam, sess, strat, side) if side in {'BUY','SELL'} else _setup_combo_strategy_key(fam, sess, strat)
+                        if combo:
+                            rows_by_combo[combo] = d
+                        if fam and sess and strat:
+                            rows_by_combo.setdefault(_setup_combo_strategy_key(fam, sess, strat), d)
+                        if fam and sess:
+                            rows_by_combo.setdefault(f'{fam}-{sess}', d)
+                cache.update({'ts': now, 'user_id': uid, 'run_id': run_id, 'rows': dict(rows_by_combo)})
+        except Exception:
+            cache.update({'ts': now, 'user_id': uid, 'run_id': '', 'rows': {}})
+        return dict(rows_by_combo)
+    except Exception:
+        return {}
+
+
+def _setup_combo_force_keep_override_for_lane(family: str, session: str, strategy: str = 'NOR', side: str = 'BOTH', user_id: int = 0) -> dict:
+    """Return a KEEP override dict when the latest evidence has decided WR >49%."""
+    try:
+        fam = str(family or '').upper().strip()
+        sess = str(session or '').upper().strip()
+        strat = _setup_strategy_suffix(value=str(strategy or 'NOR'))
+        side_u = _setup_side_suffix(value=str(side or 'BOTH'))
+        if not fam or not sess or fam in {'-', 'F0'} or sess in {'-', 'NONE'}:
+            return {}
+        rows = _setup_combo_latest_score_rows_for_runtime(int(user_id or 0))
+        keys = []
+        if side_u in {'BUY','SELL'}:
+            keys.append(_setup_combo_strategy_side_key(fam, sess, strat, side_u))
+        keys.append(_setup_combo_strategy_key(fam, sess, strat))
+        keys.append(f'{fam}-{sess}')
+        for key in keys:
+            st = dict(rows.get(str(key or '').upper().strip()) or {})
+            if not st:
+                continue
+            decided = int(st.get('decided') or st.get('last_decided') or 0)
+            wr = float(st.get('win_rate') if st.get('win_rate') is not None else (st.get('wr') if st.get('wr') is not None else (st.get('last_win_rate') or 0.0)))
+            if _setup_combo_force_keep_by_wr(decided, wr):
+                return {
+                    'combo': str(key),
+                    'decided': int(decided),
+                    'win_rate': float(wr),
+                    'avg_r': float(st.get('avg_r') if st.get('avg_r') is not None else (st.get('last_avg_r') or 0.0)),
+                    'setups': int(st.get('setups') or st.get('last_setups') or 0),
+                    'source': 'latest_setup_combo_scores',
+                    'reason': f'force_keep_wr_gt_{float(globals().get("SETUP_COMBO_POLICY_FORCE_KEEP_WR", 49.0) or 49.0):.0f}',
+                }
+        return {}
+    except Exception:
+        return {}
 
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
 # matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
@@ -47404,6 +47494,26 @@ def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', u
         out.update({'family': fam, 'session': sess, 'strategy': strat, 'side': side, 'combo': full_combo})
         if sess in {'', '-', 'NONE'} or fam in {'', '-', 'F0'}:
             return out
+
+        # yver22: enforce the same WR>49 KEEP rule used by /setup_matrix policy
+        # inside live /screen, setup-email, /setup_audit Policy and AutoTrade gates.
+        # This overrides stale scheduled DISABLE/OFF rows immediately when latest
+        # setup_combo_scores show that the exact lane is now above the owner rule.
+        force_keep = _setup_combo_force_keep_override_for_lane(fam, sess, strat, side, user_id=int(user_id or 0))
+        if force_keep:
+            pol = {
+                'user_id': int(user_id or globals().get('AUTOTRADE_OWNER_UID', 0) or 0),
+                'family': fam, 'session': sess, 'strategy': strat, 'side': side,
+                'status': 'KEEP', 'enabled': 1, 'policy_kind': 'runtime_force_keep_wr',
+                'last_decided': int(force_keep.get('decided') or 0),
+                'last_win_rate': float(force_keep.get('win_rate') or 0.0),
+                'last_avg_r': float(force_keep.get('avg_r') or 0.0),
+                'last_setups': int(force_keep.get('setups') or 0),
+                'note': str(force_keep.get('reason') or 'force_keep_wr_gt_49'),
+            }
+            out.update({'found': True, 'policy': pol, 'status': 'KEEP', 'enabled': 1,
+                        'force_keep': True, 'force_keep_info': dict(force_keep or {})})
+            return out
         rows = _setup_combo_policy_cache_rows(force=False)
         uid = int(user_id or 0)
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
@@ -49747,7 +49857,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v149:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v22:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -49797,7 +49907,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v149:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v22:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -49815,7 +49925,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v149:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v22:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50146,7 +50256,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v149:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v22:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50172,7 +50282,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v149:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v22:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -50191,7 +50301,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v149:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v22:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -50696,7 +50806,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v149:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v22:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -50721,7 +50831,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v149:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v22:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -50739,7 +50849,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v149:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v22:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -50764,7 +50874,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v149:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v22:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -54873,7 +54983,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v149:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v22:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -54893,7 +55003,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v149:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v22:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -54914,7 +55024,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v149:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v22:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
