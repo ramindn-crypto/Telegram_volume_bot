@@ -1,3 +1,4 @@
+# yver26: restores fast non-blocking /setup_matrix policy output by removing the heavy on-view full score rebuild from yver25; keeps Dec removed and WR formula note; policy scores continue to refresh via scheduled/daily/intraday safety and explicit matrix builds.
 # yver25: refreshes /setup_matrix policy scores on every fresh report so WR updates immediately after TP/SL evidence, keeps WR=TP/(TP+SL), removes Dec column from the policy table, and bumps policy cache keys.
 # yver24: makes /setup_audit Policy read the exact /setup_matrix policy state as source of truth, and lets matrix KEEP lanes pass /screen/setup-email/AutoTrade policy gates while keeping structural/risk/cooldown checks downstream.
 # yver23: lets WR>49 forced-KEEP lanes bypass the later strict KEEP edge block so /setup_matrix policy, /setup_audit Policy, setup email, /screen and AutoTrade stay synchronized; bumps admin report cache keys to v23.
@@ -49809,28 +49810,31 @@ def _setup_combo_policy_text(uid: int) -> str:
         if owner_uid <= 0:
             owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
 
-        # yver25: /setup_matrix policy is the WR source of truth and must
-        # refresh its setup_combo_scores on each FRESH report, not only every 3h
-        # safety cycle.  This writes fresh score rows only; it does not rewrite the
-        # scheduled live policy table here.  Live KEEP enforcement still reads the
-        # freshly refreshed WR/AvgR scores below and applies the WR>49 KEEP rule.
-        baseline_res = {'ok': True, 'reason': 'policy_view_scores_refreshed'}
-        try:
-            baseline_res = _setup_combo_matrix_build(
-                int(owner_uid),
-                _overall_report_effective_hours(SETUP_COMBO_REVIEW_WINDOW_HOURS),
-                True,
-                False,
-                'matrix_policy_view',
-                start_ts=_overall_report_start_ts(),
-            )
+        # yver26: keep /setup_matrix policy fast and non-blocking again.
+        # yver25 tried to run the full 15-May score rebuild on every policy view;
+        # that can take too long because it preloads OHLCV and resolves the full
+        # price-path history.  The report must return the latest stored policy/scores
+        # immediately.  Scheduled daily/intraday safety plus explicit setup-matrix
+        # builds remain responsible for refreshing setup_combo_scores.  If an admin
+        # really wants a heavy on-view refresh, it can still be enabled by env.
+        baseline_res = {'ok': True, 'reason': 'view_fast_db_policy_no_refresh'}
+        if env_bool('SETUP_MATRIX_POLICY_REFRESH_ON_VIEW', False):
             try:
-                globals().setdefault('_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE', {'ts': 0.0, 'user_id': 0, 'run_id': '', 'rows': {}})['ts'] = 0.0
-                globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0, 'user_id': 0, 'data': {}})['ts'] = 0.0
-            except Exception:
-                pass
-        except Exception as _baseline_exc:
-            baseline_res = {'ok': False, 'reason': f'{type(_baseline_exc).__name__}: {_baseline_exc}'}
+                baseline_res = _setup_combo_matrix_build(
+                    int(owner_uid),
+                    _overall_report_effective_hours(SETUP_COMBO_REVIEW_WINDOW_HOURS),
+                    True,
+                    False,
+                    'matrix_policy_view',
+                    start_ts=_overall_report_start_ts(),
+                )
+                try:
+                    globals().setdefault('_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE', {'ts': 0.0, 'user_id': 0, 'run_id': '', 'rows': {}})['ts'] = 0.0
+                    globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0, 'user_id': 0, 'data': {}})['ts'] = 0.0
+                except Exception:
+                    pass
+            except Exception as _baseline_exc:
+                baseline_res = {'ok': False, 'reason': f'{type(_baseline_exc).__name__}: {_baseline_exc}'}
 
         _setup_combo_policy_migrate()
         with sqlite3.connect(DB_PATH) as conn:
@@ -50026,11 +50030,11 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v25:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v26:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
-            fresh_ttl=15,
+            fresh_ttl=60,
             stale_ttl=12 * 3600,
             background_timeout=900,
         )
