@@ -1,4 +1,5 @@
-# yver26: restores fast non-blocking /setup_matrix policy output by removing the heavy on-view full score rebuild from yver25; keeps Dec removed and WR formula note; policy scores continue to refresh via scheduled/daily/intraday safety and explicit matrix builds.
+# yver27: fixes stale stored KEEP demotion when current WR<=49 even if latest score row is only present in policy last_* fields; /setup_matrix policy and runtime gates now treat current WR as authoritative.
+# yver26: fixes current-WR policy sync: stored KEEP rows are demoted when latest WR is <=49%, keeps fast /setup_matrix policy, removes Dec, and uses WR=TP/(TP+SL) with OPEN excluded.
 # yver25: refreshes /setup_matrix policy scores on every fresh report so WR updates immediately after TP/SL evidence, keeps WR=TP/(TP+SL), removes Dec column from the policy table, and bumps policy cache keys.
 # yver24: makes /setup_audit Policy read the exact /setup_matrix policy state as source of truth, and lets matrix KEEP lanes pass /screen/setup-email/AutoTrade policy gates while keeping structural/risk/cooldown checks downstream.
 # yver23: lets WR>49 forced-KEEP lanes bypass the later strict KEEP edge block so /setup_matrix policy, /setup_audit Policy, setup email, /screen and AutoTrade stay synchronized; bumps admin report cache keys to v23.
@@ -3092,6 +3093,35 @@ def _setup_combo_force_keep_by_wr(decided: int, wr: float) -> bool:
         return False
 
 
+def _setup_combo_current_wr_blocks_keep(decided: int, wr: float) -> bool:
+    """True when current decided evidence exists but no longer qualifies for KEEP.
+
+    Owner rule: only WR > SETUP_COMBO_POLICY_FORCE_KEEP_WR is KEEP.
+    Therefore any decided row at or below the threshold must not retain an old
+    stored KEEP status, even if the latest score snapshot is not keyed exactly and
+    the values are only available through setup_combo_policy.last_* columns.
+    """
+    try:
+        return int(decided or 0) > 0 and float(wr or 0.0) <= float(globals().get('SETUP_COMBO_POLICY_FORCE_KEEP_WR', 49.0) or 49.0)
+    except Exception:
+        return False
+
+
+def _setup_combo_has_current_score(score: dict) -> bool:
+    """True when a latest setup_combo_scores row exists for this exact/fallback lane.
+
+    yver26 fix: the visible/source-of-truth policy must follow the current WR.
+    If the score exists and WR is no longer >49, an old stored KEEP policy must
+    not keep the lane as KEEP.
+    """
+    try:
+        if not isinstance(score, dict) or not score:
+            return False
+        return any(k in score for k in ('setups', 'decided', 'win_rate', 'wr', 'avg_r', 'action'))
+    except Exception:
+        return False
+
+
 # yver22: /setup_matrix policy already displays WR>49 lanes as KEEP.  Runtime
 # gates must use the same rule immediately, without waiting for the scheduled
 # policy table writer.  This cache reads the latest setup_combo_scores snapshot
@@ -3306,7 +3336,14 @@ def _setup_matrix_policy_source_state_for_lane(family: str, session: str, strate
         wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
         avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
         adv = str(score.get('action') or '-').upper().strip() or '-'
+        has_current_score = _setup_combo_has_current_score(score)
         force_keep = _setup_combo_force_keep_by_wr(dec_v, wr_v)
+        wr_blocks_keep = _setup_combo_current_wr_blocks_keep(dec_v, wr_v)
+        # yver27 fix: the current displayed WR is authoritative even when it comes
+        # from setup_combo_policy.last_* instead of a directly matched score row.
+        # If WR is <=49, stale stored KEEP must be demoted everywhere.
+        if wr_blocks_keep and adv == 'KEEP':
+            adv = 'WATCH'
 
         full_disabled = False
         if pol:
@@ -3329,9 +3366,23 @@ def _setup_matrix_policy_source_state_for_lane(family: str, session: str, strate
             exec_state = 'PART'; live_state = 'TIGHTEN'
         else:
             pol_status = str((pol or raw_pol or {}).get('status') or '').upper().strip()
-            adv_status = str(score.get('action') or '').upper().strip()
-            if pol_status == 'KEEP' or (not pol and adv_status == 'KEEP'):
-                exec_state = 'KEEP'; live_state = 'KEEP' if pol_status == 'KEEP' else 'WATCH'
+            adv_status = str(adv or score.get('action') or '').upper().strip()
+            if wr_blocks_keep:
+                # Current WR <=49 has decided evidence, so old/stored KEEP cannot survive.
+                if bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
+                    exec_state = 'GATE'; live_state = 'WATCH'
+                else:
+                    exec_state = 'ON'; live_state = 'WATCH'
+            elif has_current_score:
+                # Current score is the source of truth. Only current WR>49 can be KEEP.
+                if adv_status == 'KEEP' and _setup_combo_force_keep_by_wr(dec_v, wr_v):
+                    exec_state = 'KEEP'; live_state = 'KEEP'
+                elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
+                    exec_state = 'GATE'; live_state = 'WATCH'
+                else:
+                    exec_state = 'ON'; live_state = 'WATCH'
+            elif pol_status == 'KEEP':
+                exec_state = 'KEEP'; live_state = 'KEEP'
             elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
                 exec_state = 'GATE'; live_state = 'WATCH'
             else:
@@ -47686,6 +47737,28 @@ def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', u
             out.update({'found': True, 'policy': pol, 'status': 'KEEP', 'enabled': 1,
                         'force_keep': True, 'force_keep_info': dict(force_keep or {})})
             return out
+
+        # yver27: if the latest/current WR is decided and <=49, proactively
+        # suppress any stale stored KEEP row in the normal policy lookup.
+        current_wr_block_info = {}
+        try:
+            _score_rows = _setup_combo_latest_score_rows_for_runtime(int(user_id or 0)) or {}
+            _keys = []
+            if side in {'BUY', 'SELL'}:
+                _keys.append(_setup_combo_strategy_side_key(fam, sess, strat, side))
+            _keys.append(_setup_combo_strategy_key(fam, sess, strat))
+            _keys.append(f'{fam}-{sess}')
+            for _k in _keys:
+                _st = dict(_score_rows.get(str(_k or '').upper().strip()) or {})
+                if not _st:
+                    continue
+                _dec = int(_st.get('decided') or _st.get('last_decided') or 0)
+                _wr = float(_st.get('win_rate') if _st.get('win_rate') is not None else (_st.get('wr') if _st.get('wr') is not None else (_st.get('last_win_rate') or 0.0)))
+                if _setup_combo_current_wr_blocks_keep(_dec, _wr):
+                    current_wr_block_info = {'combo': str(_k), 'decided': _dec, 'wr': _wr, 'source': 'latest_setup_combo_scores'}
+                    break
+        except Exception:
+            current_wr_block_info = {}
         rows = _setup_combo_policy_cache_rows(force=False)
         uid = int(user_id or 0)
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
@@ -47711,7 +47784,22 @@ def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', u
                     continue
                 status = str(pol.get('status') or 'WATCH').upper().strip()
                 enabled = 1 if int(pol.get('enabled') if pol.get('enabled') is not None else 1) == 1 else 0
-                out.update({'found': True, 'policy': dict(pol or {}), 'status': status, 'enabled': enabled,
+                pol_out = dict(pol or {})
+                try:
+                    _pol_dec = int(pol_out.get('last_decided') or 0)
+                    _pol_wr = float(pol_out.get('last_win_rate') or 0.0)
+                except Exception:
+                    _pol_dec, _pol_wr = 0, 0.0
+                if status == 'KEEP' and (bool(current_wr_block_info) or _setup_combo_current_wr_blocks_keep(_pol_dec, _pol_wr)):
+                    status = 'WATCH'
+                    enabled = 1
+                    pol_out['status'] = 'WATCH'
+                    pol_out['enabled'] = 1
+                    pol_out['policy_kind'] = str(pol_out.get('policy_kind') or '') + '|runtime_wr_demoted'
+                    pol_out['note'] = f"current_WR_at_or_below_{float(globals().get('SETUP_COMBO_POLICY_FORCE_KEEP_WR', 49.0) or 49.0):.0f}_not_KEEP"
+                    out['wr_demoted_keep'] = True
+                    out['wr_demote_info'] = dict(current_wr_block_info or {'decided': _pol_dec, 'wr': _pol_wr, 'source': 'policy_last_fields'})
+                out.update({'found': True, 'policy': pol_out, 'status': status, 'enabled': enabled,
                             'strategy': k_strat if k_strat != 'ALL' else strat, 'side': k_side if k_side != 'BOTH' else side})
                 return out
         return out
@@ -49958,7 +50046,13 @@ def _setup_combo_policy_text(uid: int) -> str:
             wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
             avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
             adv = str(score.get('action') or '-').upper().strip() or '-'
+            has_current_score = _setup_combo_has_current_score(score)
             force_keep = _setup_combo_force_keep_by_wr(dec_v, wr_v)
+            wr_blocks_keep = _setup_combo_current_wr_blocks_keep(dec_v, wr_v)
+            # yver27: current displayed WR is authoritative even when it comes
+            # from setup_combo_policy.last_* rather than a direct score row.
+            if wr_blocks_keep and adv == 'KEEP':
+                adv = 'WATCH'
 
             full_disabled = False
             if pol:
@@ -49972,7 +50066,7 @@ def _setup_combo_policy_text(uid: int) -> str:
             # side does not make the paired REV side look blocked before REV has data.
             side_block = (full_combo in side_blocks) or (strat == 'NOR' and f'{base_combo}-{side}' in legacy_side_blocks)
             if force_keep:
-                # yver21: WR >49% wins. Display and enforce the row as KEEP in both columns.
+                # yver21/yver27: only current WR >49% wins. Display and enforce KEEP.
                 exec_state = 'KEEP'; live_state = 'KEEP'; adv = 'KEEP'; active_count += 1
             elif full_disabled:
                 exec_state = 'OFF'; live_state = 'DISABLE'; disabled_count += 1
@@ -49980,9 +50074,23 @@ def _setup_combo_policy_text(uid: int) -> str:
                 exec_state = 'PART'; live_state = 'TIGHTEN'; partial_count += 1
             else:
                 pol_status = str((pol or raw_pol or {}).get('status') or '').upper().strip()
-                adv_status = str(score.get('action') or '').upper().strip()
-                if pol_status == 'KEEP' or (not pol and adv_status == 'KEEP'):
-                    exec_state = 'KEEP'; live_state = 'KEEP' if pol_status == 'KEEP' else 'WATCH'
+                adv_status = str(adv or score.get('action') or '').upper().strip()
+                if wr_blocks_keep:
+                    # Current WR <=49 has decided evidence, so stale stored KEEP cannot survive.
+                    if bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
+                        exec_state = 'GATE'; live_state = 'WATCH'
+                    else:
+                        exec_state = 'ON'; live_state = 'WATCH'
+                elif has_current_score:
+                    # Current score is the source of truth. Stale policy KEEP cannot survive WR<=49.
+                    if adv_status == 'KEEP' and _setup_combo_force_keep_by_wr(dec_v, wr_v):
+                        exec_state = 'KEEP'; live_state = 'KEEP'
+                    elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
+                        exec_state = 'GATE'; live_state = 'WATCH'
+                    else:
+                        exec_state = 'ON'; live_state = 'WATCH'
+                elif pol_status == 'KEEP':
+                    exec_state = 'KEEP'; live_state = 'KEEP'
                 elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
                     exec_state = 'GATE'; live_state = 'WATCH'
                 else:
@@ -50030,7 +50138,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v26:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v27:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
