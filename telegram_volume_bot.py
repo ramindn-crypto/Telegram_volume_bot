@@ -1,3 +1,4 @@
+# yver25: refreshes /setup_matrix policy scores on every fresh report so WR updates immediately after TP/SL evidence, keeps WR=TP/(TP+SL), removes Dec column from the policy table, and bumps policy cache keys.
 # yver24: makes /setup_audit Policy read the exact /setup_matrix policy state as source of truth, and lets matrix KEEP lanes pass /screen/setup-email/AutoTrade policy gates while keeping structural/risk/cooldown checks downstream.
 # yver23: lets WR>49 forced-KEEP lanes bypass the later strict KEEP edge block so /setup_matrix policy, /setup_audit Policy, setup email, /screen and AutoTrade stay synchronized; bumps admin report cache keys to v23.
 # yver22: runtime-enforces Ramin WR>49 KEEP rule from latest setup_combo_scores, so /screen/setup email/AutoTrade use the same forced KEEP policy shown by /setup_matrix policy; bumps admin report cache keys to v22.
@@ -49808,23 +49809,28 @@ def _setup_combo_policy_text(uid: int) -> str:
         if owner_uid <= 0:
             owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
 
-        # yver131: /setup_matrix policy is an admin view and must not block/timeout
-        # Telegram while rebuilding the full 15-May matrix. Scheduled/intraday safety
-        # jobs remain responsible for refreshing policy. Use the DB policy view fast by
-        # default; set SETUP_MATRIX_POLICY_REFRESH_ON_VIEW=1 only for manual heavy refresh.
-        baseline_res = {'ok': True, 'reason': 'view_fast_db_policy_no_refresh'}
-        if env_bool('SETUP_MATRIX_POLICY_REFRESH_ON_VIEW', False):
+        # yver25: /setup_matrix policy is the WR source of truth and must
+        # refresh its setup_combo_scores on each FRESH report, not only every 3h
+        # safety cycle.  This writes fresh score rows only; it does not rewrite the
+        # scheduled live policy table here.  Live KEEP enforcement still reads the
+        # freshly refreshed WR/AvgR scores below and applies the WR>49 KEEP rule.
+        baseline_res = {'ok': True, 'reason': 'policy_view_scores_refreshed'}
+        try:
+            baseline_res = _setup_combo_matrix_build(
+                int(owner_uid),
+                _overall_report_effective_hours(SETUP_COMBO_REVIEW_WINDOW_HOURS),
+                True,
+                False,
+                'matrix_policy_view',
+                start_ts=_overall_report_start_ts(),
+            )
             try:
-                baseline_res = _setup_combo_matrix_build(
-                    int(owner_uid),
-                    _overall_report_effective_hours(SETUP_COMBO_REVIEW_WINDOW_HOURS),
-                    True,
-                    True,
-                    'scheduled',
-                    start_ts=_overall_report_start_ts(),
-                )
-            except Exception as _baseline_exc:
-                baseline_res = {'ok': False, 'reason': f'{type(_baseline_exc).__name__}: {_baseline_exc}'}
+                globals().setdefault('_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE', {'ts': 0.0, 'user_id': 0, 'run_id': '', 'rows': {}})['ts'] = 0.0
+                globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0, 'user_id': 0, 'data': {}})['ts'] = 0.0
+            except Exception:
+                pass
+        except Exception as _baseline_exc:
+            baseline_res = {'ok': False, 'reason': f'{type(_baseline_exc).__name__}: {_baseline_exc}'}
 
         _setup_combo_policy_migrate()
         with sqlite3.connect(DB_PATH) as conn:
@@ -49982,28 +49988,28 @@ def _setup_combo_policy_text(uid: int) -> str:
             # duplicated the header policy-kind summary; no-evidence lanes show '-' metrics.
             wr_txt = f'{wr_v:.1f}%' if dec_v > 0 else '-'
             avg_txt = f'{avg_v:+.2f}' if dec_v > 0 else '-'
-            table_rows.append([full_combo, exec_state, live_state, set_v, dec_v, wr_txt, avg_txt, adv])
+            table_rows.append([full_combo, exec_state, live_state, set_v, wr_txt, avg_txt, adv])
 
         policy_rank = {'KEEP': 0, 'WATCH': 1, 'TIGHTEN': 2, 'DISABLE': 3, 'OFF': 4, '-': 5}
         def _row_key(row):
             combo = str(row[0])
             try:
-                wr_num = float(str(row[5] or '0').replace('%', '').replace('-', '0') or 0.0)
+                wr_num = float(str(row[4] or '0').replace('%', '').replace('-', '0') or 0.0)
             except Exception:
                 wr_num = -1.0
             try:
-                dec_num = int(row[4] or 0)
+                set_num = int(row[3] or 0)
             except Exception:
-                dec_num = 0
-            return (policy_rank.get(str(row[2] or '').upper().strip(), 9), -wr_num, -dec_num, combo)
+                set_num = 0
+            return (policy_rank.get(str(row[2] or '').upper().strip(), 9), -wr_num, -set_num, combo)
         table_rows = sorted(table_rows, key=_row_key)
-        table = tabulate(table_rows, headers=['Combo','ExecNow','Policy','Set','Dec','WR','AvgR','Reco'], tablefmt='plain')
+        table = tabulate(table_rows, headers=['Combo','ExecNow','Policy','Set','WR','AvgR','Reco'], tablefmt='plain')
 
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
             f"Official cycle: <b>weekly</b> | Schedule: <b>{html.escape(_setup_combo_review_schedule_text())}</b> | Evidence window: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_REVIEW_WINDOW_HOURS))}</b> | Live enforce: <b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b>\n"
             f"Daily safety: <b>{html.escape(_setup_combo_daily_safety_schedule_text())}</b> | Evidence window for manual /setup_matrix safety: <b>{html.escape(_overall_report_window_label(SETUP_COMBO_DAILY_SAFETY_WINDOW_HOURS))}</b> | Min decided: <b>{int(SETUP_COMBO_DAILY_SAFETY_MIN_DECIDED)}</b> | Action: <b>temporary severe-disable only</b>\n"
-            f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b>\n"
+            f"Intraday safety: <b>{'ON' if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) else 'OFF'}</b> | Every <b>{float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3):.1f}h</b> | Target WR: <b>{float(globals().get('SETUP_COMBO_PROFIT_TARGET_WR', 50) or 50):.0f}%+</b> | WR=<b>TP/(TP+SL)</b>, OPEN excluded\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -50020,11 +50026,11 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v21:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v25:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
-            fresh_ttl=120,
+            fresh_ttl=15,
             stale_ttl=12 * 3600,
             background_timeout=900,
         )
