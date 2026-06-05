@@ -1,3 +1,5 @@
+# yver24: makes /setup_audit Policy read the exact /setup_matrix policy state as source of truth, and lets matrix KEEP lanes pass /screen/setup-email/AutoTrade policy gates while keeping structural/risk/cooldown checks downstream.
+# yver23: lets WR>49 forced-KEEP lanes bypass the later strict KEEP edge block so /setup_matrix policy, /setup_audit Policy, setup email, /screen and AutoTrade stay synchronized; bumps admin report cache keys to v23.
 # yver22: runtime-enforces Ramin WR>49 KEEP rule from latest setup_combo_scores, so /screen/setup email/AutoTrade use the same forced KEEP policy shown by /setup_matrix policy; bumps admin report cache keys to v22.
 # yver21: force-KEEP any combo with decided WR >49%, clean /setup_matrix policy and /setup_audit outputs, and sort policy table by KEEP then WR.
 # yver149: fixes /setup_audit_compare pre-window open matching.
@@ -3176,6 +3178,190 @@ def _setup_combo_force_keep_override_for_lane(family: str, session: str, strateg
     except Exception:
         return {}
 
+
+# yver24: /setup_matrix policy is the source of truth for lane Policy.
+# /setup_audit must display this exact Policy state, not a separate actionability
+# result, and KEEP rows must not be silently re-blocked by later policy/context
+# gates before /screen, setup email, or AutoTrade selection.  Structural checks
+# such as valid SL/TP, min volume, cooldowns, duplicate guards, risk sizing and
+# exchange safety still run in their existing downstream locations.
+_SETUP_MATRIX_POLICY_SOURCE_CACHE = {'ts': 0.0, 'user_id': 0, 'data': {}}
+
+
+def _setup_matrix_policy_source_maps(user_id: int = 0, ttl_sec: int = 60) -> dict:
+    """Return the same backing maps used by /setup_matrix policy display."""
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid = int(user_id or owner_uid or 0)
+        cache = globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0, 'user_id': 0, 'data': {}})
+        now = float(time.time())
+        if int(cache.get('user_id') or 0) == uid and dict(cache.get('data') or {}) and (now - float(cache.get('ts') or 0.0)) <= max(5, int(ttl_sec or 60)):
+            return dict(cache.get('data') or {})
+
+        rows = []
+        try:
+            _setup_combo_policy_migrate()
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                rows = [dict(r) for r in cur.execute(
+                    "SELECT * FROM setup_combo_policy WHERE user_id IN (?,0) ORDER BY enabled DESC, last_score DESC, family, session, strategy, side",
+                    (int(uid),)
+                ).fetchall() or []]
+        except Exception:
+            rows = []
+        try:
+            if bool(globals().get('SETUP_POLICY_CLEAN_START_ALL_ENABLED', True)):
+                rows = [r for r in rows if not _setup_policy_row_is_clean_start_legacy(r)]
+        except Exception:
+            pass
+
+        try:
+            latest_scores = _setup_combo_latest_score_rows_for_runtime(int(uid), ttl_sec=max(5, int(ttl_sec or 60)))
+        except Exception:
+            latest_scores = {}
+        try:
+            policy_by_combo = _setup_combo_enforceable_policy_lookup(int(uid))
+        except Exception:
+            policy_by_combo = {}
+
+        rows_by_combo = {}
+        for r in rows:
+            try:
+                fam_r = str(r.get('family') or '').upper().strip()
+                sess_r = str(r.get('session') or '').upper().strip()
+                strat_r = str(r.get('strategy') or 'ALL').upper().strip() or 'ALL'
+                side_r = str(r.get('side') or 'BOTH').upper().strip() or 'BOTH'
+                if side_r not in {'BUY', 'SELL'}:
+                    side_r = 'BOTH'
+                if strat_r in {'NOR', 'REV'} and side_r in {'BUY', 'SELL'}:
+                    combo = _setup_combo_strategy_side_key(fam_r, sess_r, strat_r, side_r)
+                elif strat_r in {'NOR', 'REV'}:
+                    combo = _setup_combo_strategy_key(fam_r, sess_r, strat_r)
+                else:
+                    combo = f'{fam_r}-{sess_r}'
+                if combo and combo != '-':
+                    old_r = rows_by_combo.get(combo)
+                    if old_r is None or (int(r.get('user_id') or 0) != 0 and int(old_r.get('user_id') or 0) == 0):
+                        rows_by_combo[combo] = dict(r)
+            except Exception:
+                continue
+
+        try:
+            guard_data = _setup_edge_guard_build(
+                int(uid),
+                hours=_overall_report_effective_hours(globals().get('SETUP_EDGE_GUARD_WINDOW_HOURS', 168)),
+                force=False,
+            )
+            side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('combo_strategy_side_block') or (guard_data or {}).get('combo_side_block') or {}).keys())
+            legacy_side_blocks = set(str(x or '').upper().strip() for x in ((guard_data or {}).get('legacy_combo_side_block') or {}).keys())
+        except Exception:
+            side_blocks = set(); legacy_side_blocks = set()
+
+        data = {
+            'policy_by_combo': dict(policy_by_combo or {}),
+            'rows_by_combo': dict(rows_by_combo or {}),
+            'latest_scores': dict(latest_scores or {}),
+            'side_blocks': set(side_blocks or set()),
+            'legacy_side_blocks': set(legacy_side_blocks or set()),
+        }
+        cache.update({'ts': now, 'user_id': uid, 'data': data})
+        return dict(data)
+    except Exception:
+        return {}
+
+
+def _setup_matrix_policy_source_state_for_lane(family: str, session: str, strategy: str = 'NOR', side: str = 'BOTH', user_id: int = 0) -> dict:
+    """Return the exact ExecNow/Policy state that /setup_matrix policy would show for a lane."""
+    out = {'execnow': 'GATE', 'policy': 'WATCH', 'reco': 'WATCH', 'combo': '', 'setups': 0, 'decided': 0, 'wr': 0.0, 'avg_r': 0.0, 'source': 'setup_matrix_policy'}
+    try:
+        fam = str(family or '').upper().strip()
+        sess = str(session or '').upper().strip()
+        strat = _setup_strategy_suffix(value=str(strategy or 'NOR'))
+        side_u = _setup_side_suffix(value=str(side or 'BOTH'))
+        if side_u not in {'BUY', 'SELL'}:
+            side_u = 'BOTH'
+        if not fam or not sess or fam in {'-', 'F0'} or sess in {'-', 'NONE'}:
+            out.update({'execnow': 'OFF', 'policy': 'DISABLE', 'reco': 'DISABLE'})
+            return out
+        full_combo = _setup_combo_strategy_side_key(fam, sess, strat, side_u) if side_u in {'BUY', 'SELL'} else _setup_combo_strategy_key(fam, sess, strat)
+        strat_combo = _setup_combo_strategy_key(fam, sess, strat)
+        base_combo = f'{fam}-{sess}'
+        out['combo'] = full_combo
+        maps = _setup_matrix_policy_source_maps(int(user_id or 0)) or {}
+        policy_by_combo = dict(maps.get('policy_by_combo') or {})
+        rows_by_combo = dict(maps.get('rows_by_combo') or {})
+        latest_scores = dict(maps.get('latest_scores') or {})
+        side_blocks = set(maps.get('side_blocks') or set())
+        legacy_side_blocks = set(maps.get('legacy_side_blocks') or set())
+
+        pol = dict(policy_by_combo.get(full_combo) or policy_by_combo.get(strat_combo) or policy_by_combo.get(base_combo) or {})
+        raw_pol = dict(rows_by_combo.get(full_combo) or rows_by_combo.get(strat_combo) or rows_by_combo.get(base_combo) or {})
+        score = dict(latest_scores.get(full_combo) or latest_scores.get(strat_combo) or latest_scores.get(base_combo) or {})
+
+        set_v = int(score.get('setups') if score.get('setups') is not None else (pol.get('last_setups') or raw_pol.get('last_setups') or 0))
+        dec_v = int(score.get('decided') if score.get('decided') is not None else (pol.get('last_decided') or raw_pol.get('last_decided') or 0))
+        wr_v = float(score.get('win_rate') if score.get('win_rate') is not None else (pol.get('last_win_rate') or raw_pol.get('last_win_rate') or 0.0))
+        avg_v = float(score.get('avg_r') if score.get('avg_r') is not None else (pol.get('last_avg_r') or raw_pol.get('last_avg_r') or 0.0))
+        adv = str(score.get('action') or '-').upper().strip() or '-'
+        force_keep = _setup_combo_force_keep_by_wr(dec_v, wr_v)
+
+        full_disabled = False
+        if pol:
+            st = str(pol.get('status') or '').upper().strip()
+            full_disabled = st in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'} or int(pol.get('enabled') or 0) == 0
+        elif raw_pol:
+            full_disabled = False
+
+        side_block = False
+        try:
+            side_block = (full_combo in side_blocks) or (strat == 'NOR' and side_u in {'BUY','SELL'} and f'{base_combo}-{side_u}' in legacy_side_blocks)
+        except Exception:
+            side_block = False
+
+        if force_keep:
+            exec_state = 'KEEP'; live_state = 'KEEP'; adv = 'KEEP'
+        elif full_disabled:
+            exec_state = 'OFF'; live_state = 'DISABLE'
+        elif side_block:
+            exec_state = 'PART'; live_state = 'TIGHTEN'
+        else:
+            pol_status = str((pol or raw_pol or {}).get('status') or '').upper().strip()
+            adv_status = str(score.get('action') or '').upper().strip()
+            if pol_status == 'KEEP' or (not pol and adv_status == 'KEEP'):
+                exec_state = 'KEEP'; live_state = 'KEEP' if pol_status == 'KEEP' else 'WATCH'
+            elif bool(globals().get('SETUP_COMBO_WATCH_STRICT_QUALITY_GATE', True)):
+                exec_state = 'GATE'; live_state = 'WATCH'
+            else:
+                exec_state = 'ON'; live_state = 'WATCH'
+
+        out.update({'execnow': exec_state, 'policy': live_state, 'reco': adv, 'setups': set_v, 'decided': dec_v, 'wr': wr_v, 'avg_r': avg_v, 'force_keep': bool(force_keep)})
+        return out
+    except Exception as exc:
+        out.update({'execnow': 'OFF', 'policy': 'DISABLE', 'reco': 'DISABLE', 'error': f'{type(exc).__name__}: {exc}'})
+        return out
+
+
+def _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> dict:
+    """Return /setup_matrix policy source-of-truth state for a setup/audit row."""
+    try:
+        fam, sess2 = _setup_combo_family_session_from_obj(setup_or_row, session_name=session_name)
+        sess = str(session_name or sess2 or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        strat = _setup_strategy_suffix(setup_or_row)
+        side = _setup_side_suffix(setup_or_row)
+        if side not in {'BUY', 'SELL'}:
+            side = str(_autotrade_setup_attr(setup_or_row, 'side', '') or '').upper().strip()
+        return _setup_matrix_policy_source_state_for_lane(fam, sess, strat, side, user_id=int(user_id or 0))
+    except Exception as exc:
+        return {'execnow': 'OFF', 'policy': 'DISABLE', 'reco': 'DISABLE', 'combo': '', 'error': f'{type(exc).__name__}: {exc}', 'source': 'setup_matrix_policy'}
+
+
+def _setup_matrix_policy_is_keep_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> bool:
+    try:
+        return str((_setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0)) or {}).get('policy') or '').upper().strip() == 'KEEP'
+    except Exception:
+        return False
+
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
 # matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
 # F1-LON-BUY, GIGA/H/B) while the opposite side was still profitable.  This guard
@@ -5233,6 +5419,22 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
         meta.update({'policy_uid': int(policy_uid or 0), 'policy_status_effective': status, 'policy_combo': combo})
         l = str(lane or 'screen').lower().strip() or 'screen'
         allowed_statuses = _user_visible_allowed_policy_statuses(l)
+        # yver24: use /setup_matrix policy as source of truth for subscriber
+        # visibility and setup-email selection.  A matrix KEEP lane must be shown
+        # and eligible for delivery; non-KEEP lanes remain blocked unless WATCH is
+        # explicitly enabled below.
+        try:
+            matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0)) or {}
+            matrix_policy = str(matrix_state.get('policy') or '').upper().strip()
+            meta['setup_matrix_policy'] = matrix_policy
+            meta['setup_matrix_execnow'] = str(matrix_state.get('execnow') or '').upper().strip()
+            meta['setup_matrix_combo'] = str(matrix_state.get('combo') or combo or '').upper().strip()
+            if matrix_policy == 'KEEP':
+                return True, 'setup_matrix_policy_keep_source_of_truth', meta
+            if matrix_policy in {'DISABLE', 'TIGHTEN', 'OFF'}:
+                return False, f'{l}_setup_matrix_policy_not_keep:{matrix_policy}', meta
+        except Exception as _matrix_exc:
+            meta['setup_matrix_policy_error'] = f'{type(_matrix_exc).__name__}: {_matrix_exc}'
         if status in allowed_statuses:
             # yver104: WATCH can be shown/emailed only if it still passes the same
             # shared final quality gate used by the executable queue. This prevents
@@ -5499,6 +5701,15 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
         combo = _autotrade_setup_exact_combo_key(setup_or_row, sess)
         pstatus_exec = ''
+        # yver24: /setup_matrix policy is the source of truth.  If the
+        # exact lane is KEEP in that table, do not let secondary realised/context
+        # policy guards re-block it before AutoTrade.
+        try:
+            _matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=owner_uid) or {}
+            if str(_matrix_state.get('policy') or '').upper().strip() == 'KEEP':
+                return True, 'setup_matrix_policy_keep_source_of_truth'
+        except Exception:
+            pass
         try:
             _pinfo_exec = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=owner_uid)
             pstatus_exec = _setup_policy_effective_status(
@@ -5530,7 +5741,21 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         # lanes such as F1-LON-NOR-BUY/F2-NY-NOR-BUY while keeping stronger lanes
         # like F2-ASIA-NOR-BUY and F1-LON-REV-BUY.
         try:
-            if pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled():
+            # yver23: Ramin's explicit rule is that any exact combo/lane with
+            # decided WR >49% is KEEP.  yver22 correctly forced that in the
+            # policy lookup, but this later strict-KEEP edge guard could still
+            # re-block the same lane using a different rolling/micro dataset
+            # (seen as email_autotrade_strict_keep_edge_block for
+            # F8-ASIA-REV-BUY while /setup_matrix policy showed KEEP).
+            # When the policy lookup was force-kept from latest setup_combo_scores,
+            # do not let this secondary guard override it. Symbol/hour/directional
+            # safety checks below still remain active.
+            _force_keep_policy = False
+            try:
+                _force_keep_policy = bool((_pinfo_exec or {}).get('force_keep')) or bool((_pinfo_exec or {}).get('force_keep_info'))
+            except Exception:
+                _force_keep_policy = False
+            if pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled() and not _force_keep_policy:
                 m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
                 dec = int(m.get('decided') or 0)
                 wr = float(m.get('wr') or 0.0)
@@ -5540,6 +5765,11 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
                 min_avg = float(_autotrade_strict_keep_edge_min_avgr())
                 if dec < min_dec or wr < min_wr or avg < min_avg:
                     return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
+            elif pstatus_exec == 'KEEP' and _force_keep_policy:
+                try:
+                    _setup_quality_gate_set_attr(setup_or_row, 'yver24_matrix_keep_bypassed_strict_edge', True)
+                except Exception:
+                    pass
         except Exception as _strict_exc:
             return False, f'autotrade_strict_keep_edge_error:{type(_strict_exc).__name__}'
 
@@ -12356,6 +12586,25 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         # AutoTrade is trying to consume before their entry window expires.
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
+        # yver24: if /setup_matrix policy says KEEP, this setup is executable
+        # for the user-facing path.  Keep only the basic structural price-order
+        # validation here; risk sizing, cooldowns, duplicate guards, email gate
+        # and exchange safety remain downstream.
+        try:
+            if _setup_matrix_policy_is_keep_for_setup(s, session_name=sess, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)):
+                entry = float(getattr(s, 'entry', 0.0) or 0.0)
+                sl = float(getattr(s, 'sl', 0.0) or 0.0)
+                tp = float(_setup_target_tp(s, 0.0) or 0.0)
+                side = str(getattr(s, 'side', '') or '').upper().strip()
+                if side == 'BUY' and not (sl < entry < tp):
+                    return (False, 'matrix_keep_bad_price_order')
+                if side == 'SELL' and not (tp < entry < sl):
+                    return (False, 'matrix_keep_bad_price_order')
+                if entry <= 0 or sl <= 0 or tp <= 0:
+                    return (False, 'matrix_keep_missing_prices')
+                return (True, 'setup_matrix_policy_keep_source_of_truth')
+        except Exception:
+            pass
         try:
             policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
             final_ok, final_why, _final_meta = _setup_final_quality_gate_allows_setup(s, sess, user_id=policy_uid)
@@ -36694,6 +36943,25 @@ def is_executable_setup_eligible(
             pass
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
+        # yver24: if /setup_matrix policy says KEEP, this setup is executable
+        # for the user-facing path.  Keep only the basic structural price-order
+        # validation here; risk sizing, cooldowns, duplicate guards, email gate
+        # and exchange safety remain downstream.
+        try:
+            if _setup_matrix_policy_is_keep_for_setup(s, session_name=sess, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)):
+                entry = float(getattr(s, 'entry', 0.0) or 0.0)
+                sl = float(getattr(s, 'sl', 0.0) or 0.0)
+                tp = float(_setup_target_tp(s, 0.0) or 0.0)
+                side = str(getattr(s, 'side', '') or '').upper().strip()
+                if side == 'BUY' and not (sl < entry < tp):
+                    return (False, 'matrix_keep_bad_price_order')
+                if side == 'SELL' and not (tp < entry < sl):
+                    return (False, 'matrix_keep_bad_price_order')
+                if entry <= 0 or sl <= 0 or tp <= 0:
+                    return (False, 'matrix_keep_missing_prices')
+                return (True, 'setup_matrix_policy_keep_source_of_truth')
+        except Exception:
+            pass
         try:
             policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
             final_ok, final_why, _final_meta = _setup_final_quality_gate_allows_setup(s, sess, user_id=policy_uid)
@@ -45578,15 +45846,12 @@ def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: st
         return '-'
 
 def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
-    """Final actionable policy label for one /setup_audit row.
+    """Policy label for one /setup_audit row.
 
-    yver136: this column must not show a raw KEEP/WATCH matrix state that the
-    live delivery/execution lane would still block.  A row is displayed as KEEP
-    only if the same shared final quality/context/directional gate used by
-    executable queue, setup-email, /screen and AutoTrade currently allows it.
-    WATCH is shown only when WATCH exposure/execution is enabled. Otherwise the
-    audit row remains visible for learning, but Policy is OFF so the owner does
-    not expect an email, /screen card, or AutoTrade entry.
+    yver24: this column is no longer a separate actionability calculation.
+    It reads the same source-of-truth lane state rendered by /setup_matrix policy
+    and returns that table's Policy value (KEEP / WATCH / TIGHTEN / DISABLE).
+    Delivery, cooldown, risk and exchange safety remain separate downstream gates.
     """
     try:
         rr = dict(row or {})
@@ -45595,108 +45860,13 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
         if side_u in {'BUY', 'SELL'}:
             rr['side'] = side_u
         policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
-        sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
-        sym_u = str(rr.get('symbol') or rr.get('market_symbol') or '').upper().strip()
-        if sym_u.endswith('USDT'):
-            sym_u = sym_u[:-4]
-
-        # Final check: Policy is CURRENT actionability, not raw historical policy.
-        # A setup row outside the active session or outside AUTOTRADE_ENTRY_WINDOW_MIN
-        # can be audited, but it cannot still be emailed or opened by AutoTrade.
-        if not _setup_audit_row_inside_delivery_window(rr):
-            return 'OFF'
-        if not _setup_audit_row_matches_active_session(rr, session_name=sess):
-            return 'OFF'
-
-        # yver139: /setup_audit Policy must match the email candidate lane, not just
-        # the lower-level final quality gate. Re-run the executable eligibility wrapper
-        # on the hydrated row before labelling it KEEP/WATCH.
-        try:
-            from types import SimpleNamespace
-            _exec_obj = SimpleNamespace(**rr)
-            _exec_ok, _exec_why = is_executable_setup_eligible(_exec_obj, session_name=sess)
-            if not _exec_ok:
-                return 'OFF'
-        except Exception:
-            return 'OFF'
-
-        # First apply the real shared gate. This catches blocks that are not visible
-        # from the raw policy row alone, such as directional leader/loser conflict,
-        # final quality/risk/TP-SL validation, weak context, or exact disable state.
-        try:
-            final_ok, final_why, final_meta = _setup_final_quality_gate_allows_setup(rr, session_name=sess, user_id=policy_uid)
-            if not final_ok:
-                return 'OFF'
-        except Exception:
-            return 'OFF'
-
-        info = _setup_combo_policy_lookup_for_setup(rr, session_name=sess, user_id=policy_uid) or {}
-        found = bool(info.get('found'))
-        raw_status = str(info.get('status') or '').upper().strip()
-        status = _setup_policy_effective_status(raw_status, found=found)
-        try:
-            enabled = int(info.get('enabled') if info.get('enabled') is not None else (1 if not found else 0)) == 1
-        except Exception:
-            enabled = True if not found else False
-        if (not enabled) or status in {'DISABLE', 'BLOCK', 'PAUSE', 'OFF'}:
-            return 'OFF'
-
-        # yver137: final gate alone is not enough.  The real delivery path also
-        # applies the user-visible KEEP/WATCH policy and the context feed guard via
-        # _setup_user_visible_keep_policy_allows().  Without this, /setup_audit can
-        # still label a raw KEEP row as tradable while email, /screen and AutoTrade
-        # correctly skip it for context/symbol/hour/side reasons.
-        try:
-            visible_ok, _visible_why, _visible_meta = _setup_user_visible_keep_policy_allows(
-                rr, session_name=sess, user_id=policy_uid, lane='email'
-            )
-            if not visible_ok:
-                return 'OFF'
-        except Exception:
-            return 'OFF'
-        # Match the setup-email delivery loop as closely as possible: if the exact
-        # setup has already been emailed recently, it is still actionable for /screen
-        # and AutoTrade. If it has not, then current blackout/flip/symbol cooldown
-        # means it will not be delivered now, so show OFF instead of KEEP.
-        exact_email_recent = False
-        try:
-            from types import SimpleNamespace
-            _obj = SimpleNamespace(**rr)
-            exact_email_recent = bool(_autotrade_recent_email_gate_allows_setup(policy_uid, _obj, sess)[0])
-        except Exception:
-            exact_email_recent = False
-        if not exact_email_recent:
-            try:
-                _blk, _blk_reason = _setup_generation_blackout_now()
-                if _blk:
-                    return 'OFF'
-            except Exception:
-                pass
-            try:
-                if symbol_flip_guard_active(int(policy_uid), sym_u, side_u, sess):
-                    return 'OFF'
-            except Exception:
-                pass
-            try:
-                if _email_symbol_recently_sent(int(policy_uid), sym_u, side_u, sess, setup_id=sid):
-                    return 'OFF'
-            except Exception:
-                pass
-        try:
-            at_allowed = (not _autotrade_require_keep_policy()) or (status in _autotrade_allowed_policy_statuses())
-        except Exception:
-            at_allowed = False
-        if not at_allowed:
-            return 'OFF'
-        if status == 'KEEP':
-            return 'KEEP'
-        if status == 'WATCH':
-            # WATCH is only actionable when both subscriber-facing exposure and
-            # AutoTrade WATCH policy are explicitly enabled.
-            return 'WATCH'
-        return 'OFF'
+        state = _setup_matrix_policy_source_state_for_setup(rr, session_name=sess, user_id=policy_uid) or {}
+        pol = str(state.get('policy') or '').upper().strip()
+        if pol in {'KEEP', 'WATCH', 'TIGHTEN', 'DISABLE', 'OFF'}:
+            return 'DISABLE' if pol == 'OFF' else pol
+        return 'WATCH'
     except Exception:
-        return 'OFF'
+        return 'DISABLE'
 
 def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     """Compact setup audit with current Policy lane per setup."""
@@ -48091,6 +48261,18 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         if sess not in {'ASIA', 'LON', 'NY'}:
             return False, 'final_missing_session', meta
 
+        # yver24: /setup_matrix policy is the source of truth.  If the
+        # exact lane's Policy column is KEEP, the shared final gate must not
+        # downgrade it to OFF because of separate context/quality policy layers.
+        try:
+            _matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0)) or {}
+            if str(_matrix_state.get('policy') or '').upper().strip() == 'KEEP':
+                meta.update({'setup_matrix_policy': 'KEEP', 'setup_matrix_execnow': str(_matrix_state.get('execnow') or '').upper().strip(), 'setup_matrix_combo': str(_matrix_state.get('combo') or '').upper().strip()})
+                _setup_quality_gate_set_attr(setup_or_row, 'setup_matrix_policy_keep_source_of_truth', True)
+                return True, 'setup_matrix_policy_keep_source_of_truth', meta
+        except Exception as _matrix_exc:
+            meta['setup_matrix_policy_error'] = f'{type(_matrix_exc).__name__}: {_matrix_exc}'
+
         try:
             dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
             meta.update(dict(dir_meta or {}))
@@ -49857,7 +50039,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v22:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v24:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -49907,7 +50089,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v22:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v24:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -49925,7 +50107,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_matrix {int(hours)}",
-        f"admin:bg:v22:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v24:setup_matrix:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_combo_matrix_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), True, False, _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50256,7 +50438,7 @@ async def setup_deep_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_deep_analysis {int(hours)}",
-        f"admin:bg:v22:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
+        f"admin:bg:v24:setup_deep_analysis:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours))}",
         _setup_edge_deep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours)), _overall_report_start_ts()),
         parse_mode=ParseMode.HTML,
@@ -50282,7 +50464,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v22:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v24:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -50301,7 +50483,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v22:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v24:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -50806,7 +50988,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v22:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v24:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -50831,7 +51013,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v22:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v24:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -50849,7 +51031,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v22:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v24:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -50874,7 +51056,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v22:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v24:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -54983,7 +55165,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
         await _send_cached_or_queue_admin_report(
             update,
             "/autotrade_report_overall",
-            f"admin:bg:v22:autotrade_report_overall:{owner}:{lookback_h}",
+            f"admin:bg:v24:autotrade_report_overall:{owner}:{lookback_h}",
             _autotrade_report_overall_text_cached,
             args=(owner, lookback_h),
             parse_mode=ParseMode.HTML,
@@ -55003,7 +55185,7 @@ async def autoytrade_report_overall_cmd(update: Update, context: ContextTypes.DE
     await _send_cached_or_queue_admin_report(
         update,
         f"/autotrade_report_matrix {lookback_h}",
-        f"admin:bg:v22:autotrade_report_matrix:{owner}:{lookback_h}",
+        f"admin:bg:v24:autotrade_report_matrix:{owner}:{lookback_h}",
         _autoytrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -55024,7 +55206,7 @@ async def autotrade_report_overall_cmd(update: Update, context: ContextTypes.DEF
     await _send_cached_or_queue_admin_report(
         update,
         "/autotrade_report_overall",
-        f"admin:bg:v22:autotrade_report_overall:{owner}:{lookback_h}",
+        f"admin:bg:v24:autotrade_report_overall:{owner}:{lookback_h}",
         _autotrade_report_overall_text_cached,
         args=(owner, lookback_h),
         parse_mode=ParseMode.HTML,
@@ -62240,7 +62422,7 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         _hb_touch('email', ok=True, details='autonomous_screen_sync_tick')
         try:
-            db_log_setup_pipeline_event(0, stage='autonomous_screen_sync_tick', status='start', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='screen_email', details={'screen_required': False, 'source': 'job_queue_ver22'})
+            db_log_setup_pipeline_event(0, stage='autonomous_screen_sync_tick', status='start', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='screen_email', details={'screen_required': False, 'source': 'job_queue_ver23'})
         except Exception:
             pass
         if _AUTONOMOUS_SCREEN_SYNC_LOCK.locked():
