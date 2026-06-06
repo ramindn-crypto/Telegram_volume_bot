@@ -1,3 +1,4 @@
+# yver28: syncs /setup_audit_keep and /setup_audit_keep_watch to the exact /setup_matrix policy source-of-truth lane sets; bumps cache keys to avoid stale policy summaries.
 # yver27: fixes stale stored KEEP demotion when current WR<=49 even if latest score row is only present in policy last_* fields; /setup_matrix policy and runtime gates now treat current WR as authoritative.
 # yver26: fixes current-WR policy sync: stored KEEP rows are demoted when latest WR is <=49%, keeps fast /setup_matrix policy, removes Dec, and uses WR=TP/(TP+SL) with OPEN excluded.
 # yver25: refreshes /setup_matrix policy scores on every fresh report so WR updates immediately after TP/SL evidence, keeps WR=TP/(TP+SL), removes Dec column from the policy table, and bumps policy cache keys.
@@ -3414,6 +3415,110 @@ def _setup_matrix_policy_is_keep_for_setup(setup_or_row, session_name: str = '',
         return str((_setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0)) or {}).get('policy') or '').upper().strip() == 'KEEP'
     except Exception:
         return False
+
+def _setup_matrix_policy_current_lane_sets(user_id: int = 0) -> dict:
+    """Return current lane sets using the exact /setup_matrix policy source-of-truth.
+
+    yver28: summary commands such as /setup_audit_keep must not read the older
+    persisted setup_combo_policy table directly.  /setup_matrix policy combines
+    latest score rows, clean-start filtering, WR>49 promotion, WR<=49 demotion,
+    side tightening and stored policy rows.  This helper walks the same full lane
+    universe and asks _setup_matrix_policy_source_state_for_lane for each lane, so
+    KEEP/WATCH counts and row filtering match the table the owner sees.
+    """
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid = int(user_id or owner_uid or 0)
+    except Exception:
+        uid = int(user_id or 0)
+
+    keep_combos: set[str] = set()
+    watch_combos: set[str] = set()
+    tighten_combos: set[str] = set()
+    disable_combos: set[str] = set()
+    all_combos: set[str] = set()
+
+    families = set()
+    sessions = set()
+    try:
+        cfg = load_strategy_config(force=False)
+    except Exception:
+        cfg = {}
+    try:
+        for f in ((cfg or {}).get('active_family_codes') or []):
+            ff = str(f or '').upper().strip()
+            if re.fullmatch(r'F\d+', ff):
+                families.add(ff)
+    except Exception:
+        pass
+    for f in [f'F{i}' for i in range(1, 9)]:
+        families.add(f)
+    try:
+        for s in _strategy_cfg_execution_sessions_allowed(cfg):
+            ss = str(s or '').upper().strip()
+            if ss:
+                sessions.add(ss)
+    except Exception:
+        pass
+    try:
+        for s in _autotrade_get_sessions():
+            ss = str(s or '').upper().strip()
+            if ss:
+                sessions.add(ss)
+    except Exception:
+        pass
+    if not sessions:
+        sessions.update(['ASIA', 'LON', 'NY'])
+
+    # Include any families/sessions that exist only in stored policy or latest score rows.
+    try:
+        maps = _setup_matrix_policy_source_maps(int(uid)) or {}
+        keys = list((maps.get('policy_by_combo') or {}).keys()) + list((maps.get('rows_by_combo') or {}).keys()) + list((maps.get('latest_scores') or {}).keys())
+        for c in keys:
+            parts = str(c or '').upper().split('-')
+            if len(parts) >= 2:
+                if parts[0]:
+                    families.add(parts[0])
+                if parts[1]:
+                    sessions.add(parts[1])
+    except Exception:
+        pass
+
+    try:
+        lanes = list(_setup_combo_full_universe(families, sessions))
+    except Exception:
+        lanes = []
+    for fam, sess, strat, side, full_combo in lanes:
+        try:
+            combo_u = str(full_combo or '').upper().strip()
+            if not combo_u:
+                continue
+            st = _setup_matrix_policy_source_state_for_lane(fam, sess, strat, side, user_id=int(uid)) or {}
+            pol = str(st.get('policy') or '').upper().strip()
+            all_combos.add(combo_u)
+            if pol == 'KEEP':
+                keep_combos.add(combo_u)
+            elif pol in {'WATCH', 'GATE', 'ON'}:
+                watch_combos.add(combo_u)
+            elif pol in {'TIGHTEN', 'PART'}:
+                tighten_combos.add(combo_u)
+                watch_combos.add(combo_u)
+            elif pol in {'DISABLE', 'OFF', 'BLOCK', 'PAUSE'}:
+                disable_combos.add(combo_u)
+        except Exception:
+            continue
+    return {
+        'keep': keep_combos,
+        'watch': watch_combos,
+        'tighten': tighten_combos,
+        'disable': disable_combos,
+        'allowed': set(keep_combos) | set(watch_combos) | set(tighten_combos),
+        'all': all_combos,
+        'source': 'setup_matrix_policy',
+    }
+    
+    # unreachable fallback, kept for defensive readability
+    return {'keep': set(), 'watch': set(), 'tighten': set(), 'disable': set(), 'allowed': set(), 'all': set(), 'source': 'setup_matrix_policy'}
 
 # 13May edge-quality micro guard: family/session policy is useful, but the latest
 # matrix showed the losing edge was concentrated by side and symbol (e.g. F1-ASIA-BUY,
@@ -46028,7 +46133,7 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
 
     try:
         cache_bucket = int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))
-        cache_key = f"keep_only_summary:v142::{uid_i}::{cache_bucket}"
+        cache_key = f"keep_only_summary:v28::{uid_i}::{cache_bucket}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -46038,19 +46143,8 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
 
     keep_combos: set[str] = set()
     try:
-        pol_lookup = _setup_combo_enforceable_policy_lookup(uid_i)
-        for combo, pol in (pol_lookup or {}).items():
-            try:
-                combo_u = str(combo or '').upper().strip()
-                if not combo_u:
-                    continue
-                st = str((pol or {}).get('status') or '').upper().strip()
-                enabled = int((pol or {}).get('enabled') if (pol or {}).get('enabled') is not None else 1) == 1
-                pstatus = _setup_policy_effective_status(st, found=True)
-                if enabled and str(pstatus or '').upper().strip() == 'KEEP':
-                    keep_combos.add(combo_u)
-            except Exception:
-                continue
+        lane_sets = _setup_matrix_policy_current_lane_sets(uid_i)
+        keep_combos = set(lane_sets.get('keep') or set())
     except Exception:
         keep_combos = set()
 
@@ -46170,7 +46264,7 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
     lines = [
         "📊 <b>Setup KEEP Summary</b>",
         HDR,
-        "Policy source: <b>current enforceable KEEP lanes only</b>",
+        "Policy source: <b>/setup_matrix policy KEEP lanes only</b>",
         f"Current policy combos: <b>{len(keep_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>0</b>)",
         f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
         f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
@@ -50138,7 +50232,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v27:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v28:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -50914,7 +51008,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         uid_i = int(uid or 0)
 
     try:
-        cache_key = f"keep_watch_summary:v142::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
+        cache_key = f"keep_watch_summary:v28::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -50922,30 +51016,14 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
     except Exception:
         cache_key = ''
 
-    allowed_statuses = {'KEEP', 'WATCH'}
-    watch_like_statuses = {'WATCH', 'TIGHTEN', 'PART'}
     allowed_combos: set[str] = set()
     keep_combos: set[str] = set()
     watch_combos: set[str] = set()
     try:
-        pol_lookup = _setup_combo_enforceable_policy_lookup(uid_i)
-        for combo, pol in (pol_lookup or {}).items():
-            try:
-                combo_u = str(combo or '').upper().strip()
-                if not combo_u:
-                    continue
-                st = str((pol or {}).get('status') or '').upper().strip()
-                enabled = int((pol or {}).get('enabled') if (pol or {}).get('enabled') is not None else 1) == 1
-                if not enabled:
-                    continue
-                if st == 'KEEP':
-                    allowed_combos.add(combo_u)
-                    keep_combos.add(combo_u)
-                elif st in allowed_statuses or st in watch_like_statuses:
-                    allowed_combos.add(combo_u)
-                    watch_combos.add(combo_u)
-            except Exception:
-                continue
+        lane_sets = _setup_matrix_policy_current_lane_sets(uid_i)
+        keep_combos = set(lane_sets.get('keep') or set())
+        watch_combos = set(lane_sets.get('watch') or set()) | set(lane_sets.get('tighten') or set())
+        allowed_combos = set(keep_combos) | set(watch_combos)
     except Exception:
         allowed_combos = set()
         keep_combos = set()
@@ -51076,7 +51154,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
     lines = [
         "📊 <b>Setup KEEP + WATCH Summary</b>",
         HDR,
-        "Policy source: <b>current enforceable KEEP + WATCH lanes</b>",
+        "Policy source: <b>/setup_matrix policy KEEP + WATCH lanes</b>",
         f"Current policy combos: <b>{len(allowed_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>{len(watch_combos)}</b>)",
         f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
         f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
@@ -51106,7 +51184,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v24:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v28:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -51131,7 +51209,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v24:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v28:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
