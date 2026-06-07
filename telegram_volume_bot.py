@@ -1,3 +1,6 @@
+# yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
+# yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
+# yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
 # yver28: syncs /setup_audit_keep and /setup_audit_keep_watch to the exact /setup_matrix policy source-of-truth lane sets; bumps cache keys to avoid stale policy summaries.
 # yver27: fixes stale stored KEEP demotion when current WR<=49 even if latest score row is only present in policy last_* fields; /setup_matrix policy and runtime gates now treat current WR as authoritative.
 # yver26: fixes current-WR policy sync: stored KEEP rows are demoted when latest WR is <=49%, keeps fast /setup_matrix policy, removes Dec, and uses WR=TP/(TP+SL) with OPEN excluded.
@@ -635,6 +638,9 @@ SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY = 'setup_generation_blackout_enabled'
 SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY = 'setup_generation_blackout_windows'
 AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY = 'ver20_blackout_policy_version'
 AUTOTRADE_CFG_VER57_BLACKOUT_SYNC_VERSION_KEY = 'ver57_blackout_sync_version'
+AUTOTRADE_CFG_VER29_DAY_BLACKOUT_POLICY_VERSION_KEY = 'ver29_day_blackout_policy_version'
+SETUP_CFG_SHADOW_SCAN_ENABLED_KEY = 'setup_shadow_scan_enabled'
+VER29_RECOMMENDED_BLACKOUT_WINDOWS = '03:00-04:00,05:00-12:00,13:00-14:00,SAT 14:00-SUN 12:00'
 AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY = 'require_setup_email_for_entry'
 SETUP_POLICY_CLEAN_START_MARKER_TS_KEY = 'setup_policy_clean_start_marker_ts'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY = 'max_position_hours_enabled'
@@ -855,6 +861,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY: str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
         SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY: 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0,
         SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
+        SETUP_CFG_SHADOW_SCAN_ENABLED_KEY: 1 if env_bool('SETUP_SHADOW_SCAN_ENABLED', True) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18),
         AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True) else 0,
@@ -1548,12 +1555,101 @@ def _autotrade_max_position_hours() -> float:
     return max(0.25, min(72.0, float(val)))
 
 
-def _normalise_melbourne_blackout_windows(value, default: str = '10:00-10:45') -> str:
-    """Return a validated comma-separated HH:MM-HH:MM window list.
+_BLACKOUT_DAY_ALIASES = {
+    'MON': 0, 'MONDAY': 0, 'MONDAYS': 0,
+    'TUE': 1, 'TUES': 1, 'TUESDAY': 1, 'TUESDAYS': 1,
+    'WED': 2, 'WEDS': 2, 'WEDNESDAY': 2, 'WEDNESDAYS': 2,
+    'THU': 3, 'THUR': 3, 'THURS': 3, 'THURSDAY': 3, 'THURSDAYS': 3,
+    'FRI': 4, 'FRIDAY': 4, 'FRIDAYS': 4,
+    'SAT': 5, 'SATURDAY': 5, 'SATURDAYS': 5,
+    'SUN': 6, 'SUNDAY': 6, 'SUNDAYS': 6,
+}
+_BLACKOUT_DAY_NAMES = ('MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN')
 
-    Empty/off/none disables windows at the window-list level; the separate ENABLED
-    flags are still preferred for clarity. Invalid items are ignored so a typo in one
-    comma-separated window does not break the bot.
+
+def _blackout_parse_time_token(token: str) -> str:
+    """Parse HH:MM plus simple 10PM/10 AM forms and return canonical HH:MM."""
+    t = str(token or '').strip().upper().replace('.', '')
+    t = re.sub(r'\s+', '', t)
+    m = re.match(r'^(\d{1,2})(?::?(\d{2}))?(AM|PM)?$', t)
+    if not m:
+        raise ValueError('bad time')
+    h = int(m.group(1)); mi = int(m.group(2) or '0'); ap = m.group(3)
+    if ap:
+        if h < 1 or h > 12:
+            raise ValueError('bad 12h time')
+        if ap == 'AM':
+            h = 0 if h == 12 else h
+        else:
+            h = 12 if h == 12 else h + 12
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        raise ValueError('bad hhmm')
+    return f'{h:02d}:{mi:02d}'
+
+
+def _blackout_parse_day_token(token: str) -> str:
+    t = str(token or '').strip().upper().replace('.', '')
+    if t in _BLACKOUT_DAY_ALIASES:
+        return _BLACKOUT_DAY_NAMES[int(_BLACKOUT_DAY_ALIASES[t])]
+    raise ValueError('bad day')
+
+
+def _blackout_next_day(day: str) -> str:
+    try:
+        idx = _BLACKOUT_DAY_NAMES.index(str(day).upper())
+        return _BLACKOUT_DAY_NAMES[(idx + 1) % 7]
+    except Exception:
+        return ''
+
+
+def _blackout_part_preclean(part: str) -> str:
+    """Allow user-friendly forms like 'Sundays from 10PM until Mondays 10AM'."""
+    x = str(part or '').strip()
+    x = re.sub(r'\b(from|between)\b', ' ', x, flags=re.I)
+    x = re.sub(r'\b(until|to|through|thru)\b', '-', x, flags=re.I)
+    x = re.sub(r'\s+', ' ', x).strip()
+    return x
+
+
+def _normalise_single_blackout_window(part: str) -> str:
+    """Canonicalise one blackout window.
+
+    Supported forms:
+      * 10:00-10:30                 -> daily window
+      * 22:00-10:00                 -> daily rollover window
+      * SAT 22:00-SUN 10:00         -> day-aware rollover window
+      * Sunday 10PM-Monday 10AM     -> day-aware rollover, 12h clock accepted
+    """
+    w = _blackout_part_preclean(part)
+    if not w or '-' not in w:
+        raise ValueError('missing dash')
+    left, right = [z.strip() for z in w.split('-', 1)]
+    pat = r'^(?:(?P<day>[A-Za-z]+)\s+)?(?P<time>\d{1,2}(?::?\d{2})?\s*(?:[AaPp][Mm])?)$'
+    ml = re.match(pat, left)
+    mr = re.match(pat, right)
+    if not ml or not mr:
+        raise ValueError('bad blackout window')
+    sd_raw = ml.group('day')
+    ed_raw = mr.group('day')
+    st = _blackout_parse_time_token(ml.group('time'))
+    et = _blackout_parse_time_token(mr.group('time'))
+    sd = _blackout_parse_day_token(sd_raw) if sd_raw else ''
+    ed = _blackout_parse_day_token(ed_raw) if ed_raw else ''
+    if sd:
+        # If the user writes SAT 22:00-10:00, infer the next day on rollover.
+        if not ed:
+            sh, sm = [int(x) for x in st.split(':')]
+            eh, em = [int(x) for x in et.split(':')]
+            ed = _blackout_next_day(sd) if (eh * 60 + em) <= (sh * 60 + sm) else sd
+        return f'{sd} {st}-{ed} {et}'
+    return f'{st}-{et}'
+
+
+def _normalise_melbourne_blackout_windows(value, default: str = '10:00-10:45') -> str:
+    """Return a validated comma-separated Melbourne blackout window list.
+
+    Ver29 keeps the old daily HH:MM-HH:MM syntax and adds day-aware windows.
+    Invalid items are ignored so one typo does not break the bot.
     """
     try:
         raw = str(value if value is not None else default).strip()
@@ -1561,16 +1657,12 @@ def _normalise_melbourne_blackout_windows(value, default: str = '10:00-10:45') -
             return ''
         out = []
         for part in raw.replace(';', ',').split(','):
-            w = part.strip()
-            if not w or '-' not in w:
+            try:
+                norm = _normalise_single_blackout_window(part)
+                if norm:
+                    out.append(norm)
+            except Exception:
                 continue
-            a, b = w.split('-', 1)
-            def _hhmm(x):
-                h, m = [int(v) for v in str(x).strip().split(':')[:2]]
-                if not (0 <= h <= 23 and 0 <= m <= 59):
-                    raise ValueError('bad hhmm')
-                return f'{h:02d}:{m:02d}'
-            out.append(f'{_hhmm(a)}-{_hhmm(b)}')
         return ','.join(dict.fromkeys(out))
     except Exception:
         return str(default or '').strip()
@@ -1581,6 +1673,10 @@ def _split_blackout_windows(value) -> tuple:
         return tuple(x.strip() for x in str(value or '').split(',') if x.strip())
     except Exception:
         return tuple()
+
+
+def _blackout_window_has_day(w: str) -> bool:
+    return bool(re.match(r'^(MON|TUE|WED|THU|FRI|SAT|SUN)\s+', str(w or '').strip().upper()))
 
 
 def _autotrade_entry_blackout_enabled() -> bool:
@@ -1611,6 +1707,19 @@ def _setup_generation_blackout_windows() -> str:
     except Exception:
         raw = os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45')
     return _normalise_melbourne_blackout_windows(raw, default='10:00-10:45')
+
+def _setup_shadow_scan_enabled() -> bool:
+    """Return whether blackout shadow scans should be stored for analysis.
+
+    When ON, blackout windows still block setup email and AutoTrade entry, but
+    candidates that would otherwise enter the executable lane are written with
+    source_kind=shadow_blackout so /setup_audit can measure future WR by
+    Blackout category.
+    """
+    try:
+        return bool(_autotrade_bool_cfg(SETUP_CFG_SHADOW_SCAN_ENABLED_KEY, 'SETUP_SHADOW_SCAN_ENABLED', True))
+    except Exception:
+        return bool(env_bool('SETUP_SHADOW_SCAN_ENABLED', True))
 
 
 def _autotrade_require_setup_email_for_entry() -> bool:
@@ -1769,6 +1878,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS': str(_autotrade_entry_blackout_windows()),
         'SETUP_GENERATION_BLACKOUT_ENABLED': bool(_setup_generation_blackout_enabled()),
         'SETUP_GENERATION_BLACKOUT_WINDOWS': str(_setup_generation_blackout_windows()),
+        'SETUP_SHADOW_SCAN_ENABLED': bool(_setup_shadow_scan_enabled()),
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED': bool(_autotrade_max_position_hours_enabled()),
         'AUTOTRADE_MAX_POSITION_HOURS': float(_autotrade_max_position_hours()),
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL': bool(_autotrade_bool_cfg(AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY, 'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)),
@@ -2057,6 +2167,32 @@ def _autotrade_apply_ver58_time_exit_runtime_defaults() -> None:
         # enable it later with /autotrade_config AUTOTRADE_MAX_POSITION_HOURS_ENABLED true.
         _autotrade_config_set(AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY, 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0)
         _autotrade_config_set(AUTOTRADE_CFG_VER58_TIME_EXIT_RUNTIME_VERSION_KEY, target_version)
+    except Exception:
+        pass
+
+
+
+def _autotrade_apply_ver29_day_aware_blackout_defaults() -> None:
+    """Ver29: apply evidence-based, day-aware blackout defaults once.
+
+    These windows protect setup generation, setup email, and AutoTrade entry together.
+    They can be edited later through /autotrade_config BLACKOUT_WINDOWS.
+    """
+    try:
+        target_version = 'ver30_2026_06_07_blackout_audit_column_and_windows'
+        if str(_autotrade_config_get(AUTOTRADE_CFG_VER29_DAY_BLACKOUT_POLICY_VERSION_KEY, '') or '').strip().lower() == target_version:
+            return
+        proposed = _normalise_melbourne_blackout_windows(
+            os.environ.get('VER29_RECOMMENDED_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS),
+            VER29_RECOMMENDED_BLACKOUT_WINDOWS,
+        )
+        if proposed:
+            # User-requested evidence-based schedule. Ver30 reapplies it once so the audit Blackout column uses the same recommended windows by default.
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, proposed)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, proposed)
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_VER29_DAY_BLACKOUT_POLICY_VERSION_KEY, target_version)
     except Exception:
         pass
 
@@ -7280,6 +7416,7 @@ try:
     _autotrade_apply_ver19_entry_execution_policy_defaults()
     _autotrade_apply_ver20_blackout_policy_defaults()
     _autotrade_apply_ver57_blackout_config_sync()
+    _autotrade_apply_ver29_day_aware_blackout_defaults()
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
     _autotrade_apply_ver58_time_exit_runtime_defaults()
@@ -9357,16 +9494,47 @@ def _local_hhmm_in_window(hhmm: str, window: str) -> bool:
         return False
 
 
+def _melbourne_day_minute(dt) -> tuple[int, int]:
+    return int(dt.weekday()), int(dt.hour) * 60 + int(dt.minute)
+
+
+def _blackout_window_contains_dt(window: str, dt) -> bool:
+    """Return True if Melbourne datetime is inside daily or day-aware blackout window."""
+    try:
+        w = str(window or '').strip().upper()
+        if not w:
+            return False
+        if not _blackout_window_has_day(w):
+            return _local_hhmm_in_window(dt.strftime('%H:%M'), w)
+        m = re.match(r'^(MON|TUE|WED|THU|FRI|SAT|SUN)\s+(\d{2}:\d{2})-(MON|TUE|WED|THU|FRI|SAT|SUN)\s+(\d{2}:\d{2})$', w)
+        if not m:
+            return False
+        sd, st, ed, et = m.group(1), m.group(2), m.group(3), m.group(4)
+        sday = _BLACKOUT_DAY_NAMES.index(sd); eday = _BLACKOUT_DAY_NAMES.index(ed)
+        sh, sm = [int(x) for x in st.split(':')]; eh, em = [int(x) for x in et.split(':')]
+        cur_day, cur_min = _melbourne_day_minute(dt)
+        start_abs = sday * 1440 + sh * 60 + sm
+        end_abs = eday * 1440 + eh * 60 + em
+        cur_abs = cur_day * 1440 + cur_min
+        if end_abs <= start_abs:
+            end_abs += 7 * 1440
+            if cur_abs < start_abs:
+                cur_abs += 7 * 1440
+        return start_abs <= cur_abs < end_abs
+    except Exception:
+        return False
+
+
 def _blackout_now_from_windows(enabled: bool, windows_value, reason_prefix: str, now_ts: float | None = None) -> tuple[bool, str]:
     try:
         if not bool(enabled):
             return False, ''
         ts = float(now_ts if now_ts is not None else time.time())
         dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
-        hhmm = dt.strftime('%H:%M')
         for w in _split_blackout_windows(windows_value):
-            if _local_hhmm_in_window(hhmm, str(w)):
-                return True, f'{reason_prefix}_{w}_melbourne'
+            if _blackout_window_contains_dt(str(w), dt):
+                reason_w = re.sub(r'\s+', '_', str(w).strip())
+                return True, f'{reason_prefix}_{reason_w}_melbourne'
         return False, ''
     except Exception:
         return False, ''
@@ -19457,6 +19625,7 @@ def _setup_generation_symbol_recently_seen(user_id: int, symbol: str, side: str,
                     WHERE user_id IN ({ph})
                       AND executable_ts>=?
                       AND UPPER(COALESCE(symbol,'')) IN ({sym_ph})
+                      AND LOWER(COALESCE(source_kind,'')) NOT LIKE 'shadow%'
                       {side_clause}
                     ORDER BY executable_ts DESC
                     LIMIT 12
@@ -19480,6 +19649,7 @@ def _setup_generation_symbol_recently_seen(user_id: int, symbol: str, side: str,
                     WHERE user_id IN ({ph})
                       AND created_ts>=?
                       AND UPPER(COALESCE(symbol,'')) IN ({sym_ph})
+                      AND LOWER(COALESCE(source,'')) <> 'shadow'
                       {side_clause}
                     ORDER BY created_ts DESC
                     LIMIT 12
@@ -24492,11 +24662,20 @@ def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executab
         pass
     try:
         cutoff_ts = float(time.time()) - float(max(86400, int(_autotrade_entry_window_min()) * 60 + 21600))
+        shadow_cutoff_ts = float(time.time()) - float(86400 * 21)
         cur.execute(
             """DELETE FROM executable_setups
                    WHERE user_id=?
-                     AND executable_ts < ?""",
+                     AND executable_ts < ?
+                     AND LOWER(COALESCE(source_kind, '')) NOT LIKE 'shadow%'""",
             (int(user_id), float(cutoff_ts)),
+        )
+        cur.execute(
+            """DELETE FROM executable_setups
+                   WHERE user_id=?
+                     AND executable_ts < ?
+                     AND LOWER(COALESCE(source_kind, '')) LIKE 'shadow%'""",
+            (int(user_id), float(shadow_cutoff_ts)),
         )
         cur.execute(
             """DELETE FROM executable_setups
@@ -24547,6 +24726,7 @@ def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: flo
         WHERE x.user_id=?
           AND x.executable_ts>=?
           {where_session}
+          AND LOWER(COALESCE(x.source_kind, '')) NOT LIKE 'shadow%'
           AND COALESCE(o.outcome, 'OPEN')='OPEN'
         GROUP BY x.user_id, x.setup_id
         ORDER BY x.executable_ts DESC, x.setup_id DESC
@@ -24607,19 +24787,25 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
         stats['edge_quality_skips'] = 0
         stats['cooldown_skips'] = 0
         stats['setup_blackout_skips'] = 0
+        stats['shadow_persisted'] = 0
+        shadow_blackout = False
+        shadow_reason = ''
         try:
             _blk, _blk_reason = _setup_generation_blackout_now(now_ts)
             if _blk:
                 stats['setup_blackout_skips'] = int(len(list(setups or [])) * max(1, len(target_uids)))
+                shadow_blackout = bool(_setup_shadow_scan_enabled())
+                shadow_reason = str(_blk_reason or 'setup_generation_blackout')
                 db_log_setup_pipeline_event(
                     int(uid),
                     stage='executable_setup_generation_blackout',
-                    status='skip',
+                    status='shadow' if shadow_blackout else 'skip',
                     session=sess,
                     mode=str(mode or ''),
-                    details={'reason': str(_blk_reason or 'setup_generation_blackout'), 'windows': _setup_generation_blackout_windows(), 'attempted_setups': len(list(setups or [])), 'target_uids': target_uids},
+                    details={'reason': shadow_reason, 'windows': _setup_generation_blackout_windows(), 'attempted_setups': len(list(setups or [])), 'target_uids': target_uids, 'shadow_scan_enabled': shadow_blackout},
                 )
-                return stats
+                if not shadow_blackout:
+                    return stats
         except Exception:
             pass
         for s in (setups or []):
@@ -24703,6 +24889,8 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                         continue
                 except Exception:
                     pass
+                effective_source_kind = 'shadow_blackout' if bool(shadow_blackout) else str(source_kind or 'executable_setups')
+                effective_generated_source = 'shadow' if bool(shadow_blackout) else 'exec'
                 if int(_target_uid) > 0:
                     try:
                         db_insert_signal(s_eff, user_id=int(_target_uid))
@@ -24711,12 +24899,14 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
                         if len(stats['errors']) < 6:
                             stats['errors'].append(f"signal:{sid or sym}:{type(e).__name__}")
                     try:
-                        db_log_generated_setup(int(_target_uid), "exec", sess, s_eff)
+                        db_log_generated_setup(int(_target_uid), effective_generated_source, sess, s_eff)
                     except Exception:
                         pass
                 try:
-                    db_mark_executable_setup(int(_target_uid), sid, sess, float(now_ts), s=s_eff, source_kind=str(source_kind or 'executable_setups'))
+                    db_mark_executable_setup(int(_target_uid), sid, sess, float(now_ts), s=s_eff, source_kind=effective_source_kind, state='shadow_blackout' if bool(shadow_blackout) else 'executable_pending')
                     stats['persisted'] += 1
+                    if bool(shadow_blackout):
+                        stats['shadow_persisted'] = int(stats.get('shadow_persisted', 0) or 0) + 1
                 except Exception as e:
                     stats['queue_errors'] += 1
                     if len(stats['errors']) < 6:
@@ -25261,9 +25451,9 @@ def db_recent_generated_setups(user_id: int, source: str, lookback_hours: int = 
 def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
     """Log a generated setup (from /screen) or a sent setup (email) for correlation.
 
-    Ver20: during the admin-defined setup-generation blackout, do not create new
-    setup rows for the production/audit lane. Market context snapshots may still be
-    shown by /screen, but no setup should enter generated/executable/email records.
+    Ver20: during the admin-defined setup-generation blackout, production sources
+    are blocked. yver32 allows source='shadow' to be stored during blackout for
+    analysis only; shadow rows are not email/AutoTrade executable.
     """
     con = None
     ts_now = float(time.time())
@@ -42023,6 +42213,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = {str(summary.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '-')} Melbourne",
             f"SETUP_GENERATION_BLACKOUT_ENABLED = {'true' if bool(summary.get('SETUP_GENERATION_BLACKOUT_ENABLED', True)) else 'false'}",
             f"SETUP_GENERATION_BLACKOUT_WINDOWS = {str(summary.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '-')} Melbourne",
+            f"SETUP_SHADOW_SCAN_ENABLED = {'true' if bool(summary.get('SETUP_SHADOW_SCAN_ENABLED', True)) else 'false'} (records blackout-blocked setup rows for analysis only)",
             f"AUTOTRADE_MAX_POSITION_HOURS_ENABLED = {'true' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False)) else 'false'}",
             f"AUTOTRADE_MAX_POSITION_HOURS = {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 18.0)):.2f}",
             f"AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = {'true' if bool(summary.get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)) else 'false'}",
@@ -42070,10 +42261,12 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_HOUR 9",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE 55",
             "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP false",
-            "• /autotrade_config BLACKOUT_WINDOWS 10:00-10:45   (sets both setup + autotrade blackout)",
-            "• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS 10:00-10:45",
-            "• /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-10:45",
+            "• /autotrade_config BLACKOUT_WINDOWS 03:00-08:30,10:00-11:30,13:00-14:00,SAT 22:00-SUN 10:00,SUN 22:00-MON 10:00   (sets setup + email + AutoTrade blackout)",
+            "• /autotrade_config BLACKOUT_WINDOWS SAT 22:00-SUN 10:00,SUN 10PM-MON 10AM   (day-aware examples)",
+            "• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS SAT 22:00-SUN 10:00",
+            "• /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS SAT 22:00-SUN 10:00",
             "• /autotrade_config SETUP_GENERATION_BLACKOUT_ENABLED true",
+            "• /autotrade_config SETUP_SHADOW_SCAN_ENABLED true   (record blackout-blocked setups for audit/WR analysis only)",
             "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS_ENABLED true",
             "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 12",
             "• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true",
@@ -42132,7 +42325,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP', 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED',
         'BLACKOUT_ENABLED', 'BLACKOUT_WINDOWS',
         'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS',
-        'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS',
+        'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS', 'SETUP_SHADOW_SCAN_ENABLED',
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS',
         'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY',
         'AUTOTRADE_STRICT_TPSL_ONLY', 'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL',
@@ -42217,6 +42410,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = _normalise_melbourne_blackout_windows(value_raw, default='10:00-10:45')
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, val)
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if val else 0)
+        elif key == 'SETUP_SHADOW_SCAN_ENABLED':
+            val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
+            _autotrade_config_set(SETUP_CFG_SHADOW_SCAN_ENABLED_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 1 if val else 0)
@@ -46026,6 +46222,34 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
     except Exception:
         return 'DISABLE'
 
+
+def _setup_audit_blackout_label_for_ts(ts: float) -> str:
+    """Return the matched blackout window label, or OPEN.
+
+    yver31: this is more useful than YES/NO because it lets the owner analyse
+    WR by each blackout category later, for example 03:00-04:00 versus
+    SAT 14:00-SUN 12:00.  It is reporting-only and uses the current configured
+    setup-generation blackout windows as the source of truth.
+    """
+    try:
+        ts_f = float(ts or 0.0)
+        if ts_f <= 0:
+            return '-'
+        if not bool(_setup_generation_blackout_enabled()):
+            return 'OPEN'
+        dt = datetime.fromtimestamp(ts_f, tz=timezone.utc).astimezone(MEL_TZ)
+        for w in _split_blackout_windows(_setup_generation_blackout_windows()):
+            w_s = str(w or '').strip().upper()
+            if not w_s:
+                continue
+            if _blackout_window_contains_dt(w_s, dt):
+                # Keep labels compact for Telegram table width.
+                # Examples: 03:00-04:00, SAT 14:00-SUN 12:00
+                return re.sub(r'\s+', ' ', w_s)
+        return 'OPEN'
+    except Exception:
+        return '-'
+
 def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     """Compact setup audit with current Policy lane per setup."""
     limit = max(0, int(limit or 0))
@@ -46079,7 +46303,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
         policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
         at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
-        table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
+        blackout_label = _setup_audit_blackout_label_for_ts(ts)
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, blackout_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -46096,9 +46321,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'Blackout', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
