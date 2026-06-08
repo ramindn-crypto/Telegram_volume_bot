@@ -620,6 +620,8 @@ AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY = 'strict_keep_edge_min_avgr'
 # Defaults remain KEEP+strict WATCH for /screen, setup emails and AutoTrade.
 AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY = 'allow_watch_policy'
 USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY = 'user_visible_allow_watch_policy'
+# yver33: runtime-editable hard symbol block list for contracts the account cannot trade.
+AUTOTRADE_CFG_BLOCKED_SYMBOLS_KEY = 'blocked_symbols'
 # yver106: cap live AutoTrade TP distance by RR so a tiny SL does not create an unrealistic far TP.
 AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY = 'tp_rr_cap_enabled'
 AUTOTRADE_CFG_MAX_LIVE_RR_KEY = 'max_live_rr'
@@ -853,6 +855,7 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY: 1 if env_bool('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', True) else 0,
         AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', '1.25') or 1.25),
         AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY: float(os.environ.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', '4') or 4),
+        AUTOTRADE_CFG_BLOCKED_SYMBOLS_KEY: str(((os.environ.get('AUTOTRADE_BLOCKED_SYMBOLS', 'CL') or 'CL') + ',SOXL')),
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY: 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', True) else 0,
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', '9') or 9),
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55') or 55),
@@ -5598,13 +5601,39 @@ AUTOTRADE_ALLOW_WATCH_POLICY = env_bool("AUTOTRADE_ALLOW_WATCH_POLICY", False)
 # current Bybit futures account or repeatedly fail exchange terms (e.g. CL crude oil).
 # This is only for setup delivery/autotrade; audit can still retain historical rows.
 AUTOTRADE_BLOCKED_SYMBOLS = tuple(
-    x.strip().upper() for x in str(os.environ.get("AUTOTRADE_BLOCKED_SYMBOLS", "CL") or "").split(",") if x.strip()
+    x.strip().upper() for x in str((os.environ.get("AUTOTRADE_BLOCKED_SYMBOLS", "CL") or "CL") + ",SOXL").split(",") if x.strip()
 )
+
+def _autotrade_blocked_symbols_runtime() -> tuple[str, ...]:
+    try:
+        raw = _autotrade_config_get(AUTOTRADE_CFG_BLOCKED_SYMBOLS_KEY, (os.environ.get("AUTOTRADE_BLOCKED_SYMBOLS", "CL") or "CL") + ",SOXL")
+    except Exception:
+        raw = (os.environ.get("AUTOTRADE_BLOCKED_SYMBOLS", "CL") or "CL") + ",SOXL"
+    try:
+        return tuple(x.strip().upper() for x in str(raw or '').replace(';', ',').split(',') if x.strip())
+    except Exception:
+        return tuple(AUTOTRADE_BLOCKED_SYMBOLS)
+
+def _autotrade_add_blocked_symbol_runtime(sym: str, reason: str = '') -> None:
+    try:
+        base = _symbol_base(str(sym or '')).upper().strip()
+        if not base:
+            return
+        cur = list(_autotrade_blocked_symbols_runtime())
+        if base not in cur:
+            cur.append(base)
+            _autotrade_config_set(AUTOTRADE_CFG_BLOCKED_SYMBOLS_KEY, ','.join(cur))
+            try:
+                logger.warning('autotrade_symbol_auto_blocked symbol=%s reason=%s blocked=%s', base, str(reason or '-')[:120], ','.join(cur))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def _autotrade_symbol_blocked(sym: str) -> tuple[bool, str]:
     try:
         base = _symbol_base(str(sym or '')).upper().strip()
-        blocked = {str(x or '').upper().strip() for x in AUTOTRADE_BLOCKED_SYMBOLS if str(x or '').strip()}
+        blocked = {str(x or '').upper().strip() for x in _autotrade_blocked_symbols_runtime() if str(x or '').strip()}
         if base and base in blocked:
             return True, f'autotrade_symbol_hard_block:{base}'
     except Exception:
@@ -14873,7 +14902,14 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
         except Exception:
             pass
         if int((open_res or {}).get('retCode', -1)) != 0:
-            err = f"{(open_res or {}).get('retCode')} {(open_res or {}).get('retMsg')}"
+            ret_code = int((open_res or {}).get('retCode', -1))
+            ret_msg = str((open_res or {}).get('retMsg') or '')
+            err = f"{ret_code} {ret_msg}"
+            try:
+                if ret_code == 110126 or 'required agreement' in ret_msg.lower() or 'sign the required agreement' in ret_msg.lower():
+                    _autotrade_add_blocked_symbol_runtime(sym, reason=err)
+            except Exception:
+                pass
             _autotrade_exec_mark(reserved_keys, 'FAILED', err)
             try:
                 _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('exchange_reject'), last_reason=str(err))
@@ -42226,7 +42262,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED = {int(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 5))}",
             f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 60.0)):.1f}",
             f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', 0.25)):+.2f}",
-            f"AUTOTRADE_BLOCKED_SYMBOLS = {','.join(AUTOTRADE_BLOCKED_SYMBOLS) if AUTOTRADE_BLOCKED_SYMBOLS else '-'}",
+            f"AUTOTRADE_BLOCKED_SYMBOLS = {','.join(_autotrade_blocked_symbols_runtime()) if _autotrade_blocked_symbols_runtime() else '-'}",
             f"AUTOTRADE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('AUTOTRADE_ALLOW_WATCH_POLICY', True)) else 'false'}",
             f"USER_VISIBLE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('USER_VISIBLE_ALLOW_WATCH_POLICY', True)) else 'false'}",
             f"AUTOTRADE_TP_RR_CAP_ENABLED = {'true' if bool(summary.get('AUTOTRADE_TP_RR_CAP_ENABLED', True)) else 'false'}",
@@ -42281,6 +42317,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.25",
             "• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY false   (KEEP-only live mode)",
             "• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY false   (/screen + emails KEEP-only)",
+            "• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS CL,SOXL   (hard-block symbols/contracts that cannot be traded)",
             "• /autotrade_config AUTOTRADE_TP_RR_CAP_ENABLED true",
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 1.5",
@@ -42332,7 +42369,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
         'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT',
         'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED',
-        'AUTOTRADE_ALLOW_WATCH_POLICY', 'USER_VISIBLE_ALLOW_WATCH_POLICY',
+        'AUTOTRADE_ALLOW_WATCH_POLICY', 'USER_VISIBLE_ALLOW_WATCH_POLICY', 'AUTOTRADE_BLOCKED_SYMBOLS',
         'AUTOTRADE_TP_RR_CAP_ENABLED', 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED', 'AUTOTRADE_DYNAMIC_TP_BASE_RR', 'AUTOTRADE_MAX_LIVE_RR', 'AUTOTRADE_MIN_LIVE_RR',
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR'
     }:
@@ -42529,6 +42566,24 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['USER_VISIBLE_ALLOW_WATCH_POLICY'] = bool(val)
             _autotrade_config_set(USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY, 1 if val else 0)
+        elif key == 'AUTOTRADE_BLOCKED_SYMBOLS':
+            raw_symbols = str(value_raw or '').strip()
+            if raw_symbols.lower() in {'-', 'none', 'clear', 'off'}:
+                val = ''
+            else:
+                parts = []
+                for part in raw_symbols.replace(';', ',').replace(' ', ',').split(','):
+                    b = _symbol_base(str(part or '')).upper().strip()
+                    if b and b not in parts:
+                        parts.append(b)
+                val = ','.join(parts)
+            _autotrade_config_set(AUTOTRADE_CFG_BLOCKED_SYMBOLS_KEY, val)
+            try:
+                cache_delete(f"autotrade_db_setups_v115:{int(AUTOTRADE_OWNER_UID or 0)}:ASIA:24:30")
+                cache_delete(f"autotrade_db_setups_v115:{int(AUTOTRADE_OWNER_UID or 0)}:LON:24:30")
+                cache_delete(f"autotrade_db_setups_v115:{int(AUTOTRADE_OWNER_UID or 0)}:NY:24:30")
+            except Exception:
+                pass
         elif key == 'AUTOTRADE_TP_RR_CAP_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY, 1 if val else 0)
@@ -42563,7 +42618,20 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     summary = _autotrade_runtime_summary_dict()
-    await update.message.reply_text(f"✅ Updated {key}. Current value: {summary.get(key)}")
+    try:
+        if key == 'BLACKOUT_WINDOWS':
+            current_value = str(_autotrade_entry_blackout_windows())
+        elif key == 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS':
+            current_value = str(_autotrade_entry_blackout_windows())
+        elif key == 'SETUP_GENERATION_BLACKOUT_WINDOWS':
+            current_value = str(_setup_generation_blackout_windows())
+        elif key == 'AUTOTRADE_BLOCKED_SYMBOLS':
+            current_value = ','.join(_autotrade_blocked_symbols_runtime()) if _autotrade_blocked_symbols_runtime() else '-'
+        else:
+            current_value = summary.get(key)
+    except Exception:
+        current_value = summary.get(key)
+    await update.message.reply_text(f"✅ Updated {key}. Current value: {current_value}")
 
 
 async def autotrade_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -47904,7 +47972,7 @@ def _setup_combo_run_daily_safety_policy(uid: int, start_ts: float | None = None
             bridge_report = {}
         out.update({'ok': True, 'disabled': [_setup_combo_strategy_side_key(str((r or {}).get('family') or ''), str((r or {}).get('session') or ''), str((r or {}).get('strategy') or 'NOR'), str((r or {}).get('side') or '')) for r, _ in disabled], 'rows': len(rows), 'run_id': run_id, 'expires_ts': expires_ts, 'bridge_report': bridge_report, 'reason': 'ok', 'window_hours': int(hours), 'start_ts': float(fixed_start_ts or 0.0), 'source_label': str((res or {}).get('source_label') or 'EXECUTABLE')})
         try:
-            logger.info('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
+            logger.debug('setup_combo_daily_safety_complete run_id=%s disabled=%s expires=%s', run_id, ','.join(out['disabled']) or '-', _setup_combo_format_policy_ts(expires_ts))
         except Exception:
             pass
         return out
