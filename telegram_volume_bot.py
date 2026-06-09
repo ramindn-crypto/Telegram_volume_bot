@@ -3549,9 +3549,30 @@ def _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name: str 
         return {'execnow': 'OFF', 'policy': 'DISABLE', 'reco': 'DISABLE', 'combo': '', 'error': f'{type(exc).__name__}: {exc}', 'source': 'setup_matrix_policy'}
 
 
+def _setup_matrix_policy_live_keep_state_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    """Return whether the exact /setup_matrix policy row is live-executable KEEP.
+
+    Ver34: runtime delivery must match /setup_matrix policy 100%.  A stale legacy
+    KEEP row, BigMove/F8 path, or cached setup must not be emailed, shown as
+    tradeable, or AutoTraded unless the current matrix state is BOTH:
+      ExecNow = KEEP and Policy = KEEP.
+    """
+    try:
+        st = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0)) or {}
+        pol = str(st.get('policy') or '').upper().strip()
+        exe = str(st.get('execnow') or '').upper().strip()
+        combo = str(st.get('combo') or '').upper().strip()
+        ok = (pol == 'KEEP' and exe == 'KEEP')
+        reason = 'setup_matrix_policy_live_keep' if ok else f'setup_matrix_policy_not_live_keep:{exe or "-"}/{pol or "-"}:{combo or "-"}'
+        return bool(ok), reason, dict(st or {})
+    except Exception as exc:
+        return False, f'setup_matrix_policy_live_keep_exception:{type(exc).__name__}', {'error': f'{type(exc).__name__}: {exc}'}
+
+
 def _setup_matrix_policy_is_keep_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> bool:
     try:
-        return str((_setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0)) or {}).get('policy') or '').upper().strip() == 'KEEP'
+        ok, _why, _st = _setup_matrix_policy_live_keep_state_for_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
+        return bool(ok)
     except Exception:
         return False
 
@@ -5749,13 +5770,17 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
         try:
             matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0)) or {}
             matrix_policy = str(matrix_state.get('policy') or '').upper().strip()
+            matrix_execnow = str(matrix_state.get('execnow') or '').upper().strip()
+            matrix_combo = str(matrix_state.get('combo') or combo or '').upper().strip()
             meta['setup_matrix_policy'] = matrix_policy
-            meta['setup_matrix_execnow'] = str(matrix_state.get('execnow') or '').upper().strip()
-            meta['setup_matrix_combo'] = str(matrix_state.get('combo') or combo or '').upper().strip()
-            if matrix_policy == 'KEEP':
-                return True, 'setup_matrix_policy_keep_source_of_truth', meta
-            if matrix_policy in {'DISABLE', 'TIGHTEN', 'OFF'}:
-                return False, f'{l}_setup_matrix_policy_not_keep:{matrix_policy}', meta
+            meta['setup_matrix_execnow'] = matrix_execnow
+            meta['setup_matrix_combo'] = matrix_combo
+            # Ver34: /setup_matrix policy is the live source of truth. Do not fall
+            # back to old setup_combo_policy KEEP for WATCH/OFF/DISABLE/TIGHTEN rows,
+            # and do not let BigMove/F8 bypass the current matrix state.
+            if matrix_policy == 'KEEP' and matrix_execnow == 'KEEP':
+                return True, 'setup_matrix_policy_live_keep_source_of_truth', meta
+            return False, f'{l}_setup_matrix_policy_not_live_keep:{matrix_execnow or "-"}/{matrix_policy or "-"}:{matrix_combo or "-"}', meta
         except Exception as _matrix_exc:
             meta['setup_matrix_policy_error'] = f'{type(_matrix_exc).__name__}: {_matrix_exc}'
         if status in allowed_statuses:
@@ -6029,8 +6054,8 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         # policy guards re-block it before AutoTrade.
         try:
             _matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=owner_uid) or {}
-            if str(_matrix_state.get('policy') or '').upper().strip() == 'KEEP':
-                return True, 'setup_matrix_policy_keep_source_of_truth'
+            if str(_matrix_state.get('policy') or '').upper().strip() == 'KEEP' and str(_matrix_state.get('execnow') or '').upper().strip() == 'KEEP':
+                return True, 'setup_matrix_policy_live_keep_source_of_truth'
         except Exception:
             pass
         try:
@@ -14179,6 +14204,19 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
+    # Ver34: final hard matrix gate before any Bybit placement.  This is the
+    # last line of defence for all paths, including BigMove/F8 fast AutoTrade.
+    try:
+        _mx_ok, _mx_why, _mx_state = _setup_matrix_policy_live_keep_state_for_setup(s, session_name=session_label, user_id=int(uid))
+        if not _mx_ok:
+            try:
+                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason('autotrade_matrix_policy_block'), last_reason=str(_mx_why))
+            except Exception:
+                pass
+            return (False, str(_mx_why or 'autotrade_matrix_policy_block'))
+    except Exception:
+        return (False, 'autotrade_matrix_policy_gate_exception')
+
     # yver129: final hard gate before any Bybit placement. Even if an upstream
     # selector accidentally passes a raw executable object, do not open it unless
     # the exact setup was emailed/delivered recently.
@@ -20867,6 +20905,23 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                 'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
                 'reason': 'no_bigmove_autotrade_setups_built', 'session': sess,
                 'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_email_immediate',
+            }
+            return
+
+        # Ver34: immediate BigMove/F8 AutoTrade must consume only the same live
+        # matrix-KEEP lane that setup email and /screen would expose.  This prevents
+        # F8 rows whose current /setup_matrix policy has dropped to OFF/DISABLE
+        # from being placed from the BigMove fast path.
+        try:
+            setup_list, _bm_at_reasons = await to_thread_autotrade(_setup_email_presend_executable_filter, owner_uid, sess, list(setup_list or []), 'bigmove_autotrade_immediate', timeout=8)
+        except Exception:
+            setup_list, _bm_at_reasons = [], Counter({'bigmove_autotrade_presend_exception': 1})
+        if not setup_list:
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
+                'reason': f'bigmove_autotrade_matrix_policy_blocked:{dict((_bm_at_reasons or Counter()).most_common(3))}',
+                'session': sess, 'mode': str(_autotrade_runtime_mode()).lower(),
+                'trigger': 'bigmove_email_immediate',
             }
             return
 
@@ -48743,10 +48798,10 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         # downgrade it to OFF because of separate context/quality policy layers.
         try:
             _matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0)) or {}
-            if str(_matrix_state.get('policy') or '').upper().strip() == 'KEEP':
+            if str(_matrix_state.get('policy') or '').upper().strip() == 'KEEP' and str(_matrix_state.get('execnow') or '').upper().strip() == 'KEEP':
                 meta.update({'setup_matrix_policy': 'KEEP', 'setup_matrix_execnow': str(_matrix_state.get('execnow') or '').upper().strip(), 'setup_matrix_combo': str(_matrix_state.get('combo') or '').upper().strip()})
-                _setup_quality_gate_set_attr(setup_or_row, 'setup_matrix_policy_keep_source_of_truth', True)
-                return True, 'setup_matrix_policy_keep_source_of_truth', meta
+                _setup_quality_gate_set_attr(setup_or_row, 'setup_matrix_policy_live_keep_source_of_truth', True)
+                return True, 'setup_matrix_policy_live_keep_source_of_truth', meta
         except Exception as _matrix_exc:
             meta['setup_matrix_policy_error'] = f'{type(_matrix_exc).__name__}: {_matrix_exc}'
 
