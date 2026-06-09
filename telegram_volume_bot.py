@@ -18492,9 +18492,14 @@ def db_init():
     if "sessions_unlimited" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN sessions_unlimited INTEGER NOT NULL DEFAULT 0")
     
-    # NEW: Big-move alert emails (even if not a valid setup)
+    # NEW: Big-move alert emails (raw market-event email, even if not a valid setup)
     if "bigmove_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
+
+    # ver36: split raw Big-Move alert emails from BigMove/F8 setup emails.
+    # Users can turn raw alert emails OFF while keeping F8 setup emails ON.
+    if "bigmove_setup_email_on" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_setup_email_on INTEGER NOT NULL DEFAULT 1")
     
     # Big-move alert defaults: 15m >= 1.5%, 1H >= 3%, 4H >= 5% in the same direction.
     if "bigmove_alert_15m" not in cols:
@@ -20271,6 +20276,18 @@ def _user_bigmove_thresholds(user: dict | None) -> tuple[float, float, float]:
     p1 = _pick("bigmove_alert_1h", BIGMOVE_DEFAULT_1H_PCT)
     p4 = _pick("bigmove_alert_4h", BIGMOVE_DEFAULT_4H_PCT)
     return float(p15), float(p1), float(p4)
+
+
+def _user_bigmove_setup_email_on(user: dict | None) -> bool:
+    """Whether confirmed BigMove/F8 candidates may still become normal setup emails.
+
+    This is intentionally separate from bigmove_alert_on, which controls only the
+    raw market-event Big-Move notification email. Default ON preserves F8 setups.
+    """
+    try:
+        return bool(int((user or {}).get("bigmove_setup_email_on", 1) or 0))
+    except Exception:
+        return True
 
 
 def _user_bigmove_min_vol_usd(user: dict | None, default: float = BIGMOVE_DEFAULT_MIN_VOL_USD) -> float:
@@ -41121,7 +41138,7 @@ Trade Journal
 /limits emaildaycap 
 • Set max number of emails per day
 
-/bigmove_alert on|off [15m%] [1H%] [4H%]
+/bigmove_alert on|off|setup_on|setup_off [15m%] [1H%] [4H%]
 • Big move alerts in either direction (UP or DOWN)
 • Defaults: 15m=2%, 1H=4%, 4H=6%, Min Vol=18M
 • Email sends only after the next 15m candle confirms the same direction
@@ -43038,6 +43055,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cur_on = int(user.get("bigmove_alert_on", 1) or 0)
+    cur_setup_on = 1 if _user_bigmove_setup_email_on(user) else 0
     cur_p15, cur_p1, cur_p4 = _user_bigmove_thresholds(user)
     cur_min_vol = max(BIGMOVE_MIN_SUPPORTED_VOL_USD, _user_bigmove_min_vol_usd(user, BIGMOVE_DEFAULT_MIN_VOL_USD))
 
@@ -43045,9 +43063,10 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         updated_ts = float(user.get("bigmove_alert_updated_ts", 0.0) or 0.0)
         updated_reason = str(user.get("bigmove_alert_update_reason", "") or "").strip()
         lines = [
-            "📣 Big-Move Alert Emails",
+            "📣 Big-Move / F8 Setup Controls",
             f"{HDR}",
-            f"Status: {'ON' if cur_on else 'OFF'}",
+            f"Raw Big-Move Alert Emails: {'ON' if cur_on else 'OFF'}",
+            f"BigMove/F8 Setup Emails: {'ON' if cur_setup_on else 'OFF'}",
             f"Thresholds: |15m| ≥ {cur_p15:g}% AND |1H| ≥ {cur_p1:g}% AND |4H| ≥ {cur_p4:g}% (same direction only)",
             f"Min Vol (24H): {cur_min_vol/1e6:.1f}M",
         ]
@@ -43057,8 +43076,10 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Reason: {updated_reason}")
         lines.extend([
             "",
-            "Set: /bigmove_alert on 1.5 3 5",
-            "Off: /bigmove_alert off",
+            "Raw alert ON: /bigmove_alert on 1.5 3 5",
+            "Raw alert OFF: /bigmove_alert off",
+            "F8 setup emails ON: /bigmove_alert setup_on",
+            "F8 setup emails OFF: /bigmove_alert setup_off",
         ])
         await update.message.reply_text("\n".join(lines))
         return
@@ -43066,8 +43087,18 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.args[0].strip().lower()
 
     if mode in {"off", "0", "disable"}:
-        _record_bigmove_settings_change(uid, False, cur_p15, cur_p1, cur_p4, cur_min_vol, "command_off via /bigmove_alert")
-        await update.message.reply_text("✅ Big-move alert emails: OFF")
+        _record_bigmove_settings_change(uid, False, cur_p15, cur_p1, cur_p4, cur_min_vol, "command_off via /bigmove_alert; raw alert emails disabled, F8 setup emails unchanged")
+        await update.message.reply_text("✅ Raw Big-Move alert emails: OFF\n✅ BigMove/F8 setup emails remain: " + ("ON" if cur_setup_on else "OFF"))
+        return
+
+    if mode in {"setup_on", "setupon", "setup-enable", "setup_enable", "f8_on", "f8on"}:
+        update_user(uid, bigmove_setup_email_on=1, bigmove_alert_updated_ts=float(time.time()), bigmove_alert_update_reason="command_setup_on via /bigmove_alert")
+        await update.message.reply_text("✅ BigMove/F8 setup emails: ON\nRaw Big-Move alert emails are unchanged: " + ("ON" if cur_on else "OFF"))
+        return
+
+    if mode in {"setup_off", "setupoff", "setup-disable", "setup_disable", "f8_off", "f8off"}:
+        update_user(uid, bigmove_setup_email_on=0, bigmove_alert_updated_ts=float(time.time()), bigmove_alert_update_reason="command_setup_off via /bigmove_alert")
+        await update.message.reply_text("✅ BigMove/F8 setup emails: OFF\nRaw Big-Move alert emails are unchanged: " + ("ON" if cur_on else "OFF"))
         return
 
     if mode in {"on", "1", "enable"}:
@@ -43084,10 +43115,10 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)")
                 return
         _record_bigmove_settings_change(uid, True, p15, p1, p4, min_vol, f"command_on via /bigmove_alert (15m>={p15:.2f}% AND 1H>={p1:.2f}% AND 4H>={p4:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
+        await update.message.reply_text(f"✅ Raw Big-Move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)\nBigMove/F8 setup emails remain: " + ("ON" if cur_setup_on else "OFF"))
         return
 
-    await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)  OR  /bigmove_alert off")
+    await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%> OR /bigmove_alert off OR /bigmove_alert setup_on OR /bigmove_alert setup_off")
 
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59655,9 +59686,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         def _build_bigmove_payload_for_user(uid: int, tz):
             try:
                 uu = get_user(int(uid)) or {}
-                on = int(uu.get("bigmove_alert_on", 1) or 0)
-                if not on:
-                    return {"status": "SKIP", "reasons": ["bigmove_alert_off"]}
+                alert_on = int(uu.get("bigmove_alert_on", 1) or 0)
+                setup_email_on = 1 if _user_bigmove_setup_email_on(uu) else 0
+                if not alert_on and not setup_email_on:
+                    return {"status": "SKIP", "reasons": ["bigmove_alert_and_f8_setup_email_off"]}
 
                 try:
                     p15, p1, p4 = _user_bigmove_thresholds(uu)
@@ -59826,6 +59858,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     "top_dir": str(top_dir or ""),
                     "top_tf": str(top_tf or ""),
                     "top_move": float(top_move or 0.0),
+                    "alert_email_on": bool(alert_on),
+                    "setup_email_on": bool(setup_email_on),
                     "reasons": [
                         f"candidates={len(filtered)}",
                         f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%",
@@ -60085,70 +60119,86 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 top_dir = str(payload.get('top_dir') or '')
                 top_tf = str(payload.get('top_tf') or '')
                 top_move = float(payload.get('top_move') or 0.0)
+                alert_email_on = bool(payload.get('alert_email_on', True))
+                setup_email_on = bool(payload.get('setup_email_on', True))
 
-                try:
-                    ok = await _send_email_async(
-                        int(EMAIL_SEND_TIMEOUT_SEC),
-                        subject,
-                        body,
-                        user_id_for_debug=int(uid),
-                        bypass_user_email_master=True,
-                        enforce_trade_window=False,
-                    )
-                except Exception as e:
-                    ok = False
+                raw_alert_ok = True
+                raw_alert_sent = False
+                if alert_email_on:
                     try:
-                        _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
-                    except Exception:
-                        pass
-
-                _LAST_BIGMOVE_DECISION[int(uid)] = {
-                    "status": "SENT" if ok else "ERROR",
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "subject": subject,
-                    "reasons": (
-                        [f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", f"sent_{tag}"]
-                        if ok else
-                        [f"send_email_failed_or_timeout_{tag}", _LAST_SMTP_ERROR.get(int(uid), "send_email_failed")]
-                    ),
-                }
-                if ok:
-                    for c in filtered[:8]:
+                        raw_alert_ok = await _send_email_async(
+                            int(EMAIL_SEND_TIMEOUT_SEC),
+                            subject,
+                            body,
+                            user_id_for_debug=int(uid),
+                            bypass_user_email_master=True,
+                            enforce_trade_window=False,
+                        )
+                        raw_alert_sent = bool(raw_alert_ok)
+                    except Exception as e:
+                        raw_alert_ok = False
                         try:
-                            mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
+                            _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
                         except Exception:
                             pass
-                    bm_sess = _bigmove_autotrade_session_name()
-                    setup_email_setups = []
-                    setup_email_sent = False
+
+                _LAST_BIGMOVE_DECISION[int(uid)] = {
+                    "status": ("SENT" if raw_alert_sent else ("SETUP_ONLY" if (not alert_email_on and setup_email_on) else ("SKIP" if not setup_email_on else "ERROR"))),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "subject": subject if alert_email_on else "",
+                    "reasons": (
+                        [f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", f"sent_raw_alert_{tag}"]
+                        if raw_alert_sent else
+                        ([f"raw_bigmove_alert_email_off", f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%"] if (not alert_email_on and setup_email_on) else [f"send_email_failed_or_timeout_{tag}", _LAST_SMTP_ERROR.get(int(uid), "send_email_failed")])
+                    ),
+                }
+
+                bm_sess = _bigmove_autotrade_session_name()
+                setup_email_setups = []
+                setup_email_sent = False
+                if setup_email_on and raw_alert_ok:
                     try:
                         setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
                     except Exception:
                         setup_email_setups, setup_email_sent = [], False
                     try:
                         if setup_email_sent:
+                            _LAST_BIGMOVE_DECISION[int(uid)]["status"] = "SETUP_SENT" if not raw_alert_sent else "SENT"
                             _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
                         else:
                             _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
                     except Exception:
                         pass
+                elif not setup_email_on:
                     try:
-                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                                "status": "QUEUED",
-                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
-                                "session": str(bm_sess or ""),
-                                "mode": str(_autotrade_runtime_mode()).lower(),
-                                "trigger": "bigmove_setup_email_immediate",
-                            }
-                            _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
-                                "autotrade_after_bigmove_setup_email",
-                            )
+                        _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_off')
                     except Exception:
                         pass
+
+                if raw_alert_sent or setup_email_sent:
+                    for c in filtered[:8]:
+                        try:
+                            mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
+                        except Exception:
+                            pass
+
+                try:
+                    owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+                    if setup_email_sent and owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            "status": "QUEUED",
+                            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade",
+                            "session": str(bm_sess or ""),
+                            "mode": str(_autotrade_runtime_mode()).lower(),
+                            "trigger": "bigmove_setup_email_immediate",
+                        }
+                        _safe_create_task(
+                            _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
+                            "autotrade_after_bigmove_setup_email",
+                        )
+                except Exception:
+                    pass
             except Exception as e:
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[int(uid)] = {
@@ -60175,7 +60225,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             pass
         users_bigmove = list(users_bigmove or [])
         try:
-            users_bigmove = [u for u in users_bigmove if int((u or {}).get('bigmove_alert_on', 1) or 0) == 1]
+            # ver36: raw Big-Move alert emails and BigMove/F8 setup emails are separate.
+            # Keep users in this lane if either raw alerts are ON or F8 setup emails are ON.
+            users_bigmove = [u for u in users_bigmove if (int((u or {}).get('bigmove_alert_on', 1) or 0) == 1 or _user_bigmove_setup_email_on(u))]
         except Exception:
             users_bigmove = list(users_bigmove or [])
         _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)
@@ -61095,6 +61147,10 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         bigm_on = 1
     try:
+        bigm_setup_on = 1 if _user_bigmove_setup_email_on(user) else 0
+    except Exception:
+        bigm_setup_on = 1
+    try:
         bigm_p15, bigm_p1, bigm_p4 = _user_bigmove_thresholds(user)
     except Exception:
         bigm_p15, bigm_p1, bigm_p4 = BIGMOVE_DEFAULT_15M_PCT, BIGMOVE_DEFAULT_1H_PCT, BIGMOVE_DEFAULT_4H_PCT
@@ -61109,8 +61165,9 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     bigm_updated_reason = str(user.get("bigmove_alert_update_reason", "") or "").strip()
 
     lines.append("")
-    lines.append("⚡ Big-Move Alert Settings")
-    lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
+    lines.append("⚡ Big-Move / F8 Setup Settings")
+    lines.append(f"Raw Alert Emails: {'ON' if bigm_on else 'OFF'}")
+    lines.append(f"F8 Setup Emails: {'ON' if bigm_setup_on else 'OFF'}")
     lines.append(f"Thresholds: |15m| ≥ {bigm_p15:g}% AND |1H| ≥ {bigm_p1:g}% AND |4H| ≥ {bigm_p4:g}% (same direction only)")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
     lines.append(f"Payload timeout: {int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60)}s")
