@@ -3563,6 +3563,18 @@ def _setup_matrix_policy_live_keep_state_for_setup(setup_or_row, session_name: s
         exe = str(st.get('execnow') or '').upper().strip()
         combo = str(st.get('combo') or '').upper().strip()
         ok = (pol == 'KEEP' and exe == 'KEEP')
+        # yver35: live KEEP is necessary but not sufficient for delivery.
+        # A setup fighting the current Leaders/Losers context must not be shown,
+        # emailed, or AutoTraded even when its combo lane is KEEP.
+        if ok:
+            try:
+                dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=session_name, user_id=int(user_id or 0))
+                if isinstance(dir_meta, dict):
+                    st.update(dir_meta)
+                if not dir_ok:
+                    return False, str(dir_why or 'directional_context_blocked'), dict(st or {})
+            except Exception as _dir_exc:
+                st['directional_context_guard_error'] = f'{type(_dir_exc).__name__}: {_dir_exc}'
         reason = 'setup_matrix_policy_live_keep' if ok else f'setup_matrix_policy_not_live_keep:{exe or "-"}/{pol or "-"}:{combo or "-"}'
         return bool(ok), reason, dict(st or {})
     except Exception as exc:
@@ -5768,19 +5780,25 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
         # and eligible for delivery; non-KEEP lanes remain blocked unless WATCH is
         # explicitly enabled below.
         try:
-            matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0)) or {}
+            matrix_ok, matrix_why, matrix_state = _setup_matrix_policy_live_keep_state_for_setup(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0))
+            matrix_state = dict(matrix_state or {})
             matrix_policy = str(matrix_state.get('policy') or '').upper().strip()
             matrix_execnow = str(matrix_state.get('execnow') or '').upper().strip()
             matrix_combo = str(matrix_state.get('combo') or combo or '').upper().strip()
             meta['setup_matrix_policy'] = matrix_policy
             meta['setup_matrix_execnow'] = matrix_execnow
             meta['setup_matrix_combo'] = matrix_combo
-            # Ver34: /setup_matrix policy is the live source of truth. Do not fall
-            # back to old setup_combo_policy KEEP for WATCH/OFF/DISABLE/TIGHTEN rows,
-            # and do not let BigMove/F8 bypass the current matrix state.
-            if matrix_policy == 'KEEP' and matrix_execnow == 'KEEP':
+            meta['setup_matrix_live_keep_reason'] = str(matrix_why or '')
+            for _k, _v in matrix_state.items():
+                if str(_k).startswith('directional_context_'):
+                    meta[_k] = _v
+            # Ver35: /setup_matrix KEEP remains the source of truth, but it is now
+            # guarded by the current Leaders/Losers directional context. Leader SELL
+            # and Loser BUY are blocked from /screen, setup email, BigMove/F8 email,
+            # and AutoTrade.
+            if matrix_ok:
                 return True, 'setup_matrix_policy_live_keep_source_of_truth', meta
-            return False, f'{l}_setup_matrix_policy_not_live_keep:{matrix_execnow or "-"}/{matrix_policy or "-"}:{matrix_combo or "-"}', meta
+            return False, f'{l}_{matrix_why or ("setup_matrix_policy_not_live_keep")}', meta
         except Exception as _matrix_exc:
             meta['setup_matrix_policy_error'] = f'{type(_matrix_exc).__name__}: {_matrix_exc}'
         if status in allowed_statuses:
@@ -6049,13 +6067,14 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
         combo = _autotrade_setup_exact_combo_key(setup_or_row, sess)
         pstatus_exec = ''
-        # yver24: /setup_matrix policy is the source of truth.  If the
-        # exact lane is KEEP in that table, do not let secondary realised/context
-        # policy guards re-block it before AutoTrade.
+        # yver35: /setup_matrix KEEP is the lane source of truth, but it must not
+        # bypass the current Leaders/Losers directional guard.
         try:
-            _matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=owner_uid) or {}
-            if str(_matrix_state.get('policy') or '').upper().strip() == 'KEEP' and str(_matrix_state.get('execnow') or '').upper().strip() == 'KEEP':
+            _matrix_ok, _matrix_why, _matrix_state = _setup_matrix_policy_live_keep_state_for_setup(setup_or_row, session_name=sess, user_id=owner_uid)
+            if _matrix_ok:
                 return True, 'setup_matrix_policy_live_keep_source_of_truth'
+            if str(_matrix_why or '').startswith('directional_context_blocks'):
+                return False, str(_matrix_why)
         except Exception:
             pass
         try:
@@ -48793,18 +48812,9 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         if sess not in {'ASIA', 'LON', 'NY'}:
             return False, 'final_missing_session', meta
 
-        # yver24: /setup_matrix policy is the source of truth.  If the
-        # exact lane's Policy column is KEEP, the shared final gate must not
-        # downgrade it to OFF because of separate context/quality policy layers.
-        try:
-            _matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0)) or {}
-            if str(_matrix_state.get('policy') or '').upper().strip() == 'KEEP' and str(_matrix_state.get('execnow') or '').upper().strip() == 'KEEP':
-                meta.update({'setup_matrix_policy': 'KEEP', 'setup_matrix_execnow': str(_matrix_state.get('execnow') or '').upper().strip(), 'setup_matrix_combo': str(_matrix_state.get('combo') or '').upper().strip()})
-                _setup_quality_gate_set_attr(setup_or_row, 'setup_matrix_policy_live_keep_source_of_truth', True)
-                return True, 'setup_matrix_policy_live_keep_source_of_truth', meta
-        except Exception as _matrix_exc:
-            meta['setup_matrix_policy_error'] = f'{type(_matrix_exc).__name__}: {_matrix_exc}'
-
+        # yver35: directional context must be checked before accepting matrix KEEP.
+        # Matrix KEEP is the lane source of truth, but it is not allowed to bypass
+        # the real-time Leaders/Losers guard.
         try:
             dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
             meta.update(dict(dir_meta or {}))
@@ -48812,6 +48822,21 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
                 return False, str(dir_why or 'directional_context_blocked'), meta
         except Exception as _dir_exc:
             meta['directional_context_guard_error'] = f'{type(_dir_exc).__name__}: {_dir_exc}'
+
+        # yver24/yver35: /setup_matrix policy is the lane source of truth. If the
+        # exact lane's Policy and ExecNow columns are KEEP and the directional
+        # context above allows it, the shared final gate must not downgrade it.
+        try:
+            _matrix_ok, _matrix_why, _matrix_state = _setup_matrix_policy_live_keep_state_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
+            _matrix_state = dict(_matrix_state or {})
+            meta.update({'setup_matrix_policy': str(_matrix_state.get('policy') or '').upper().strip(), 'setup_matrix_execnow': str(_matrix_state.get('execnow') or '').upper().strip(), 'setup_matrix_combo': str(_matrix_state.get('combo') or '').upper().strip(), 'setup_matrix_live_keep_reason': str(_matrix_why or '')})
+            if _matrix_ok:
+                _setup_quality_gate_set_attr(setup_or_row, 'setup_matrix_policy_live_keep_source_of_truth', True)
+                return True, 'setup_matrix_policy_live_keep_source_of_truth', meta
+            if str(_matrix_why or '').startswith('directional_context_blocks'):
+                return False, str(_matrix_why), meta
+        except Exception as _matrix_exc:
+            meta['setup_matrix_policy_error'] = f'{type(_matrix_exc).__name__}: {_matrix_exc}'
 
         info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
         found = bool(info.get('found'))
