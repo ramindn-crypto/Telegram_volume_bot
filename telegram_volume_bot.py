@@ -14399,9 +14399,43 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if sl_for_order <= 0:
         sl_for_order = intended_sl
     if side == 'BUY' and sl_for_order >= price_ref:
-        return (False, 'stop_invalid_after_tick_rounding_for_buy')
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'reject_reason': 'stop_invalid_after_tick_rounding_for_buy',
+                'live_entry': float(price_ref),
+                'rounded_sl': float(sl_for_order),
+            })
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(
+                int(uid), setup_id,
+                state=_admin_setup_state_from_reason('stale_deadline'),
+                last_reason=f'setup_invalidated_by_price_after_rounding BUY entry={float(price_ref):.10g} sl={float(sl_for_order):.10g}'
+            )
+        except Exception:
+            pass
+        return (False, 'setup_invalidated_by_price_buy')
     if side == 'SELL' and sl_for_order <= price_ref:
-        return (False, 'stop_invalid_after_tick_rounding_for_sell')
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'reject_reason': 'stop_invalid_after_tick_rounding_for_sell',
+                'live_entry': float(price_ref),
+                'rounded_sl': float(sl_for_order),
+            })
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(
+                int(uid), setup_id,
+                state=_admin_setup_state_from_reason('stale_deadline'),
+                last_reason=f'setup_invalidated_by_price_after_rounding SELL entry={float(price_ref):.10g} sl={float(sl_for_order):.10g}'
+            )
+        except Exception:
+            pass
+        return (False, 'setup_invalidated_by_price_sell')
 
     equity = _effective_equity_for_risk(get_user(uid) or {}, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
     if equity <= 0:
