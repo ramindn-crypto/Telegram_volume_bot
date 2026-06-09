@@ -55215,14 +55215,10 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
+    # Ver37: keep /autotrade_debug concise per user request.
     lines = [
         '🧪 AutoTrade Debug',
         HDR,
-        f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Entries: {'ON' if _autotrade_entry_enabled() else 'OFF'} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
-        f"Trading day: {snap.get('today_window_label')}",
-        "Configured sessions: ASIA/LON/NY active by default; current Session line only shows the active session/time block right now.",
-        (f"Keep-all test: ON | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(_autotrade_entry_window_min())}m" if _autotrade_keep_all_test_mode() else None),
-        (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry blackout: {'ON' if _autotrade_entry_blackout_enabled() else 'OFF'} | Setup blackout: {'ON' if _setup_generation_blackout_enabled() else 'OFF'}" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
         SEP,
         f"EquityAT: ${equity:.2f}",
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
@@ -55235,32 +55231,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Realised net today (AT): ${_debug_realised_display:+.2f}",
         f"Daily risk used (AT) (open risk - realised net): ${_debug_daily_used_display:.2f}",
         ('Daily risk remaining (AT): ∞' if not math.isfinite(float(_debug_remaining_display)) else f"Daily risk remaining (AT): ${float(_debug_remaining_display):.2f}"),
-        SEP,
-        'Email / AutoTrade entry gate',
-        f"AutoTrade lane filter: {('KEEP+WATCH policy ON' if _autotrade_allow_watch_policy() else 'KEEP-only policy ON') if _autotrade_require_keep_policy() else 'policy filter OFF'}",
-        f"AutoTrade capital guard: daily loss stop {'ON' if _autotrade_daily_realized_loss_stop_enabled() else 'OFF'} {_autotrade_daily_realized_loss_stop_pct():.1f}% | realised-combo {'ON' if _autotrade_require_realized_combo_edge() else 'OFF'} | context feed {'ON' if _autotrade_context_feed_guard_enabled() else 'OFF'}",
-        f"AutoTrade capital gate: {'OPEN' if _autotrade_daily_realized_loss_stop_allows(int(owner))[0] else 'BLOCKED'} | {_autotrade_daily_realized_loss_stop_allows(int(owner))[1]}",
-        f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
-        f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
-        f"Session email cap: {session_cap_txt} (configured)",
-        f"Emails sent in session: {int(email_gate.get('sent_in_session', 0) or 0)}",
-        f"Daily email cap: {day_cap_txt} (configured)",
-        f"Emails sent today: {int(email_gate.get('sent_today', 0) or 0)}",
-        f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
-        f"Email/AutoTrade gate: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
-        f"Recent emailed setups (unique, 12h): {emailed_recent}",
-        f"Recent executable setups (unique sym/side, 12h): {exec_recent}",
     ]
-    try:
-        lines.append(f"Recent sent setup-email batches (12h): {int(sent_email_batches_recent or 0)}")
-    except Exception:
-        pass
-    try:
-        reset_ts = float(_autotrade_cooldown_reset_ts() or 0.0)
-        if reset_ts > 0:
-            lines.append(f"Cooldown reset marker: {_fmt_dt_local(datetime.fromtimestamp(reset_ts, tz=timezone.utc))}")
-    except Exception:
-        pass
     if reasons and not ready:
         lines.extend([SEP, 'Blocking reasons'])
         for r in reasons[:6]:
