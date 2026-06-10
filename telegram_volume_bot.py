@@ -1,3 +1,4 @@
+# yver39: adds HOT WATCH research-only setup emails for strong recent disabled-regime shifts, improves /email_decision hot-watch diagnostics, and adds /setup_audit Gate column for email-delivery transparency.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -46457,6 +46458,38 @@ def _setup_audit_blackout_label_for_ts(ts: float) -> str:
     except Exception:
         return '-'
 
+
+def _setup_audit_gate_label(policy_label: str, blackout_label: str, at_state: str, ts: float, result_label: str = '') -> str:
+    """Compact delivery gate label for /setup_audit.
+
+    yver39: Policy shows /setup_matrix state only. Gate explains why a row did or
+    did not become a setup email at report time. For old rows this is diagnostic,
+    not a historical promise about the exact gate at creation time.
+    """
+    try:
+        pol = str(policy_label or '').upper().strip()
+        blk = str(blackout_label or '').upper().strip()
+        at = str(at_state or '').upper().strip()
+        res = str(result_label or '').upper().strip()
+        if blk and blk not in {'OPEN', '-', 'NO'}:
+            return 'BLACKOUT'
+        if pol not in {'KEEP'}:
+            return 'POLICY'
+        if at in {'SENT', 'AT', 'AT_OPEN', 'AT_CLOSED', 'AT_TP', 'AT_SL'} or at.startswith('SENT') or at.startswith('AT_'):
+            return at
+        try:
+            age_sec = float(time.time()) - float(ts or 0.0)
+            if age_sec > float(_setup_email_actionable_queue_window_sec()):
+                return 'EXPIRED'
+        except Exception:
+            pass
+        if res in {'TP', 'SL', 'NOHIT'}:
+            return res
+        return 'EMAIL?'
+    except Exception:
+        return '-'
+
+
 def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     """Compact setup audit with current Policy lane per setup."""
     limit = max(0, int(limit or 0))
@@ -46511,7 +46544,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
         at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
         blackout_label = _setup_audit_blackout_label_for_ts(ts)
-        table_rows.append([ttxt, sym, side, combo_key, policy_label, blackout_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
+        gate_label = _setup_audit_gate_label(policy_label, blackout_label, at_state, ts, result)
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, blackout_label, gate_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -46528,9 +46562,9 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'Blackout', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'Blackout', 'Gate', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
@@ -59012,6 +59046,547 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
         pass
     return list(out or []), reasons
 
+
+
+# =========================================================
+# yver39 HOT WATCH research-only setup emails
+# =========================================================
+_HOT_WATCH_EMAIL_SENT_CACHE: dict = {}
+
+
+def _hot_watch_email_enabled() -> bool:
+    try:
+        return env_bool("SETUP_HOT_WATCH_EMAIL_ENABLED", True)
+    except Exception:
+        return True
+
+
+def _hot_watch_email_stats_hours() -> int:
+    try:
+        return int(max(3, min(48, int(os.environ.get("SETUP_HOT_WATCH_STATS_HOURS", "12") or 12))))
+    except Exception:
+        return 12
+
+
+def _hot_watch_email_min_decided() -> int:
+    try:
+        return int(max(3, min(30, int(os.environ.get("SETUP_HOT_WATCH_MIN_DECIDED", "5") or 5))))
+    except Exception:
+        return 5
+
+
+def _hot_watch_email_min_wr() -> float:
+    try:
+        return float(max(50.0, min(95.0, float(os.environ.get("SETUP_HOT_WATCH_MIN_WR", "65") or 65.0))))
+    except Exception:
+        return 65.0
+
+
+def _hot_watch_email_min_avgr() -> float:
+    try:
+        return float(os.environ.get("SETUP_HOT_WATCH_MIN_AVGR", "0.30") or 0.30)
+    except Exception:
+        return 0.30
+
+
+def _hot_watch_email_cooldown_sec() -> int:
+    try:
+        return int(max(900, min(24 * 3600, int(os.environ.get("SETUP_HOT_WATCH_COOLDOWN_SEC", "10800") or 10800))))
+    except Exception:
+        return 10800
+
+
+def _hot_watch_setup_combo_key(setup_or_row, session_name: str = '') -> str:
+    try:
+        if isinstance(setup_or_row, dict):
+            fam = _setup_audit_family_code(setup_or_row)
+            sess = str(session_name or setup_or_row.get('session') or setup_or_row.get('source_session') or '').upper().strip()
+            side = str(setup_or_row.get('side') or '').upper().strip()
+            return str(_setup_combo_strategy_side_key(fam, sess, setup_or_row, side) or '').upper().strip()
+        engine = str(getattr(setup_or_row, 'engine', '') or '').upper().strip()
+        fam_id = str(getattr(setup_or_row, 'family_id', '') or '').upper().strip()
+        if not fam_id:
+            try:
+                fam_id = _family_id_from_engine(engine, setup_or_row)
+            except Exception:
+                fam_id = ''
+        fam = _setup_family_id_to_code(fam_id or 'F0')
+        sess = str(session_name or getattr(setup_or_row, 'session', '') or getattr(setup_or_row, 'source_session', '') or '').upper().strip()
+        side = str(getattr(setup_or_row, 'side', '') or '').upper().strip()
+        return str(_setup_combo_strategy_side_key(fam, sess, setup_or_row, side) or '').upper().strip()
+    except Exception:
+        return ''
+
+
+def _hot_watch_recent_stats_for_combo(user_id: int, combo_key: str, session_name: str = '') -> dict:
+    """Recent regime stats for one exact combo, including disabled/generated rows.
+
+    This is research-only evidence for HOT WATCH emails; it never changes /setup_matrix
+    policy and never makes a setup AutoTrade-eligible.
+    """
+    combo_u = str(combo_key or '').upper().strip()
+    if not combo_u:
+        return {}
+    hours = _hot_watch_email_stats_hours()
+    try:
+        rows = _setup_audit_load_rows(
+            int(user_id or 0),
+            hours=int(hours),
+            limit=0,
+            dedup=True,
+            apply_final_quality_gate=False,
+            source_mode_override='ALL',
+        )
+    except Exception:
+        rows = []
+    tp = sl = op = nh = set_n = 0
+    sum_r = 0.0
+    for r in list(rows or []):
+        try:
+            sess = str(session_name or r.get('session') or r.get('source_session') or '').upper().strip()
+            ck = _hot_watch_setup_combo_key(r, sess)
+            if ck != combo_u:
+                continue
+            set_n += 1
+            res = _setup_audit_keep_watch_fast_result_label(r, _setup_audit_result_horizon_hours())
+            if res == 'TP':
+                tp += 1
+                try:
+                    entry = float(r.get('entry') or 0.0)
+                    slp = float(r.get('sl') or 0.0)
+                    tpp = float(_setup_target_tp(r, 0.0) or 0.0)
+                    sum_r += max(0.1, float(rr_to_tp(entry, slp, tpp))) if entry > 0 and slp > 0 and tpp > 0 else 1.0
+                except Exception:
+                    sum_r += 1.0
+            elif res == 'SL':
+                sl += 1
+                sum_r -= 1.0
+            elif res == 'NOHIT':
+                nh += 1
+            else:
+                op += 1
+        except Exception:
+            continue
+    dec = tp + sl
+    wr = (tp / dec * 100.0) if dec > 0 else 0.0
+    avg_r = (sum_r / dec) if dec > 0 else 0.0
+    return {'combo': combo_u, 'hours': hours, 'set': set_n, 'tp': tp, 'sl': sl, 'open': op, 'nohit': nh, 'decided': dec, 'wr': wr, 'avg_r': avg_r}
+
+
+def _hot_watch_recently_sent(user_id: int, key: str) -> bool:
+    try:
+        uid = int(user_id or 0)
+        k = f"{uid}:{str(key or '').upper().strip()}"
+        ts = float(_HOT_WATCH_EMAIL_SENT_CACHE.get(k) or 0.0)
+        return ts > 0 and (float(time.time()) - ts) < float(_hot_watch_email_cooldown_sec())
+    except Exception:
+        return False
+
+
+def _mark_hot_watch_sent(user_id: int, key: str) -> None:
+    try:
+        uid = int(user_id or 0)
+        k = f"{uid}:{str(key or '').upper().strip()}"
+        _HOT_WATCH_EMAIL_SENT_CACHE[k] = float(time.time())
+        cutoff = float(time.time()) - float(_hot_watch_email_cooldown_sec() * 2)
+        for kk, vv in list(_HOT_WATCH_EMAIL_SENT_CACHE.items()):
+            try:
+                if float(vv or 0.0) < cutoff:
+                    _HOT_WATCH_EMAIL_SENT_CACHE.pop(kk, None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _hot_watch_basic_candidate_ok(s, session_name: str, user_id: int = 0) -> tuple[bool, str]:
+    try:
+        sess = str(session_name or getattr(s, 'session', '') or getattr(s, 'source_session', '') or '').upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            return False, 'hot_watch_missing_session'
+        sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        blocked, reason = _autotrade_symbol_blocked(sym)
+        if blocked:
+            return False, reason or 'symbol_blocked'
+        if not _setup_volume_ok(s):
+            return False, 'below_min_volume'
+        entry = float(getattr(s, 'entry', 0.0) or 0.0)
+        slp = float(getattr(s, 'sl', 0.0) or 0.0)
+        tpp = float(_setup_target_tp(s, 0.0) or 0.0)
+        if entry <= 0 or slp <= 0 or tpp <= 0:
+            return False, 'missing_prices'
+        if side == 'BUY' and not (slp < entry < tpp):
+            return False, 'bad_price_order_buy'
+        if side == 'SELL' and not (tpp < entry < slp):
+            return False, 'bad_price_order_sell'
+        try:
+            rr = float(rr_to_tp(entry, slp, tpp))
+            if rr < float(os.environ.get('SETUP_HOT_WATCH_MIN_RR', '1.05') or 1.05):
+                return False, f'hot_watch_rr_below_{float(os.environ.get("SETUP_HOT_WATCH_MIN_RR", "1.05") or 1.05):.2f}'
+        except Exception:
+            pass
+        try:
+            conf = int(float(getattr(s, 'conf', 0) or 0))
+            if conf < int(os.environ.get('SETUP_HOT_WATCH_MIN_CONF', '76') or 76):
+                return False, f'hot_watch_conf_below_{int(os.environ.get("SETUP_HOT_WATCH_MIN_CONF", "76") or 76)}'
+        except Exception:
+            pass
+        try:
+            ctx_ok, ctx_reason = _autotrade_policy_context_execution_allows(s, session_name=sess, user_id=int(user_id or 0))
+            if not ctx_ok:
+                return False, str(ctx_reason or 'context_guard_block')
+        except Exception:
+            pass
+        return True, 'ok'
+    except Exception as exc:
+        return False, f'hot_watch_candidate_exception:{type(exc).__name__}'
+
+
+
+
+def _setup_object_from_audit_row_for_email(row: dict, session_name: str = ''):
+    """Hydrate a generated/executable audit row back into a Setup-like object."""
+    from types import SimpleNamespace
+    try:
+        r = dict(row or {})
+        sess = str(session_name or r.get('session') or r.get('source_session') or '').upper().strip()
+        sid = str(r.get('setup_id') or _setup_audit_unique_key(r) or '').strip()
+        item = SimpleNamespace(
+            setup_id=sid,
+            id=sid,
+            symbol=str(r.get('symbol') or '').upper().strip(),
+            market_symbol=str(r.get('market_symbol') or r.get('symbol') or '').strip(),
+            side=str(r.get('side') or '').upper().strip(),
+            conf=int(float(r.get('conf') or 0.0)),
+            entry=float(r.get('entry') or 0.0),
+            sl=float(r.get('sl') or 0.0),
+            tp=float(_setup_target_tp(r, 0.0) or 0.0),
+            alt_target_a=float(r.get('alt_target_a') or 0.0),
+            alt_target_b=float(r.get('alt_target_b') or 0.0),
+            fut_vol_usd=float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0),
+            ch24=float(r.get('ch24') or 0.0),
+            ch4=float(r.get('ch4') or 0.0),
+            ch1=float(r.get('ch1') or 0.0),
+            ch15=float(r.get('ch15') or 0.0),
+            quality_score=float(r.get('quality_score') or r.get('conf') or 0.0),
+            atr_pct=float(r.get('atr_pct') or 0.0),
+            engine=str(r.get('engine') or ''),
+            created_ts=float(_setup_audit_row_ts(r) or 0.0),
+            signal_created_ts=float(r.get('signal_created_ts') or _setup_audit_row_ts(r) or 0.0),
+            executable_ts=float(r.get('executable_ts') or _setup_audit_row_ts(r) or 0.0),
+            email_logged_ts=0.0,
+            generated_logged_ts=float(_setup_audit_row_ts(r) or 0.0),
+            source_kind='audit_keep_rescue',
+            source_session=sess,
+            session=sess,
+            family_id=str(r.get('family_id') or ''),
+            setup_strategy=str(r.get('setup_strategy') or ''),
+            strategy=str(r.get('setup_strategy') or ''),
+            strategy_mode=str(r.get('setup_strategy') or ''),
+            strategy_reason=str(r.get('strategy_reason') or 'audit_keep_open_rescue')[:500],
+            original_setup_id=str(r.get('original_setup_id') or ''),
+            original_side=str(r.get('original_side') or ''),
+            delivery_lane_locked=True,
+        )
+        try:
+            item = _research_finalize_setup(item, session_name=sess)
+        except Exception:
+            pass
+        return item
+    except Exception:
+        return None
+
+
+def _select_recent_keep_open_audit_rescue_email_setups(user_id: int, session_name: str, limit: int | None = None) -> tuple[list, Counter]:
+    """Last-chance normal setup email rescue for current KEEP+OPEN audit rows.
+
+    This covers the case where /setup_audit shows a fresh KEEP/OPEN row but the
+    in-memory email pool was empty or missed the row. It still uses KEEP-only,
+    current entry-window, cooldown, presend and AutoTrade-compatible gates.
+    """
+    reasons = Counter()
+    out = []
+    try:
+        uid = int(user_id or 0)
+        sess = str(session_name or '').upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            reasons['audit_rescue_missing_session'] += 1
+            return [], reasons
+        blk, blk_reason = _setup_generation_blackout_now()
+        if blk:
+            reasons[str(blk_reason or 'setup_generation_blackout')] += 1
+            return [], reasons
+        win_sec = float(_setup_email_actionable_queue_window_sec())
+        cutoff = float(time.time()) - win_sec
+        hours = max(1, int(math.ceil((win_sec / 3600.0) + 1.0)))
+        try:
+            max_n = int(limit if limit is not None else max(1, int(EMAIL_SETUPS_N or 1)))
+        except Exception:
+            max_n = 1
+        try:
+            rows = _setup_audit_load_rows(uid, hours=hours, limit=0, dedup=True, apply_final_quality_gate=False, source_mode_override='ALL')
+        except Exception:
+            rows = []
+        seen = set()
+        for r in list(rows or []):
+            try:
+                ts = float(_setup_audit_row_ts(r) or 0.0)
+                if ts <= cutoff:
+                    reasons['audit_rescue_expired'] += 1
+                    continue
+                rsess = str(r.get('session') or r.get('source_session') or '').upper().strip()
+                if rsess != sess:
+                    continue
+                blackout_label = _setup_audit_blackout_label_for_ts(ts)
+                if str(blackout_label or '').upper().strip() != 'OPEN':
+                    reasons['audit_rescue_blackout'] += 1
+                    continue
+                side = str(r.get('side') or '').upper().strip()
+                policy_label = _setup_audit_policy_label(r, uid=uid, session_name=rsess, side=side)
+                if str(policy_label or '').upper().strip() != 'KEEP':
+                    reasons['audit_rescue_not_keep'] += 1
+                    continue
+                try:
+                    fast_res = _setup_audit_keep_watch_fast_result_label(r, _setup_audit_result_horizon_hours())
+                    if str(fast_res or '').upper().strip() not in {'OPEN', ''}:
+                        reasons[f'audit_rescue_already_{str(fast_res).lower()}'] += 1
+                        continue
+                except Exception:
+                    pass
+                s = _setup_object_from_audit_row_for_email(r, rsess)
+                if s is None:
+                    reasons['audit_rescue_hydrate_failed'] += 1
+                    continue
+                sid = str(getattr(s, 'setup_id', '') or '').strip()
+                sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+                side = str(getattr(s, 'side', '') or '').upper().strip()
+                key = sid or f'{sym}:{side}:{float(getattr(s, "entry", 0.0) or 0.0):.8f}'
+                if key in seen:
+                    continue
+                seen.add(key)
+                if _email_setup_identity_recently_sent(uid, s) or _email_symbol_recently_sent(uid, sym, side, sess, setup_id=sid):
+                    reasons['audit_rescue_email_cooldown'] += 1
+                    continue
+                if symbol_flip_guard_active(uid, sym, side, sess):
+                    reasons['audit_rescue_flip_guard'] += 1
+                    continue
+                ok_exec, why_exec = is_executable_setup_eligible(s, session_name=sess)
+                if not ok_exec:
+                    reasons[f'audit_rescue_exec_{why_exec}'] += 1
+                    continue
+                ok_vis, why_vis, _meta_vis = _setup_user_visible_keep_policy_allows(s, session_name=sess, user_id=uid, lane='email')
+                if not ok_vis:
+                    reasons[f'audit_rescue_visible_{why_vis}'] += 1
+                    continue
+                try:
+                    setattr(s, 'audit_keep_open_rescue', True)
+                except Exception:
+                    pass
+                out.append(s)
+                reasons['audit_rescue_selected'] += 1
+                if len(out) >= max_n:
+                    break
+            except Exception as exc:
+                reasons[f'audit_rescue_exception:{type(exc).__name__}'] += 1
+                continue
+    except Exception as exc:
+        reasons[f'audit_rescue_outer_exception:{type(exc).__name__}'] += 1
+    return out, reasons
+
+def _select_hot_watch_email_setups(user_id: int, session_name: str, setups: list, best_fut: dict | None = None, limit: int | None = None) -> tuple[list, Counter]:
+    """Pick research-only disabled/WATCH candidates during a strong recent regime.
+
+    Normal setup email and AutoTrade remain KEEP-only. This function only creates an
+    informational email when the main policy would otherwise suppress all visibility.
+    """
+    reasons = Counter()
+    out = []
+    try:
+        if not _hot_watch_email_enabled():
+            reasons['hot_watch_disabled'] += 1
+            return [], reasons
+        blk, blk_reason = _setup_generation_blackout_now()
+        if blk:
+            reasons[str(blk_reason or 'setup_generation_blackout')] += 1
+            return [], reasons
+    except Exception:
+        pass
+    try:
+        max_n = int(limit if limit is not None else max(1, int(EMAIL_SETUPS_N or 1)))
+    except Exception:
+        max_n = 1
+    sess = str(session_name or '').upper().strip()
+    uid = int(user_id or 0)
+    seen = set()
+    stats_cache = {}
+    # High-confidence first, then volume; this is awareness only, not execution.
+    try:
+        cand_list = sorted(list(setups or []), key=lambda x: (int(getattr(x, 'conf', 0) or 0), float(getattr(x, 'fut_vol_usd', 0.0) or 0.0)), reverse=True)
+    except Exception:
+        cand_list = list(setups or [])
+    for raw in cand_list:
+        try:
+            s = _setup_route_candidate_for_executable_lane(raw, sess, uid)
+            sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+            side = str(getattr(s, 'side', '') or '').upper().strip()
+            combo = _hot_watch_setup_combo_key(s, sess)
+            if not combo:
+                reasons['hot_watch_missing_combo'] += 1
+                continue
+            key = f'{combo}:{sym}:{side}'
+            if key in seen:
+                continue
+            seen.add(key)
+            if _hot_watch_recently_sent(uid, key) or _hot_watch_recently_sent(uid, combo):
+                reasons['hot_watch_cooldown'] += 1
+                continue
+            # Do not duplicate normal KEEP setup emails. HOT WATCH is only for blocked policy lanes.
+            try:
+                pol = _setup_audit_policy_label({'session': sess, 'source_session': sess, 'symbol': sym, 'side': side, 'setup_id': str(getattr(s, 'setup_id', '') or ''), 'family_id': str(getattr(s, 'family_id', '') or ''), 'engine': str(getattr(s, 'engine', '') or ''), 'setup_strategy': _setup_strategy_label(s)}, uid=uid, session_name=sess, side=side)
+            except Exception:
+                pol = ''
+            if str(pol or '').upper().strip() == 'KEEP':
+                reasons['hot_watch_skip_keep_normal_lane'] += 1
+                continue
+            ok_basic, why_basic = _hot_watch_basic_candidate_ok(s, sess, user_id=uid)
+            if not ok_basic:
+                reasons[str(why_basic or 'hot_watch_basic_block')] += 1
+                continue
+            if combo in stats_cache:
+                stats = dict(stats_cache.get(combo) or {})
+            else:
+                stats = _hot_watch_recent_stats_for_combo(uid, combo, sess)
+                stats_cache[combo] = dict(stats or {})
+            dec = int(stats.get('decided') or 0)
+            wr = float(stats.get('wr') or 0.0)
+            avg_r = float(stats.get('avg_r') or 0.0)
+            if dec < _hot_watch_email_min_decided():
+                reasons[f'hot_watch_decided_below_{_hot_watch_email_min_decided()}'] += 1
+                continue
+            if wr < _hot_watch_email_min_wr():
+                reasons[f'hot_watch_wr_below_{_hot_watch_email_min_wr():.0f}'] += 1
+                continue
+            if avg_r < _hot_watch_email_min_avgr():
+                reasons[f'hot_watch_avgr_below_{_hot_watch_email_min_avgr():.2f}'] += 1
+                continue
+            try:
+                setattr(s, 'hot_watch_only', True)
+                setattr(s, 'hot_watch_combo', combo)
+                setattr(s, 'hot_watch_policy', str(pol or 'DISABLE'))
+                setattr(s, 'hot_watch_stats', dict(stats or {}))
+                setattr(s, 'delivery_lane_locked', True)
+                if not getattr(s, 'source_session', None):
+                    setattr(s, 'source_session', sess)
+                if not getattr(s, 'session', None):
+                    setattr(s, 'session', sess)
+            except Exception:
+                pass
+            out.append(s)
+            reasons['hot_watch_selected'] += 1
+            if len(out) >= max_n:
+                break
+        except Exception as exc:
+            reasons[f'hot_watch_exception:{type(exc).__name__}'] += 1
+            continue
+    return out, reasons
+
+
+def _send_hot_watch_only_email(user: dict, sess: dict, setups: list, best_fut: dict | None = None, reasons: Counter | None = None) -> bool:
+    """Send a research-only email. Never marks setup as emailed/executable, never triggers AutoTrade."""
+    if not setups:
+        return False
+    try:
+        uid = int((user or {}).get('user_id') or (user or {}).get('id') or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        return False
+    try:
+        tz, user_tz = _zoneinfo_or_default((user or {}).get('tz') or (user or {}).get('timezone'))
+    except Exception:
+        tz, user_tz = timezone.utc, 'UTC'
+    sess_name = str((sess or {}).get('name') or getattr(setups[0], 'source_session', '') or getattr(setups[0], 'session', '') or '').upper().strip()
+    first = setups[0]
+    subject = f"PulseFutures • HOT WATCH ONLY • {sess_name or '-'} • {str(getattr(first, 'side', '') or '').upper()} {str(getattr(first, 'symbol', '') or '').upper()}"
+    if len(setups) > 1:
+        subject += f" (+{len(setups)-1} more)"
+    now_txt = datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')
+    lines = []
+    lines.append("PulseFutures — HOT WATCH ONLY")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"Session: {sess_name or '-'} | Time: {now_txt} {user_tz}")
+    lines.append("")
+    lines.append("Research-only alert. Main /setup_matrix policy is not KEEP, so this is NOT AutoTrade eligible and is NOT added to the executable queue.")
+    lines.append("Reason: the exact combo has strong recent 12h TP/SL performance, so visibility is useful without weakening live AutoTrade.")
+    for s in list(setups or []):
+        try:
+            stats = dict(getattr(s, 'hot_watch_stats', {}) or {})
+            combo = str(getattr(s, 'hot_watch_combo', '') or _hot_watch_setup_combo_key(s, sess_name))
+            pol = str(getattr(s, 'hot_watch_policy', '') or 'DISABLE')
+            sym = str(getattr(s, 'symbol', '') or '').upper()
+            side = str(getattr(s, 'side', '') or '').upper()
+            entry = float(getattr(s, 'entry', 0.0) or 0.0)
+            slp = float(getattr(s, 'sl', 0.0) or 0.0)
+            tpp = float(_setup_target_tp(s, 0.0) or 0.0)
+            rr = float(rr_to_tp(entry, slp, tpp)) if entry > 0 and slp > 0 and tpp > 0 else 0.0
+            lines.append("")
+            lines.append(f"• {sym} {side} — {combo} | Policy {pol}")
+            lines.append(f"  Conf {int(getattr(s, 'conf', 0) or 0)} | Vol {float(getattr(s, 'fut_vol_usd', 0.0) or 0.0)/1e6:.0f}M | RR {rr:.2f}")
+            lines.append(f"  Entry {fmt_price(entry)} | SL {fmt_price(slp)} | TP {fmt_price(tpp)}")
+            lines.append(f"  Recent {int(stats.get('hours') or _hot_watch_email_stats_hours())}h: Set {int(stats.get('set') or 0)}, TP {int(stats.get('tp') or 0)}, SL {int(stats.get('sl') or 0)}, WR {float(stats.get('wr') or 0.0):.1f}%, AvgR {float(stats.get('avg_r') or 0.0):+.2f}")
+        except Exception:
+            continue
+    lines.append("")
+    lines.append("AutoTrade action: NONE — watch/research only.")
+    body = "\n".join(lines).strip()
+    try:
+        body_html = '<br>'.join(html.escape(x) for x in lines)
+    except Exception:
+        body_html = None
+    try:
+        sent = send_email(subject, body, body_html=body_html, user_id_for_debug=uid, enforce_trade_window=True)
+    except Exception as exc:
+        sent = False
+        try:
+            _LAST_SMTP_ERROR[uid] = f"{type(exc).__name__}: {exc}"
+        except Exception:
+            pass
+    try:
+        details = {
+            'setups': len(setups or []),
+            'picked': [f"{str(getattr(x, 'side', '') or '').upper()} {str(getattr(x, 'symbol', '') or '').upper()}" for x in list(setups or [])[:6]],
+            'reason': 'recent_hot_disabled_regime_research_only',
+            'top_reasons': _pipeline_top_reasons((reasons or Counter()), 6),
+            'autotrade': 'NONE',
+        }
+        db_log_setup_pipeline_event(int(uid), stage='hot_watch_email', status='sent' if sent else 'failed', session=sess_name, mode='email', details=details)
+    except Exception:
+        pass
+    if sent:
+        try:
+            for s in list(setups or []):
+                combo = str(getattr(s, 'hot_watch_combo', '') or _hot_watch_setup_combo_key(s, sess_name))
+                sym = str(getattr(s, 'symbol', '') or '').upper()
+                side = str(getattr(s, 'side', '') or '').upper()
+                _mark_hot_watch_sent(uid, combo)
+                _mark_hot_watch_sent(uid, f'{combo}:{sym}:{side}')
+        except Exception:
+            pass
+        dec = {
+            'status': 'SENT_HOT_WATCH',
+            'picked': ', '.join([f"{str(getattr(s, 'side', '') or '').upper()} {str(getattr(s, 'symbol', '') or '').upper()}" for s in list(setups or [])]),
+            'when': datetime.now(tz).isoformat(timespec='seconds'),
+            'reasons': ['hot_watch_research_only', 'not_autotrade_eligible'],
+            'autotrade': 'NONE',
+        }
+        try:
+            _LAST_EMAIL_DECISION[uid] = dict(dec)
+            _LAST_EMAIL_SENT[uid] = dict(dec)
+        except Exception:
+            pass
+    return bool(sent)
+
 def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
     """
     One email containing multiple setups.
@@ -60816,6 +61391,59 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 chosen_list.append(s)
 
             if not chosen_list:
+                # yver39 first rescue: if /setup_audit has a fresh KEEP+OPEN row
+                # but the in-memory email pool missed it, send it through the normal
+                # setup-email path (still KEEP-only and AutoTrade-compatible).
+                audit_rescue_reasons = Counter()
+                try:
+                    audit_rescue_list, audit_rescue_reasons = _select_recent_keep_open_audit_rescue_email_setups(
+                        int(uid), str(sess_name or ''), limit=max(1, int(EMAIL_SETUPS_N or 1))
+                    )
+                except Exception as _audit_rescue_exc:
+                    audit_rescue_list, audit_rescue_reasons = [], Counter({f'audit_rescue_exception:{type(_audit_rescue_exc).__name__}': 1})
+                if audit_rescue_list:
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_audit_keep_open_rescue', status='selected', session=str(sess_name or ''), mode='email', details={'eligible': len(audit_rescue_list), 'top_reasons': _pipeline_top_reasons(audit_rescue_reasons, 6)})
+                    except Exception:
+                        pass
+                    chosen_list = list(audit_rescue_list or [])
+
+            if not chosen_list:
+                # yver39: if the strict KEEP email lane is empty, optionally send a
+                # HOT WATCH research-only email for a current DISABLE/WATCH combo
+                # that has a strong recent 12h regime. This never marks the setup
+                # executable and never triggers AutoTrade.
+                hot_watch_reasons = Counter()
+                try:
+                    hot_watch_list, hot_watch_reasons = _select_hot_watch_email_setups(
+                        int(uid), str(sess_name or ''), list(setups_all or []), best_fut or {}, limit=max(1, int(EMAIL_SETUPS_N or 1))
+                    )
+                except Exception as _hot_exc:
+                    hot_watch_list, hot_watch_reasons = [], Counter({f'hot_watch_exception:{type(_hot_exc).__name__}': 1})
+                if hot_watch_list:
+                    hot_ok = False
+                    try:
+                        hot_ok = await asyncio.wait_for(
+                            to_thread_heavy(_send_hot_watch_only_email, user, sess, list(hot_watch_list or []), best_fut or {}, hot_watch_reasons, timeout=EMAIL_SEND_TIMEOUT_SEC),
+                            timeout=EMAIL_SEND_TIMEOUT_SEC + 2,
+                        )
+                    except Exception as _hot_send_exc:
+                        hot_ok = False
+                        try:
+                            db_log_setup_pipeline_event(int(uid), stage='hot_watch_email', status='error', session=str(sess_name or ''), mode='email', details={'error': f'{type(_hot_send_exc).__name__}: {_hot_send_exc}', 'top_reasons': _pipeline_top_reasons(hot_watch_reasons, 6)})
+                        except Exception:
+                            pass
+                    if hot_ok:
+                        try:
+                            email_state_set(uid, last_email_ts=time.time(), sent_count=int(st.get("sent_count", 0) or 0) + 1)
+                        except Exception:
+                            pass
+                        try:
+                            _email_daily_inc(uid, day_local)
+                        except Exception:
+                            pass
+                        continue
+
                 reasons = []
                 if cooldown_blocked:
                     reasons.append(f"cooldown_blocked={cooldown_blocked}")
@@ -60827,6 +61455,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     reasons.append(f"owner_manual_same_symbol_blocked={owner_manual_same_symbol_blocked}")
                 if combo_policy_blocked:
                     reasons.append(f"combo_policy_quality_gate_blocked={combo_policy_blocked}")
+                if audit_rescue_reasons:
+                    reasons.append("audit_rescue=" + str(dict(audit_rescue_reasons.most_common(5))))
+                if hot_watch_reasons:
+                    reasons.append("hot_watch=" + str(dict(hot_watch_reasons.most_common(5))))
                 reasons.append("all_candidates_blocked")
 
                 _LAST_EMAIL_DECISION[uid] = {
@@ -61258,6 +61890,16 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 lines.append("Build pool: " + _pipe_summary(pipe_build))
             if pipe_exec:
                 lines.append("Executable pool: " + _pipe_summary(pipe_exec))
+            try:
+                audit_rescue_ev = _latest_setup_pipeline_event(uid, stage='email_audit_keep_open_rescue', session=pipe_lookup_sess, mode='email') or _latest_setup_pipeline_event(uid, stage='email_audit_keep_open_rescue', mode='email') or {}
+                if audit_rescue_ev:
+                    lines.append("KEEP/OPEN audit rescue last: " + _pipe_summary(audit_rescue_ev))
+                hot_ev = _latest_setup_pipeline_event(uid, stage='hot_watch_email', session=pipe_lookup_sess, mode='email') or _latest_setup_pipeline_event(uid, stage='hot_watch_email', mode='email') or {}
+                lines.append(f"Hot Watch rescue: {'ON' if _hot_watch_email_enabled() else 'OFF'}")
+                if hot_ev:
+                    lines.append("Hot Watch last: " + _pipe_summary(hot_ev))
+            except Exception:
+                pass
     except Exception:
         pass
 
