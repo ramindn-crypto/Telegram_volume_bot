@@ -1,3 +1,4 @@
+# yver41: aligns BigMove/F8 minimum volume with normal $10M setup floor and makes /email_decision show active setup blackout + normal setup min-volume diagnostics.
 # yver40: lowers normal setup/executable liquidity floor from $15M to $10M while keeping KEEP policy, blackout, leader/loser, RR/SL/TP and risk gates intact; BigMove raw alert default remains separately controlled.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
@@ -18597,7 +18598,7 @@ def db_init():
     if "spike_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_alert_on INTEGER NOT NULL DEFAULT 1")
 
-    # default volume gate: 15M
+    # default volume gate: 10M
     if "spike_min_vol_usd" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
 
@@ -19822,7 +19823,7 @@ def _safe_float(x, default: float = 0.0) -> float:
 BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "1.5") or 1.5)
 BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") or 3.0)
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
-BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0)
+BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "10000000") or 10_000_000.0)
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "7200") or 7200)  # Ver15: same-symbol/same-direction F8 cooldown (opposite direction still allowed)
 # Guard against stale Render env BIGMOVE_COOLDOWN_SEC=0 from older no-cooldown builds.
@@ -21105,7 +21106,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
 
 def _spike_reversal_candidates(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 15_000_000.0,
+    min_vol_usd: float = 10_000_000.0,
     wick_ratio_min: float = 0.55,
     atr_mult_min: float = 1.20,
     max_items: int = 10,
@@ -21253,7 +21254,7 @@ def _spike_reversal_candidates(
 
 def _spike_reversal_warnings(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 15_000_000.0,
+    min_vol_usd: float = 10_000_000.0,
     atr_mult_min: float = 1.05,
     body_ratio_min: float = 0.50,
     lookback_1h: int = 8,
@@ -61894,6 +61895,21 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 lines.append(f"Current session: {sess_now or '-'}")
             lines.append(f"Configured build timeout: {float(EMAIL_BUILD_POOL_TIMEOUT_SEC):.1f}s")
+            # yver41: make it obvious when the owner is inside a configured blackout
+            # or volume floor, so "no setups" is not mistaken for a broken scanner.
+            try:
+                lines.append(f"Normal Setup Min Vol (24H): ${float(_setup_min_volume_floor_usd())/1e6:.0f}M")
+            except Exception:
+                pass
+            try:
+                bo_now = _setup_audit_blackout_label_for_ts(time.time())
+                bo_u = str(bo_now or '').upper().strip()
+                if bo_u and bo_u not in {'OPEN', '-', 'NO'}:
+                    lines.append(f"Setup Blackout Now: YES ({bo_now})")
+                else:
+                    lines.append("Setup Blackout Now: NO")
+            except Exception:
+                pass
             if pipe_build:
                 lines.append("Build pool: " + _pipe_summary(pipe_build))
             if pipe_exec:
