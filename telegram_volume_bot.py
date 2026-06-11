@@ -1,4 +1,4 @@
-# yver45: based on yver35; ONLY change is min liquidity floor from $15M to $10M for normal setup/executable gates and BigMove/F8 alert/setup defaults.
+# yver46: ver45 baseline + sync fix. Matrix KEEP+OPEN setup emails and AutoTrade are no longer blocked by secondary strict-KEEP/realized-combo gates; presend gate skips are reported as SKIP instead of SMTP ERROR.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -877,9 +877,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY: 1 if env_bool('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True) else 0,
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True) else 0,
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: float(os.environ.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', '3.0') or 3.0),
-        AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True) else 0,
+        AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', False) else 0,
         AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1 if env_bool('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True) else 0,
-        AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1 if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True) else 0,
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1 if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', False) else 0,
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5') or 5),
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0') or 60.0),
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25') or 0.25),
@@ -1174,10 +1174,15 @@ def _autotrade_daily_realized_loss_stop_pct() -> float:
 
 
 def _autotrade_require_realized_combo_edge() -> bool:
+    # yver46: setup/email/AutoTrade must be synced to /setup_matrix KEEP.
+    # The old realised-combo self-block can hide a matrix KEEP setup from email/AutoTrade,
+    # so it is disabled by default. Re-enable only with explicit env override.
     try:
-        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)
+        if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE_FORCE_ENABLED', False):
+            return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', False)
+        return False
     except Exception:
-        return bool(globals().get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True))
+        return False
 
 
 def _autotrade_context_feed_guard_enabled() -> bool:
@@ -1188,10 +1193,15 @@ def _autotrade_context_feed_guard_enabled() -> bool:
 
 
 def _autotrade_strict_keep_edge_enabled() -> bool:
+    # yver46: do not let the secondary 60%/AvgR strict gate override /setup_matrix KEEP.
+    # This was the reason a KEEP+OPEN row such as F1-LON-NOR-BUY could appear in
+    # /setup_audit but not be emailed/autotraded. Re-enable only with explicit env override.
     try:
-        return _autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)
+        if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_FORCE_ENABLED', False):
+            return _autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', False)
+        return False
     except Exception:
-        return env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)
+        return False
 
 
 def _autotrade_strict_keep_edge_min_decided() -> int:
@@ -42349,7 +42359,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT = {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)):.2f}",
             f"AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) else 'false'}",
             f"AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED = {'true' if bool(summary.get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_STRICT_KEEP_EDGE_ENABLED = {'true' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)) else 'false'}",
+            f"AUTOTRADE_STRICT_KEEP_EDGE_ENABLED = {'true' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', False)) else 'false'}",
             f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED = {int(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 5))}",
             f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 60.0)):.1f}",
             f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', 0.25)):+.2f}",
@@ -42402,7 +42412,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
             "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
-            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true   (syncs /screen + email + AutoTrade to high-edge KEEP lanes)",
+            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_FORCE_ENABLED true   (advanced: re-enable secondary strict KEEP edge; default OFF for setup/email/AutoTrade sync)",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 60",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 5",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.25",
@@ -60888,13 +60898,31 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 _LAST_EMAIL_DECISION[uid] = _tmp_dec
                 _LAST_EMAIL_SENT[uid] = dict(_tmp_dec)
             else:
-                _tmp_dec = {
-                    "status": "ERROR",
-                    "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                }
-                _LAST_EMAIL_DECISION[uid] = _tmp_dec
-                _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
+                # yver46: send_email_alert_multi can return False because its final
+                # presend executable gate removed all candidates. That is a clean SKIP,
+                # not an SMTP/email failure. Keep real SMTP failures as ERROR.
+                try:
+                    _cur_dec = dict(_LAST_EMAIL_DECISION.get(uid) or {})
+                    _cur_reasons = [str(_r) for _r in list(_cur_dec.get('reasons') or [])]
+                except Exception:
+                    _cur_dec, _cur_reasons = {}, []
+                if str(_cur_dec.get('status') or '').upper() == 'SKIP' and any('presend_executable_gate_empty' in _r for _r in _cur_reasons):
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_delivery', status='skip', session=str(sess.get("name") or sess_name or ''), mode='email', details={'reason': 'presend_executable_gate_empty', 'reasons': _cur_reasons[:6]})
+                    except Exception:
+                        pass
+                    try:
+                        _LAST_EMAIL_ERROR.pop(uid, None)
+                    except Exception:
+                        pass
+                else:
+                    _tmp_dec = {
+                        "status": "ERROR",
+                        "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    }
+                    _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                    _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
 
 
         # -----------------------------------------------------
