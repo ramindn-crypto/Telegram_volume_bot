@@ -1,3 +1,4 @@
+# yver45: based on yver35; only change is forcing normal setup and BigMove/F8 minimum 24h volume to $15M.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -135,7 +136,7 @@ from typing import Any  # yver130 early import required before early helper anno
 
 # --- ASIA tightening (hard-coded, no env vars) ---
 ASIA_MIN_CONF_BOOST = 10
-ASIA_MIN_FUT_VOL_USD = 10_000_000
+ASIA_MIN_FUT_VOL_USD = 15_000_000
 ASIA_EXCLUDED_PREFIXES = ("1000",)
 ASIA_SYMBOL_COOLDOWN_HOURS = 3
 
@@ -5480,18 +5481,18 @@ EMAIL_SETUPS_N = max(1, min(int(EMAIL_SETUPS_N or 1), int(os.environ.get("EMAIL_
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "72"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
-MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
+MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "15000000"))
 # Production quality floor: no setup display/email/autotrade below this 24h futures volume.
-SETUP_MIN_24H_VOL_USD = float(os.environ.get("SETUP_MIN_24H_VOL_USD", "10000000") or 10000000)
-MIN_FUT_VOL_USD = max(float(MIN_FUT_VOL_USD or 0.0), float(SETUP_MIN_24H_VOL_USD or 0.0), 10_000_000.0)
+SETUP_MIN_24H_VOL_USD = float(os.environ.get("SETUP_MIN_24H_VOL_USD", "15000000") or 15000000)
+MIN_FUT_VOL_USD = max(float(MIN_FUT_VOL_USD or 0.0), float(SETUP_MIN_24H_VOL_USD or 0.0), 15_000_000.0)
 MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP", os.environ.get("MIN_RR_TP", "1.45"))))
 MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as final target
 
 def _setup_min_volume_floor_usd() -> float:
     try:
-        return max(10_000_000.0, float(SETUP_MIN_24H_VOL_USD or 0.0), float(MIN_FUT_VOL_USD or 0.0))
+        return max(15_000_000.0, float(SETUP_MIN_24H_VOL_USD or 0.0), float(MIN_FUT_VOL_USD or 0.0))
     except Exception:
-        return 10_000_000.0
+        return 15_000_000.0
 
 def _setup_volume_ok(setup_or_vol) -> bool:
     try:
@@ -6350,7 +6351,7 @@ def _strategy_config_defaults() -> dict:
 
         # Universe backtest autopilot (zero-touch telemetry feeding learning/optimizer)
         "universe_backtest_top_n": 100,
-        "universe_backtest_min_vol_usd": 10000000.0,
+        "universe_backtest_min_vol_usd": 15000000.0,
         "universe_backtest_windows": [7, 30],
         "universe_backtest_exec_tf": "15m",
 
@@ -7295,7 +7296,7 @@ ENGINE_C_MIN_BASE_BARS = 3
 ENGINE_C_MAX_BASE_WIDTH_PCT = 7.2
 ENGINE_C_HOLD_PORTION = 0.52
 ENGINE_C_BREAKOUT_BUFFER_PCT = 0.35
-ENGINE_C_MIN_FUT_VOL_USD = 10_000_000.0
+ENGINE_C_MIN_FUT_VOL_USD = 15_000_000.0
 ENGINE_C_RR_BONUS = 0.20
 ENGINE_C_TP_CAP_BONUS_PCT = 2.0
 
@@ -18551,7 +18552,7 @@ def db_init():
 
     # default volume gate: 15M
     if "spike_min_vol_usd" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
+        cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 15000000")
 
     # wick ratio threshold (0.55 means wick is 55%+ of candle range)
     if "spike_wick_ratio" not in cols:
@@ -19282,7 +19283,7 @@ def ensure_email_column():
             pass
 
         try:
-            cur.execute("ALTER TABLE users ADD COLUMN bigmove_min_usd REAL DEFAULT 10000000")
+            cur.execute("ALTER TABLE users ADD COLUMN bigmove_min_usd REAL DEFAULT 15000000")
             con.commit()
             logger.info("Added bigmove_min_usd column to users table")
         except sqlite3.OperationalError:
@@ -19774,7 +19775,7 @@ def _safe_float(x, default: float = 0.0) -> float:
 BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "1.5") or 1.5)
 BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") or 3.0)
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
-BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0)
+BIGMOVE_DEFAULT_MIN_VOL_USD = max(15_000_000.0, float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0))
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "7200") or 7200)  # Ver15: same-symbol/same-direction F8 cooldown (opposite direction still allowed)
 # Guard against stale Render env BIGMOVE_COOLDOWN_SEC=0 from older no-cooldown builds.
@@ -31316,7 +31317,7 @@ def run_universe_backtest(days: int = 7, session_mode: str = 'ALL', tf: str | No
         exec_tf = str(tf or cfg.get('universe_backtest_exec_tf') or cfg.get('exec_tf_default') or '15m').strip().lower()
         d = max(3, int(days or 7))
         top_n = int(max(10, top_n or cfg.get('universe_backtest_top_n', 80) or 80))
-        min_vol_usd = float(min_vol_usd or cfg.get('universe_backtest_min_vol_usd', 10000000.0) or 10000000.0)
+        min_vol_usd = float(min_vol_usd or cfg.get('universe_backtest_min_vol_usd', 15000000.0) or 15000000.0)
         session_mode = str(session_mode or 'ALL').upper().strip()
         snap = _build_universe_snapshot_top_volume(top_n=top_n, min_vol_usd=min_vol_usd)
         universe = list(snap.get('market_symbols') or [])[:top_n]
