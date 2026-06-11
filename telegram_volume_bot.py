@@ -1,4 +1,4 @@
-# yver42: final setup-generation/email/AutoTrade sync lock. /setup_matrix KEEP + executable setup + OPEN blackout + delivery email is the single source of truth for AutoTrade; removes the extra strict AutoTrade WR60/AvgR gate and realised-combo self-blocking while preserving blackouts, leader/loser, context, drift, duplicate, risk and Bybit execution guards.
+# yver43: fixes the remaining setup/email sync diagnostic gap. Email executable pool now applies /setup_matrix KEEP + user-visible/context policy BEFORE persisting/advertising executable rows, so persisted executable rows, /why, /email_decision, setup email and AutoTrade all speak the same lane. No loosening of risk/blackout/leader-loser/TP-SL gates.
 # yver41: aligns BigMove/F8 minimum volume with normal $10M setup floor and makes /email_decision show active setup blackout + normal setup min-volume diagnostics.
 # yver40: lowers normal setup/executable liquidity floor from $15M to $10M while keeping KEEP policy, blackout, leader/loser, RR/SL/TP and risk gates intact; BigMove raw alert default remains separately controlled.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
@@ -61229,14 +61229,40 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
 
             skip_reasons_counter = Counter()
             eligible: List[Setup] = []
-            for s in (setups_all or []):
+
+            def _email_live_keep_candidate(_raw_s):
+                """Return routed setup only when it is actually deliverable in the live setup lane.
+
+                yver43: do this BEFORE persisting/logging executable rows. Previously
+                structurally-valid but matrix-DISABLE rows could be written as
+                "persisted executable rows" and then be blocked later by the email
+                policy gate. That made /why look like setup generation worked while
+                /email_decision showed eligible=0. The live email/AutoTrade lane is now:
+                executable geometry + /setup_matrix KEEP + user-visible/context gate.
+                """
                 try:
-                    s_eff = _setup_route_candidate_for_executable_lane(s, sess_name, int(uid))
-                    ok, why = is_executable_setup_eligible(s_eff, session_name=sess_name)
+                    _eff = _setup_route_candidate_for_executable_lane(_raw_s, sess_name, int(uid))
+                    _ok, _why = is_executable_setup_eligible(_eff, session_name=sess_name)
+                    if not _ok:
+                        return None, str(_why or 'email_exec_gate_block')
+                    try:
+                        if not _setup_combo_policy_allows_setup(_eff, sess_name, user_id=int(uid)):
+                            return None, 'email_setup_matrix_policy_not_live_keep'
+                    except Exception:
+                        return None, 'email_setup_matrix_policy_gate_exception'
+                    try:
+                        _vis_ok, _vis_why, _vis_meta = _setup_user_visible_keep_policy_allows(_eff, session_name=sess_name, user_id=int(uid), lane='email')
+                        if not _vis_ok:
+                            return None, str(_vis_why or 'email_user_visible_policy_block')
+                    except Exception:
+                        return None, 'email_user_visible_policy_exception'
+                    return _eff, 'ok'
                 except Exception:
-                    s_eff = s
-                    ok, why = False, 'email_exec_gate_exception'
-                if ok:
+                    return None, 'email_exec_gate_exception'
+
+            for s in (setups_all or []):
+                s_eff, why = _email_live_keep_candidate(s)
+                if s_eff is not None:
                     eligible.append(s_eff)
                 else:
                     skip_reasons_counter[str(why)] += 1
@@ -61263,7 +61289,15 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 hydrated = _executable_rows_to_setup_objects(list(exec_rows or []), session_name=str(sess_name or ''))
             except Exception:
                 hydrated = []
-            eligible_db = [s for s in (hydrated or []) if s is not None]
+            eligible_db = []
+            for _db_s in (hydrated or []):
+                if _db_s is None:
+                    continue
+                _db_eff, _db_why = _email_live_keep_candidate(_db_s)
+                if _db_eff is not None:
+                    eligible_db.append(_db_eff)
+                else:
+                    skip_reasons_counter[str(_db_why)] += 1
             if eligible_db:
                 eligible = list(eligible_db)
             elif eligible_from_pool:
@@ -61290,12 +61324,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     for _cand in (recent_candidates or []):
                         if _cand is None:
                             continue
-                        try:
-                            _cand_eff = _setup_route_candidate_for_executable_lane(_cand, sess_name, int(uid))
-                            if is_executable_setup_eligible(_cand_eff, session_name=sess_name)[0]:
-                                eligible.append(_cand_eff)
-                        except Exception:
-                            continue
+                        _cand_eff, _cand_why = _email_live_keep_candidate(_cand)
+                        if _cand_eff is not None:
+                            eligible.append(_cand_eff)
+                        else:
+                            skip_reasons_counter[str(_cand_why)] += 1
                     try:
                         db_log_setup_pipeline_event(int(uid), stage='email_executable_pool_fallback', status='ok' if eligible else 'empty', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'source': f'recent_candidates_{int(_setup_email_actionable_queue_window_sec())}s'})
                     except Exception:
@@ -61309,11 +61342,12 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     recovery_now = []
                     for _s in list(setups_all or []):
                         try:
-                            _s_eff = _setup_route_candidate_for_executable_lane(_s, sess_name, int(uid))
-                            setattr(_s_eff, 'recovery_fallback', True)
-                            ok_now, _why_now = is_executable_setup_eligible(_s_eff, session_name=sess_name)
-                            if ok_now:
+                            _s_eff, _why_now = _email_live_keep_candidate(_s)
+                            if _s_eff is not None:
+                                setattr(_s_eff, 'recovery_fallback', True)
                                 recovery_now.append(_s_eff)
+                            else:
+                                skip_reasons_counter[str(_why_now)] += 1
                         except Exception:
                             continue
                     if recovery_now:
