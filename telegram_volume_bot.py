@@ -1,4 +1,4 @@
-# yver46: ver45 baseline + sync fix. Matrix KEEP+OPEN setup emails and AutoTrade are no longer blocked by secondary strict-KEEP/realized-combo gates; presend gate skips are reported as SKIP instead of SMTP ERROR.
+# yver47: keeps ver46 baseline/sync fixes and hardens alert_job scheduling so Render/APScheduler does not repeatedly skip the email loop when a cold or slow tick exceeds the interval; adds wrapper timeout and raises default alert interval safety margin.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -63190,10 +63190,26 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
-        await _alert_job_async_internal(context)
+        # yver47: hard guard the wrapper as well as the internal budget.
+        # On Render, a cold scan/email tick can otherwise still be running when
+        # APScheduler fires the next interval, producing noisy
+        # "maximum number of running instances reached" warnings and delaying
+        # the next email/setup loop.
+        timeout_sec = max(45.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 25.0)
+        await asyncio.wait_for(_alert_job_async_internal(context), timeout=timeout_sec)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
             _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
+        except Exception:
+            pass
+    except asyncio.TimeoutError as e:
+        try:
+            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"alert_job_timeout>{timeout_sec:.0f}s"
+        except Exception:
+            pass
+        _hb_touch('email', ok=False, error=f"alert_job_timeout>{timeout_sec:.0f}s", details='alert_job_timeout')
+        try:
+            logger.warning("Alert job timed out after %.1fs; next tick will continue", timeout_sec)
         except Exception:
             pass
     except Exception as e:
@@ -63458,7 +63474,11 @@ def main():
         # the pipeline alive.
         # Ver110: schedule interval must be longer than the allowed runtime to avoid
         # APScheduler max_instances skipped-run warnings on Render.
-        interval_sec = max(90, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 30)
+        # yver47: keep the email/autotrade loop responsive but ensure the scheduled
+        # interval is safely longer than the wrapper timeout. Default becomes 3m
+        # instead of 2m, which avoids Render/APScheduler max_instances skipped-run
+        # warnings during cold or slow ticks.
+        interval_sec = max(180, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 90)
     
         app.job_queue.run_repeating(
             alert_job,
