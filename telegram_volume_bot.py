@@ -1,4 +1,4 @@
-# yver47: keeps ver46 baseline/sync fixes and hardens alert_job scheduling so Render/APScheduler does not repeatedly skip the email loop when a cold or slow tick exceeds the interval; adds wrapper timeout and raises default alert interval safety margin.
+# yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -59003,6 +59003,156 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
         pass
     return list(out or []), reasons
 
+def _setup_object_from_audit_row_for_email(row: dict, session_name: str = ''):
+    """Hydrate a generated/executable audit row back into a Setup-like object."""
+    from types import SimpleNamespace
+    try:
+        r = dict(row or {})
+        sess = str(session_name or r.get('session') or r.get('source_session') or '').upper().strip()
+        sid = str(r.get('setup_id') or _setup_audit_unique_key(r) or '').strip()
+        item = SimpleNamespace(
+            setup_id=sid,
+            id=sid,
+            symbol=str(r.get('symbol') or '').upper().strip(),
+            market_symbol=str(r.get('market_symbol') or r.get('symbol') or '').strip(),
+            side=str(r.get('side') or '').upper().strip(),
+            conf=int(float(r.get('conf') or 0.0)),
+            entry=float(r.get('entry') or 0.0),
+            sl=float(r.get('sl') or 0.0),
+            tp=float(_setup_target_tp(r, 0.0) or 0.0),
+            alt_target_a=float(r.get('alt_target_a') or 0.0),
+            alt_target_b=float(r.get('alt_target_b') or 0.0),
+            fut_vol_usd=float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0),
+            ch24=float(r.get('ch24') or 0.0),
+            ch4=float(r.get('ch4') or 0.0),
+            ch1=float(r.get('ch1') or 0.0),
+            ch15=float(r.get('ch15') or 0.0),
+            quality_score=float(r.get('quality_score') or r.get('conf') or 0.0),
+            atr_pct=float(r.get('atr_pct') or 0.0),
+            engine=str(r.get('engine') or ''),
+            created_ts=float(_setup_audit_row_ts(r) or 0.0),
+            signal_created_ts=float(r.get('signal_created_ts') or _setup_audit_row_ts(r) or 0.0),
+            executable_ts=float(r.get('executable_ts') or _setup_audit_row_ts(r) or 0.0),
+            email_logged_ts=0.0,
+            generated_logged_ts=float(_setup_audit_row_ts(r) or 0.0),
+            source_kind='audit_keep_rescue',
+            source_session=sess,
+            session=sess,
+            family_id=str(r.get('family_id') or ''),
+            setup_strategy=str(r.get('setup_strategy') or ''),
+            strategy=str(r.get('setup_strategy') or ''),
+            strategy_mode=str(r.get('setup_strategy') or ''),
+            strategy_reason=str(r.get('strategy_reason') or 'audit_keep_open_rescue')[:500],
+            original_setup_id=str(r.get('original_setup_id') or ''),
+            original_side=str(r.get('original_side') or ''),
+            delivery_lane_locked=True,
+        )
+        try:
+            item = _research_finalize_setup(item, session_name=sess)
+        except Exception:
+            pass
+        return item
+    except Exception:
+        return None
+
+
+def _select_recent_keep_open_audit_rescue_email_setups(user_id: int, session_name: str, limit: int | None = None) -> tuple[list, Counter]:
+    """Last-chance normal setup email rescue for current KEEP+OPEN audit rows.
+
+    This covers the case where /setup_audit shows a fresh KEEP/OPEN row but the
+    in-memory email pool was empty or missed the row. It still uses KEEP-only,
+    current entry-window, cooldown, presend and AutoTrade-compatible gates.
+    """
+    reasons = Counter()
+    out = []
+    try:
+        uid = int(user_id or 0)
+        sess = str(session_name or '').upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            reasons['audit_rescue_missing_session'] += 1
+            return [], reasons
+        blk, blk_reason = _setup_generation_blackout_now()
+        if blk:
+            reasons[str(blk_reason or 'setup_generation_blackout')] += 1
+            return [], reasons
+        win_sec = float(_setup_email_actionable_queue_window_sec())
+        cutoff = float(time.time()) - win_sec
+        hours = max(1, int(math.ceil((win_sec / 3600.0) + 1.0)))
+        try:
+            max_n = int(limit if limit is not None else max(1, int(EMAIL_SETUPS_N or 1)))
+        except Exception:
+            max_n = 1
+        try:
+            rows = _setup_audit_load_rows(uid, hours=hours, limit=0, dedup=True, apply_final_quality_gate=False, source_mode_override='ALL')
+        except Exception:
+            rows = []
+        seen = set()
+        for r in list(rows or []):
+            try:
+                ts = float(_setup_audit_row_ts(r) or 0.0)
+                if ts <= cutoff:
+                    reasons['audit_rescue_expired'] += 1
+                    continue
+                rsess = str(r.get('session') or r.get('source_session') or '').upper().strip()
+                if rsess != sess:
+                    continue
+                blackout_label = _setup_audit_blackout_label_for_ts(ts)
+                if str(blackout_label or '').upper().strip() != 'OPEN':
+                    reasons['audit_rescue_blackout'] += 1
+                    continue
+                side = str(r.get('side') or '').upper().strip()
+                policy_label = _setup_audit_policy_label(r, uid=uid, session_name=rsess, side=side)
+                if str(policy_label or '').upper().strip() != 'KEEP':
+                    reasons['audit_rescue_not_keep'] += 1
+                    continue
+                try:
+                    fast_res = _setup_audit_keep_watch_fast_result_label(r, _setup_audit_result_horizon_hours())
+                    if str(fast_res or '').upper().strip() not in {'OPEN', ''}:
+                        reasons[f'audit_rescue_already_{str(fast_res).lower()}'] += 1
+                        continue
+                except Exception:
+                    pass
+                s = _setup_object_from_audit_row_for_email(r, rsess)
+                if s is None:
+                    reasons['audit_rescue_hydrate_failed'] += 1
+                    continue
+                sid = str(getattr(s, 'setup_id', '') or '').strip()
+                sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+                side = str(getattr(s, 'side', '') or '').upper().strip()
+                key = sid or f'{sym}:{side}:{float(getattr(s, "entry", 0.0) or 0.0):.8f}'
+                if key in seen:
+                    continue
+                seen.add(key)
+                if _email_setup_identity_recently_sent(uid, s) or _email_symbol_recently_sent(uid, sym, side, sess, setup_id=sid):
+                    reasons['audit_rescue_email_cooldown'] += 1
+                    continue
+                if symbol_flip_guard_active(uid, sym, side, sess):
+                    reasons['audit_rescue_flip_guard'] += 1
+                    continue
+                ok_exec, why_exec = is_executable_setup_eligible(s, session_name=sess)
+                if not ok_exec:
+                    reasons[f'audit_rescue_exec_{why_exec}'] += 1
+                    continue
+                ok_vis, why_vis, _meta_vis = _setup_user_visible_keep_policy_allows(s, session_name=sess, user_id=uid, lane='email')
+                if not ok_vis:
+                    reasons[f'audit_rescue_visible_{why_vis}'] += 1
+                    continue
+                try:
+                    setattr(s, 'audit_keep_open_rescue', True)
+                except Exception:
+                    pass
+                out.append(s)
+                reasons['audit_rescue_selected'] += 1
+                if len(out) >= max_n:
+                    break
+            except Exception as exc:
+                reasons[f'audit_rescue_exception:{type(exc).__name__}'] += 1
+                continue
+    except Exception as exc:
+        reasons[f'audit_rescue_outer_exception:{type(exc).__name__}'] += 1
+    return out, reasons
+
+
 def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
     """
     One email containing multiple setups.
@@ -60673,8 +60823,37 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         pass
 
             if not eligible:
+                # yver48: final last-chance rescue from /setup_audit.
+                # This catches the exact case where /setup_audit shows a fresh
+                # KEEP + OPEN row, but the live executable/email pool is empty
+                # because the row was written by another scan lane/cycle.
+                audit_rescue_reasons = Counter()
+                try:
+                    audit_rescue_list, audit_rescue_reasons = _select_recent_keep_open_audit_rescue_email_setups(
+                        int(uid), str(sess_name or ''), limit=max(1, int(EMAIL_SETUPS_N or 1))
+                    )
+                except Exception as _audit_rescue_exc:
+                    audit_rescue_list, audit_rescue_reasons = [], Counter({f'audit_rescue_exception:{type(_audit_rescue_exc).__name__}': 1})
+                if audit_rescue_list:
+                    eligible = list(audit_rescue_list or [])
+                    try:
+                        _persist_stats = _persist_executable_candidates(int(uid), str(sess_name or ''), list(eligible or []), source_kind='executable_setups', mode='email_audit_rescue')
+                        persisted_count = max(int(persisted_count or 0), int((_persist_stats or {}).get('persisted') or 0))
+                    except Exception:
+                        pass
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_audit_keep_open_rescue', status='selected', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'persisted': int(persisted_count or 0), 'top_reasons': _pipeline_top_reasons(audit_rescue_reasons, 6)})
+                    except Exception:
+                        pass
+
+            if not eligible:
                 top_reasons = dict(skip_reasons_counter.most_common(3))
-                db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'persisted': persisted_count, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
+                try:
+                    if 'audit_rescue_reasons' in locals() and audit_rescue_reasons:
+                        top_reasons = dict((audit_rescue_reasons or Counter()).most_common(3))
+                except Exception:
+                    pass
+                db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'persisted': persisted_count, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5), 'audit_rescue': _pipeline_top_reasons((audit_rescue_reasons if 'audit_rescue_reasons' in locals() else Counter()), 5)})
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": ([_email_no_setups_reason(sess, fallback_session=sess_name)] if not setups_all else ["no_setups_after_filters"]) + [f"top_reasons={top_reasons}"],
@@ -60784,6 +60963,21 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                 chosen_list.append(s)
+
+            if not chosen_list:
+                audit_rescue_reasons = Counter()
+                try:
+                    audit_rescue_list, audit_rescue_reasons = _select_recent_keep_open_audit_rescue_email_setups(
+                        int(uid), str(sess_name or ''), limit=max(1, int(EMAIL_SETUPS_N or 1))
+                    )
+                except Exception as _audit_rescue_exc:
+                    audit_rescue_list, audit_rescue_reasons = [], Counter({f'audit_rescue_exception:{type(_audit_rescue_exc).__name__}': 1})
+                if audit_rescue_list:
+                    try:
+                        db_log_setup_pipeline_event(int(uid), stage='email_audit_keep_open_rescue', status='selected_after_filters', session=str(sess_name or ''), mode='email', details={'eligible': len(audit_rescue_list), 'top_reasons': _pipeline_top_reasons(audit_rescue_reasons, 6)})
+                    except Exception:
+                        pass
+                    chosen_list = list(audit_rescue_list or [])
 
             if not chosen_list:
                 reasons = []
@@ -61241,6 +61435,12 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 lines.append("Build pool: " + _pipe_summary(pipe_build))
             if pipe_exec:
                 lines.append("Executable pool: " + _pipe_summary(pipe_exec))
+            try:
+                audit_rescue_ev = _latest_setup_pipeline_event(uid, stage='email_audit_keep_open_rescue', session=pipe_lookup_sess, mode='email') or _latest_setup_pipeline_event(uid, stage='email_audit_keep_open_rescue', mode='email') or {}
+                if audit_rescue_ev:
+                    lines.append("KEEP/OPEN audit rescue last: " + _pipe_summary(audit_rescue_ev))
+            except Exception:
+                pass
     except Exception:
         pass
 
