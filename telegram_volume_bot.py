@@ -1,3 +1,4 @@
+# yver42: final setup-generation/email/AutoTrade sync lock. /setup_matrix KEEP + executable setup + OPEN blackout + delivery email is the single source of truth for AutoTrade; removes the extra strict AutoTrade WR60/AvgR gate and realised-combo self-blocking while preserving blackouts, leader/loser, context, drift, duplicate, risk and Bybit execution guards.
 # yver41: aligns BigMove/F8 minimum volume with normal $10M setup floor and makes /email_decision show active setup blackout + normal setup min-volume diagnostics.
 # yver40: lowers normal setup/executable liquidity floor from $15M to $10M while keeping KEEP policy, blackout, leader/loser, RR/SL/TP and risk gates intact; BigMove raw alert default remains separately controlled.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
@@ -878,9 +879,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY: 1 if env_bool('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True) else 0,
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True) else 0,
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: float(os.environ.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', '3.0') or 3.0),
-        AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True) else 0,
+        AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', False) else 0,
         AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1 if env_bool('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True) else 0,
-        AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1 if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True) else 0,
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1 if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', False) else 0,
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5') or 5),
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0') or 60.0),
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25') or 0.25),
@@ -1176,9 +1177,9 @@ def _autotrade_daily_realized_loss_stop_pct() -> float:
 
 def _autotrade_require_realized_combo_edge() -> bool:
     try:
-        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', False)
     except Exception:
-        return bool(globals().get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True))
+        return bool(globals().get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', False))
 
 
 def _autotrade_context_feed_guard_enabled() -> bool:
@@ -1190,9 +1191,9 @@ def _autotrade_context_feed_guard_enabled() -> bool:
 
 def _autotrade_strict_keep_edge_enabled() -> bool:
     try:
-        return _autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', False)
     except Exception:
-        return env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)
+        return env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', False)
 
 
 def _autotrade_strict_keep_edge_min_decided() -> int:
@@ -2825,6 +2826,45 @@ def _autotrade_apply_ver119_audit_match_config_defaults() -> None:
         # the owner can increase them if he wants more coverage, but safety defaults
         # should remain under Telegram control.
         _autotrade_config_set('ver119_audit_match_config_version', target_version)
+    except Exception:
+        pass
+
+
+
+def _autotrade_apply_ver42_final_setup_sync_defaults() -> None:
+    """yver42: final setup-generation/email/AutoTrade sync mode.
+
+    The source of truth for real-money entry is now:
+      final executable setup -> /setup_matrix Policy=KEEP -> Blackout=OPEN -> setup email sent.
+
+    Remove extra AutoTrade-only quality blocks that made AutoTrade diverge from
+    setup generation/email, especially the WR60/AvgR strict KEEP edge and realised
+    live-combo self-blocking. Keep operational safety layers: blackouts, leader/loser
+    direction guard, context feed guard, risk caps, duplicate guards, drift guard,
+    Bybit execution validation and strict TP/SL lifecycle.
+    """
+    try:
+        target_version = 'yver42_2026_06_11_final_setup_email_autotrade_sync'
+        if str(_autotrade_config_get('ver42_final_setup_sync_version', '') or '').strip().lower() == target_version:
+            return
+        desired = {
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1,
+            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY: 1,
+            AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY: 1,
+            AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY: 0,
+            AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY: 0,
+        }
+        for k, v in desired.items():
+            try:
+                _autotrade_config_set(k, v)
+            except Exception:
+                pass
+        _autotrade_config_set('ver42_final_setup_sync_version', target_version)
     except Exception:
         pass
 
@@ -7514,6 +7554,7 @@ try:
     _autotrade_apply_ver117_live_test_alignment_defaults()
     _autotrade_apply_ver118_audit_match_config_defaults()
     _autotrade_apply_ver119_audit_match_config_defaults()
+    _autotrade_apply_ver42_final_setup_sync_defaults()
 except Exception:
     pass
 
@@ -42444,9 +42485,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK true",
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true",
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
-            "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (audit-match default)",
+            "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (recommended setup-sync mode; do not let small live sample block matrix KEEP setups)",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
-            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true   (syncs /screen + email + AutoTrade to high-edge KEEP lanes)",
+            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED false   (recommended setup-sync mode; no extra WR60/AvgR gate after /setup_matrix KEEP)",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 60",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 5",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.25",
