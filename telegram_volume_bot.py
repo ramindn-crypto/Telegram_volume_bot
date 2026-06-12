@@ -1,7 +1,4 @@
-# yver55: ver54 + Render-safe APScheduler deploy-misfire log filter; no strategy/email/autotrade logic changes.
-# yver52: adds F9 Persistent Leaders research family on top of yver51. F9 records leader/loser daily membership, generates WATCH/audit-only persistent-leader continuation BUY setups after a 2-day leader streak, and cannot promote to KEEP until enough decided evidence is collected; existing F1-F8 setup/email/AutoTrade flow is unchanged.
-# yver54: hard responsiveness patch. Adds true group=-100 instant command handlers, no DB/channel guard before ACK, short Telegram send timeouts for fast commands, user-activity deferral for heavy jobs, and keeps all strategy/F1-F9/email/AutoTrade logic unchanged.
-# yver52b: runtime/cache hardening: detailed /setup_audit no longer shows misleading stale cache older than 90s; alert/guardian scheduler overlap warnings removed via effective runtime cap + lock-check instances; transient Telegram send timeouts logged as INFO.
+# yver51: scheduler-overlap warning fix on top of yver50. alert_job and autonomous_screen_sync_job now allow one extra fast lock-check instance (max_instances=2), so a slow real tick does not produce Render/APScheduler skipped-run warnings; locks still prevent overlapping real work. BigMove raw-alert email toggle remains separated from F8 setup generation/email/AutoTrade.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
@@ -3494,15 +3491,6 @@ def _setup_matrix_policy_source_state_for_lane(family: str, session: str, strate
         has_current_score = _setup_combo_has_current_score(score)
         force_keep = _setup_combo_force_keep_by_wr(dec_v, wr_v)
         wr_blocks_keep = _setup_combo_current_wr_blocks_keep(dec_v, wr_v)
-        # yver52: F9 is a new research-only family.  It may collect WATCH/audit
-        # rows immediately, but it cannot become KEEP/AutoTrade just because one
-        # early result wins.  Require a real evidence sample before promotion.
-        if fam == 'F9':
-            f9_min_dec = int(globals().get('F9_MIN_DECIDED_BEFORE_KEEP', 30) or 30)
-            f9_min_wr = float(globals().get('F9_MIN_WR_BEFORE_KEEP', 50.0) or 50.0)
-            f9_min_avg_r = float(globals().get('F9_MIN_AVG_R_BEFORE_KEEP', 0.15) or 0.15)
-            force_keep = bool(int(dec_v or 0) >= f9_min_dec and float(wr_v or 0.0) >= f9_min_wr and float(avg_v or 0.0) >= f9_min_avg_r)
-            wr_blocks_keep = bool(int(dec_v or 0) > 0 and not force_keep)
         # yver27 fix: the current displayed WR is authoritative even when it comes
         # from setup_combo_policy.last_* instead of a directly matched score row.
         # If WR is <=49, stale stored KEEP must be demoted everywhere.
@@ -3647,7 +3635,7 @@ def _setup_matrix_policy_current_lane_sets(user_id: int = 0) -> dict:
                 families.add(ff)
     except Exception:
         pass
-    for f in [f'F{i}' for i in range(1, 10)]:
+    for f in [f'F{i}' for i in range(1, 9)]:
         families.add(f)
     try:
         for s in _strategy_cfg_execution_sessions_allowed(cfg):
@@ -4072,47 +4060,6 @@ def _recent_user_activity(window_sec: int | None = None) -> bool:
         return (float(time.time()) - float(_USER_ACTIVITY_TS or 0.0)) <= max(1, win)
     except Exception:
         return False
-
-# yver54: Telegram command ACK path must never wait behind slow retries or DB/network gates.
-# Use very short API timeouts for the first user-facing response and never retry inside
-# the update handler. If Telegram itself is briefly unavailable, the handler exits quickly
-# so the next command/update is not stuck for minutes.
-FAST_TELEGRAM_SEND_TIMEOUT_SEC = float(os.getenv("FAST_TELEGRAM_SEND_TIMEOUT_SEC", "2.8") or 2.8)
-FAST_TELEGRAM_API_TIMEOUT_SEC = float(os.getenv("FAST_TELEGRAM_API_TIMEOUT_SEC", "2.2") or 2.2)
-
-async def _fast_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *, parse_mode: str | None = None, disable_web_page_preview: bool = True, reply_markup=None) -> bool:
-    try:
-        chat = getattr(update, 'effective_chat', None)
-        if not chat:
-            return False
-        body = str(text or '')
-        if len(body) > 3900:
-            body = body[:3850].rstrip() + "\n…"
-        coro = context.bot.send_message(
-            chat_id=int(chat.id),
-            text=body,
-            parse_mode=parse_mode,
-            disable_web_page_preview=disable_web_page_preview,
-            reply_markup=reply_markup,
-            connect_timeout=FAST_TELEGRAM_API_TIMEOUT_SEC,
-            read_timeout=FAST_TELEGRAM_API_TIMEOUT_SEC,
-            write_timeout=FAST_TELEGRAM_API_TIMEOUT_SEC,
-            pool_timeout=0.5,
-        )
-        await asyncio.wait_for(coro, timeout=max(1.0, FAST_TELEGRAM_SEND_TIMEOUT_SEC))
-        return True
-    except Exception as e:
-        try:
-            logger.info("fast Telegram send skipped/failed quickly: %s: %s", type(e).__name__, e)
-        except Exception:
-            pass
-        return False
-
-async def _activity_marker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        _mark_user_activity()
-    except Exception:
-        pass
 
 
 def _goal_profile_quiet_window_ok(now_ts: float | None = None) -> bool:
@@ -4590,7 +4537,7 @@ def _setup_combo_full_universe(families=None, sessions=None) -> list[tuple[str, 
         fams = [str(f or '').upper().strip() for f in (families or []) if str(f or '').strip()]
         sesses = [str(s or '').upper().strip() for s in (sessions or []) if str(s or '').strip()]
         if not fams:
-            fams = [f'F{i}' for i in range(1, 10)]
+            fams = [f'F{i}' for i in range(1, 9)]
         if not sesses:
             sesses = ['ASIA', 'LON', 'NY']
         fams = sorted(set(fams), key=lambda x: (int(x[1:]) if re.fullmatch(r'F\d+', x) else 99, x))
@@ -5485,45 +5432,6 @@ class RedactSecretsFilter(logging.Filter):
         record.args = ()
         return True
 
-class RenderQuietNoiseFilter(logging.Filter):
-    """Suppress expected Render/APScheduler deploy noise without hiding real bot errors.
-
-    APScheduler logs a WARNING when a repeating/background job is missed during
-    Render deploy/cold-start/sleep windows. Those messages do not mean setup
-    generation, setup email, or AutoTrade failed; they only mean a non-critical
-    catch-up/watchdog tick was skipped. Keep the Render log clean while leaving
-    real exceptions visible.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            msg = record.getMessage()
-        except Exception:
-            return True
-
-        name = str(getattr(record, "name", "") or "")
-        if name.startswith("apscheduler"):
-            # Typical after deploy/restart: "Run time of job ... was missed by ...".
-            # These are skipped/coalesced background ticks, not trading failures.
-            if "Run time of job" in msg and "was missed by" in msg:
-                return False
-            # If a duplicate scheduled instance reaches APScheduler before our in-job
-            # lock can fast-return, this is also noise for protected background jobs.
-            if "Execution of job" in msg and "maximum number of running instances reached" in msg:
-                protected_jobs = (
-                    "alert_job",
-                    "autonomous_screen_sync_job",
-                    "autotrade_exit_guardian_job",
-                    "screen_cache_warmup_job",
-                    "research_framework_watchdog_job",
-                    "autonomous_optimize_job",
-                    "evolution_hourly_job",
-                    "setup_combo_policy_catchup_job",
-                )
-                if any(j in msg for j in protected_jobs):
-                    return False
-        return True
-
 
 def setup_logging():
     # Let Render control via LOG_LEVEL, default INFO
@@ -5534,31 +5442,12 @@ def setup_logging():
     for noisy in ("httpx", "telegram", "telegram.ext", "apscheduler"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    # Redact secrets from ALL logs and keep Render clean from expected
-    # APScheduler deploy/cold-start misfire noise. Attach filters to both the
-    # root logger and existing handlers because third-party loggers often
-    # propagate directly to the root handler.
+    # Redact secrets from ALL logs
     secrets = [
         os.environ.get("TELEGRAM_TOKEN", ""),
         os.environ.get("EMAIL_PASS", ""),
     ]
-    _redact_filter = RedactSecretsFilter(secrets)
-    _render_quiet_filter = RenderQuietNoiseFilter()
-    root_logger = logging.getLogger()
-    root_logger.addFilter(_redact_filter)
-    root_logger.addFilter(_render_quiet_filter)
-    for _handler in list(root_logger.handlers or []):
-        try:
-            _handler.addFilter(_redact_filter)
-            _handler.addFilter(_render_quiet_filter)
-        except Exception:
-            pass
-    for _lname in ("apscheduler", "apscheduler.executors.default", "apscheduler.scheduler"):
-        try:
-            _lg = logging.getLogger(_lname)
-            _lg.addFilter(_render_quiet_filter)
-        except Exception:
-            pass
+    logging.getLogger().addFilter(RedactSecretsFilter(secrets))
 
 
 # Call once at import time (after TOKEN/envs exist)
@@ -6856,7 +6745,7 @@ def _strategy_cfg_execution_sessions_allowed(cfg: dict | None) -> set[str]:
 
 def _strategy_cfg_execution_engines_allowed(cfg: dict | None) -> set[str]:
     try:
-        default_all = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
+        default_all = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
         raw = (cfg or {}).get('execution_engines_allowed', default_all) or default_all
         out = {str(x).upper().strip().replace('-', '_') for x in raw if str(x).strip()}
         aliases = {
@@ -6868,15 +6757,12 @@ def _strategy_cfg_execution_engines_allowed(cfg: dict | None) -> set[str]:
             'VWAP': 'F6', 'VWAP_RECLAIM': 'F6', 'F6_VWAP_RECLAIM': 'F6',
             'EXHAUSTION': 'F7', 'EXHAUSTION_FAILURE': 'F7', 'F7_EXHAUSTION_FAILURE': 'F7',
             'BIGMOVE': 'F8', 'BIG_MOVE': 'F8', 'BIGMOVE_CONT': 'F8', 'F8_BIGMOVE_CONT': 'F8',
-            'PERSISTENT_LEADER': 'F9', 'PERSISTENT_LEADER_CONT': 'F9', 'F9_PERSISTENT_LEADER_CONT': 'F9',
         }
         norm = {aliases.get(x, x) for x in out}
-        cleaned = {x for x in norm if x in {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9'}}
-        if bool(globals().get('F9_PERSISTENT_LEADER_ENABLED', True)):
-            cleaned.add('F9')
-        return cleaned or {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9'}
+        cleaned = {x for x in norm if x in {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}}
+        return cleaned or {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}
     except Exception:
-        return {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9'}
+        return {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}
 
 def _strategy_cfg_preferred_trade_window(cfg: dict | None) -> tuple[str, str]:
     try:
@@ -7174,8 +7060,8 @@ def _strategy_config_apply_ver08_quality_patch() -> None:
         # Ver14: discovery mode. Keep all eight setup families active so we can
         # collect enough real samples before prioritising winners. F1/F2/F3 are
         # represented by engines A/B/C; F4-F7 are research-family overlays; F8 is BigMove.
-        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
-        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
+        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
+        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8']
         cfg['execution_asia_enabled'] = True
         cfg['execution_asia_user_override'] = False
         cfg['execution_engine_b_email_enabled'] = True
@@ -15933,14 +15819,6 @@ def _research_family_registry_defaults() -> list[dict]:
             "eligible_regimes_json": json.dumps(["EXPANSION", "TREND_UP", "TREND_DOWN", "UNSTABLE_HIGH_VOL"]),
             "thesis": "Multi-timeframe big-move continuation using 15m/1H/4H aligned expansion with high liquidity.",
         },
-        {
-            "family_id": "F9_PERSISTENT_LEADER_CONT",
-            "family_name": "Persistent Leader Continuation",
-            "status": "active",
-            "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
-            "eligible_regimes_json": json.dumps(["TREND_UP", "EXPANSION", "UNSTABLE_HIGH_VOL"]),
-            "thesis": "Research-only persistent leaders: symbols repeatedly in the Leaders table for consecutive Melbourne days, then continuation BUY after a controlled pullback/reclaim.",
-        },
     ]
 
 
@@ -15954,8 +15832,6 @@ def _family_id_from_engine(engine: str, setup: Any | None = None) -> str:
         return 'F3_IMPULSE_BASE_CONT'
     if eng in {'F8', 'BIGMOVE', 'BIG_MOVE', 'F8_BIGMOVE_CONT'}:
         return 'F8_BIGMOVE_CONT'
-    if eng in {'F9', 'PERSISTENT_LEADER', 'PERSISTENT_LEADER_CONT', 'F9_PERSISTENT_LEADER_CONT'}:
-        return 'F9_PERSISTENT_LEADER_CONT'
     try:
         rid = str(getattr(setup, 'family_id', '') or '').strip()
         if rid:
@@ -15976,7 +15852,6 @@ def _family_name_from_id(family_id: str) -> str:
         'F6_VWAP_RECLAIM': 'VWAP Reclaim',
         'F7_EXHAUSTION_FAILURE': 'Exhaustion Failure Reversal',
         'F8_BIGMOVE_CONT': BIGMOVE_FAMILY_NAME,
-        'F9_PERSISTENT_LEADER_CONT': 'Persistent Leader Continuation',
     }
     return mapping.get(fam, fam or 'Unknown Family')
 
@@ -16309,8 +16184,8 @@ def _ver14_all_family_profile_bootstrap() -> None:
         cfg['ver14_all_family_discovery_applied'] = True
         cfg['ver14_all_family_discovery_ts'] = float(time.time())
         cfg['execution_sessions_allowed'] = ['ASIA', 'LON', 'NY']
-        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
-        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
+        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
+        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8']
         cfg['execution_asia_enabled'] = True
         cfg['execution_engine_b_email_enabled'] = True
         cfg['family_allocator_shadow_mode'] = True
@@ -28337,7 +28212,7 @@ async def send_long_message(
                             pass
                 except (TimedOut, NetworkError) as e:
                     try:
-                        logger.info('Telegram send transient network timeout (pre-table): %s', e)
+                        logger.warning('Telegram send failed (pre-table network): %s', e)
                     except Exception:
                         pass
                     await asyncio.sleep(1)
@@ -28480,8 +28355,8 @@ async def send_long_message(
                 except Exception as e2:
                     logger.warning("Telegram plain fallback failed: %s", e2)
             else:
-                logger.info("Telegram send transient network timeout: %s", e)
-                await asyncio.sleep(1)
+                logger.warning("Telegram send failed (network): %s", e)
+                await asyncio.sleep(2)
                 try:
                     await _send(parse_mode)
                 except Exception as e2:
@@ -28491,7 +28366,7 @@ async def send_long_message(
                         except Exception as e3:
                             logger.warning("Telegram plain fallback after network retry failed: %s", e3)
                     else:
-                        logger.info("Telegram retry transient network failure: %s", e2)
+                        logger.warning("Telegram retry failed (network): %s", e2)
 
         except Exception as e:
             if _is_parse_entity_error(e):
@@ -32113,7 +31988,7 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cached = _admin_status_cache_get(cache_key, ttl=45.0)
         if cached:
-            await _fast_send_text(update, context, cached, parse_mode=None)
+            await send_long_message(update, cached, parse_mode=None)
             return
     except Exception:
         pass
@@ -33671,7 +33546,7 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         txt = await to_thread_bg(_lessons_learned_text, True, timeout=max(10, HEAVY_ADMIN_COMMAND_TIMEOUT_SEC))
         _admin_status_cache_put(cache_name, txt)
-        await _fast_send_text(update, context, txt, parse_mode=None)
+        await send_long_message(update, txt, parse_mode=None)
     except Exception:
         if cached_txt:
             await send_long_message(update, cached_txt, parse_mode=None)
@@ -38015,19 +37890,6 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.60, 8_000_000.0)):
                     return (False, "asia_below_liquidity")
 
-        if engine == 'F9' or fam == globals().get('F9_PERSISTENT_LEADER_FAMILY_ID', 'F9_PERSISTENT_LEADER_CONT'):
-            if side != 'BUY':
-                return (False, 'f9_research_buy_only')
-            if fut_vol < float(globals().get('F9_PERSISTENT_LEADER_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0):
-                return (False, 'f9_below_liquidity')
-            if conf < 76:
-                return (False, 'f9_below_conf')
-            if rr_final < 1.20:
-                return (False, 'f9_below_rr')
-            if ch24 < float(globals().get('MOVER_UP_24H_MIN', 10.0) or 10.0) or ch4 < 0.15:
-                return (False, 'f9_not_persistent_leader_context')
-            return (True, 'ok')
-
         if engine == "A":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
                 if sess == 'ASIA' and ch24_abs < 5.0:
@@ -39935,257 +39797,6 @@ def pick_bigmove_family_setups(best_fut: Dict[str, MarketVol], n: int, session_n
         return out[:int(max(0, n))]
 
 
-F9_PERSISTENT_LEADER_FAMILY_ID = 'F9_PERSISTENT_LEADER_CONT'
-F9_PERSISTENT_LEADER_FAMILY_NAME = 'Persistent Leader Continuation'
-F9_PERSISTENT_LEADER_ENABLED = env_bool('F9_PERSISTENT_LEADER_ENABLED', True)
-F9_PERSISTENT_LEADER_MIN_STREAK_DAYS = int(os.environ.get('F9_PERSISTENT_LEADER_MIN_STREAK_DAYS', '2') or 2)
-F9_PERSISTENT_LEADER_MIN_VOL_USD = float(os.environ.get('F9_PERSISTENT_LEADER_MIN_VOL_USD', '10000000') or 10000000)
-F9_PERSISTENT_LEADER_MAX_PER_SCAN = int(os.environ.get('F9_PERSISTENT_LEADER_MAX_PER_SCAN', '4') or 4)
-F9_MIN_DECIDED_BEFORE_KEEP = int(os.environ.get('F9_MIN_DECIDED_BEFORE_KEEP', '30') or 30)
-F9_MIN_WR_BEFORE_KEEP = float(os.environ.get('F9_MIN_WR_BEFORE_KEEP', '50') or 50)
-F9_MIN_AVG_R_BEFORE_KEEP = float(os.environ.get('F9_MIN_AVG_R_BEFORE_KEEP', '0.15') or 0.15)
-
-
-def _f9_mel_day(ts: float | None = None) -> str:
-    try:
-        return datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d')
-    except Exception:
-        return datetime.now(MEL_TZ).strftime('%Y-%m-%d')
-
-
-def _f9_persistent_mover_migrate() -> None:
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute('''CREATE TABLE IF NOT EXISTS f9_persistent_movers (
-                day TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                bucket TEXT NOT NULL,
-                first_seen_ts REAL NOT NULL DEFAULT 0,
-                last_seen_ts REAL NOT NULL DEFAULT 0,
-                rank INTEGER NOT NULL DEFAULT 0,
-                ch24 REAL NOT NULL DEFAULT 0,
-                ch4 REAL NOT NULL DEFAULT 0,
-                vol_usd REAL NOT NULL DEFAULT 0,
-                price REAL NOT NULL DEFAULT 0,
-                PRIMARY KEY(day, symbol, bucket)
-            )''')
-            cur.execute('CREATE INDEX IF NOT EXISTS idx_f9_persistent_movers_symbol_bucket_day ON f9_persistent_movers(symbol, bucket, day)')
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _f9_record_directional_memberships(up_list: list, dn_list: list, best_fut: dict | None = None) -> None:
-    """Record daily Leaders/Losers membership for F9 research.
-
-    This does not create trades. It only builds consecutive-day evidence.
-    """
-    if not bool(globals().get('F9_PERSISTENT_LEADER_ENABLED', True)):
-        return
-    try:
-        _f9_persistent_mover_migrate()
-        day = _f9_mel_day()
-        now_ts = float(time.time())
-        rows = []
-        for bucket, items in (('LEADER', up_list or []), ('LOSER', dn_list or [])):
-            for idx, item in enumerate(list(items or [])[:10], start=1):
-                try:
-                    base = str(item[0] if isinstance(item, (list, tuple)) and item else item or '').upper().strip()
-                    if not base:
-                        continue
-                    mv = (best_fut or {}).get(base)
-                    vol = float(item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else (usd_notional(mv) if mv else 0.0) or 0.0)
-                    ch24 = float(item[2] if isinstance(item, (list, tuple)) and len(item) > 2 else (getattr(mv, 'percentage', 0.0) if mv else 0.0) or 0.0)
-                    ch4 = float(item[3] if isinstance(item, (list, tuple)) and len(item) > 3 else 0.0)
-                    px = float(item[4] if isinstance(item, (list, tuple)) and len(item) > 4 else (getattr(mv, 'last', 0.0) if mv else 0.0) or 0.0)
-                    rows.append((day, base, bucket, now_ts, now_ts, int(idx), float(ch24), float(ch4), float(vol), float(px)))
-                except Exception:
-                    continue
-        if not rows:
-            return
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.executemany('''INSERT INTO f9_persistent_movers(day, symbol, bucket, first_seen_ts, last_seen_ts, rank, ch24, ch4, vol_usd, price)
-                               VALUES(?,?,?,?,?,?,?,?,?,?)
-                               ON CONFLICT(day, symbol, bucket) DO UPDATE SET
-                                 last_seen_ts=excluded.last_seen_ts,
-                                 rank=MIN(f9_persistent_movers.rank, excluded.rank),
-                                 ch24=excluded.ch24,
-                                 ch4=excluded.ch4,
-                                 vol_usd=excluded.vol_usd,
-                                 price=excluded.price''', rows)
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _f9_consecutive_days(symbol: str, bucket: str = 'LEADER', max_days: int = 10) -> int:
-    try:
-        _f9_persistent_mover_migrate()
-        sym = str(symbol or '').upper().strip()
-        bkt = str(bucket or 'LEADER').upper().strip()
-        if not sym:
-            return 0
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            rows = cur.execute('SELECT day FROM f9_persistent_movers WHERE symbol=? AND bucket=? ORDER BY day DESC LIMIT ?', (sym, bkt, int(max(1, max_days)))).fetchall() or []
-        have = {str(r[0]) for r in rows if r and r[0]}
-        try:
-            today_dt = datetime.strptime(_f9_mel_day(), '%Y-%m-%d').date()
-        except Exception:
-            today_dt = datetime.now(MEL_TZ).date()
-        streak = 0
-        for i in range(int(max(1, max_days))):
-            d = (today_dt - timedelta(days=i)).strftime('%Y-%m-%d')
-            if d in have:
-                streak += 1
-            else:
-                break
-        return int(streak)
-    except Exception:
-        return 0
-
-
-def make_f9_persistent_leader_setup(base: str, mv: Any, session_name: str = 'ASIA', streak_days: int = 0) -> Optional[Setup]:
-    """F9 research setup: persistent leader continuation BUY only."""
-    try:
-        if not bool(globals().get('F9_PERSISTENT_LEADER_ENABLED', True)):
-            return None
-        base_u = str(base or '').upper().strip()
-        if not base_u or mv is None:
-            return None
-        streak_days = int(streak_days or _f9_consecutive_days(base_u, 'LEADER'))
-        if streak_days < int(globals().get('F9_PERSISTENT_LEADER_MIN_STREAK_DAYS', 2) or 2):
-            return None
-        fut_vol = float(usd_notional(mv) or 0.0)
-        if fut_vol < float(globals().get('F9_PERSISTENT_LEADER_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0):
-            return None
-        ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0)
-        if ch24 < float(globals().get('MOVER_UP_24H_MIN', 10.0) or 10.0):
-            return None
-        ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
-        if (not c15) or len(c15) < 16 or float(atr_1h or 0.0) <= 0:
-            return None
-        if float(ch4 or 0.0) < 0.20:
-            return None
-        if float(ch1 or 0.0) < -0.45:
-            return None
-        if float(ch15 or 0.0) < -0.30:
-            return None
-        entry = float(c15[-1][4] or getattr(mv, 'last', 0.0) or 0.0)
-        if entry <= 0:
-            return None
-        ema_v = float(ema_support_15m or 0.0)
-        ema_dist_pct = abs(entry - ema_v) / entry * 100.0 if ema_v > 0 else 999.0
-        if ema_v > 0 and entry < ema_v * 0.992:
-            return None
-        if ema_dist_pct > 1.65:
-            return None
-        lows_recent = [float(x[3] or 0.0) for x in c15[-10:] if float(x[3] or 0.0) > 0]
-        if not lows_recent:
-            return None
-        swing_low = min(lows_recent)
-        sl = min(entry - max(float(atr_1h) * 1.10, entry * 0.0065), swing_low - max(float(atr_1h) * 0.18, entry * 0.0015))
-        if sl <= 0 or sl >= entry:
-            return None
-        risk = entry - sl
-        if risk <= 0:
-            return None
-        if (risk / entry) * 100.0 > 10.5:
-            return None
-        rr_target = 1.55 if str(session_name or '').upper().strip() == 'ASIA' else 1.65
-        tp = entry + rr_target * risk
-        conf = int(clamp(76.0 + min(6.0, streak_days * 1.5) + min(6.0, max(0.0, ch24 - 10.0) * 0.08) + (2.0 if fut_vol >= 50_000_000.0 else 0.0), 76.0, 91.0))
-        s = Setup(
-            setup_id=make_setup_id(base_u, 'BUY'),
-            symbol=base_u,
-            market_symbol=str(getattr(mv, 'symbol', '') or base_u).upper(),
-            side='BUY',
-            conf=int(conf),
-            entry=float(entry),
-            sl=float(sl),
-            tp=float(tp),
-            alt_target_a=0.0,
-            alt_target_b=0.0,
-            fut_vol_usd=float(fut_vol),
-            ch24=float(ch24),
-            ch4=float(ch4),
-            ch1=float(ch1),
-            ch15=float(ch15),
-            ema_support_period=int(ema_period or 0),
-            ema_support_dist_pct=float(ema_dist_pct),
-            pullback_ema_period=int(ema_period or 0),
-            pullback_ema_dist_pct=float(ema_dist_pct),
-            pullback_ready=bool(ema_dist_pct <= 0.90 or float(ch15 or 0.0) >= 0.05),
-            pullback_bypass_hot=bool(fut_vol >= 50_000_000.0),
-            leader_base_override=True,
-            engine='F9',
-            is_trailing_alt_target_b=False,
-            created_ts=time.time(),
-            family_id=F9_PERSISTENT_LEADER_FAMILY_ID,
-            family_name=F9_PERSISTENT_LEADER_FAMILY_NAME,
-            regime_primary='TREND_UP',
-            regime_secondary='PERSISTENT_LEADER',
-            regime_confidence=min(0.92, 0.64 + streak_days * 0.04),
-            validation_state='research_watch',
-        )
-        try:
-            setattr(s, 'atr_pct', float((float(atr_1h) / float(entry) * 100.0) if entry > 0 else 0.0))
-            setattr(s, 'regime', 'TREND_UP')
-            setattr(s, 'trend', 'BULLISH')
-            setattr(s, 'structure', 'PERSISTENT_LEADER_CONTINUATION')
-            setattr(s, 'f9_persistent_leader', True)
-            setattr(s, 'f9_streak_days', int(streak_days))
-            setattr(s, 'entry_reason', f'F9 persistent leader continuation: {streak_days} consecutive leader days')
-            setattr(s, 'generated_reason', f'F9 persistent leader continuation: {streak_days} consecutive leader days')
-            score, comps = compute_setup_quality_score(s, session_name=session_name)
-            setattr(s, 'quality_score', float(clamp(float(score or 0.0) + 2.0, 0.0, 100.0)))
-            setattr(s, 'quality_components', comps or {})
-        except Exception:
-            pass
-        return _research_finalize_setup(s, session_name=session_name)
-    except Exception:
-        return None
-
-
-def pick_f9_persistent_leader_setups(best_fut: Dict[str, MarketVol], leaders: list[str], n: int, session_name: str, scan_profile: str = DEFAULT_SCAN_PROFILE) -> List[Setup]:
-    out: List[Setup] = []
-    try:
-        if not bool(globals().get('F9_PERSISTENT_LEADER_ENABLED', True)):
-            return []
-        ranked = []
-        for base in list(leaders or [])[:10]:
-            try:
-                b = str(base or '').upper().strip()
-                mv = (best_fut or {}).get(b)
-                if not b or not mv:
-                    continue
-                streak = _f9_consecutive_days(b, 'LEADER')
-                if streak < int(globals().get('F9_PERSISTENT_LEADER_MIN_STREAK_DAYS', 2) or 2):
-                    try:
-                        _rej('f9_waiting_for_2day_leader_streak', b, mv, f'streak={streak}')
-                    except Exception:
-                        pass
-                    continue
-                ranked.append((int(streak), float(getattr(mv, 'percentage', 0.0) or 0.0), float(usd_notional(mv) or 0.0), b, mv))
-            except Exception:
-                continue
-        ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-        for streak, _ch24, _vol, base, mv in ranked[:max(1, int(n or 1) * 2)]:
-            setup = make_f9_persistent_leader_setup(base, mv, session_name=session_name, streak_days=streak)
-            if setup:
-                out.append(setup)
-                try:
-                    _rej('ok_f9_persistent_leader', base, mv, f'streak={streak}')
-                except Exception:
-                    pass
-            if len(out) >= int(max(0, n)):
-                break
-    except Exception:
-        pass
-    return out[:int(max(0, n))]
-
 def _email_market_regime(best_fut: dict) -> str:
     try:
         best = dict(best_fut or {})
@@ -41757,7 +41368,7 @@ def build_help_html(title: str, sections: list) -> str:
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
-FAST_PATH_COMMANDS = {"start", "screen", "help", "commands", "help_admin", "size", "health", "status", "equity", "trade_close", "why"}
+FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size", "health", "status", "equity", "trade_close", "why"}
 
 
 def _command_args_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[str]:
@@ -41984,20 +41595,20 @@ async def _instant_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     task = _safe_create_task(to_thread_fast(_instant_status_text_sync, uid), 'instant_status')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=max(1.0, float(os.getenv('INSTANT_STATUS_TIMEOUT_SEC', '1.2') or 1.2)))
-        await _fast_send_text(update, context, txt, parse_mode=None)
+        await send_long_message(update, txt, parse_mode=None)
     except asyncio.TimeoutError:
         cached = _instant_cache_get(_INSTANT_STATUS_TEXT_CACHE, uid, max_age_sec=900)
         if cached:
-            await _fast_send_text(update, context, cached + "\n\n⏳ Fresh status is still refreshing in the background.", parse_mode=None)
+            await send_long_message(update, cached + "\n\n⏳ Fresh status is still refreshing in the background.", parse_mode=None)
         else:
-            await _fast_send_text(update, context, "⏳ Status is refreshing in the background. I’ll send it as soon as it is ready.")
+            await update.message.reply_text("⏳ Status is refreshing in the background. I’ll send it as soon as it is ready.")
             _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), 'reply_later')
     except Exception:
         cached = _instant_cache_get(_INSTANT_STATUS_TEXT_CACHE, uid, max_age_sec=900)
         if cached:
-            await _fast_send_text(update, context, cached, parse_mode=None)
+            await send_long_message(update, cached, parse_mode=None)
         else:
-            await _fast_send_text(update, context, "⚠️ Status snapshot is warming up. Try again in a few seconds.")
+            await update.message.reply_text("⚠️ Status snapshot is warming up. Try again in a few seconds.")
 
 
 async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -42010,14 +41621,14 @@ async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             user = get_user_cached_fast(uid, ttl=300) or {}
         txt = f"Manual Equity: ${float((user or {}).get('equity') or 0.0):.2f}"
         _instant_cache_set(_INSTANT_EQUITY_TEXT_CACHE, uid, txt)
-        await _fast_send_text(update, context, txt)
+        await update.message.reply_text(txt)
         return
     try:
         eq = float(args[0])
         if eq < 0:
             raise ValueError()
     except Exception:
-        await _fast_send_text(update, context, "Usage: /equity 1000")
+        await update.message.reply_text("Usage: /equity 1000")
         return
 
     async def _write_equity():
@@ -42031,9 +41642,9 @@ async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     task = _safe_create_task(_write_equity(), 'instant_equity_write')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
-        await _fast_send_text(update, context, txt)
+        await update.message.reply_text(txt)
     except asyncio.TimeoutError:
-        await _fast_send_text(update, context, "⏳ Equity update is queued. I’ll confirm as soon as it is saved.")
+        await update.message.reply_text("⏳ Equity update is queued. I’ll confirm as soon as it is saved.")
         _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), 'reply_later')
 
 
@@ -42043,118 +41654,12 @@ async def _instant_trade_close_cmd(update: Update, context: ContextTypes.DEFAULT
     task = _safe_create_task(to_thread_fast(_instant_trade_close_sync, uid, raw), 'instant_trade_close')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=max(1.0, float(os.getenv('INSTANT_TRADE_CLOSE_TIMEOUT_SEC', '1.5') or 1.5)))
-        await _fast_send_text(update, context, txt)
+        await update.message.reply_text(txt)
     except asyncio.TimeoutError:
-        await _fast_send_text(update, context, "⏳ Trade close is queued. I’ll confirm as soon as the journal write finishes.")
+        await update.message.reply_text("⏳ Trade close is queued. I’ll confirm as soon as the journal write finishes.")
         _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), 'reply_later')
     except Exception:
-        await _fast_send_text(update, context, "⚠️ Could not close the trade instantly. Please try again.")
-
-
-async def _instant_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Zero-DB /start ACK. yver54: no owner DB lookup, no channel check, no long send retry."""
-    await _fast_send_text(
-        update, context,
-        "✅ PulseFutures is live.\n\n"
-        "Fast checks:\n"
-        "/screen\n"
-        "/autotrade_debug\n"
-        "/email_decision\n"
-        "/setup_audit 2\n"
-    )
-
-
-async def _instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner/admin zero-DB /screen reply.
-
-    Returns latest in-memory/global cache or a cached ticker snapshot immediately and
-    queues the real executable refresh in the dedicated background lane. It avoids
-    get_user(), has_active_access(), SQLite, OHLCV, Bybit and email-sync work in the
-    Telegram update path so /screen feels instant after deployments.
-    """
-    try:
-        uid = int(getattr(getattr(update, 'effective_user', None), 'id', 0) or 0)
-    except Exception:
-        uid = 0
-    try:
-        live_session = current_session_utc()
-    except Exception:
-        live_session = 'UNKNOWN'
-    try:
-        scan_session = str(scan_session_name_utc() or '').upper()
-    except Exception:
-        scan_session = str(live_session or '').upper()
-    try:
-        tz = ZoneInfo(str(globals().get('TIMEZONE') or os.environ.get('TIMEZONE') or 'Australia/Melbourne'))
-        loc_label = 'Melbourne (Australia)'
-        loc_time = datetime.now(tz).strftime('%Y-%m-%d %H:%M')
-    except Exception:
-        loc_label, loc_time = 'Melbourne (Australia)', datetime.now().strftime('%Y-%m-%d %H:%M')
-
-    try:
-        _schedule_screen_cache_refresh(uid, scan_session)
-    except Exception:
-        pass
-
-    try:
-        cache_keys = [f"uid:{uid}::{scan_session}", f"global::{scan_session}"]
-        for _k, _v in list((_SCREEN_CACHE or {}).items()):
-            if str(_k).startswith((f"uid:{uid}::", "global::")) and (_v or {}).get('body'):
-                cache_keys.append(_k)
-        cache_entry, age = _screen_choose_best_cache(cache_keys)
-        if (cache_entry or {}).get('body'):
-            cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
-            note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
-            if age <= float(globals().get('SCREEN_CACHE_TTL_SEC', 60) or 60):
-                note = "_Showing latest cached scan._\n"
-            header = (
-                f"*PulseFutures — Market Scan*\n"
-                f"{HDR}\n"
-                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                f"{_screen_when_line('Cached scan built', cache_ts)}"
-                f"{note}"
-            )
-            keyboard = [
-                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
-                for (sym, sid) in ((cache_entry or {}).get('kb') or [])
-            ]
-            await _fast_send_text(
-                update, context,
-                _telegram_html_to_plain_for_fallback(_screen_markdown_to_html((header + "\n" + str((cache_entry or {}).get('body') or '')).strip())),
-                parse_mode=None,
-                disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-            )
-            return
-    except Exception:
-        pass
-
-    try:
-        quick_best = get_cached_futures_tickers() or {}
-        if quick_best:
-            body, kb, _ = _screen_quick_ticker_snapshot_body(quick_best, scan_session)
-            header = (
-                f"*PulseFutures — Market Scan*\n"
-                f"{HDR}\n"
-                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                f"{_screen_when_line('Ticker snapshot', time.time())}"
-                f"_Showing instant ticker snapshot while full executable scan warms up._\n"
-            )
-            await _fast_send_text(
-                update, context,
-                _telegram_html_to_plain_for_fallback(_screen_markdown_to_html((header + "\n" + body).strip())),
-                parse_mode=None,
-                disable_web_page_preview=True,
-            )
-            return
-    except Exception:
-        pass
-
-    try:
-        await _fast_send_text(update, context, "🔎 /screen received instantly. Cache is warming up and the executable refresh is queued.")
-    except Exception:
-        pass
-
+        await update.message.reply_text("⚠️ Could not close the trade instantly. Please try again.")
 
 async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ultra-light command lane so /help and /size never wait behind heavier middleware."""
@@ -42170,23 +41675,16 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
             return
 
         try:
-            _mark_user_activity()
-        except Exception:
-            pass
-        try:
             _parts = txt.split()
             context.args = _parts[1:] if len(_parts) > 1 else []
         except Exception:
             pass
 
-        # yver54: ACK-first fast lane. Do not call is_admin_user(), channel membership,
-        # SQLite, Bybit, or long Telegram retry logic before answering these commands.
-        if cmd == 'start':
-            await _instant_start_cmd(update, context)
-            raise ApplicationHandlerStop
-        if cmd == 'screen':
-            await _instant_screen_cmd(update, context)
-            raise ApplicationHandlerStop
+        if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
+            ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
+            if not ok:
+                await _reply_subscribe_required(update, context)
+                raise ApplicationHandlerStop
 
         if cmd == 'help':
             await send_long_message(update, HELP_TEXT, parse_mode=None, disable_web_page_preview=True)
@@ -42222,39 +41720,6 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
         raise
     except Exception:
         return
-
-async def _ultra_start_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        _mark_user_activity()
-    except Exception:
-        pass
-    await _instant_start_cmd(update, context)
-    raise ApplicationHandlerStop
-
-async def _ultra_screen_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        _mark_user_activity()
-    except Exception:
-        pass
-    await _instant_screen_cmd(update, context)
-    raise ApplicationHandlerStop
-
-async def _ultra_status_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        _mark_user_activity()
-    except Exception:
-        pass
-    await _instant_status_cmd(update, context)
-    raise ApplicationHandlerStop
-
-async def _ultra_equity_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        _mark_user_activity()
-    except Exception:
-        pass
-    await _instant_equity_cmd(update, context)
-    raise ApplicationHandlerStop
-
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Plain text help (no tables, no HTML builder)
@@ -45413,8 +44878,6 @@ def _setup_engine_to_family_id(engine: str, row: dict | None = None) -> str:
             return 'F7_EXHAUSTION_FAILURE'
         if eng in {'F8', 'ENGINE_F8', 'BIGMOVE', 'BIG_MOVE', 'BIGMOVE_CONT', 'F8_BIGMOVE_CONT'} or 'BIGMOVE' in eng or 'BIG_MOVE' in eng:
             return 'F8_BIGMOVE_CONT'
-        if eng in {'F9', 'ENGINE_F9', 'PERSISTENT_LEADER', 'PERSISTENT_LEADER_CONT', 'F9_PERSISTENT_LEADER_CONT'}:
-            return 'F9_PERSISTENT_LEADER_CONT'
         try:
             return _family_id_from_engine(eng, None)
         except Exception:
@@ -45450,8 +44913,6 @@ def _setup_audit_family_from_row(row: dict) -> str:
                     return 'F7_EXHAUSTION_FAILURE'
                 if fam == 'F8':
                     return 'F8_BIGMOVE_CONT'
-                if fam == 'F9':
-                    return 'F9_PERSISTENT_LEADER_CONT'
                 return fam
 
         # 2) details_json from executable/admin lifecycle. This is where modern setups
@@ -45482,7 +44943,7 @@ def _setup_audit_family_from_row(row: dict) -> str:
 
         # 4) Setup-id/name fallback for rare family-coded rows.
         text = ' '.join(str(rr.get(k) or '') for k in ('setup_id', 'note', 'open_reason', 'close_reason')).upper()
-        m = re.search(r'\b(F[1-9])\b', text)
+        m = re.search(r'\b(F[1-8])\b', text)
         if m:
             code = m.group(1)
             return {
@@ -45494,7 +44955,6 @@ def _setup_audit_family_from_row(row: dict) -> str:
                 'F6': 'F6_VWAP_RECLAIM',
                 'F7': 'F7_EXHAUSTION_FAILURE',
                 'F8': 'F8_BIGMOVE_CONT',
-                'F9': 'F9_PERSISTENT_LEADER_CONT',
             }.get(code, code)
         return 'F0_UNKNOWN'
     except Exception:
@@ -51668,14 +51128,12 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v52b:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v21:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
-        fresh_ttl=60,
-        # yver52b: detailed setup_audit cache older than 90s can be misleading
-        # because new rows arrive constantly; show an ack instead of stale tables.
-        stale_ttl=90,
+        fresh_ttl=45,
+        stale_ttl=6 * 3600,
         background_timeout=600,
     )
 
@@ -56715,10 +56173,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     directional_table_n = 10
     leaders = [str(t[0]).upper() for t in (up_list or [])[:directional_table_n]]
     losers  = [str(t[0]).upper() for t in (dn_list or [])[:directional_table_n]]
-    try:
-        _f9_record_directional_memberships(list((up_list or [])[:directional_table_n]), list((dn_list or [])[:directional_table_n]), best_fut)
-    except Exception:
-        pass
 
     # Market Leaders (Top by Futures Volume)
     market_bases = _market_leader_bases(best_fut, market_take)
@@ -56968,22 +56422,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         bm_setups = []
     if bm_setups:
         priority_setups.extend(bm_setups)
-
-    # ------------------------------------------------
-    # F9 Persistent Leader Continuation family (research WATCH/audit first)
-    # ------------------------------------------------
-    try:
-        f9_setups = pick_f9_persistent_leader_setups(
-            best_fut,
-            leaders,
-            int(max(1, min(F9_PERSISTENT_LEADER_MAX_PER_SCAN, n_target))),
-            session_name,
-            scan_profile=prof,
-        )
-    except Exception:
-        f9_setups = []
-    if f9_setups:
-        priority_setups.extend(f9_setups)
 
 
     # -----------------------------------------------------
@@ -60158,12 +59596,9 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = min(25, int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "25") or 25))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
-# yver52b: cap this job's effective runtime even if Render env has an older high value.
-# A 280s alert_job caused APScheduler overlap warnings and delayed Telegram command replies.
-_ALERT_JOB_MAX_RUNTIME_ENV_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
-ALERT_JOB_MAX_RUNTIME_SEC = min(max(35, _ALERT_JOB_MAX_RUNTIME_ENV_SEC), int(os.environ.get("ALERT_JOB_EFFECTIVE_MAX_RUNTIME_CAP_SEC", "55") or 55))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
@@ -60959,10 +60394,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Ver110: Big-Move is important, but it must not consume the entire
             # alert_job runtime and starve the normal session setup/email/autotrade pool.
             if _bigmove_session_reserve_hit():
-                logger.info("alert_job bigmove queue reserved session budget after %.1fs", time.time() - job_started_ts)
+                logger.warning("alert_job bigmove queue reserved session budget after %.1fs", time.time() - job_started_ts)
                 break
             if _job_budget_exhausted():
-                logger.info("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
+                logger.warning("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
                 break
             try:
                 uid = int(u.get("user_id") or u.get("id") or 0)
@@ -60997,7 +60432,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # even when no user is currently inside those sessions.
         # -----------------------------------------------------
         if _job_budget_exhausted():
-            logger.info("alert_job runtime budget exhausted before session pools after %.1fs", time.time() - job_started_ts)
+            logger.warning("alert_job runtime budget exhausted before session pools after %.1fs", time.time() - job_started_ts)
             return
 
         notify_runtime = []
@@ -61204,7 +60639,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             notify_runtime = notify_runtime[:_notify_max]
         for meta in notify_runtime:
             if _job_budget_exhausted():
-                logger.info("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
+                logger.warning("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
                 return
             user = dict(meta.get("user") or {})
             uid = int(meta.get("uid") or 0)
@@ -63857,11 +63292,6 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
     produced without waiting for the admin/user to press /screen.
     """
     job_started_ts = float(time.time())
-    try:
-        if _recent_user_activity(25):
-            return
-    except Exception:
-        pass
 
     def _budget_left() -> float:
         try:
@@ -64026,18 +63456,12 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
-        # yver54: if an interactive command just arrived, do not compete with it.
-        # The next scheduled tick will continue setup/email work; this prevents
-        # /start, /screen, /status and /equity from waiting behind background scans.
-        if _recent_user_activity(20):
-            _hb_touch('email', ok=True, details='defer_recent_user_activity')
-            return
         # yver47: hard guard the wrapper as well as the internal budget.
         # On Render, a cold scan/email tick can otherwise still be running when
         # APScheduler fires the next interval, producing noisy
         # "maximum number of running instances reached" warnings and delaying
         # the next email/setup loop.
-        timeout_sec = max(20.0, min(60.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 55) + 8.0))
+        timeout_sec = max(45.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 25.0)
         await asyncio.wait_for(_alert_job_async_internal(context), timeout=timeout_sec)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
@@ -64120,15 +63544,15 @@ def main():
         .connection_pool_size(int(os.getenv('TELEGRAM_CONNECTION_POOL_SIZE', '256') or 256))
         .pool_timeout(float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0))
         .connect_timeout(float(os.getenv('TELEGRAM_CONNECT_TIMEOUT_SEC', '3.0') or 3.0))
-        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '12.0') or 12.0))
-        .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '4.0') or 4.0))
+        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '30.0') or 30.0))
+        .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '10.0') or 10.0))
     )
     # PTB >=20.6 deprecates passing getUpdates timeouts to run_polling().
     # Configure them on ApplicationBuilder to remove the warning and keep polling stable.
     for _method, _value in (
         ('get_updates_connect_timeout', float(os.getenv('TELEGRAM_POLL_CONNECT_TIMEOUT_SEC', '10') or 10)),
-        ('get_updates_read_timeout', float(os.getenv('TELEGRAM_POLL_READ_TIMEOUT_SEC', '20') or 20)),
-        ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '8') or 8)),
+        ('get_updates_read_timeout', float(os.getenv('TELEGRAM_POLL_READ_TIMEOUT_SEC', '35') or 35)),
+        ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '20') or 20)),
         ('get_updates_pool_timeout', float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0)),
     ):
         try:
@@ -64137,16 +63561,8 @@ def main():
             pass
     app = builder.build()
 
-    # yver54: absolute first-touch activity marker and instant stop-handlers.
-    # These run before billing/channel/global guards and before any heavy command handler.
-    app.add_handler(MessageHandler(filters.ALL, _activity_marker, block=False), group=-1000)
-    app.add_handler(CommandHandler("start", _ultra_start_stop_cmd, block=True), group=-100)
-    app.add_handler(CommandHandler("screen", _ultra_screen_stop_cmd, block=True), group=-100)
-    app.add_handler(CommandHandler("status", _ultra_status_stop_cmd, block=True), group=-100)
-    app.add_handler(CommandHandler("equity", _ultra_equity_stop_cmd, block=True), group=-100)
-
     # Fast-lane for ultra-light commands that must feel instant (/help, /size, etc.)
-    app.add_handler(MessageHandler(filters.COMMAND, _fast_path_command_router, block=True), group=-2)
+    app.add_handler(MessageHandler(filters.COMMAND, _fast_path_command_router), group=-2)
 
     # Global access + Pro gating (runs before any other command handler)
     app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=-1)
@@ -64503,10 +63919,7 @@ def main():
             first=90,
             name="autotrade_exit_guardian_job",
             job_kwargs={
-                # yver52b: guardian owns AUTOTRADE_GUARDIAN_LOCK; allow a second
-                # scheduler instance to fast-return on the lock instead of APScheduler
-                # logging max_instances warnings on Render.
-                "max_instances": 2,
+                "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 120,
             },
