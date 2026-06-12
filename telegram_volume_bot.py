@@ -1,3 +1,4 @@
+# Ver94: BigMove/F8 setup conversion no longer depends on the heavy routed setup builder. If the normal builder times out, a lightweight F8 continuation setup is created in the background, then still passes the same presend KEEP/context/executable gates before setup email, /screen, DB, and AutoTrade. No Telegram command-lane, risk, TP/SL, or policy loosening.
 # Ver93: /screen safe renderer always includes market context (Pulse + Leaders + Losers) and avoids returning positions-only or cache-warming output when ticker data can be fetched in the deferred worker. No strategy/risk/policy/F8/TP/SL/trading changes.
 # Ver92: fixes autonomous setup starvation after command-firewall/no-lag mode. User command activity no longer switches the core setup/email/AutoTrade pipeline to light-only, and screen cache warmup no longer defers just because commands were pressed. Telegram commands remain instant; no strategy/risk/policy/F8/TP/SL/trading changes.
 # Ver91: command-firewall screen override so /screen cannot fall back to the old heavy/ticker-only handler; it uses the safe cache/DB/live-position snapshot handler in the background. No strategy/risk/policy/trading changes.
@@ -21093,6 +21094,117 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
         return None
 
 
+
+def _bigmove_candidate_to_autotrade_setup_fast(candidate: dict, best_fut: dict | None = None, session_name: str = '') -> Optional[Setup]:
+    """Timeout-safe BigMove/F8 setup builder.
+
+    The normal BigMove builder can call the strategy router/research finalizer, which is
+    useful but not allowed to make the F8 setup-email leg disappear under load. This fast
+    builder creates the same continuation setup from the confirmed BigMove alert and then
+    lets the existing presend KEEP/context/executable gates decide delivery/trading.
+    """
+    try:
+        c = dict(candidate or {})
+        sym = str(c.get('symbol') or '').upper().strip()
+        if not sym:
+            return None
+        plan = _bigmove_autotrade_price_plan(c, best_fut)
+        if not bool((plan or {}).get('ok')):
+            return None
+        mv = _bigmove_candidate_marketvol(c, best_fut)
+        fut_vol = float(c.get('vol') or (usd_notional(mv) if mv is not None else 0.0) or 0.0)
+        ch15 = float(c.get('confirm_15m_pct', c.get('ch15', 0.0)) or 0.0)
+        ch1 = float(c.get('ch1', 0.0) or 0.0)
+        ch4 = float(c.get('ch4', 0.0) or 0.0)
+        ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0) if mv is not None else 0.0
+        direction = str(c.get('direction') or '').upper().strip()
+        side = str((plan or {}).get('side') or '').upper().strip()
+        if side not in {'BUY', 'SELL'}:
+            side = 'BUY' if direction == 'UP' else 'SELL'
+        conf = _bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, fut_vol, 0.0)
+        conf = int(clamp(max(float(conf), 82.0), 68.0, 96.0))
+        setup_id = f"BMAT-{sym}-{side}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        sess_u = str(session_name or '').upper().strip()
+        market_symbol = _bigmove_candidate_market_symbol(c, best_fut)
+        now_ts = float(time.time())
+        s = Setup(
+            setup_id=setup_id,
+            symbol=sym,
+            market_symbol=market_symbol,
+            side=side,
+            conf=int(conf),
+            entry=float((plan or {}).get('entry') or 0.0),
+            sl=float((plan or {}).get('sl') or 0.0),
+            tp=float((plan or {}).get('tp') or 0.0),
+            alt_target_a=0.0,
+            alt_target_b=0.0,
+            fut_vol_usd=float(fut_vol),
+            ch24=float(ch24),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
+            ema_support_period=0,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=0,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=True,
+            leader_base_override=True,
+            engine='F8',
+            is_trailing_alt_target_b=False,
+            created_ts=now_ts,
+            family_id=BIGMOVE_FAMILY_ID,
+            family_name=BIGMOVE_FAMILY_NAME,
+            session=sess_u,
+        )
+        try:
+            _setup_strategy_set_attr(s, 'setup_strategy', 'NORMAL')
+            _setup_strategy_set_attr(s, 'strategy', 'NORMAL')
+            _setup_strategy_set_attr(s, 'strategy_mode', 'NORMAL')
+            _setup_strategy_set_attr(s, 'strategy_reason', 'bigmove_fast_builder_timeout_safe_continuation')
+        except Exception:
+            pass
+        try:
+            setattr(s, 'atr_pct', float((plan or {}).get('atr_pct') or 0.0))
+            setattr(s, 'quality_score', 0.0)
+            setattr(s, 'source_kind', 'emailed_setups')
+            setattr(s, 'source_session', sess_u)
+            setattr(s, 'delivery_lane_locked', True)
+            setattr(s, 'email_logged_ts', now_ts)
+            setattr(s, 'emailed_ts', now_ts)
+            setattr(s, 'bigmove_signal', True)
+            setattr(s, 'bigmove_alert_autotrade', True)
+            setattr(s, 'bigmove_direction', direction)
+            setattr(s, 'bigmove_sl_model', str((plan or {}).get('sl_model') or ''))
+            setattr(s, 'bigmove_sl_pct', float((plan or {}).get('sl_pct') or 0.0))
+            setattr(s, 'bigmove_tp_pct', float((plan or {}).get('tp_pct') or 0.0))
+            setattr(s, 'bigmove_rr', float((plan or {}).get('rr') or BIGMOVE_AUTOTRADE_RR))
+            setattr(s, 'risk_source', 'autotrade_config')
+            setattr(s, 'bigmove_routed_side', side)
+            setattr(s, 'bigmove_routed_strategy', 'NORMAL')
+            setattr(s, 'why', f"Confirmed Big-Move alert {direction} | Fast F8 continuation {side} | SL {float((plan or {}).get('sl_pct') or 0.0):.2f}% ({(plan or {}).get('sl_model')}) | TP {float((plan or {}).get('tp_pct') or 0.0):.2f}% (~{float((plan or {}).get('rr') or BIGMOVE_AUTOTRADE_RR):.2f}R)")
+        except Exception:
+            pass
+        return s
+    except Exception:
+        return None
+
+
+def _bigmove_candidates_to_autotrade_setups_fast(candidates: list, best_fut: dict | None = None, session_name: str = '') -> list:
+    out = []
+    try:
+        max_n = max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 1))
+    except Exception:
+        max_n = 8
+    for c in list(candidates or [])[:max_n]:
+        try:
+            s = _bigmove_candidate_to_autotrade_setup_fast(c, best_fut, session_name=session_name)
+            if s is not None:
+                out.append(s)
+        except Exception:
+            continue
+    return out
+
 def _bigmove_candidates_to_autotrade_setups(candidates: list, best_fut: dict | None = None, session_name: str = '') -> list:
     out = []
     try:
@@ -21170,7 +21282,15 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             }
             return
 
-        setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(fresh_candidates or []), best_fut or {}, sess, timeout=8)
+        try:
+            setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(fresh_candidates or []), best_fut or {}, sess, timeout=8)
+        except Exception:
+            setup_list = []
+        if not setup_list:
+            try:
+                setup_list = _bigmove_candidates_to_autotrade_setups_fast(list(fresh_candidates or []), best_fut or {}, sess)
+            except Exception:
+                setup_list = []
         if not setup_list:
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
                 'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
@@ -61103,10 +61223,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 setups = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(filtered or []), best_fut_snapshot or {}, sess_u, timeout=8)
             except Exception as exc:
                 try:
-                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_build', status='error', session=sess_u, mode='bigmove', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_build', status='fallback_fast_builder', session=sess_u, mode='bigmove', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
                 except Exception:
                     pass
-                setups = []
+                try:
+                    setups = _bigmove_candidates_to_autotrade_setups_fast(list(filtered or []), best_fut_snapshot or {}, sess_u)
+                except Exception:
+                    setups = []
             if not setups:
                 try:
                     db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_build', status='empty', session=sess_u, mode='bigmove', details={'candidates': len(filtered or []), 'tag': str(tag or '')})
@@ -61202,14 +61325,19 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as exc:
                 try:
-                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', status='error', session=sess_u, mode='bigmove_setup_email', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', status='fallback_fast_builder', session=sess_u, mode='bigmove_setup_email', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
                 except Exception:
                     pass
                 try:
-                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f'f8_setup_build_error:{type(exc).__name__}: {str(exc)[:120]}')
+                    setups = _bigmove_candidates_to_autotrade_setups_fast(list(filtered or []), best_fut_snapshot or {}, sess_u)
+                except Exception:
+                    setups = []
+                try:
+                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f'f8_setup_build_fallback_after:{type(exc).__name__}')
                 except Exception:
                     pass
-                return [], False
+                if not setups:
+                    return [], False
 
             if not setups:
                 try:
