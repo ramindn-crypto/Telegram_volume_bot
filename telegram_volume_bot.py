@@ -1,4 +1,4 @@
-# yver51: scheduler-overlap warning fix on top of yver50. alert_job and autonomous_screen_sync_job now allow one extra fast lock-check instance (max_instances=2), so a slow real tick does not produce Render/APScheduler skipped-run warnings; locks still prevent overlapping real work. BigMove raw-alert email toggle remains separated from F8 setup generation/email/AutoTrade.
+# yver52: adds F9 Persistent Leaders research family on top of yver51. F9 records leader/loser daily membership, generates WATCH/audit-only persistent-leader continuation BUY setups after a 2-day leader streak, and cannot promote to KEEP until enough decided evidence is collected; existing F1-F8 setup/email/AutoTrade flow is unchanged.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
@@ -3491,6 +3491,15 @@ def _setup_matrix_policy_source_state_for_lane(family: str, session: str, strate
         has_current_score = _setup_combo_has_current_score(score)
         force_keep = _setup_combo_force_keep_by_wr(dec_v, wr_v)
         wr_blocks_keep = _setup_combo_current_wr_blocks_keep(dec_v, wr_v)
+        # yver52: F9 is a new research-only family.  It may collect WATCH/audit
+        # rows immediately, but it cannot become KEEP/AutoTrade just because one
+        # early result wins.  Require a real evidence sample before promotion.
+        if fam == 'F9':
+            f9_min_dec = int(globals().get('F9_MIN_DECIDED_BEFORE_KEEP', 30) or 30)
+            f9_min_wr = float(globals().get('F9_MIN_WR_BEFORE_KEEP', 50.0) or 50.0)
+            f9_min_avg_r = float(globals().get('F9_MIN_AVG_R_BEFORE_KEEP', 0.15) or 0.15)
+            force_keep = bool(int(dec_v or 0) >= f9_min_dec and float(wr_v or 0.0) >= f9_min_wr and float(avg_v or 0.0) >= f9_min_avg_r)
+            wr_blocks_keep = bool(int(dec_v or 0) > 0 and not force_keep)
         # yver27 fix: the current displayed WR is authoritative even when it comes
         # from setup_combo_policy.last_* instead of a directly matched score row.
         # If WR is <=49, stale stored KEEP must be demoted everywhere.
@@ -3635,7 +3644,7 @@ def _setup_matrix_policy_current_lane_sets(user_id: int = 0) -> dict:
                 families.add(ff)
     except Exception:
         pass
-    for f in [f'F{i}' for i in range(1, 9)]:
+    for f in [f'F{i}' for i in range(1, 10)]:
         families.add(f)
     try:
         for s in _strategy_cfg_execution_sessions_allowed(cfg):
@@ -4537,7 +4546,7 @@ def _setup_combo_full_universe(families=None, sessions=None) -> list[tuple[str, 
         fams = [str(f or '').upper().strip() for f in (families or []) if str(f or '').strip()]
         sesses = [str(s or '').upper().strip() for s in (sessions or []) if str(s or '').strip()]
         if not fams:
-            fams = [f'F{i}' for i in range(1, 9)]
+            fams = [f'F{i}' for i in range(1, 10)]
         if not sesses:
             sesses = ['ASIA', 'LON', 'NY']
         fams = sorted(set(fams), key=lambda x: (int(x[1:]) if re.fullmatch(r'F\d+', x) else 99, x))
@@ -6745,7 +6754,7 @@ def _strategy_cfg_execution_sessions_allowed(cfg: dict | None) -> set[str]:
 
 def _strategy_cfg_execution_engines_allowed(cfg: dict | None) -> set[str]:
     try:
-        default_all = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
+        default_all = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
         raw = (cfg or {}).get('execution_engines_allowed', default_all) or default_all
         out = {str(x).upper().strip().replace('-', '_') for x in raw if str(x).strip()}
         aliases = {
@@ -6757,12 +6766,15 @@ def _strategy_cfg_execution_engines_allowed(cfg: dict | None) -> set[str]:
             'VWAP': 'F6', 'VWAP_RECLAIM': 'F6', 'F6_VWAP_RECLAIM': 'F6',
             'EXHAUSTION': 'F7', 'EXHAUSTION_FAILURE': 'F7', 'F7_EXHAUSTION_FAILURE': 'F7',
             'BIGMOVE': 'F8', 'BIG_MOVE': 'F8', 'BIGMOVE_CONT': 'F8', 'F8_BIGMOVE_CONT': 'F8',
+            'PERSISTENT_LEADER': 'F9', 'PERSISTENT_LEADER_CONT': 'F9', 'F9_PERSISTENT_LEADER_CONT': 'F9',
         }
         norm = {aliases.get(x, x) for x in out}
-        cleaned = {x for x in norm if x in {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}}
-        return cleaned or {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}
+        cleaned = {x for x in norm if x in {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9'}}
+        if bool(globals().get('F9_PERSISTENT_LEADER_ENABLED', True)):
+            cleaned.add('F9')
+        return cleaned or {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9'}
     except Exception:
-        return {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}
+        return {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9'}
 
 def _strategy_cfg_preferred_trade_window(cfg: dict | None) -> tuple[str, str]:
     try:
@@ -7060,8 +7072,8 @@ def _strategy_config_apply_ver08_quality_patch() -> None:
         # Ver14: discovery mode. Keep all eight setup families active so we can
         # collect enough real samples before prioritising winners. F1/F2/F3 are
         # represented by engines A/B/C; F4-F7 are research-family overlays; F8 is BigMove.
-        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
-        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8']
+        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
+        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
         cfg['execution_asia_enabled'] = True
         cfg['execution_asia_user_override'] = False
         cfg['execution_engine_b_email_enabled'] = True
@@ -15819,6 +15831,14 @@ def _research_family_registry_defaults() -> list[dict]:
             "eligible_regimes_json": json.dumps(["EXPANSION", "TREND_UP", "TREND_DOWN", "UNSTABLE_HIGH_VOL"]),
             "thesis": "Multi-timeframe big-move continuation using 15m/1H/4H aligned expansion with high liquidity.",
         },
+        {
+            "family_id": "F9_PERSISTENT_LEADER_CONT",
+            "family_name": "Persistent Leader Continuation",
+            "status": "active",
+            "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["TREND_UP", "EXPANSION", "UNSTABLE_HIGH_VOL"]),
+            "thesis": "Research-only persistent leaders: symbols repeatedly in the Leaders table for consecutive Melbourne days, then continuation BUY after a controlled pullback/reclaim.",
+        },
     ]
 
 
@@ -15832,6 +15852,8 @@ def _family_id_from_engine(engine: str, setup: Any | None = None) -> str:
         return 'F3_IMPULSE_BASE_CONT'
     if eng in {'F8', 'BIGMOVE', 'BIG_MOVE', 'F8_BIGMOVE_CONT'}:
         return 'F8_BIGMOVE_CONT'
+    if eng in {'F9', 'PERSISTENT_LEADER', 'PERSISTENT_LEADER_CONT', 'F9_PERSISTENT_LEADER_CONT'}:
+        return 'F9_PERSISTENT_LEADER_CONT'
     try:
         rid = str(getattr(setup, 'family_id', '') or '').strip()
         if rid:
@@ -15852,6 +15874,7 @@ def _family_name_from_id(family_id: str) -> str:
         'F6_VWAP_RECLAIM': 'VWAP Reclaim',
         'F7_EXHAUSTION_FAILURE': 'Exhaustion Failure Reversal',
         'F8_BIGMOVE_CONT': BIGMOVE_FAMILY_NAME,
+        'F9_PERSISTENT_LEADER_CONT': 'Persistent Leader Continuation',
     }
     return mapping.get(fam, fam or 'Unknown Family')
 
@@ -16184,8 +16207,8 @@ def _ver14_all_family_profile_bootstrap() -> None:
         cfg['ver14_all_family_discovery_applied'] = True
         cfg['ver14_all_family_discovery_ts'] = float(time.time())
         cfg['execution_sessions_allowed'] = ['ASIA', 'LON', 'NY']
-        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
-        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8']
+        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
+        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
         cfg['execution_asia_enabled'] = True
         cfg['execution_engine_b_email_enabled'] = True
         cfg['family_allocator_shadow_mode'] = True
@@ -37890,6 +37913,19 @@ def is_executable_setup_eligible(
                 if fut_vol < float(max(MIN_FUT_VOL_USD * 0.60, 8_000_000.0)):
                     return (False, "asia_below_liquidity")
 
+        if engine == 'F9' or fam == globals().get('F9_PERSISTENT_LEADER_FAMILY_ID', 'F9_PERSISTENT_LEADER_CONT'):
+            if side != 'BUY':
+                return (False, 'f9_research_buy_only')
+            if fut_vol < float(globals().get('F9_PERSISTENT_LEADER_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0):
+                return (False, 'f9_below_liquidity')
+            if conf < 76:
+                return (False, 'f9_below_conf')
+            if rr_final < 1.20:
+                return (False, 'f9_below_rr')
+            if ch24 < float(globals().get('MOVER_UP_24H_MIN', 10.0) or 10.0) or ch4 < 0.15:
+                return (False, 'f9_not_persistent_leader_context')
+            return (True, 'ok')
+
         if engine == "A":
             if fam == 'F4_SWEEP_RECLAIM' and regime in {'BALANCE', 'EXHAUSTION'}:
                 if sess == 'ASIA' and ch24_abs < 5.0:
@@ -39796,6 +39832,257 @@ def pick_bigmove_family_setups(best_fut: Dict[str, MarketVol], n: int, session_n
     except Exception:
         return out[:int(max(0, n))]
 
+
+F9_PERSISTENT_LEADER_FAMILY_ID = 'F9_PERSISTENT_LEADER_CONT'
+F9_PERSISTENT_LEADER_FAMILY_NAME = 'Persistent Leader Continuation'
+F9_PERSISTENT_LEADER_ENABLED = env_bool('F9_PERSISTENT_LEADER_ENABLED', True)
+F9_PERSISTENT_LEADER_MIN_STREAK_DAYS = int(os.environ.get('F9_PERSISTENT_LEADER_MIN_STREAK_DAYS', '2') or 2)
+F9_PERSISTENT_LEADER_MIN_VOL_USD = float(os.environ.get('F9_PERSISTENT_LEADER_MIN_VOL_USD', '10000000') or 10000000)
+F9_PERSISTENT_LEADER_MAX_PER_SCAN = int(os.environ.get('F9_PERSISTENT_LEADER_MAX_PER_SCAN', '4') or 4)
+F9_MIN_DECIDED_BEFORE_KEEP = int(os.environ.get('F9_MIN_DECIDED_BEFORE_KEEP', '30') or 30)
+F9_MIN_WR_BEFORE_KEEP = float(os.environ.get('F9_MIN_WR_BEFORE_KEEP', '50') or 50)
+F9_MIN_AVG_R_BEFORE_KEEP = float(os.environ.get('F9_MIN_AVG_R_BEFORE_KEEP', '0.15') or 0.15)
+
+
+def _f9_mel_day(ts: float | None = None) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d')
+    except Exception:
+        return datetime.now(MEL_TZ).strftime('%Y-%m-%d')
+
+
+def _f9_persistent_mover_migrate() -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute('''CREATE TABLE IF NOT EXISTS f9_persistent_movers (
+                day TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                first_seen_ts REAL NOT NULL DEFAULT 0,
+                last_seen_ts REAL NOT NULL DEFAULT 0,
+                rank INTEGER NOT NULL DEFAULT 0,
+                ch24 REAL NOT NULL DEFAULT 0,
+                ch4 REAL NOT NULL DEFAULT 0,
+                vol_usd REAL NOT NULL DEFAULT 0,
+                price REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(day, symbol, bucket)
+            )''')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_f9_persistent_movers_symbol_bucket_day ON f9_persistent_movers(symbol, bucket, day)')
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _f9_record_directional_memberships(up_list: list, dn_list: list, best_fut: dict | None = None) -> None:
+    """Record daily Leaders/Losers membership for F9 research.
+
+    This does not create trades. It only builds consecutive-day evidence.
+    """
+    if not bool(globals().get('F9_PERSISTENT_LEADER_ENABLED', True)):
+        return
+    try:
+        _f9_persistent_mover_migrate()
+        day = _f9_mel_day()
+        now_ts = float(time.time())
+        rows = []
+        for bucket, items in (('LEADER', up_list or []), ('LOSER', dn_list or [])):
+            for idx, item in enumerate(list(items or [])[:10], start=1):
+                try:
+                    base = str(item[0] if isinstance(item, (list, tuple)) and item else item or '').upper().strip()
+                    if not base:
+                        continue
+                    mv = (best_fut or {}).get(base)
+                    vol = float(item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else (usd_notional(mv) if mv else 0.0) or 0.0)
+                    ch24 = float(item[2] if isinstance(item, (list, tuple)) and len(item) > 2 else (getattr(mv, 'percentage', 0.0) if mv else 0.0) or 0.0)
+                    ch4 = float(item[3] if isinstance(item, (list, tuple)) and len(item) > 3 else 0.0)
+                    px = float(item[4] if isinstance(item, (list, tuple)) and len(item) > 4 else (getattr(mv, 'last', 0.0) if mv else 0.0) or 0.0)
+                    rows.append((day, base, bucket, now_ts, now_ts, int(idx), float(ch24), float(ch4), float(vol), float(px)))
+                except Exception:
+                    continue
+        if not rows:
+            return
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.executemany('''INSERT INTO f9_persistent_movers(day, symbol, bucket, first_seen_ts, last_seen_ts, rank, ch24, ch4, vol_usd, price)
+                               VALUES(?,?,?,?,?,?,?,?,?,?)
+                               ON CONFLICT(day, symbol, bucket) DO UPDATE SET
+                                 last_seen_ts=excluded.last_seen_ts,
+                                 rank=MIN(f9_persistent_movers.rank, excluded.rank),
+                                 ch24=excluded.ch24,
+                                 ch4=excluded.ch4,
+                                 vol_usd=excluded.vol_usd,
+                                 price=excluded.price''', rows)
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _f9_consecutive_days(symbol: str, bucket: str = 'LEADER', max_days: int = 10) -> int:
+    try:
+        _f9_persistent_mover_migrate()
+        sym = str(symbol or '').upper().strip()
+        bkt = str(bucket or 'LEADER').upper().strip()
+        if not sym:
+            return 0
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            rows = cur.execute('SELECT day FROM f9_persistent_movers WHERE symbol=? AND bucket=? ORDER BY day DESC LIMIT ?', (sym, bkt, int(max(1, max_days)))).fetchall() or []
+        have = {str(r[0]) for r in rows if r and r[0]}
+        try:
+            today_dt = datetime.strptime(_f9_mel_day(), '%Y-%m-%d').date()
+        except Exception:
+            today_dt = datetime.now(MEL_TZ).date()
+        streak = 0
+        for i in range(int(max(1, max_days))):
+            d = (today_dt - timedelta(days=i)).strftime('%Y-%m-%d')
+            if d in have:
+                streak += 1
+            else:
+                break
+        return int(streak)
+    except Exception:
+        return 0
+
+
+def make_f9_persistent_leader_setup(base: str, mv: Any, session_name: str = 'ASIA', streak_days: int = 0) -> Optional[Setup]:
+    """F9 research setup: persistent leader continuation BUY only."""
+    try:
+        if not bool(globals().get('F9_PERSISTENT_LEADER_ENABLED', True)):
+            return None
+        base_u = str(base or '').upper().strip()
+        if not base_u or mv is None:
+            return None
+        streak_days = int(streak_days or _f9_consecutive_days(base_u, 'LEADER'))
+        if streak_days < int(globals().get('F9_PERSISTENT_LEADER_MIN_STREAK_DAYS', 2) or 2):
+            return None
+        fut_vol = float(usd_notional(mv) or 0.0)
+        if fut_vol < float(globals().get('F9_PERSISTENT_LEADER_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0):
+            return None
+        ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0)
+        if ch24 < float(globals().get('MOVER_UP_24H_MIN', 10.0) or 10.0):
+            return None
+        ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+        if (not c15) or len(c15) < 16 or float(atr_1h or 0.0) <= 0:
+            return None
+        if float(ch4 or 0.0) < 0.20:
+            return None
+        if float(ch1 or 0.0) < -0.45:
+            return None
+        if float(ch15 or 0.0) < -0.30:
+            return None
+        entry = float(c15[-1][4] or getattr(mv, 'last', 0.0) or 0.0)
+        if entry <= 0:
+            return None
+        ema_v = float(ema_support_15m or 0.0)
+        ema_dist_pct = abs(entry - ema_v) / entry * 100.0 if ema_v > 0 else 999.0
+        if ema_v > 0 and entry < ema_v * 0.992:
+            return None
+        if ema_dist_pct > 1.65:
+            return None
+        lows_recent = [float(x[3] or 0.0) for x in c15[-10:] if float(x[3] or 0.0) > 0]
+        if not lows_recent:
+            return None
+        swing_low = min(lows_recent)
+        sl = min(entry - max(float(atr_1h) * 1.10, entry * 0.0065), swing_low - max(float(atr_1h) * 0.18, entry * 0.0015))
+        if sl <= 0 or sl >= entry:
+            return None
+        risk = entry - sl
+        if risk <= 0:
+            return None
+        if (risk / entry) * 100.0 > 10.5:
+            return None
+        rr_target = 1.55 if str(session_name or '').upper().strip() == 'ASIA' else 1.65
+        tp = entry + rr_target * risk
+        conf = int(clamp(76.0 + min(6.0, streak_days * 1.5) + min(6.0, max(0.0, ch24 - 10.0) * 0.08) + (2.0 if fut_vol >= 50_000_000.0 else 0.0), 76.0, 91.0))
+        s = Setup(
+            setup_id=make_setup_id(base_u, 'BUY'),
+            symbol=base_u,
+            market_symbol=str(getattr(mv, 'symbol', '') or base_u).upper(),
+            side='BUY',
+            conf=int(conf),
+            entry=float(entry),
+            sl=float(sl),
+            tp=float(tp),
+            alt_target_a=0.0,
+            alt_target_b=0.0,
+            fut_vol_usd=float(fut_vol),
+            ch24=float(ch24),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
+            ema_support_period=int(ema_period or 0),
+            ema_support_dist_pct=float(ema_dist_pct),
+            pullback_ema_period=int(ema_period or 0),
+            pullback_ema_dist_pct=float(ema_dist_pct),
+            pullback_ready=bool(ema_dist_pct <= 0.90 or float(ch15 or 0.0) >= 0.05),
+            pullback_bypass_hot=bool(fut_vol >= 50_000_000.0),
+            leader_base_override=True,
+            engine='F9',
+            is_trailing_alt_target_b=False,
+            created_ts=time.time(),
+            family_id=F9_PERSISTENT_LEADER_FAMILY_ID,
+            family_name=F9_PERSISTENT_LEADER_FAMILY_NAME,
+            regime_primary='TREND_UP',
+            regime_secondary='PERSISTENT_LEADER',
+            regime_confidence=min(0.92, 0.64 + streak_days * 0.04),
+            validation_state='research_watch',
+        )
+        try:
+            setattr(s, 'atr_pct', float((float(atr_1h) / float(entry) * 100.0) if entry > 0 else 0.0))
+            setattr(s, 'regime', 'TREND_UP')
+            setattr(s, 'trend', 'BULLISH')
+            setattr(s, 'structure', 'PERSISTENT_LEADER_CONTINUATION')
+            setattr(s, 'f9_persistent_leader', True)
+            setattr(s, 'f9_streak_days', int(streak_days))
+            setattr(s, 'entry_reason', f'F9 persistent leader continuation: {streak_days} consecutive leader days')
+            setattr(s, 'generated_reason', f'F9 persistent leader continuation: {streak_days} consecutive leader days')
+            score, comps = compute_setup_quality_score(s, session_name=session_name)
+            setattr(s, 'quality_score', float(clamp(float(score or 0.0) + 2.0, 0.0, 100.0)))
+            setattr(s, 'quality_components', comps or {})
+        except Exception:
+            pass
+        return _research_finalize_setup(s, session_name=session_name)
+    except Exception:
+        return None
+
+
+def pick_f9_persistent_leader_setups(best_fut: Dict[str, MarketVol], leaders: list[str], n: int, session_name: str, scan_profile: str = DEFAULT_SCAN_PROFILE) -> List[Setup]:
+    out: List[Setup] = []
+    try:
+        if not bool(globals().get('F9_PERSISTENT_LEADER_ENABLED', True)):
+            return []
+        ranked = []
+        for base in list(leaders or [])[:10]:
+            try:
+                b = str(base or '').upper().strip()
+                mv = (best_fut or {}).get(b)
+                if not b or not mv:
+                    continue
+                streak = _f9_consecutive_days(b, 'LEADER')
+                if streak < int(globals().get('F9_PERSISTENT_LEADER_MIN_STREAK_DAYS', 2) or 2):
+                    try:
+                        _rej('f9_waiting_for_2day_leader_streak', b, mv, f'streak={streak}')
+                    except Exception:
+                        pass
+                    continue
+                ranked.append((int(streak), float(getattr(mv, 'percentage', 0.0) or 0.0), float(usd_notional(mv) or 0.0), b, mv))
+            except Exception:
+                continue
+        ranked.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        for streak, _ch24, _vol, base, mv in ranked[:max(1, int(n or 1) * 2)]:
+            setup = make_f9_persistent_leader_setup(base, mv, session_name=session_name, streak_days=streak)
+            if setup:
+                out.append(setup)
+                try:
+                    _rej('ok_f9_persistent_leader', base, mv, f'streak={streak}')
+                except Exception:
+                    pass
+            if len(out) >= int(max(0, n)):
+                break
+    except Exception:
+        pass
+    return out[:int(max(0, n))]
 
 def _email_market_regime(best_fut: dict) -> str:
     try:
@@ -44878,6 +45165,8 @@ def _setup_engine_to_family_id(engine: str, row: dict | None = None) -> str:
             return 'F7_EXHAUSTION_FAILURE'
         if eng in {'F8', 'ENGINE_F8', 'BIGMOVE', 'BIG_MOVE', 'BIGMOVE_CONT', 'F8_BIGMOVE_CONT'} or 'BIGMOVE' in eng or 'BIG_MOVE' in eng:
             return 'F8_BIGMOVE_CONT'
+        if eng in {'F9', 'ENGINE_F9', 'PERSISTENT_LEADER', 'PERSISTENT_LEADER_CONT', 'F9_PERSISTENT_LEADER_CONT'}:
+            return 'F9_PERSISTENT_LEADER_CONT'
         try:
             return _family_id_from_engine(eng, None)
         except Exception:
@@ -44913,6 +45202,8 @@ def _setup_audit_family_from_row(row: dict) -> str:
                     return 'F7_EXHAUSTION_FAILURE'
                 if fam == 'F8':
                     return 'F8_BIGMOVE_CONT'
+                if fam == 'F9':
+                    return 'F9_PERSISTENT_LEADER_CONT'
                 return fam
 
         # 2) details_json from executable/admin lifecycle. This is where modern setups
@@ -44943,7 +45234,7 @@ def _setup_audit_family_from_row(row: dict) -> str:
 
         # 4) Setup-id/name fallback for rare family-coded rows.
         text = ' '.join(str(rr.get(k) or '') for k in ('setup_id', 'note', 'open_reason', 'close_reason')).upper()
-        m = re.search(r'\b(F[1-8])\b', text)
+        m = re.search(r'\b(F[1-9])\b', text)
         if m:
             code = m.group(1)
             return {
@@ -44955,6 +45246,7 @@ def _setup_audit_family_from_row(row: dict) -> str:
                 'F6': 'F6_VWAP_RECLAIM',
                 'F7': 'F7_EXHAUSTION_FAILURE',
                 'F8': 'F8_BIGMOVE_CONT',
+                'F9': 'F9_PERSISTENT_LEADER_CONT',
             }.get(code, code)
         return 'F0_UNKNOWN'
     except Exception:
@@ -56173,6 +56465,10 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     directional_table_n = 10
     leaders = [str(t[0]).upper() for t in (up_list or [])[:directional_table_n]]
     losers  = [str(t[0]).upper() for t in (dn_list or [])[:directional_table_n]]
+    try:
+        _f9_record_directional_memberships(list((up_list or [])[:directional_table_n]), list((dn_list or [])[:directional_table_n]), best_fut)
+    except Exception:
+        pass
 
     # Market Leaders (Top by Futures Volume)
     market_bases = _market_leader_bases(best_fut, market_take)
@@ -56422,6 +56718,22 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         bm_setups = []
     if bm_setups:
         priority_setups.extend(bm_setups)
+
+    # ------------------------------------------------
+    # F9 Persistent Leader Continuation family (research WATCH/audit first)
+    # ------------------------------------------------
+    try:
+        f9_setups = pick_f9_persistent_leader_setups(
+            best_fut,
+            leaders,
+            int(max(1, min(F9_PERSISTENT_LEADER_MAX_PER_SCAN, n_target))),
+            session_name,
+            scan_profile=prof,
+        )
+    except Exception:
+        f9_setups = []
+    if f9_setups:
+        priority_setups.extend(f9_setups)
 
 
     # -----------------------------------------------------
