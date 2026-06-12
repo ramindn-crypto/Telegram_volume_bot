@@ -1,4 +1,4 @@
-# Ver72: BigMove/F8 verification hardening. Keeps Ver71 no-lag behavior unchanged; adds explicit F8 setup-build/presend-gate logging and /email_decision visibility so a confirmed Big-Move alert shows whether its matching F8 setup was sent or blocked by KEEP/context policy. No strategy/risk/policy loosening.
+# Ver73: emergency rollback to Ver71 no-lag baseline after Ver72 caused lag. Removes all Ver72 BigMove/F8 extra logging and /email_decision additions; no strategy/risk/policy changes.
 # Ver71: no-lag core pipeline hotfix. Keeps owner commands instant, but no longer lets user activity or 10-minute no-lag scheduling starve setup-email/AutoTrade; email_decision now shows heartbeat/pipeline state after restart.
 # yver61: yver60 emergency no-lag patch. Hard safe-core by default, all non-essential background schedulers disabled unless explicitly enabled, alert loop shortened and de-overlapped, owner commands remain instant. No strategy/risk/setup/autotrade policy changes.
 # yver62: fixes fresh KEEP/OPEN handoff across session change so /setup_audit KEEP rows enter /screen, setup email and AutoTrade within entry_window even when ASIA→LON/NY changes.
@@ -60475,40 +60475,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', status='empty', session=sess_u, mode='bigmove_setup_email', details={'candidates': len(filtered or []), 'tag': str(tag or '')})
                 except Exception:
                     pass
-                try:
-                    _LAST_EMAIL_DECISION[int(uid)] = {
-                        'status': 'SKIP',
-                        'picked': '',
-                        'when': datetime.now(_zoneinfo_or_default((get_user(int(uid)) or {}).get('tz'))[0]).isoformat(timespec='seconds'),
-                        'reasons': ['bigmove_alert_f8_setup_build_empty', f'candidates={len(filtered or [])}', f'tag={str(tag or "")}'],
-                    }
-                except Exception:
-                    pass
                 return [], False
-
-            # Ver72: record that the F8 setup conversion succeeded before the strict
-            # setup-email/AutoTrade presend gate runs. This does not loosen policy or
-            # make the row tradable; it only gives /email_decision a grounded reason
-            # when the alert email is sent but the matching F8 setup is blocked.
-            try:
-                _bm_built_preview = []
-                for _s0 in list(setups or [])[:8]:
-                    try:
-                        _fam0, _sess0 = _setup_combo_family_session_from_obj(_s0, session_name=sess_u)
-                        _combo0 = _setup_combo_strategy_side_key(_fam0, sess_u, _s0, getattr(_s0, 'side', ''))
-                        _bm_built_preview.append(f"{getattr(_s0, 'symbol', '')}:{getattr(_s0, 'side', '')}:{_combo0}")
-                    except Exception:
-                        _bm_built_preview.append(f"{getattr(_s0, 'symbol', '')}:{getattr(_s0, 'side', '')}")
-                db_log_setup_pipeline_event(
-                    int(uid),
-                    stage='bigmove_setup_email_build',
-                    status='built',
-                    session=sess_u,
-                    mode='bigmove_setup_email',
-                    details={'candidates': len(filtered or []), 'setups': len(setups or []), 'preview': _bm_built_preview, 'tag': str(tag or '')},
-                )
-            except Exception:
-                pass
 
             # Stabilise metadata before sending. send_email_alert_multi will set the final
             # emailed timestamp after SMTP succeeds/soft-succeeds.
@@ -60533,24 +60500,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 setups, _bm_gate_reasons = [], Counter({'bigmove_presend_gate_exception': 1})
             if not setups:
                 try:
-                    _top_bm_gate_reasons = _pipeline_top_reasons(_bm_gate_reasons, 8)
-                except Exception:
-                    _top_bm_gate_reasons = {}
-                try:
-                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', status='empty', session=sess_u, mode='bigmove_setup_email', details={'tag': str(tag or ''), 'top_reasons': _top_bm_gate_reasons})
-                except Exception:
-                    pass
-                try:
-                    _reason_items = [f"{k}={v}" for k, v in dict(_top_bm_gate_reasons or {}).items()]
-                    _LAST_EMAIL_DECISION[int(uid)] = {
-                        'status': 'SKIP',
-                        'picked': '',
-                        'when': datetime.now(_zoneinfo_or_default((get_user(int(uid)) or {}).get('tz'))[0]).isoformat(timespec='seconds'),
-                        'reasons': ['bigmove_alert_f8_setup_blocked_by_presend_gate'] + (_reason_items or ['no_presend_reason_recorded']),
-                    }
-                    _bm_dec = _LAST_BIGMOVE_DECISION.get(int(uid))
-                    if isinstance(_bm_dec, dict):
-                        _bm_dec.setdefault('reasons', []).append('f8_setup_email_blocked:' + (', '.join(_reason_items[:3]) if _reason_items else 'presend_gate_empty'))
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', status='empty', session=sess_u, mode='bigmove_setup_email', details={'tag': str(tag or ''), 'top_reasons': _pipeline_top_reasons(_bm_gate_reasons, 8)})
                 except Exception:
                     pass
                 return [], False
@@ -60685,9 +60635,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         if setup_email_sent:
                             _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
                         else:
-                            _bm_rs = _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', [])
-                            if not any(str(_r).startswith(('f8_setup_email_blocked:', 'f8_setup_email_sent:', 'f8_setup_email_failed_or_empty')) for _r in list(_bm_rs or [])):
-                                _bm_rs.append('f8_setup_email_failed_or_empty')
+                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
                     except Exception:
                         pass
                     try:
@@ -61605,9 +61553,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         if setup_email_sent:
                             _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
                         else:
-                            _bm_rs = _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', [])
-                            if not any(str(_r).startswith(('f8_setup_email_blocked:', 'f8_setup_email_sent:', 'f8_setup_email_failed_or_empty')) for _r in list(_bm_rs or [])):
-                                _bm_rs.append('f8_setup_email_failed_or_empty')
+                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
                     except Exception:
                         pass
                     try:
@@ -61772,67 +61718,6 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         rs = bigm.get("reasons") or []
         if rs:
             lines.append("Reasons:\n- " + "\n- ".join(rs))
-
-    # Ver72: show the F8 setup-email leg separately from the market-event
-    # Big-Move alert. A Big-Move alert can be SENT while its matching F8 setup is
-    # correctly blocked by KEEP-only matrix policy or leader/loser context; this
-    # section makes that explicit instead of looking like F8 silently failed.
-    try:
-        _bm_pipe_rows = []
-        for _stage in ('bigmove_setup_email_build', 'bigmove_setup_email_presend_gate', 'bigmove_setup_email_delivery'):
-            _ev = _latest_setup_pipeline_event(uid, stage=_stage, mode='bigmove_setup_email') or {}
-            if _ev:
-                _bm_pipe_rows.append((_stage, _ev))
-        if _bm_pipe_rows:
-            def _bm_event_summary(_row: dict) -> str:
-                try:
-                    _details = json.loads(str(_row.get('details_json') or '{}')) if _row.get('details_json') else {}
-                except Exception:
-                    _details = {}
-                _parts = [str(_row.get('status') or '-'), f"session={str(_row.get('session') or '-').upper()}"]
-                try:
-                    _evt = float(_row.get('event_ts') or 0.0)
-                    if _evt > 0:
-                        _parts.append(_fmt_when_local(_evt))
-                except Exception:
-                    pass
-                try:
-                    if _details.get('setups') is not None:
-                        _parts.append(f"setups={int(_details.get('setups') or 0)}")
-                    if _details.get('eligible') is not None:
-                        _parts.append(f"eligible={int(_details.get('eligible') or 0)}")
-                    if _details.get('candidates') is not None:
-                        _parts.append(f"candidates={int(_details.get('candidates') or 0)}")
-                except Exception:
-                    pass
-                try:
-                    _preview = _details.get('preview') or []
-                    if _preview:
-                        _parts.append('preview=' + ', '.join([str(x) for x in list(_preview)[:3]]))
-                except Exception:
-                    pass
-                try:
-                    _top = _details.get('top_reasons') or {}
-                    if isinstance(_top, dict) and _top:
-                        _parts.append('top=' + ', '.join([f"{k}={v}" for k, v in list(_top.items())[:3]]))
-                    elif isinstance(_top, list) and _top:
-                        _parts.append('top=' + ', '.join([str(x) for x in _top[:3]]))
-                except Exception:
-                    pass
-                try:
-                    _err = str(_details.get('error') or _details.get('smtp_error') or '').strip()
-                    if _err:
-                        _parts.append(_err[:160])
-                except Exception:
-                    pass
-                return ' | '.join(_parts)
-            lines.append("")
-            lines.append("⚡ F8 Setup Email Pipeline")
-            for _stage, _ev in _bm_pipe_rows:
-                _label = str(_stage).replace('bigmove_setup_email_', '').replace('_', ' ').title()
-                lines.append(f"{_label}: " + _bm_event_summary(_ev))
-    except Exception:
-        pass
 
     try:
         ctx_now = _session_gap_context(datetime.now(timezone.utc))
