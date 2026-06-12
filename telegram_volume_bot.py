@@ -1,4 +1,5 @@
 # yver61: yver60 emergency no-lag patch. Hard safe-core by default, all non-essential background schedulers disabled unless explicitly enabled, alert loop shortened and de-overlapped, owner commands remain instant. No strategy/risk/setup/autotrade policy changes.
+# yver62: fixes fresh KEEP/OPEN handoff across session change so /setup_audit KEEP rows enter /screen, setup email and AutoTrade within entry_window even when ASIA→LON/NY changes.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
@@ -5658,13 +5659,16 @@ def _setup_audit_row_inside_delivery_window(row: dict) -> bool:
 
 
 def _setup_audit_row_matches_active_session(row: dict, session_name: str = '') -> bool:
-    """Keep Policy=current/actionable, not historical policy.
+    """Return whether an audit row is still deliverable in the live lane.
 
-    A setup from a previous session can remain visible for audit/learning, but it
-    should not be labelled KEEP/WATCH if the live email/autotrade loop is already
-    operating in another market session.
+    yver62: do NOT drop a fresh KEEP/OPEN setup only because the wall-clock
+    session changed after generation. The entry window is the delivery contract
+    for /screen, setup email and AutoTrade. Historical/expired rows remain
+    session-aware so old ASIA rows do not leak into later sessions.
     """
     try:
+        if _setup_audit_row_inside_delivery_window(dict(row or {})):
+            return True
         sess = str(session_name or (row or {}).get('session') or (row or {}).get('source_session') or '').upper().strip()
         live = str(current_session_utc(datetime.now(timezone.utc)) or '').upper().strip()
         if live in {'ASIA', 'LON', 'NY'} and sess in {'ASIA', 'LON', 'NY'}:
@@ -5672,6 +5676,30 @@ def _setup_audit_row_matches_active_session(row: dict, session_name: str = '') -
         return True
     except Exception:
         return True
+
+
+def _fresh_setup_policy_session(setup_or_row, fallback_session: str = '') -> str:
+    """Effective policy/evidence session for a fresh setup.
+
+    A setup generated at 18:05 as F2-ASIA-NOR must keep using ASIA combo policy
+    during its 60m entry window, even if the current runtime session becomes LON.
+    The delivery bucket may be LON, but policy/executable quality must be checked
+    against the setup's own source session.
+    """
+    try:
+        fb = str(fallback_session or '').upper().strip()
+        src = ''
+        if isinstance(setup_or_row, dict):
+            src = str(setup_or_row.get('source_session') or setup_or_row.get('session') or '').upper().strip()
+            ts = float(_setup_audit_row_ts(setup_or_row) or setup_or_row.get('created_ts') or setup_or_row.get('signal_created_ts') or 0.0)
+        else:
+            src = str(getattr(setup_or_row, 'source_session', '') or getattr(setup_or_row, 'session', '') or '').upper().strip()
+            ts = float(getattr(setup_or_row, 'created_ts', 0.0) or getattr(setup_or_row, 'signal_created_ts', 0.0) or getattr(setup_or_row, 'executable_ts', 0.0) or 0.0)
+        if src in {'ASIA', 'LON', 'NY'} and ts > 0 and (float(time.time()) - ts) <= float(_setup_delivery_actionable_window_sec()):
+            return src
+        return src if src in {'ASIA', 'LON', 'NY'} else fb
+    except Exception:
+        return str(fallback_session or '').upper().strip()
 
 SCREEN_UNIVERSE_N = int(os.environ.get("SCREEN_UNIVERSE_N", str(SCAN_SYMBOL_LIMIT)) or SCAN_SYMBOL_LIMIT)
 SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
@@ -24904,8 +24932,17 @@ def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: flo
     where_session = ''
     sess = str(session_name or '').upper().strip()
     if sess:
-        where_session = ' AND UPPER(COALESCE(x.session, "")) = ? '
-        params.append(sess)
+        # yver62: fresh executable rows remain valid until entry_window expires even
+        # when the live session rolls over (for example ASIA KEEP at 18:05, LON at
+        # 18:13).  Since ts_from is already the entry-window cutoff, allow any
+        # fresh row while preserving strict session filtering when explicitly disabled.
+        if env_bool('ALLOW_FRESH_CROSS_SESSION_EXECUTABLES', True):
+            where_session = ' AND (UPPER(COALESCE(x.session, "")) = ? OR x.executable_ts >= ?) '
+            params.append(sess)
+            params.append(float(ts_from))
+        else:
+            where_session = ' AND UPPER(COALESCE(x.session, "")) = ? '
+            params.append(sess)
     fetch_limit = max(int(limit or 10), min(max(int(limit or 10) * 6, int(limit or 10) + 30), 250))
     params.append(int(fetch_limit))
     cur.execute(
@@ -57722,19 +57759,24 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                         continue
                     src_session_u = str(getattr(item, 'source_session', '') or getattr(item, 'session', '') or '').upper().strip()
                     if sess and src_session_u and src_session_u not in {'', sess}:
-                        continue
+                        try:
+                            _fresh_src_ok = (float(time.time()) - float(getattr(item, 'created_ts', 0.0) or getattr(item, 'signal_created_ts', 0.0) or getattr(item, 'executable_ts', 0.0) or 0.0)) <= float(_setup_delivery_actionable_window_sec())
+                        except Exception:
+                            _fresh_src_ok = False
+                        if not _fresh_src_ok:
+                            continue
                     try:
                         if source_name == 'emailed':
                             ok_basic = _basic_valid(item)
                             ok_final, _why_final, _meta_final = _setup_final_quality_gate_allows_setup(item, session_name=sess, user_id=int(uid)) if ok_basic else (False, 'screen_emailed_basic_invalid', {})
                             ok_exec = bool(ok_basic and ok_final)
                         else:
-                            ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=sess)
+                            ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=_fresh_setup_policy_session(item, sess))
                     except Exception:
                         ok_exec = False
                     if not ok_exec:
                         continue
-                    keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=sess, user_id=int(uid), lane='screen')
+                    keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=_fresh_setup_policy_session(item, sess), user_id=int(uid), lane='screen')
                     if not keep_ok:
                         continue
                     if source_name != 'emailed' and not _screen_attach_email_delivery_or_skip(int(uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
@@ -57846,16 +57888,21 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                             continue
                         src_session_u = str(getattr(item, 'source_session', '') or '').upper().strip()
                         if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
-                            continue
+                            try:
+                                _fresh_src_ok = (float(time.time()) - float(getattr(item, 'created_ts', 0.0) or getattr(item, 'signal_created_ts', 0.0) or getattr(item, 'executable_ts', 0.0) or 0.0)) <= float(_setup_delivery_actionable_window_sec())
+                            except Exception:
+                                _fresh_src_ok = False
+                            if not _fresh_src_ok:
+                                continue
                         if source_name == 'emailed':
                             ok_exec = _basic_valid(item)
                         else:
                             try:
-                                ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=req_session_u or src_session_u or _session)
+                                ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=_fresh_setup_policy_session(item, req_session_u or src_session_u or _session))
                             except Exception:
                                 ok_exec, _why_exec = False, 'screen_lane_exec_gate_exception'
                         if ok_exec:
-                            keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=(req_session_u or src_session_u or _session), user_id=int(_uid), lane='screen')
+                            keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=_fresh_setup_policy_session(item, req_session_u or src_session_u or _session), user_id=int(_uid), lane='screen')
                             if not keep_ok:
                                 continue
                             if source_name != 'emailed' and not _screen_attach_email_delivery_or_skip(int(_uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
@@ -57923,7 +57970,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         setups = []
 
     if not setups and _exec_ready and not _screen_requires_emailed_delivery_for_setup():
-        _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=str(session or ''), user_id=int(uid), lane='screen')
+        _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=_fresh_setup_policy_session((_exec_ready or [None])[0], str(session or '')), user_id=int(uid), lane='screen')
         setups = list(_screen_keep_ready[:max(1, int(SETUPS_N))])
     elif not setups and _exec_ready and _screen_requires_emailed_delivery_for_setup():
         _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=str(session or ''), user_id=int(uid), lane='screen')
@@ -57934,7 +57981,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     # /screen is an action dashboard, not a dump. Also enforce the production 24h-volume floor.
     try:
         setups = [s for s in list(setups or []) if _setup_volume_ok(s)]
-        setups = _filter_user_visible_keep_setups(setups, session_name=str(session or ''), user_id=int(uid), lane='screen')
+        setups = [x for x in list(setups or []) if _setup_user_visible_keep_policy_allows(x, session_name=_fresh_setup_policy_session(x, str(session or '')), user_id=int(uid), lane='screen')[0]]
     except Exception:
         setups = list(setups or [])
     try:
@@ -59209,11 +59256,13 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
     seen = set()
     for raw in list(setups or []):
         try:
-            eff = _setup_route_candidate_for_executable_lane(raw, sess, int(gate_uid or uid or 0))
+            policy_sess = _fresh_setup_policy_session(raw, sess)
+            eff = _setup_route_candidate_for_executable_lane(raw, policy_sess, int(gate_uid or uid or 0))
             try:
-                setattr(eff, 'source_session', sess)
+                if not getattr(eff, 'source_session', None):
+                    setattr(eff, 'source_session', policy_sess)
                 if not getattr(eff, 'session', None):
-                    setattr(eff, 'session', sess)
+                    setattr(eff, 'session', policy_sess)
             except Exception:
                 pass
             sym = str(getattr(eff, 'symbol', '') or '').upper().strip()
@@ -59226,7 +59275,7 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
             if key in seen:
                 continue
             seen.add(key)
-            ok, why = is_executable_setup_eligible(eff, session_name=sess)
+            ok, why = is_executable_setup_eligible(eff, session_name=policy_sess)
             if not ok:
                 reasons[str(why or 'not_executable')] += 1
                 try:
@@ -59234,7 +59283,7 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
                 except Exception:
                     pass
                 continue
-            keep_ok, keep_why, keep_meta = _setup_user_visible_keep_policy_allows(eff, session_name=sess, user_id=int(gate_uid or uid or 0), lane=str(lane or 'email'))
+            keep_ok, keep_why, keep_meta = _setup_user_visible_keep_policy_allows(eff, session_name=policy_sess, user_id=int(gate_uid or uid or 0), lane=str(lane or 'email'))
             if not keep_ok:
                 reasons[str(keep_why or 'email_policy_not_keep')] += 1
                 try:
@@ -59343,14 +59392,15 @@ def _select_recent_keep_open_audit_rescue_email_setups(user_id: int, session_nam
                     reasons['audit_rescue_expired'] += 1
                     continue
                 rsess = str(r.get('session') or r.get('source_session') or '').upper().strip()
+                policy_sess = rsess if rsess in {'ASIA', 'LON', 'NY'} else sess
                 if rsess != sess:
-                    continue
+                    reasons['audit_rescue_cross_session_fresh'] += 1
                 blackout_label = _setup_audit_blackout_label_for_ts(ts)
                 if str(blackout_label or '').upper().strip() != 'OPEN':
                     reasons['audit_rescue_blackout'] += 1
                     continue
                 side = str(r.get('side') or '').upper().strip()
-                policy_label = _setup_audit_policy_label(r, uid=uid, session_name=rsess, side=side)
+                policy_label = _setup_audit_policy_label(r, uid=uid, session_name=policy_sess, side=side)
                 if str(policy_label or '').upper().strip() != 'KEEP':
                     reasons['audit_rescue_not_keep'] += 1
                     continue
@@ -59361,7 +59411,7 @@ def _select_recent_keep_open_audit_rescue_email_setups(user_id: int, session_nam
                         continue
                 except Exception:
                     pass
-                s = _setup_object_from_audit_row_for_email(r, rsess)
+                s = _setup_object_from_audit_row_for_email(r, policy_sess)
                 if s is None:
                     reasons['audit_rescue_hydrate_failed'] += 1
                     continue
@@ -59372,17 +59422,17 @@ def _select_recent_keep_open_audit_rescue_email_setups(user_id: int, session_nam
                 if key in seen:
                     continue
                 seen.add(key)
-                if _email_setup_identity_recently_sent(uid, s) or _email_symbol_recently_sent(uid, sym, side, sess, setup_id=sid):
+                if _email_setup_identity_recently_sent(uid, s) or _email_symbol_recently_sent(uid, sym, side, policy_sess, setup_id=sid):
                     reasons['audit_rescue_email_cooldown'] += 1
                     continue
-                if symbol_flip_guard_active(uid, sym, side, sess):
+                if symbol_flip_guard_active(uid, sym, side, policy_sess):
                     reasons['audit_rescue_flip_guard'] += 1
                     continue
-                ok_exec, why_exec = is_executable_setup_eligible(s, session_name=sess)
+                ok_exec, why_exec = is_executable_setup_eligible(s, session_name=policy_sess)
                 if not ok_exec:
                     reasons[f'audit_rescue_exec_{why_exec}'] += 1
                     continue
-                ok_vis, why_vis, _meta_vis = _setup_user_visible_keep_policy_allows(s, session_name=sess, user_id=uid, lane='email')
+                ok_vis, why_vis, _meta_vis = _setup_user_visible_keep_policy_allows(s, session_name=policy_sess, user_id=uid, lane='email')
                 if not ok_vis:
                     reasons[f'audit_rescue_visible_{why_vis}'] += 1
                     continue
@@ -60990,8 +61040,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             eligible: List[Setup] = []
             for s in (setups_all or []):
                 try:
-                    s_eff = _setup_route_candidate_for_executable_lane(s, sess_name, int(uid))
-                    ok, why = is_executable_setup_eligible(s_eff, session_name=sess_name)
+                    _pol_sess = _fresh_setup_policy_session(s, sess_name)
+                    s_eff = _setup_route_candidate_for_executable_lane(s, _pol_sess, int(uid))
+                    ok, why = is_executable_setup_eligible(s_eff, session_name=_pol_sess)
                 except Exception:
                     s_eff = s
                     ok, why = False, 'email_exec_gate_exception'
@@ -61050,8 +61101,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         if _cand is None:
                             continue
                         try:
-                            _cand_eff = _setup_route_candidate_for_executable_lane(_cand, sess_name, int(uid))
-                            if is_executable_setup_eligible(_cand_eff, session_name=sess_name)[0]:
+                            _pol_sess = _fresh_setup_policy_session(_cand, sess_name)
+                            _cand_eff = _setup_route_candidate_for_executable_lane(_cand, _pol_sess, int(uid))
+                            if is_executable_setup_eligible(_cand_eff, session_name=_pol_sess)[0]:
                                 eligible.append(_cand_eff)
                         except Exception:
                             continue
@@ -61068,9 +61120,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     recovery_now = []
                     for _s in list(setups_all or []):
                         try:
-                            _s_eff = _setup_route_candidate_for_executable_lane(_s, sess_name, int(uid))
+                            _pol_sess = _fresh_setup_policy_session(_s, sess_name)
+                            _s_eff = _setup_route_candidate_for_executable_lane(_s, _pol_sess, int(uid))
                             setattr(_s_eff, 'recovery_fallback', True)
-                            ok_now, _why_now = is_executable_setup_eligible(_s_eff, session_name=sess_name)
+                            ok_now, _why_now = is_executable_setup_eligible(_s_eff, session_name=_pol_sess)
                             if ok_now:
                                 recovery_now.append(_s_eff)
                         except Exception:
@@ -61177,7 +61230,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 sess_name = str(sess["name"])
 
                 try:
-                    if not _setup_combo_policy_allows_setup(s, sess_name, user_id=int(uid)):
+                    policy_sess = _fresh_setup_policy_session(s, sess_name)
+                    if not _setup_combo_policy_allows_setup(s, policy_sess, user_id=int(uid)):
                         combo_policy_blocked += 1
                         continue
                 except Exception:
@@ -61189,7 +61243,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 # Otherwise the top candidate can be chosen then removed by presend,
                 # causing the whole email batch to fail instead of trying the next valid setup.
                 try:
-                    _vis_ok, _vis_why, _vis_meta = _setup_user_visible_keep_policy_allows(s, session_name=sess_name, user_id=int(uid), lane='email')
+                    _vis_ok, _vis_why, _vis_meta = _setup_user_visible_keep_policy_allows(s, session_name=policy_sess, user_id=int(uid), lane='email')
                     if not _vis_ok:
                         combo_policy_blocked += 1
                         try:
@@ -61201,11 +61255,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     combo_policy_blocked += 1
                     continue
 
-                if symbol_flip_guard_active(uid, sym, side, sess_name):
+                if symbol_flip_guard_active(uid, sym, side, policy_sess):
                     flip_blocked += 1
                     continue
 
-                ok_div, why_div = _email_diversification_guard(s, chosen_list, best_fut, sess_name)
+                ok_div, why_div = _email_diversification_guard(s, chosen_list, best_fut, policy_sess)
                 if not ok_div:
                     diversify_blocked[str(why_div)] += 1
                     continue
@@ -61213,7 +61267,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 if _email_setup_identity_recently_sent(uid, s):
                     cooldown_blocked += 1
                     continue
-                if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
+                if _email_symbol_recently_sent(uid, sym, side, policy_sess, setup_id=str(getattr(s, 'setup_id', '') or '')):
                     cooldown_blocked += 1
                     continue
 
