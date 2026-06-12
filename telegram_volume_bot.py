@@ -12,6 +12,7 @@
 # yver61: yver60 emergency no-lag patch. Hard safe-core by default, all non-essential background schedulers disabled unless explicitly enabled, alert loop shortened and de-overlapped, owner commands remain instant. No strategy/risk/setup/autotrade policy changes.
 # yver62: fixes fresh KEEP/OPEN handoff across session change so /setup_audit KEEP rows enter /screen, setup email and AutoTrade within entry_window even when ASIA→LON/NY changes.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
+# yver96: fixes setup starvation from legacy broad blackout windows: resets broad 03:00/05:00/13:00/SAT-SUN blackout defaults back to 10:00-10:45 only, keeps command firewall, and makes /why show active blackout/config gates clearly.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -657,8 +658,9 @@ SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY = 'setup_generation_blackout_windows'
 AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY = 'ver20_blackout_policy_version'
 AUTOTRADE_CFG_VER57_BLACKOUT_SYNC_VERSION_KEY = 'ver57_blackout_sync_version'
 AUTOTRADE_CFG_VER29_DAY_BLACKOUT_POLICY_VERSION_KEY = 'ver29_day_blackout_policy_version'
+AUTOTRADE_CFG_VER96_BLACKOUT_UNSTARVE_VERSION_KEY = 'ver96_blackout_unstarve_version'
 SETUP_CFG_SHADOW_SCAN_ENABLED_KEY = 'setup_shadow_scan_enabled'
-VER29_RECOMMENDED_BLACKOUT_WINDOWS = '03:00-04:00,05:00-12:00,13:00-14:00,SAT 14:00-SUN 12:00'
+VER29_RECOMMENDED_BLACKOUT_WINDOWS = '10:00-10:45'  # yver96: no broad hidden setup-starvation windows by default
 AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY = 'require_setup_email_for_entry'
 SETUP_POLICY_CLEAN_START_MARKER_TS_KEY = 'setup_policy_clean_start_marker_ts'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY = 'max_position_hours_enabled'
@@ -2225,6 +2227,51 @@ def _autotrade_apply_ver29_day_aware_blackout_defaults() -> None:
     except Exception:
         pass
 
+
+
+def _autotrade_apply_ver96_blackout_unstarve_defaults() -> None:
+    """yver96: remove legacy broad blackout windows that starved NY setup generation.
+
+    The earlier day-aware defaults included 03:00-04:00, 05:00-12:00,
+    13:00-14:00 and SAT 14:00-SUN 12:00 Melbourne. In the no-lag forward-test
+    build those windows made the email/setup loop report no_setups_generated with
+    Symbols processed=0, which looks like a broken scanner and suppresses fresh
+    setup evidence. Keep the short ASIA reset protection (10:00-10:45) but remove
+    broad hidden windows from both setup-generation and entry blackout configs.
+    """
+    try:
+        target_version = 'yver96_2026_06_13_blackout_unstarve'
+        if str(_autotrade_config_get(AUTOTRADE_CFG_VER96_BLACKOUT_UNSTARVE_VERSION_KEY, '') or '').strip().lower() == target_version:
+            return
+        safe_w = _normalise_melbourne_blackout_windows(
+            os.environ.get('PULSEFUTURES_SAFE_BLACKOUT_WINDOWS', os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45')),
+            '10:00-10:45',
+        ) or '10:00-10:45'
+        legacy_tokens = ('03:00-04:00', '05:00-12:00', '13:00-14:00', 'SAT 14:00-SUN 12:00')
+        def _needs_reset(value: str) -> bool:
+            v = str(value or '').upper()
+            return (not v.strip()) or any(tok in v for tok in legacy_tokens)
+        try:
+            cur_setup = _normalise_melbourne_blackout_windows(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, ''), safe_w)
+        except Exception:
+            cur_setup = ''
+        try:
+            cur_entry = _normalise_melbourne_blackout_windows(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, ''), safe_w)
+        except Exception:
+            cur_entry = ''
+        if _needs_reset(cur_setup):
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, safe_w)
+        if _needs_reset(cur_entry):
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, safe_w)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_VER96_BLACKOUT_UNSTARVE_VERSION_KEY, target_version)
+        try:
+            logger.warning('yver96 blackout unstarve applied: setup_windows=%s entry_windows=%s', str(_setup_generation_blackout_windows()), str(_autotrade_entry_blackout_windows()))
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 def _autotrade_apply_ver15_time_exit_policy_defaults() -> None:
     """Ver15: make the 09:55 flat reliable after deployment/reset.
@@ -7715,6 +7762,7 @@ try:
     _autotrade_apply_ver20_blackout_policy_defaults()
     _autotrade_apply_ver57_blackout_config_sync()
     _autotrade_apply_ver29_day_aware_blackout_defaults()
+    _autotrade_apply_ver96_blackout_unstarve_defaults()
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
     _autotrade_apply_ver58_time_exit_runtime_defaults()
@@ -27322,6 +27370,13 @@ def _no_reject_stats_fallback_report(uid: int) -> str:
     except Exception:
         pass
     try:
+        _sblk, _swhy = _setup_generation_blackout_now()
+        _eblk, _ewhy = _autotrade_entry_blackout_now()
+        lines.append(f"Setup blackout now: {'ACTIVE' if _sblk else 'OPEN'}" + (f" | {_swhy}" if _sblk and _swhy else "") + f" | windows={_setup_generation_blackout_windows()}")
+        lines.append(f"Entry blackout now: {'ACTIVE' if _eblk else 'OPEN'}" + (f" | {_ewhy}" if _eblk and _ewhy else "") + f" | windows={_autotrade_entry_blackout_windows()}")
+    except Exception:
+        pass
+    try:
         recent_universe = list(dict.fromkeys([str(x).upper().strip() for x in (globals().get('_LAST_SCAN_UNIVERSE') or []) if str(x).strip()]))
         if recent_universe:
             lines.append(f"Universe: {len(recent_universe)} symbols")
@@ -27338,6 +27393,7 @@ def _no_reject_stats_fallback_report(uid: int) -> str:
         exec_ev = _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', session=sess, mode='email') or _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', mode='email') or {}
         screen_ev = _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', session=sess, mode='screen') or _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', mode='screen') or {}
         bm_build_ev = _latest_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', session=sess, mode='bigmove_setup_email') or _latest_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', session=sess, mode='bigmove_setup_email') or _latest_setup_pipeline_event(int(uid), stage='bigmove_setup_email_delivery', session=sess, mode='bigmove_setup_email') or {}
+        blackout_ev = _latest_setup_pipeline_event(int(uid), stage='setup_email_blackout', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='executable_setup_generation_blackout', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='executable_setup_generation_blackout', mode='email') or {}
         def _one(label, ev):
             if not ev:
                 return
@@ -27376,6 +27432,7 @@ def _no_reject_stats_fallback_report(uid: int) -> str:
         _one('Email pool', pool_ev)
         _one('Email executable', exec_ev)
         _one('Screen executable', screen_ev)
+        _one('Blackout gate', blackout_ev)
         _one('BigMove/F8 setup', bm_build_ev)
     except Exception:
         pass
@@ -62776,6 +62833,13 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"Mode/session: {str(h.get('last_scan_mode') or '-')}/{str(h.get('last_scan_session') or '-')}")
         lines.append(f"TF phase: {str(h.get('last_tf_phase') or '-')} | Symbols processed: {int(h.get('symbols_processed') or 0)}")
         lines.append(f"Rate-limit hits: {int(h.get('rate_limit_hits') or 0)} | Stale uses: {int(h.get('stale_usage') or 0)} | OHLCV limit: {int(h.get('ohlcv_limit') or MAX_OHLCV_LIMIT)}")
+    except Exception:
+        pass
+    try:
+        _sblk, _swhy = _setup_generation_blackout_now()
+        _eblk, _ewhy = _autotrade_entry_blackout_now()
+        lines.append(f"Setup blackout now: {'ACTIVE' if _sblk else 'OPEN'}" + (f" | {_swhy}" if _sblk and _swhy else "") + f" | windows={_setup_generation_blackout_windows()}")
+        lines.append(f"Entry blackout now: {'ACTIVE' if _eblk else 'OPEN'}" + (f" | {_ewhy}" if _eblk and _ewhy else "") + f" | windows={_autotrade_entry_blackout_windows()}")
     except Exception:
         pass
 
