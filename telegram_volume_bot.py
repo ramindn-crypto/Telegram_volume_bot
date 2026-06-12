@@ -1,5 +1,5 @@
-# Ver73: emergency rollback to Ver71 no-lag baseline after Ver72 caused lag. Removes all Ver72 BigMove/F8 extra logging and /email_decision additions; no strategy/risk/policy changes.
-# Ver71: no-lag core pipeline hotfix. Keeps owner commands instant, but no longer lets user activity or 10-minute no-lag scheduling starve setup-email/AutoTrade; email_decision now shows heartbeat/pipeline state after restart.
+# Ver74: BigMove/F8 setup bridge fix from Ver73. Preserves confirmed BigMove continuation side when NOR→REV routing would create a leader/loser context conflict, and honors delivery_lane_locked so emailed/executable F8 rows are not re-routed before presend/AutoTrade gates. No lag-path, risk, TP/SL, or KEEP-policy loosening.
+# Ver73: emergency no-lag hardening from Ver72. Fixes lost instant ACK fallback, removes single-command output bottleneck, and makes /screen read recent emailed/AT_OPEN setup lane before ticker snapshot. No strategy/risk/policy changes.
 # yver61: yver60 emergency no-lag patch. Hard safe-core by default, all non-essential background schedulers disabled unless explicitly enabled, alert loop shortened and de-overlapped, owner commands remain instant. No strategy/risk/setup/autotrade policy changes.
 # yver62: fixes fresh KEEP/OPEN handoff across session change so /setup_audit KEEP rows enter /screen, setup email and AutoTrade within entry_window even when ASIA→LON/NY changes.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
@@ -3031,7 +3031,78 @@ PULSEFUTURES_FORCE_NO_LAG_MODE = env_bool("PULSEFUTURES_FORCE_NO_LAG_MODE", True
 AUTOTRADE_CORE_IGNORE_USER_ACTIVITY_DEFER = env_bool("AUTOTRADE_CORE_IGNORE_USER_ACTIVITY_DEFER", True)
 PULSEFUTURES_SKIP_NONESSENTIAL_JOBS = env_bool("PULSEFUTURES_SKIP_NONESSENTIAL_JOBS", True)
 OWNER_INSTANT_COMMANDS = {"start", "screen", "status", "equity"}
-TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC = float(os.getenv("TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC", "2.5") or 2.5)
+# Ver72 hard no-lag: these read/report commands must never make Telegram wait.
+# They ACK immediately in the owner/admin priority router, then post the full
+# existing command output from the background. No live strategy/risk gates change.
+OWNER_DEFERRED_COMMAND_HANDLERS = {
+    "why": "why_no_setups_cmd",
+    "email_decision": "email_decision_cmd",
+    "email_pipeline_status": "email_pipeline_status_cmd",
+    "autotrade_debug": "autotrade_debug_cmd",
+    "autotrade_last": "autotrade_last_cmd",
+    "autotrade_report": "autotrade_report_cmd",
+    "autotrade_closed": "autotrade_closed_cmd",
+    "autotradeclosed": "autotrade_closed_cmd",
+    "autotrade_report_overall": "autotrade_report_overall_cmd",
+    "autotrade_report_overal": "autotrade_report_overall_cmd",
+    "autoytrade_report_overall": "autoytrade_report_overall_cmd",
+    "autoytrade_report_overal": "autoytrade_report_overall_cmd",
+    "autotrade_report_matrix": "autoytrade_report_overall_cmd",
+    "performance_report": "performance_report_cmd",
+    "trade_lifecycle": "trade_lifecycle_cmd",
+    "trade_lifecycle_detail": "trade_lifecycle_detail_cmd",
+    "setup_audit": "setup_audit_cmd",
+    "setup_quality": "setup_audit_cmd",
+    "setup_audit_overall": "setup_audit_overall_cmd",
+    "setup_audit_keep_watch": "setup_audit_keep_watch_cmd",
+    "setup_audit_keep": "setup_audit_keep_cmd",
+    "setup_keep_watch_summary": "setup_audit_keep_watch_cmd",
+    "setup_audit_compare": "setup_audit_compare_cmd",
+    "setup_audit_reconcile": "setup_audit_compare_cmd",
+    "setup_matrix": "setup_matrix_cmd",
+    "setup_edge_matrix": "setup_matrix_cmd",
+    "setup_deep_analysis": "setup_deep_analysis_cmd",
+    "setup_edge_deep": "setup_deep_analysis_cmd",
+    "setup_matrix_deep": "setup_deep_analysis_cmd",
+    "dev_status": "dev_status_cmd",
+    "framework_status": "dev_status_cmd",
+    "health_sys": "health_sys_cmd",
+    "learning_status": "learning_status_cmd",
+    "optimizer_status": "learning_status_cmd",
+    "edge_status": "edge_status_cmd",
+    "winrate": "winrate_cmd",
+    "ny_winrate": "ny_winrate_cmd",
+    "nywinrate": "ny_winrate_cmd",
+    "lessons_learned": "lessons_learned_cmd",
+    "report_daily": "report_daily_cmd",
+    "report_weekly": "report_weekly_cmd",
+    "report_overall": "report_overall_cmd",
+    "signals_daily": "signals_daily_cmd",
+    "signals_weekly": "signals_weekly_cmd",
+    "open_trades": "open_trades_cmd",
+    "cooldowns": "cooldowns_cmd",
+    "cooldown": "cooldown_cmd",
+    "setups_log": "setups_log_cmd",
+    "params_show": "cmd_params_show",
+    "optimize_report": "cmd_optimize_report",
+    "self_optimize_report": "cmd_self_optimize_report",
+    "autopilot_report": "cmd_self_optimize_report",
+    "adaptive_status": "market_adaptive_status_cmd",
+    "goal_status": "goal_profile_status_cmd",
+    "goalstatus": "goal_profile_status_cmd",
+    "backtest": "cmd_backtest",
+    "universe_backtest": "cmd_universe_backtest",
+}
+OWNER_DEFERRED_COMMANDS = set(OWNER_DEFERRED_COMMAND_HANDLERS.keys())
+OWNER_DEFERRED_COMMAND_TIMEOUT_SEC = int(os.getenv("OWNER_DEFERRED_COMMAND_TIMEOUT_SEC", "900") or 900)
+# Ver73: deferred commands already ACK first; do not make report/debug outputs wait
+# behind a previous report for minutes.  Keep a small concurrency cap so 10 pressed
+# commands stay responsive without stampeding the live AutoTrade/email executors.
+OWNER_DEFERRED_COMMAND_DELAY_SEC = float(os.getenv("OWNER_DEFERRED_COMMAND_DELAY_SEC", "0.05") or 0.05)
+OWNER_DEFERRED_COMMAND_MAX_CONCURRENT = int(os.getenv("OWNER_DEFERRED_COMMAND_MAX_CONCURRENT", "4") or 4)
+# Ver73: 1s was too aggressive on Render/Telegram and could drop the visible ACK;
+# the command path still returns quickly, but the owner sees the accepted message.
+TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC = float(os.getenv("TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC", "2.0") or 2.0)
 
 # 07May_v01: DB-backed family/session edge governance.
 # The review table is always persisted. Live blocking is deliberately limited to
@@ -4937,11 +5008,26 @@ def _setup_route_candidate_for_executable_lane(setup, session_name: str = '', us
     router before `is_executable_setup_eligible()` is called.  Earlier builds checked
     the raw NORMAL setup first, so weak NORMAL combos were rejected before they could
     be converted into their intended REVERSE test lane.
+
+    Ver74 fix: when a setup was already locked by a delivery bridge (setup email,
+    BigMove/F8, screen cache or AutoTrade handoff), preserve the exact delivered
+    side/strategy.  The downstream executable/policy gates still run; this only
+    prevents a second presend pass from re-routing an already-built F8 row into the
+    opposite side.
     """
     try:
-        routed = _setup_adaptive_strategy_route_setup(setup, session_name=session_name, user_id=int(user_id or 0))
+        if bool(_setup_strategy_attr(setup, 'delivery_lane_locked', False)):
+            routed = setup
+        else:
+            try:
+                routed = _setup_adaptive_strategy_route_setup(setup, session_name=session_name, user_id=int(user_id or 0))
+            except Exception:
+                routed = setup
     except Exception:
-        routed = setup
+        try:
+            routed = _setup_adaptive_strategy_route_setup(setup, session_name=session_name, user_id=int(user_id or 0))
+        except Exception:
+            routed = setup
     try:
         sess = str(session_name or '').upper().strip()
         if sess:
@@ -20914,17 +21000,44 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
             session=str(session_name or '').upper().strip(),
         )
 
-        # yver127: BigMove/F8 candidates must pass through the same NOR→REV
-        # router BEFORE becoming an emailed/executable delivery lane.  Previously
-        # a raw disabled F8-ASIA-NOR-SELL could be emailed and then AutoTrade
-        # correctly skipped it as final_combo_disabled, while /setup_audit showed
-        # the routed F8-ASIA-REV-BUY.  Route first, then lock the delivered lane.
+        # yver127: BigMove/F8 candidates normally pass through the same NOR→REV
+        # router BEFORE becoming an emailed/executable delivery lane.  Ver74 adds a
+        # safety correction for confirmed BigMove alerts: if the router flips the
+        # continuation signal into the opposite side and that opposite side is then
+        # blocked by the real-time leader/loser context guard (e.g. HMSTR DOWN ->
+        # REV BUY on a loser), preserve the original confirmed continuation side.
+        # The preserved row still goes through the same executable, KEEP-policy,
+        # cooldown, risk and AutoTrade gates; this is not a policy bypass.
         try:
             owner_for_policy = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
         except Exception:
             owner_for_policy = 0
         try:
+            _raw_bigmove_setup = copy.deepcopy(s)
+        except Exception:
+            _raw_bigmove_setup = s
+        try:
             s = _setup_route_candidate_for_executable_lane(s, session_name=session_name, user_id=owner_for_policy)
+        except Exception:
+            pass
+        try:
+            routed_ok, routed_why, routed_meta = _setup_directional_context_guard_allows_setup(s, session_name=session_name, user_id=owner_for_policy)
+            raw_ok, raw_why, raw_meta = _setup_directional_context_guard_allows_setup(_raw_bigmove_setup, session_name=session_name, user_id=owner_for_policy)
+            raw_side = str(getattr(_raw_bigmove_setup, 'side', '') or '').upper().strip()
+            raw_dir = str(c.get('direction') or '').upper().strip()
+            raw_matches_alert = bool((raw_dir == 'UP' and raw_side == 'BUY') or (raw_dir == 'DOWN' and raw_side == 'SELL'))
+            if (not routed_ok) and raw_ok and raw_matches_alert and str(routed_why or '').startswith('directional_context_blocks'):
+                s = _raw_bigmove_setup
+                try:
+                    _setup_strategy_set_attr(s, 'setup_strategy', 'NORMAL')
+                    _setup_strategy_set_attr(s, 'strategy', 'NORMAL')
+                    _setup_strategy_set_attr(s, 'strategy_mode', 'NORMAL')
+                    _setup_strategy_set_attr(s, 'strategy_reason', f'bigmove_continuation_preserved_after_reverse_context_block:{str(routed_why or "")[:180]}')
+                    _setup_strategy_set_attr(s, 'bigmove_reverse_context_blocked', True)
+                    _setup_strategy_set_attr(s, 'bigmove_reverse_block_reason', str(routed_why or '')[:240])
+                    _setup_strategy_set_attr(s, 'bigmove_raw_context_reason', str(raw_why or '')[:240])
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -41826,38 +41939,84 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
 
 
 async def _instant_reply(update: Update, text: str, parse_mode: Optional[str] = None, reply_markup=None) -> bool:
-    """Very short timeout Telegram reply for owner/admin commands.
+    """Best-effort short Telegram reply for the owner/admin fast lane.
 
-    This prevents one slow Telegram send from holding the command path for minutes.
-    It is used only for tiny instant replies/snapshots; larger reports still use
-    send_long_message.
+    Ver73: the previous 1s single reply path could time out silently on Render,
+    so the user saw no ACK until the deferred report finished.  Try the normal
+    reply first, then a direct bot.send_message fallback with a slightly longer
+    but still bounded timeout.  This function must never raise into the command
+    path.
     """
     try:
         if not update or not getattr(update, 'message', None):
             return False
+    except Exception:
+        return False
+
+    txt = str(text or '')
+    base_timeout = max(1.5, float(TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC or 2.0))
+
+    try:
         await asyncio.wait_for(
             update.message.reply_text(
-                str(text or ''),
+                txt,
                 parse_mode=parse_mode,
                 disable_web_page_preview=True,
                 reply_markup=reply_markup,
-                read_timeout=max(1.0, TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC),
-                write_timeout=max(1.0, TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC),
+                read_timeout=max(2.0, base_timeout),
+                write_timeout=max(2.0, base_timeout),
                 connect_timeout=2.0,
-                pool_timeout=0.5,
+                pool_timeout=1.0,
             ),
-            timeout=max(1.5, TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC + 0.75),
+            timeout=max(2.5, base_timeout + 1.0),
         )
         return True
     except TypeError:
         try:
             await asyncio.wait_for(
-                update.message.reply_text(str(text or ''), parse_mode=parse_mode, disable_web_page_preview=True, reply_markup=reply_markup),
-                timeout=max(1.5, TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC + 0.75),
+                update.message.reply_text(txt, parse_mode=parse_mode, disable_web_page_preview=True, reply_markup=reply_markup),
+                timeout=max(2.5, base_timeout + 1.0),
             )
             return True
         except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Direct bot fallback.  This avoids losing the ACK if reply_text was cancelled
+    # by a short timeout or message-reply metadata issue.
+    try:
+        chat_id = getattr(getattr(update, 'effective_chat', None), 'id', None)
+        if chat_id is None:
             return False
+        bot = None
+        try:
+            bot = update.get_bot()
+        except Exception:
+            bot = getattr(update, '_bot', None)
+        if bot is None:
+            return False
+        try:
+            await asyncio.wait_for(
+                bot.send_message(
+                    chat_id=chat_id,
+                    text=txt,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup,
+                    read_timeout=max(2.0, base_timeout),
+                    write_timeout=max(2.0, base_timeout),
+                    connect_timeout=2.0,
+                    pool_timeout=1.0,
+                ),
+                timeout=max(3.0, base_timeout + 1.5),
+            )
+        except TypeError:
+            await asyncio.wait_for(
+                bot.send_message(chat_id=chat_id, text=txt, parse_mode=parse_mode, disable_web_page_preview=True, reply_markup=reply_markup),
+                timeout=max(3.0, base_timeout + 1.5),
+            )
+        return True
     except Exception:
         return False
 
@@ -41868,6 +42027,101 @@ def _owner_or_admin_from_update(update: Update) -> bool:
         return bool(uid and (uid == int(AUTOTRADE_OWNER_UID or 0) or is_admin_user(uid)))
     except Exception:
         return False
+
+
+_OWNER_DEFERRED_COMMAND_SEMAPHORE = None
+_OWNER_DEFERRED_COMMAND_SEQ = 0
+
+
+def _owner_deferred_command_semaphore():
+    """Create the no-lag deferred command semaphore lazily inside the running loop."""
+    global _OWNER_DEFERRED_COMMAND_SEMAPHORE
+    try:
+        if _OWNER_DEFERRED_COMMAND_SEMAPHORE is None:
+            _OWNER_DEFERRED_COMMAND_SEMAPHORE = asyncio.Semaphore(max(1, int(OWNER_DEFERRED_COMMAND_MAX_CONCURRENT or 1)))
+        return _OWNER_DEFERRED_COMMAND_SEMAPHORE
+    except Exception:
+        return asyncio.Semaphore(1)
+
+
+async def _owner_deferred_command_runner(cmd: str, handler_name: str, update: Update, context: ContextTypes.DEFAULT_TYPE, args_snapshot: list[str], seq: int) -> None:
+    """Run a heavy owner/admin command after the instant ACK has been sent.
+
+    Ver72 purpose: user commands must never wait for Bybit/SQLite/OHLCV/report work.
+    The original handler remains the single source of truth for the actual report;
+    this wrapper only moves it behind an immediate acknowledgement and serialises
+    bounded report work so 10 pressed commands cannot block the command lane.
+    """
+    try:
+        await asyncio.sleep(max(0.0, float(OWNER_DEFERRED_COMMAND_DELAY_SEC or 0.0)))
+    except Exception:
+        pass
+    sem = _owner_deferred_command_semaphore()
+    async with sem:
+        try:
+            try:
+                context.args = list(args_snapshot or [])
+            except Exception:
+                pass
+            handler = globals().get(str(handler_name or ''))
+            if not handler:
+                try:
+                    await update.message.reply_text(f"⚠️ /{cmd} background handler is not available.")
+                except Exception:
+                    pass
+                return
+            await asyncio.wait_for(handler(update, context), timeout=max(30, int(OWNER_DEFERRED_COMMAND_TIMEOUT_SEC or 900)))
+        except asyncio.TimeoutError:
+            try:
+                await update.message.reply_text(f"⚠️ /{cmd} is still running in the background and exceeded the safe response window. Try again shortly.")
+            except Exception:
+                pass
+        except ApplicationHandlerStop:
+            pass
+        except Exception as e:
+            try:
+                logger.exception("deferred owner command /%s failed: %s", cmd, e)
+            except Exception:
+                pass
+            try:
+                await update.message.reply_text(f"⚠️ /{cmd} background run failed: {type(e).__name__}: {str(e)[:180]}")
+            except Exception:
+                pass
+
+
+async def _owner_defer_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str, handler_name: str) -> bool:
+    """Instantly ACK a heavy owner/admin command and queue its full output.
+
+    Returns True only when the ACK was visibly accepted by Telegram.  If the ACK
+    cannot be sent quickly, the router lets the normal handler continue instead
+    of swallowing the command and making the user wait in silence.
+    """
+    global _OWNER_DEFERRED_COMMAND_SEQ
+    try:
+        _OWNER_DEFERRED_COMMAND_SEQ += 1
+        seq = int(_OWNER_DEFERRED_COMMAND_SEQ)
+    except Exception:
+        seq = 0
+    try:
+        args_snapshot = list((str(update.message.text or '').split()[1:]) if getattr(update, 'message', None) else (context.args or []))
+    except Exception:
+        args_snapshot = list(context.args or [])
+    try:
+        context.args = list(args_snapshot)
+    except Exception:
+        pass
+    label = str(cmd or 'command').strip() or 'command'
+    ack_ok = await _instant_reply(
+        update,
+        f"⏳ /{label} accepted. The bot is working in the background and will post the output when ready."
+    )
+    if not ack_ok:
+        return False
+    _safe_create_task(
+        _owner_deferred_command_runner(label, handler_name, update, context, args_snapshot, seq),
+        label=f"owner-deferred-command:{label}:{seq}",
+    )
+    return True
 
 
 async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -41925,8 +42179,42 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
             return
-        # No full cache: use only cached tickers. No fetch_futures_tickers here.
+        # No full cache: use only cached tickers / DB. No fetch_futures_tickers here.
         best = get_cached_futures_tickers() or {}
+
+        # Ver73: before falling back to the ticker-only warming screen, read the
+        # recent setup-email/executable lane from DB.  This is lightweight and keeps
+        # /screen synced with the exact setups already emailed/opened by AutoTrade
+        # (for example WLD/BTC AT_OPEN) even when the full scan cache is warming.
+        try:
+            body_db, kb_db, shown_db = await to_thread_fast(
+                _screen_recent_db_body_and_kb,
+                int(uid or 0),
+                str(scan_session or ''),
+                best or {},
+                max_age_min=_screen_actionable_fallback_max_age_min(),
+                include_email_source=True,
+                timeout=3,
+            )
+        except Exception:
+            body_db, kb_db, shown_db = '', [], []
+        if body_db:
+            header = (
+                "*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{_screen_when_line('Recent setup lane', time.time())}"
+                "_Showing the latest emailed/executable setup lane while the full scan refreshes._\n"
+            )
+            await send_long_message(
+                update,
+                _screen_markdown_to_html((header + "\n" + str(body_db or '')).strip()),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))] for (sym, sid) in (kb_db or [])]) if kb_db else None,
+            )
+            return
+
         if best:
             body, kb, _ = _screen_quick_ticker_snapshot_body(best, scan_session)
             header = (
@@ -41970,7 +42258,7 @@ async def _owner_instant_command_router(update: Update, context: ContextTypes.DE
         if not txt.startswith('/'):
             return
         cmd = txt.split()[0][1:].split('@')[0].strip().lower()
-        if cmd not in OWNER_INSTANT_COMMANDS:
+        if cmd not in OWNER_INSTANT_COMMANDS and cmd not in OWNER_DEFERRED_COMMANDS:
             return
         if not _owner_or_admin_from_update(update):
             return
@@ -42007,8 +42295,21 @@ async def _owner_instant_command_router(update: Update, context: ContextTypes.DE
             await _instant_equity_cmd(update, context)
             raise ApplicationHandlerStop
         if cmd == 'screen':
-            await _owner_instant_screen_cmd(update, context)
-            raise ApplicationHandlerStop
+            # Ver72 strict no-lag: even /screen should ACK first, then post the
+            # cached/ticker snapshot from the deferred lane. This avoids one long
+            # Telegram table send delaying the next command in a burst.
+            if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)):
+                if await _owner_defer_command(update, context, cmd, '_owner_instant_screen_cmd'):
+                    raise ApplicationHandlerStop
+                return
+            else:
+                await _owner_instant_screen_cmd(update, context)
+                raise ApplicationHandlerStop
+        if cmd in OWNER_DEFERRED_COMMANDS:
+            handler_name = str(OWNER_DEFERRED_COMMAND_HANDLERS.get(cmd) or '')
+            if await _owner_defer_command(update, context, cmd, handler_name):
+                raise ApplicationHandlerStop
+            return
     except ApplicationHandlerStop:
         raise
     except Exception:
