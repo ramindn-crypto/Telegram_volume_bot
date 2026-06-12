@@ -1,3 +1,4 @@
+# Ver78: no-lag polish from Ver77. Keeps instant ACK path. /screen now prefers recent/open AutoTrade positions over stale ticker-only cache, and /setup_audit deferred path falls back to the existing cached/background report wrapper instead of rebuilding synchronously. No strategy/risk/policy changes.
 # Ver74: BigMove/F8 setup bridge fix from Ver73. Preserves confirmed BigMove continuation side when NOR→REV routing would create a leader/loser context conflict, and honors delivery_lane_locked so emailed/executable F8 rows are not re-routed before presend/AutoTrade gates. No lag-path, risk, TP/SL, or KEEP-policy loosening.
 # Ver77: no-lag polish from Ver76. Keeps instant ACK path, raises deferred output concurrency, removes artificial delayed output, and makes /screen show active AutoTrade OPEN positions even when current-session setup cache is empty/expired. No strategy/risk/policy changes.
 # Ver73: emergency no-lag hardening from Ver72. Fixes lost instant ACK fallback, removes single-command output bottleneck, and makes /screen read recent emailed/AT_OPEN setup lane before ticker snapshot. No strategy/risk/policy changes.
@@ -42207,23 +42208,17 @@ def _owner_deferred_direct_sync_text(cmd: str, args_snapshot: list[str], request
         h = _owner_parse_hours_arg(args_snapshot, default=24, min_h=1, max_h=168)
         return (_autotrade_report_text_cached(owner, h), ParseMode.HTML)
     if cmd in {'setup_audit', 'setup_quality'}:
+        # Ver78: do not rebuild setup audits synchronously inside the no-lag
+        # deferred worker.  The original setup_audit_cmd already has the correct
+        # cached-or-background report wrapper and posts stale cache instantly when
+        # available.  Rebuilding here was why /setup_audit 2 could hold the
+        # deferred output lane for ~2 minutes even though the Telegram ACK was instant.
         try:
             if args_snapshot and str(args_snapshot[0]).lower() in {'h', 'help', '?', 'guide'}:
                 return (_setup_audit_help_text(), ParseMode.HTML)
-            if args_snapshot and str(args_snapshot[0]).lower() in {'overall', 'alltime', 'all-time'}:
-                return (_setup_audit_overall_text(owner), ParseMode.HTML)
-            if args_snapshot and str(args_snapshot[0]).lower() in {'compare', 'reconcile', 'traded', 'autotrade'}:
-                cmp_h = 24
-                if len(args_snapshot) >= 2:
-                    try:
-                        cmp_h = int(clamp(int(float(str(args_snapshot[1]))), 1, 168))
-                    except Exception:
-                        cmp_h = 24
-                return (_setup_audit_compare_text(owner, cmp_h), ParseMode.HTML)
-            h = _owner_parse_hours_arg(args_snapshot, default=24, min_h=1, max_h=168)
-            return (_setup_audit_text(owner, 0, h), ParseMode.HTML)
-        except Exception as e:
-            return (f"⚠️ /setup_audit failed in no-lag worker: {type(e).__name__}: {str(e)[:180]}", None)
+        except Exception:
+            pass
+        return None
     return None
 
 
@@ -42377,6 +42372,28 @@ def _screen_open_autotrade_positions_body_sync(uid: int, max_rows: int = 6) -> s
     except Exception:
         rows = []
     if not rows:
+        # Ver78: if the fast accounting cache is cold or missing row details,
+        # fall back to the local AutoTrade journal only.  This is DB-only and
+        # avoids a live exchange call, so /screen remains no-lag but still shows
+        # known AT_OPEN/OPEN trades instead of a misleading ticker-only screen.
+        try:
+            with sqlite3.connect(DB_PATH, timeout=0.8) as conn:
+                conn.row_factory = sqlite3.Row
+                c = conn.cursor()
+                q_uid = int(owner or uid or 0)
+                sql = """
+                    SELECT symbol, side, COALESCE(risk_usd, 0) AS risk_usd,
+                           COALESCE(pnl_usdt, 0) AS pnl_usdt, opened_ts, status
+                    FROM autotrade_trades
+                    WHERE (? = 0 OR uid = ?)
+                      AND UPPER(COALESCE(status,'')) IN ('OPEN','AT_OPEN','LIVE','PLACED')
+                    ORDER BY COALESCE(opened_ts,0) DESC
+                    LIMIT ?
+                """
+                rows = [dict(r) for r in c.execute(sql, (q_uid, q_uid, max(1, int(max_rows or 6)))).fetchall()]
+        except Exception:
+            rows = []
+    if not rows:
         return ''
     lines = []
     lines.append('*Top Trade Setups*')
@@ -42436,6 +42453,71 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
                 cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
             except Exception:
                 cache_ts = 0.0
+            cache_body_s = str((cache_entry or {}).get('body') or '')
+            cache_is_ticker_only = (
+                ('Executable scan is warming up' in cache_body_s)
+                or ('No confirmed setup shown' in cache_body_s)
+                or ('Live setup/email/AutoTrade pipeline is running in the background' in cache_body_s and 'AT_OPEN' not in cache_body_s and 'Open AutoTrade Positions' not in cache_body_s)
+            )
+            if cache_is_ticker_only:
+                # Ver78: do not let a stale ticker-only cache hide active/recent
+                # setup lane rows.  This was visible at 23:55: /screen returned
+                # the cached market snapshot while WLD/LINK were still open.
+                try:
+                    best_for_db = get_cached_futures_tickers() or {}
+                except Exception:
+                    best_for_db = {}
+                try:
+                    body_db, kb_db, shown_db = await to_thread_fast(
+                        _screen_recent_db_body_and_kb,
+                        int(uid or 0),
+                        str(scan_session or ''),
+                        best_for_db or {},
+                        max_age_min=_screen_actionable_fallback_max_age_min(),
+                        include_email_source=True,
+                        timeout=2,
+                    )
+                except Exception:
+                    body_db, kb_db, shown_db = '', [], []
+                if body_db:
+                    header = (
+                        "*PulseFutures — Market Scan*\n"
+                        f"{HDR}\n"
+                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                        f"{_screen_when_line('Recent setup lane', time.time())}"
+                        "_Showing the latest emailed/executable setup lane while the full scan refreshes._\n"
+                    )
+                    await send_long_message(
+                        update,
+                        _screen_markdown_to_html((header + "\n" + str(body_db or '')).strip()),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))] for (sym, sid) in (kb_db or [])]) if kb_db else None,
+                    )
+                    return
+                try:
+                    open_body = await to_thread_fast(
+                        _screen_open_autotrade_positions_body_sync,
+                        int(uid or 0),
+                        timeout=2,
+                    )
+                except Exception:
+                    open_body = ''
+                if str(open_body or '').strip():
+                    header = (
+                        "*PulseFutures — Market Scan*\n"
+                        f"{HDR}\n"
+                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                        f"{_screen_when_line('Active position snapshot', time.time())}"
+                        "_Showing active AutoTrade positions from the fast cache. Live setup/email/AutoTrade pipeline continues in the background._\n"
+                    )
+                    await send_long_message(
+                        update,
+                        _screen_markdown_to_html((header + "\n" + str(open_body or '')).strip()),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                    return
             header = (
                 "*PulseFutures — Market Scan*\n"
                 f"{HDR}\n"
@@ -42449,7 +42531,7 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
             ]
             await send_long_message(
                 update,
-                _screen_markdown_to_html((header + "\n" + str((cache_entry or {}).get('body') or '')).strip()),
+                _screen_markdown_to_html((header + "\n" + cache_body_s).strip()),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
