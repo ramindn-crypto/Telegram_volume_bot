@@ -1,3 +1,4 @@
+# Ver98: restores full /why reject diagnostics by persisting raw scan reject payloads to SQLite and always combining the last meaningful raw reject report with current blackout/pipeline status; no strategy/risk/trading changes.
 # Ver97: restores user-configured/broad Melbourne blackout schedule after Ver96 mistake. Keeps all blackout windows in autotrade_config, merges required windows back if Ver96 overwrote them, and preserves command-firewall/no-lag + /why blackout visibility. No strategy/risk/KEEP/F8/TP/SL/trading changes.
 # Ver95: prevents BigMove from starving the normal setup/email scan: BigMove payload/F8 setup handling is fire-and-forget with an in-flight guard, so session pool generation always proceeds; /why now shows pool/build events when no reject stats exist. No strategy/risk/KEEP/TP/SL/trading changes.
 # Ver94: BigMove/F8 setup conversion no longer depends on the heavy routed setup builder. If the normal builder times out, a lightweight F8 continuation setup is created in the background, then still passes the same presend KEEP/context/executable gates before setup email, /screen, DB, and AutoTrade. No Telegram command-lane, risk, TP/SL, or policy loosening.
@@ -18015,6 +18016,126 @@ def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> No
     return
 
 
+
+
+def _reject_diag_migrate_tables() -> None:
+    """Persist full /why reject snapshots so diagnostics survive restarts/blackout periods."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS scan_reject_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_ts REAL NOT NULL DEFAULT 0,
+                user_id INTEGER NOT NULL DEFAULT 0,
+                mode TEXT NOT NULL DEFAULT '',
+                session TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_scan_reject_diag_user_ts ON scan_reject_diagnostics(user_id, created_ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_scan_reject_diag_mode_session_ts ON scan_reject_diagnostics(mode, session, created_ts)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _reject_diag_payload_meaningful(payload: dict | None) -> bool:
+    try:
+        if not isinstance(payload, dict):
+            return False
+        if payload.get('counts'):
+            return True
+        if payload.get('per_symbol'):
+            return True
+        if payload.get('allow'):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _reject_diag_save_payload(payload: dict, uid: int | None = None) -> None:
+    """Save the same rich reject payload used by /why.
+
+    Ver98: /why became too short after deploys/blackout because _LAST_REJECTS is
+    in-memory only. Saving the payload lets /why show the last real raw scan even
+    while current setup generation is intentionally blacked out.
+    """
+    try:
+        if not _reject_diag_payload_meaningful(payload):
+            return
+        _reject_diag_migrate_tables()
+        user_id = int(uid or 0)
+        created_ts = float(payload.get('ts') or time.time())
+        mode = str(payload.get('mode') or '').strip().lower()
+        session = str(payload.get('session') or '').strip().upper()
+        # Trim extreme payloads but keep the exact old /why information.
+        safe_payload = dict(payload)
+        try:
+            counts = dict(safe_payload.get('counts') or {})
+            if len(counts) > 220:
+                counts = dict(sorted(counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:220])
+                safe_payload['counts'] = counts
+        except Exception:
+            pass
+        try:
+            per = dict(safe_payload.get('per_symbol') or {})
+            if len(per) > 120:
+                keep = list(per.items())[:120]
+                safe_payload['per_symbol'] = dict(keep)
+        except Exception:
+            pass
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO scan_reject_diagnostics(created_ts,user_id,mode,session,payload_json) VALUES(?,?,?,?,?)",
+                (created_ts, user_id, mode, session, json.dumps(safe_payload, default=str, separators=(',', ':'))),
+            )
+            # Keep DB small. These diagnostics are operational, not long-term evidence.
+            cutoff = time.time() - 7 * 86400
+            c.execute("DELETE FROM scan_reject_diagnostics WHERE created_ts<?", (float(cutoff),))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _reject_diag_latest_payload(uid: int = 0, max_age_hours: float = 72.0) -> dict:
+    """Return latest meaningful raw reject payload for /why, including shared uid=0 scans."""
+    try:
+        _reject_diag_migrate_tables()
+        ids = []
+        try:
+            if int(uid or 0) > 0:
+                ids.append(int(uid))
+        except Exception:
+            pass
+        try:
+            owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+            if owner_uid > 0 and owner_uid not in ids:
+                ids.append(owner_uid)
+        except Exception:
+            pass
+        if 0 not in ids:
+            ids.append(0)
+        qmarks = ','.join('?' for _ in ids)
+        cutoff = float(time.time()) - max(3600.0, float(max_age_hours or 72.0) * 3600.0)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            rows = c.execute(
+                f"SELECT payload_json FROM scan_reject_diagnostics WHERE created_ts>=? AND user_id IN ({qmarks}) ORDER BY created_ts DESC LIMIT 80",
+                (cutoff, *ids),
+            ).fetchall() or []
+        for r in rows:
+            try:
+                payload = json.loads(str(r['payload_json'] or '{}'))
+                if _reject_diag_payload_meaningful(payload):
+                    return payload
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {}
+
 def _setup_pipeline_recent_gate_summary(uid: int = 0, session: str = '', lookback_min: int = 45) -> dict:
     """Summarise post-generation executable gate events for /why.
 
@@ -18140,6 +18261,16 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
             if isinstance(_v, dict) and (_v.get("counts") or _v.get("per_symbol") or _v.get("allow")):
                 candidates.append(_v)
 
+    # Ver98: also load the last meaningful raw scan from SQLite. This keeps /why
+    # complete after a redeploy and during blackout windows where the current scan
+    # is intentionally skipped.
+    try:
+        _persisted = _reject_diag_latest_payload(int(uid), max_age_hours=72.0)
+        if isinstance(_persisted, dict) and (_persisted.get("counts") or _persisted.get("per_symbol") or _persisted.get("allow")):
+            candidates.append(_persisted)
+    except Exception:
+        pass
+
     def _ts(_r: dict) -> float:
         try:
             return float((_r or {}).get("ts") or 0.0)
@@ -18236,6 +18367,19 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
             extra.append(f"Updated: {_when} Melbourne")
         if extra:
             lines.append(" • ".join(extra))
+        try:
+            age_min = (time.time() - float(_tsv or 0.0)) / 60.0 if _tsv > 0 else 0.0
+            if age_min >= 30.0:
+                lines.append(f"Showing last meaningful raw scan ({age_min:.0f}m old); current scan may be blacked out, empty, or warming.")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        _sblk, _swhy = _setup_generation_blackout_now()
+        _eblk, _ewhy = _autotrade_entry_blackout_now()
+        lines.append(f"Setup blackout now: {'ACTIVE' if _sblk else 'OPEN'}" + (f" | {_swhy}" if _sblk and _swhy else "") + f" | windows={_setup_generation_blackout_windows()}")
+        lines.append(f"Entry blackout now: {'ACTIVE' if _eblk else 'OPEN'}" + (f" | {_ewhy}" if _eblk and _ewhy else "") + f" | windows={_autotrade_entry_blackout_windows()}")
     except Exception:
         pass
     if allow_set_unique:
@@ -57879,6 +58023,17 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
             shared_bucket["latest"] = dict(payload)
             _LAST_REJECTS_SHARED.clear()
             _LAST_REJECTS_SHARED.update(shared_bucket)
+        except Exception:
+            pass
+        try:
+            _reject_diag_save_payload(payload, uid=0 if uid is None else int(uid))
+        except Exception:
+            pass
+        # Always save autonomous/shared scans as uid=0 as well, so owner /why can
+        # still find the last meaningful raw scan after a restart.
+        try:
+            if uid is not None:
+                _reject_diag_save_payload(payload, uid=0)
         except Exception:
             pass
         if uid is not None:
