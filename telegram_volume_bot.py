@@ -1,3 +1,4 @@
+# Ver79: no-lag polish from Ver78. /screen active-position fallback now uses live Bybit position rows only (no stale DB OPEN fallback), dedupes rows, and BigMove/F8 failures now record the exact presend gate reason instead of only f8_setup_email_failed_or_empty. No strategy/risk/policy changes.
 # Ver78: no-lag polish from Ver77. Keeps instant ACK path. /screen now prefers recent/open AutoTrade positions over stale ticker-only cache, and /setup_audit deferred path falls back to the existing cached/background report wrapper instead of rebuilding synchronously. No strategy/risk/policy changes.
 # Ver74: BigMove/F8 setup bridge fix from Ver73. Preserves confirmed BigMove continuation side when NOR→REV routing would create a leader/loser context conflict, and honors delivery_lane_locked so emailed/executable F8 rows are not re-routed before presend/AutoTrade gates. No lag-path, risk, TP/SL, or KEEP-policy loosening.
 # Ver77: no-lag polish from Ver76. Keeps instant ACK path, raises deferred output concurrency, removes artificial delayed output, and makes /screen show active AutoTrade OPEN positions even when current-session setup cache is empty/expired. No strategy/risk/policy changes.
@@ -42341,71 +42342,58 @@ async def _owner_defer_command(update: Update, context: ContextTypes.DEFAULT_TYP
 def _screen_open_autotrade_positions_body_sync(uid: int, max_rows: int = 6) -> str:
     """Lightweight /screen fallback for active AutoTrade positions.
 
-    yver77: /screen is intentionally cache-only, so it can miss older LON setups
-    after a session change even though AutoTrade positions are still live.  This
-    helper uses the existing fast accounting cache and never performs a forced
-    exchange refresh.  If the cache is cold/slow it simply returns empty and
-    /screen falls back to the ticker snapshot.
+    Ver79: the previous fallback could read stale OPEN rows from the local journal
+    and showed closed/duplicate positions on /screen (for example BTC/SOL/BEAT
+    while /autotrade_debug showed only WLD/LINK live).  This fallback now uses the
+    same live Bybit position rows that AutoTrade/debug use.  It runs only after the
+    instant ACK/background handoff, so it cannot block Telegram command intake.
     """
     try:
         owner = int(AUTOTRADE_OWNER_UID or uid or 0)
     except Exception:
         owner = int(uid or 0)
     try:
-        user = get_user(owner) or {}
+        live_positions = list(_bybit_get_open_positions_linear() or [])
     except Exception:
-        user = {}
+        live_positions = []
+    if not live_positions:
+        return ''
     try:
-        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=max(10, int(FAST_ADMIN_SNAPSHOT_TTL_SEC)), force_refresh=False)
+        bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(
+            int(owner or uid or 0), positions=live_positions, fallback_unmatched_as_owned=True
+        )
     except Exception:
-        snap = {}
-    try:
-        equity = float((snap or {}).get('equity') or 0.0)
-    except Exception:
-        equity = 0.0
-    try:
-        mday = _autotrade_day_risk_metrics_cached(owner, float(equity), ttl=max(10, int(FAST_ADMIN_METRICS_TTL_SEC)), force_refresh=False)
-    except Exception:
-        mday = {}
-    try:
-        rows = list((snap or {}).get('open_positions') or (mday or {}).get('open_positions') or [])
-    except Exception:
-        rows = []
-    if not rows:
-        # Ver78: if the fast accounting cache is cold or missing row details,
-        # fall back to the local AutoTrade journal only.  This is DB-only and
-        # avoids a live exchange call, so /screen remains no-lag but still shows
-        # known AT_OPEN/OPEN trades instead of a misleading ticker-only screen.
+        bot_positions, external_positions = [], []
+    rows = []
+    seen = set()
+    for p, tr in list(bot_positions or []):
         try:
-            with sqlite3.connect(DB_PATH, timeout=0.8) as conn:
-                conn.row_factory = sqlite3.Row
-                c = conn.cursor()
-                q_uid = int(owner or uid or 0)
-                sql = """
-                    SELECT symbol, side, COALESCE(risk_usd, 0) AS risk_usd,
-                           COALESCE(pnl_usdt, 0) AS pnl_usdt, opened_ts, status
-                    FROM autotrade_trades
-                    WHERE (? = 0 OR uid = ?)
-                      AND UPPER(COALESCE(status,'')) IN ('OPEN','AT_OPEN','LIVE','PLACED')
-                    ORDER BY COALESCE(opened_ts,0) DESC
-                    LIMIT ?
-                """
-                rows = [dict(r) for r in c.execute(sql, (q_uid, q_uid, max(1, int(max_rows or 6)))).fetchall()]
+            sym_full = str(_pos_symbol(p) or (tr or {}).get('symbol') or '').upper().strip()
+            side = str(_pos_side_text(p) or (tr or {}).get('side') or '').upper().strip()
+            if not sym_full or not side:
+                continue
+            key = (sym_full.replace('USDT',''), side)
+            if key in seen:
+                continue
+            seen.add(key)
+            risk = float(_estimate_position_risk_usd(p) or (tr or {}).get('risk_usd') or (tr or {}).get('risk') or 0.0)
+            pnl = float(_pos_unreal_pnl(p) or 0.0)
+            rows.append({'symbol': sym_full, 'side': side, 'risk_usd': risk, 'pnl': pnl})
         except Exception:
-            rows = []
+            continue
     if not rows:
         return ''
     lines = []
     lines.append('*Top Trade Setups*')
     lines.append(HDR)
-    lines.append('_No fresh current-session setup cache yet. Showing active AutoTrade positions already opened by the setup pipeline._')
+    lines.append('_No fresh current-session setup cache yet. Showing currently live AutoTrade positions._')
     lines.append('')
     lines.append('*Open AutoTrade Positions*')
     lines.append('```')
     lines.append(f"{'SYM':<10} {'Side':<6} {'Risk$':>8} {'PnL$':>9}")
     for r in rows[:max(1, int(max_rows or 6))]:
         try:
-            sym = str(r.get('symbol') or r.get('base') or '-').upper().replace('USDT','')[:10]
+            sym = str(r.get('symbol') or '-').upper().replace('USDT','')[:10]
             side = str(r.get('side') or '-').upper()[:6]
             risk = float(r.get('risk_usd') or r.get('risk') or 0.0)
             pnl = float(r.get('pnl') or r.get('unrealized_pnl') or r.get('pnl_usdt') or 0.0)
@@ -42509,7 +42497,7 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
                         f"{HDR}\n"
                         f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                         f"{_screen_when_line('Active position snapshot', time.time())}"
-                        "_Showing active AutoTrade positions from the fast cache. Live setup/email/AutoTrade pipeline continues in the background._\n"
+                        "_Showing currently live AutoTrade positions. Live setup/email/AutoTrade pipeline continues in the background._\n"
                     )
                     await send_long_message(
                         update,
@@ -42589,7 +42577,7 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
                 f"{HDR}\n"
                 f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                 f"{_screen_when_line('Active position snapshot', time.time())}"
-                "_Showing active AutoTrade positions from the fast cache. Live setup/email/AutoTrade pipeline continues in the background._\n"
+                "_Showing currently live AutoTrade positions. Live setup/email/AutoTrade pipeline continues in the background._\n"
             )
             await send_long_message(
                 update,
@@ -61159,11 +61147,19 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', status='error', session=sess_u, mode='bigmove_setup_email', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
                 except Exception:
                     pass
+                try:
+                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f'f8_setup_build_error:{type(exc).__name__}: {str(exc)[:120]}')
+                except Exception:
+                    pass
                 return [], False
 
             if not setups:
                 try:
                     db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', status='empty', session=sess_u, mode='bigmove_setup_email', details={'candidates': len(filtered or []), 'tag': str(tag or '')})
+                except Exception:
+                    pass
+                try:
+                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_build_empty')
                 except Exception:
                     pass
                 return [], False
@@ -61191,7 +61187,22 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 setups, _bm_gate_reasons = [], Counter({'bigmove_presend_gate_exception': 1})
             if not setups:
                 try:
-                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', status='empty', session=sess_u, mode='bigmove_setup_email', details={'tag': str(tag or ''), 'top_reasons': _pipeline_top_reasons(_bm_gate_reasons, 8)})
+                    top_reasons = _pipeline_top_reasons(_bm_gate_reasons, 8)
+                except Exception:
+                    top_reasons = []
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', status='empty', session=sess_u, mode='bigmove_setup_email', details={'tag': str(tag or ''), 'top_reasons': top_reasons})
+                except Exception:
+                    pass
+                try:
+                    reason_txt = ', '.join([str(x) for x in list(top_reasons or [])[:4]]) or 'presend_gate_empty'
+                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f'f8_setup_blocked:{reason_txt}')
+                    _LAST_EMAIL_DECISION[int(uid)] = {
+                        'status': 'SKIP',
+                        'picked': '',
+                        'when': datetime.now(_zoneinfo_or_default((get_user(int(uid)) or {}).get('tz'))[0]).isoformat(timespec='seconds'),
+                        'reasons': ['bigmove_alert_f8_setup_blocked', reason_txt[:240]],
+                    }
                 except Exception:
                     pass
                 return [], False
@@ -61326,7 +61337,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         if setup_email_sent:
                             _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
                         else:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
+                            _existing_f8_reasons = [str(x) for x in (_LAST_BIGMOVE_DECISION[int(uid)].get('reasons') or [])]
+                            if not any(x.startswith('f8_setup_') for x in _existing_f8_reasons):
+                                _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
                     except Exception:
                         pass
                     try:
@@ -62244,7 +62257,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         if setup_email_sent:
                             _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
                         else:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
+                            _existing_f8_reasons = [str(x) for x in (_LAST_BIGMOVE_DECISION[int(uid)].get('reasons') or [])]
+                            if not any(x.startswith('f8_setup_') for x in _existing_f8_reasons):
+                                _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
                     except Exception:
                         pass
                     try:
