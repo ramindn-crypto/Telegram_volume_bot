@@ -1,3 +1,4 @@
+# Ver90: full Telegram command firewall. Every slash command is intercepted before all legacy handlers, sends an immediate ACK, then runs the original command handler in a bounded background worker. Manual commands no longer run Bybit/OHLCV/report work in the Telegram update path. No strategy/risk/policy/F8/TP/SL/AutoTrade trading logic changes.
 # Ver79: no-lag polish from Ver78. /screen active-position fallback now uses live Bybit position rows only (no stale DB OPEN fallback), dedupes rows, and BigMove/F8 failures now record the exact presend gate reason instead of only f8_setup_email_failed_or_empty. No strategy/risk/policy changes.
 # Ver78: no-lag polish from Ver77. Keeps instant ACK path. /screen now prefers recent/open AutoTrade positions over stale ticker-only cache, and /setup_audit deferred path falls back to the existing cached/background report wrapper instead of rebuilding synchronously. No strategy/risk/policy changes.
 # Ver74: BigMove/F8 setup bridge fix from Ver73. Preserves confirmed BigMove continuation side when NOR→REV routing would create a leader/loser context conflict, and honors delivery_lane_locked so emailed/executable F8 rows are not re-routed before presend/AutoTrade gates. No lag-path, risk, TP/SL, or KEEP-policy loosening.
@@ -64515,6 +64516,229 @@ async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(f"✅ AutoTrade sessions updated: {','.join(parts)}")
 
 
+
+# =========================================================
+# Ver90 TELEGRAM COMMAND FIREWALL
+# =========================================================
+# Non-negotiable rule for this bot:
+#   Telegram handler path = parse command -> ACK -> enqueue worker -> return.
+# No slash command is allowed to run reports, scans, Bybit calls, OHLCV fetches,
+# heavy SQLite reads, or email decisions before the visible ACK has been sent.
+PULSEFUTURES_COMMAND_FIREWALL_ENABLED = env_bool("PULSEFUTURES_COMMAND_FIREWALL_ENABLED", True)
+COMMAND_FIREWALL_MAX_CONCURRENT = int(os.getenv("COMMAND_FIREWALL_MAX_CONCURRENT", "8") or 8)
+COMMAND_FIREWALL_RESULT_TIMEOUT_SEC = int(os.getenv("COMMAND_FIREWALL_RESULT_TIMEOUT_SEC", "900") or 900)
+COMMAND_FIREWALL_ACK_TEXT = os.getenv(
+    "COMMAND_FIREWALL_ACK_TEXT",
+    "⏳ /{cmd} accepted. The bot is working in the background and will post the output when ready.",
+)
+_COMMAND_FIREWALL_REGISTRY: dict[str, object] = {}
+_COMMAND_FIREWALL_SEMAPHORE = None
+_COMMAND_FIREWALL_SEQ = 0
+_COMMAND_FIREWALL_INSTALLED = False
+
+
+def _command_firewall_parse(update: Update) -> tuple[str, list[str], str]:
+    try:
+        msg = getattr(update, 'message', None)
+        txt = str(getattr(msg, 'text', '') or '').strip()
+        if not txt.startswith('/'):
+            return '', [], txt
+        parts = txt.split()
+        raw_cmd = parts[0][1:].split('@')[0].strip().lower()
+        args = parts[1:] if len(parts) > 1 else []
+        return raw_cmd, list(args), txt
+    except Exception:
+        return '', [], ''
+
+
+def _command_firewall_set_args(context: ContextTypes.DEFAULT_TYPE, args: list[str]) -> None:
+    try:
+        context.args = list(args or [])
+    except Exception:
+        pass
+
+
+def _command_firewall_semaphore():
+    global _COMMAND_FIREWALL_SEMAPHORE
+    try:
+        if _COMMAND_FIREWALL_SEMAPHORE is None:
+            _COMMAND_FIREWALL_SEMAPHORE = asyncio.Semaphore(max(1, int(COMMAND_FIREWALL_MAX_CONCURRENT or 1)))
+        return _COMMAND_FIREWALL_SEMAPHORE
+    except Exception:
+        return asyncio.Semaphore(1)
+
+
+def _command_firewall_refresh_registry(app) -> None:
+    """Build the command -> original callback registry from the Application.
+
+    This prevents missed legacy paths. Instead of manually patching one command
+    at a time, Ver90 discovers every CommandHandler already registered in the bot
+    and routes all of them through the same ACK/background firewall.
+    """
+    global _COMMAND_FIREWALL_REGISTRY
+    reg: dict[str, object] = {}
+    try:
+        handlers_by_group = getattr(app, 'handlers', {}) or {}
+        for _group, handlers in list(handlers_by_group.items()):
+            for h in list(handlers or []):
+                try:
+                    if isinstance(h, CommandHandler):
+                        cb = getattr(h, 'callback', None)
+                        if not cb:
+                            continue
+                        for c in list(getattr(h, 'commands', []) or []):
+                            key = str(c or '').strip().lower().lstrip('/')
+                            if key:
+                                reg[key] = cb
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # Backstop aliases from the previous owner-deferred map, in case a command is
+    # registered via a regex MessageHandler or a legacy alias was not discovered.
+    try:
+        for key, handler_name in dict(globals().get('OWNER_DEFERRED_COMMAND_HANDLERS', {}) or {}).items():
+            cb = globals().get(str(handler_name or ''))
+            if cb:
+                reg[str(key or '').strip().lower().lstrip('/')] = cb
+    except Exception:
+        pass
+
+    # Regex-only / slash-in-name aliases.
+    manual = {
+        'autotrade/closed': 'autotrade_closed_cmd',
+    }
+    for key, handler_name in manual.items():
+        cb = globals().get(handler_name)
+        if cb:
+            reg[str(key).lower()] = cb
+
+    _COMMAND_FIREWALL_REGISTRY = reg
+    try:
+        logger.warning("Ver90 command firewall registry loaded: %s commands", len(_COMMAND_FIREWALL_REGISTRY))
+    except Exception:
+        pass
+
+
+async def _command_firewall_ack(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str) -> bool:
+    label = str(cmd or 'command').strip() or 'command'
+    try:
+        if label == 'start':
+            text = "✅ PulseFutures is live. Command accepted; full output will follow in the background."
+        elif label == 'status':
+            # Keep /status useful even before the background detail arrives.
+            try:
+                sess = current_session_utc()
+            except Exception:
+                sess = scan_session_name_utc() or 'UNKNOWN'
+            text = f"✅ PulseFutures status: LIVE\nSession: {sess}\nCommands are using the Ver90 instant firewall."
+        else:
+            try:
+                text = str(COMMAND_FIREWALL_ACK_TEXT or '').format(cmd=label)
+            except Exception:
+                text = f"⏳ /{label} accepted. The bot is working in the background and will post the output when ready."
+        ok = await _instant_reply(update, text, context=context)
+        if ok:
+            return True
+    except Exception:
+        pass
+    # Last-chance fallback. This is still bounded; if Telegram itself is down, no
+    # code can force delivery, but the command worker is still queued.
+    try:
+        await asyncio.wait_for(
+            update.message.reply_text(f"⏳ /{label} accepted. Working in background."),
+            timeout=2.0,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _command_firewall_worker(cmd: str, args_snapshot: list[str], update: Update, context: ContextTypes.DEFAULT_TYPE, seq: int) -> None:
+    sem = _command_firewall_semaphore()
+    async with sem:
+        try:
+            _command_firewall_set_args(context, args_snapshot)
+            # Preserve original access / Pro / channel behavior, but only after ACK.
+            try:
+                await _command_guard(update, context)
+            except ApplicationHandlerStop:
+                return
+            except Exception:
+                pass
+
+            handler = _COMMAND_FIREWALL_REGISTRY.get(str(cmd or '').strip().lower())
+            if not handler:
+                handler = globals().get('unknown_command')
+            if not handler:
+                try:
+                    await update.message.reply_text(f"Unknown command: /{cmd}")
+                except Exception:
+                    pass
+                return
+
+            _command_firewall_set_args(context, args_snapshot)
+            try:
+                async def _call_handler_once():
+                    res = handler(update, context)
+                    if inspect.isawaitable(res):
+                        return await res
+                    return res
+                await asyncio.wait_for(
+                    _call_handler_once(),
+                    timeout=max(30, int(COMMAND_FIREWALL_RESULT_TIMEOUT_SEC or 900)),
+                )
+            except ApplicationHandlerStop:
+                return
+        except asyncio.TimeoutError:
+            try:
+                await update.message.reply_text(
+                    f"⚠️ /{cmd} is still running after the safe response window. The command lane stayed instant; try again shortly for the latest cached result."
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                logger.exception("Ver90 command firewall worker failed for /%s: %s", cmd, e)
+            except Exception:
+                pass
+            try:
+                await update.message.reply_text(f"⚠️ /{cmd} background run failed: {type(e).__name__}: {str(e)[:180]}")
+            except Exception:
+                pass
+
+
+async def _command_firewall_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Absolute first Telegram command handler.
+
+    It stops propagation for every slash command, so old CommandHandlers cannot
+    accidentally do heavy work before an ACK. The original command result is sent
+    by _command_firewall_worker.
+    """
+    if not bool(globals().get('PULSEFUTURES_COMMAND_FIREWALL_ENABLED', True)):
+        return
+    cmd, args_snapshot, _raw = _command_firewall_parse(update)
+    if not cmd:
+        return
+    try:
+        _mark_user_activity()
+    except Exception:
+        pass
+    _command_firewall_set_args(context, args_snapshot)
+    global _COMMAND_FIREWALL_SEQ
+    try:
+        _COMMAND_FIREWALL_SEQ += 1
+        seq = int(_COMMAND_FIREWALL_SEQ)
+    except Exception:
+        seq = 0
+    await _command_firewall_ack(update, context, cmd)
+    _safe_create_task(
+        _command_firewall_worker(str(cmd), list(args_snapshot or []), update, context, seq),
+        label=f"ver90-command-firewall:{cmd}:{seq}",
+    )
+    raise ApplicationHandlerStop
+
 def main():
     # Render note: if deployed as a Web Service, bind to $PORT so Render keeps the service alive.
     if os.environ.get("RENDER_SERVICE_TYPE") == "web":
@@ -64565,6 +64789,12 @@ def main():
         except Exception:
             pass
     app = builder.build()
+
+    # Ver90: absolute first command firewall. Every slash command ACKs first and the
+    # original handler runs later in the background. This prevents any legacy handler
+    # from blocking Telegram responsiveness.
+    if bool(globals().get('PULSEFUTURES_COMMAND_FIREWALL_ENABLED', True)):
+        app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/"), _command_firewall_router), group=-1000)
 
     # yver60: owner/admin priority lane must run before all guard/heavy handlers.
     app.add_handler(MessageHandler(filters.COMMAND, _owner_instant_command_router), group=-100)
@@ -64739,6 +64969,12 @@ def main():
 
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+
+    # Ver90: discover every registered CommandHandler after registration is complete.
+    try:
+        _command_firewall_refresh_registry(app)
+    except Exception as e:
+        logger.warning('Ver90 command firewall registry refresh failed: %s', e)
 
     if app.job_queue:
         # Ver21: autonomous setup/email/autotrade loop.
