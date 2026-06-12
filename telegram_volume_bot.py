@@ -1,5 +1,4 @@
-# yver60: NO-LAG STABLE BASELINE from yver49. Keeps core /screen + setup-email + AutoTrade alive, but removes scheduler starvation: 5m alert cadence, bounded alert/autotrade runtime, research/intelligence jobs OFF by default, BigMove cold/extra lane OFF by default, and instant admin command fallbacks. No F9/BigMove additions.
-# yver49: Render lag hardening baseline: alert wrapper timeout/3m interval and transient Telegram network errors downgraded from WARNING by default.
+# yver61: yver60 emergency no-lag patch. Hard safe-core by default, all non-essential background schedulers disabled unless explicitly enabled, alert loop shortened and de-overlapped, owner commands remain instant. No strategy/risk/setup/autotrade policy changes.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
@@ -257,11 +256,6 @@ def _mask_addr(value: str | None, head: int = 6, tail: int = 4) -> str:
     if len(s) <= head + tail + 3:
         return s
     return f"{s[:head]}...{s[-tail:]}"
-
-# yver60: Render no-lag stable mode is ON by default.
-# It disables non-core research/optimizer schedulers and caps long-running jobs so
-# Telegram command polling remains responsive on small Render instances.
-RENDER_NO_LAG_MODE = env_bool("RENDER_NO_LAG_MODE", True)
 import sys
 import time
 import logging
@@ -2999,13 +2993,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import functools as _functools
 
-_FAST_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(6, int(os.getenv("FAST_EXECUTOR_WORKERS", "6") or 6))))
+_FAST_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("FAST_EXECUTOR_WORKERS", "8")))
 # User-facing heavy work: reports, diagnostics, manual runs.
-_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(2, int(os.getenv("HEAVY_EXECUTOR_WORKERS", "2") or 2))))
+_HEAVY_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("HEAVY_EXECUTOR_WORKERS", "4")))
 # Dedicated /screen lane: must not be starved by backtests, optimizer, email, or autotrade.
-_SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(1, int(os.getenv("SCREEN_EXECUTOR_WORKERS", "1") or 1))))
+_SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SCREEN_EXECUTOR_WORKERS", "2")))
 # Dedicated email/network lane: SMTP/ticker calls must not wait behind research jobs.
-_EMAIL_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, min(1, int(os.getenv("EMAIL_EXECUTOR_WORKERS", "1") or 1))))
+_EMAIL_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("EMAIL_EXECUTOR_WORKERS", "2")))
 # Dedicated autotrade lane: live entry/risk checks must never queue behind optimizers or scans.
 _AUTOTRADE_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("AUTOTRADE_EXECUTOR_WORKERS", "1")))
 # Ver22: autonomous screen-equivalent setup sync. This is the production lane that
@@ -3019,6 +3013,19 @@ AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_S
 AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC", "300") or 300)
 AUTONOMOUS_SCREEN_SYNC_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_FIRST_SEC", "45") or 55)
 AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_USERS", "1") or 1)
+
+# yver60: stability-first mode. Keep live setup/email/autotrade core, but do not
+# schedule non-essential research/optimizer/cache warmup jobs that can block or
+# starve Telegram command responses on a small Render worker. Set to false only
+# after the bot has been stable for a full day.
+# yver61: responsiveness first. Ignore old Render env values that may have left heavy
+# background jobs ON. Full/background research mode must be explicitly re-enabled.
+PULSEFUTURES_FULL_BACKGROUND_MODE = env_bool("PULSEFUTURES_FULL_BACKGROUND_MODE", False)
+PULSEFUTURES_SAFE_CORE_MODE = True if not PULSEFUTURES_FULL_BACKGROUND_MODE else env_bool("PULSEFUTURES_SAFE_CORE_MODE", True)
+PULSEFUTURES_FORCE_NO_LAG_MODE = env_bool("PULSEFUTURES_FORCE_NO_LAG_MODE", True)
+PULSEFUTURES_SKIP_NONESSENTIAL_JOBS = env_bool("PULSEFUTURES_SKIP_NONESSENTIAL_JOBS", True)
+OWNER_INSTANT_COMMANDS = {"start", "screen", "status", "equity"}
+TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC = float(os.getenv("TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC", "2.5") or 2.5)
 
 # 07May_v01: DB-backed family/session edge governance.
 # The review table is always persisted. Live blocking is deliberately limited to
@@ -3065,15 +3072,15 @@ SETUP_COMBO_DAILY_SAFETY_ZERO_TP_MIN_SL = int(os.environ.get("SETUP_COMBO_DAILY_
 # Ver23 profit-first safety loop: run the severe-loser safety pass during the day,
 # not only at the 10:00 tick. This keeps live policy aligned with the latest
 # executable-lane evidence while still expiring disables at the next weekly review.
-SETUP_COMBO_INTRADAY_SAFETY_ENABLED = env_bool("SETUP_COMBO_INTRADAY_SAFETY_ENABLED", (not RENDER_NO_LAG_MODE))
+SETUP_COMBO_INTRADAY_SAFETY_ENABLED = env_bool("SETUP_COMBO_INTRADAY_SAFETY_ENABLED", True)
 SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS = float(os.environ.get("SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS", "3") or 3)
-SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED = env_bool("SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED", (not RENDER_NO_LAG_MODE))
+SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED = env_bool("SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_ENABLED", True)
 SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_COOLDOWN_SEC = int(os.environ.get("SETUP_COMBO_POLICY_VIEW_AUTO_SAFETY_COOLDOWN_SEC", "600") or 600)
 SETUP_COMBO_PROFIT_TARGET_WR = float(os.environ.get("SETUP_COMBO_PROFIT_TARGET_WR", "50") or 50)
 # Catch up missed policy reviews after Render restarts/redeploys. Without this, if the
 # service starts after the scheduled Sunday 23:00 or daily 10:00 tick, APScheduler waits
 # for the next cycle and a bad combo can stay live for another day/week.
-SETUP_COMBO_POLICY_CATCHUP_ENABLED = env_bool("SETUP_COMBO_POLICY_CATCHUP_ENABLED", (not RENDER_NO_LAG_MODE))
+SETUP_COMBO_POLICY_CATCHUP_ENABLED = env_bool("SETUP_COMBO_POLICY_CATCHUP_ENABLED", True)
 SETUP_COMBO_DAILY_SAFETY_CATCHUP_MAX_HOURS = float(os.environ.get("SETUP_COMBO_DAILY_SAFETY_CATCHUP_MAX_HOURS", "2.5") or 2.5)
 SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS = float(os.environ.get("SETUP_COMBO_WEEKLY_REVIEW_CATCHUP_MAX_HOURS", "8") or 8)
 # Ver13: link Setup Edge Matrix policy decisions into the optimizer/adaptive runtime config.
@@ -4048,7 +4055,7 @@ def _run_async_in_new_loop(coro_fn, *args, **kwargs):
 
 # Fast-command activity hint so background jobs can yield briefly to user-facing commands.
 _USER_ACTIVITY_TS = 0.0
-USER_ACTIVITY_COOLDOWN_SEC = int(os.getenv("USER_ACTIVITY_COOLDOWN_SEC", "60") or 60)
+USER_ACTIVITY_COOLDOWN_SEC = int(os.getenv("USER_ACTIVITY_COOLDOWN_SEC", "180") or 180)
 FAST_ADMIN_SNAPSHOT_TTL_SEC = int(os.getenv("FAST_ADMIN_SNAPSHOT_TTL_SEC", "20") or 20)
 FAST_ADMIN_METRICS_TTL_SEC = int(os.getenv("FAST_ADMIN_METRICS_TTL_SEC", "20") or 20)
 FAST_ADMIN_COMMAND_TIMEOUT_SEC = int(os.getenv("FAST_ADMIN_COMMAND_TIMEOUT_SEC", "4") or 4)
@@ -5289,7 +5296,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Commands that should force a fresh access check (never use cache)
         # (/screen is the only one you said can be slow; we keep it strict/fresh here)
-        FORCE_FRESH = {"screen"}
+        FORCE_FRESH = set()  # yver60: do not make /screen wait on a fresh access DB check
 
         # 0) Channel subscription gate (optional)
         if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
@@ -5438,6 +5445,27 @@ class RedactSecretsFilter(logging.Filter):
         record.args = ()
         return True
 
+class RenderNoLagNoiseFilter(logging.Filter):
+    """Suppress expected Render/APScheduler deploy/cold-start noise.
+
+    These warnings were causing confusion and are not trading failures. Real
+    exceptions from our code are still shown.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            name = str(getattr(record, "name", "") or "")
+        except Exception:
+            return True
+        if name.startswith("apscheduler"):
+            if "Run time of job" in msg and "was missed by" in msg:
+                return False
+            if "Execution of job" in msg and "maximum number of running instances reached" in msg:
+                known = ("alert_job", "autonomous_screen_sync_job", "autotrade_exit_guardian_job", "evolution_hourly_job", "scan_intelligence_job", "screen_cache_warmup_job")
+                if any(k in msg for k in known):
+                    return False
+        return True
+
 
 def setup_logging():
     # Let Render control via LOG_LEVEL, default INFO
@@ -5448,12 +5476,31 @@ def setup_logging():
     for noisy in ("httpx", "telegram", "telegram.ext", "apscheduler"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    # Redact secrets from ALL logs
+    # Redact secrets from ALL logs and keep Render clean from expected
+    # APScheduler deploy/cold-start noise.
     secrets = [
         os.environ.get("TELEGRAM_TOKEN", ""),
         os.environ.get("EMAIL_PASS", ""),
     ]
-    logging.getLogger().addFilter(RedactSecretsFilter(secrets))
+    _redact_filter = RedactSecretsFilter(secrets)
+    _render_nolag_filter = RenderNoLagNoiseFilter() if 'RenderNoLagNoiseFilter' in globals() else None
+    _root_logger = logging.getLogger()
+    _root_logger.addFilter(_redact_filter)
+    if _render_nolag_filter:
+        _root_logger.addFilter(_render_nolag_filter)
+    for _handler in list(_root_logger.handlers or []):
+        try:
+            _handler.addFilter(_redact_filter)
+            if _render_nolag_filter:
+                _handler.addFilter(_render_nolag_filter)
+        except Exception:
+            pass
+    if _render_nolag_filter:
+        for _lname in ("apscheduler", "apscheduler.executors.default", "apscheduler.scheduler"):
+            try:
+                logging.getLogger(_lname).addFilter(_render_nolag_filter)
+            except Exception:
+                pass
 
 
 # Call once at import time (after TOKEN/envs exist)
@@ -15435,14 +15482,14 @@ ALERT_LOCK = asyncio.Lock()
 AUTOTRADE_GUARDIAN_LOCK = asyncio.Lock()
 SCAN_LOCK = asyncio.Lock()  # prevents /screen from blocking other commands under load
 AUTOTRADE_EXEC_LOCK = asyncio.Lock()  # serializes live autotrade placement and duplicate guards
-AUTOTRADE_JOB_TIMEOUT_SEC = max(15, min(35, int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "35") or 35)))
+AUTOTRADE_JOB_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_JOB_TIMEOUT_SEC", "55") or 55)
 # Keep this job intentionally less frequent and very short; it consumes the DB executable lane.
 # Heavy pool refreshes belong to /screen/email lanes, otherwise Render misses scheduler ticks.
-AUTOTRADE_JOB_INTERVAL_SEC = max(90, int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "90") or 90))
-AUTOTRADE_JOB_MAX_RUNTIME_SEC = max(15, min(40, int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "35") or 35)))
+AUTOTRADE_JOB_INTERVAL_SEC = int(os.getenv("AUTOTRADE_JOB_INTERVAL_SEC", "60") or 60)
+AUTOTRADE_JOB_MAX_RUNTIME_SEC = int(os.getenv("AUTOTRADE_JOB_MAX_RUNTIME_SEC", "115") or 115)
 # Keep autotrade execution lightweight: consume the executable DB lane only by default.
 # Full pool refresh is owned by /screen/email scan lanes to avoid scheduler starvation.
-AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", False)
+AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY = env_bool("AUTOTRADE_REFRESH_EXECUTABLE_WHEN_EMPTY", True)
 AUTOTRADE_GUARDIAN_TIMEOUT_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_TIMEOUT_SEC", "15") or 15)
 AUTOTRADE_GUARDIAN_INTERVAL_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_INTERVAL_SEC", "150") or 150)
 AUTOTRADE_GUARDIAN_MIN_GAP_SEC = int(os.getenv("AUTOTRADE_GUARDIAN_MIN_GAP_SEC", "20") or 20)
@@ -16691,7 +16738,7 @@ def _admin_status_cache_put(name: str, value: Any) -> None:
 HEAVY_ADMIN_CACHE_TTL_SEC = int(os.getenv("HEAVY_ADMIN_CACHE_TTL_SEC", "75") or 75)
 HEAVY_ADMIN_STALE_TTL_SEC = int(os.getenv("HEAVY_ADMIN_STALE_TTL_SEC", "900") or 900)
 HEAVY_ADMIN_COMMAND_TIMEOUT_SEC = int(os.getenv("HEAVY_ADMIN_COMMAND_TIMEOUT_SEC", "8") or 8)
-HEAVY_USER_ACTIVITY_DEFER_SEC = int(os.getenv("HEAVY_USER_ACTIVITY_DEFER_SEC", "180") or 180)
+HEAVY_USER_ACTIVITY_DEFER_SEC = int(os.getenv("HEAVY_USER_ACTIVITY_DEFER_SEC", "360") or 360)
 LOG_WARN_THROTTLE_SEC = int(os.getenv("LOG_WARN_THROTTLE_SEC", "120") or 120)
 _LOG_WARN_THROTTLE_UNTIL: dict[str, float] = {}
 
@@ -19829,7 +19876,7 @@ BIGMOVE_SIGNAL_TP2_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP2_RR", str(BIGMOV
 # Best-practice implementation: adaptive 15m ATR stop, fixed 2R target, hard capped
 # to the user's requested 10% SL / 20% TP envelope. If ATR is unavailable, the
 # fallback is exactly 10% SL and 20% TP.
-BIGMOVE_AUTOTRADE_ENABLED = env_bool("BIGMOVE_AUTOTRADE_ENABLED", False)
+BIGMOVE_AUTOTRADE_ENABLED = env_bool("BIGMOVE_AUTOTRADE_ENABLED", True)
 BIGMOVE_AUTOTRADE_ATR_TIMEFRAME = str(os.environ.get("BIGMOVE_AUTOTRADE_ATR_TIMEFRAME", "15m") or "15m").strip() or "15m"
 BIGMOVE_AUTOTRADE_ATR_MULT = float(os.environ.get("BIGMOVE_AUTOTRADE_ATR_MULT", "2.2") or 2.2)
 BIGMOVE_AUTOTRADE_SL_MIN_PCT = float(os.environ.get("BIGMOVE_AUTOTRADE_SL_MIN_PCT", "3.0") or 3.0)
@@ -27029,8 +27076,8 @@ def _current_scan_tf_phase() -> str:
         return phases[int(globals().get('_SCAN_TF_PHASE', 0) or 0) % len(phases)]
     except Exception:
         return "15m"
-BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK = env_bool("BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK", False)
-BIGMOVE_ALLOW_COLD_CONFIRM_FETCH = env_bool("BIGMOVE_ALLOW_COLD_CONFIRM_FETCH", False)
+BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK = env_bool("BIGMOVE_ALLOW_COLD_OHLCV_FALLBACK", True)
+BIGMOVE_ALLOW_COLD_CONFIRM_FETCH = env_bool("BIGMOVE_ALLOW_COLD_CONFIRM_FETCH", True)
 _OHLCV_COLD_FETCH_LOCK = threading.Lock()
 _OHLCV_COLD_FETCH_WINDOW_TS = 0.0
 _OHLCV_COLD_FETCH_COUNT = 0
@@ -30107,7 +30154,7 @@ _SELF_OPT_STATE = {
 _MARKET_ADAPTIVE_LOCK = threading.Lock()
 
 # Zero-touch autonomous optimization governance
-AUTONOMOUS_OPT_ENABLED = str(os.environ.get("AUTONOMOUS_OPT_ENABLED", "0" if RENDER_NO_LAG_MODE else "1")).strip().lower() in ("1", "true", "yes", "on")
+AUTONOMOUS_OPT_ENABLED = str(os.environ.get("AUTONOMOUS_OPT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 AUTONOMOUS_OPT_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_INTERVAL_HOURS", "6") or 6)
 AUTONOMOUS_OPT_MIN_INTERVAL_HOURS = float(os.environ.get("AUTONOMOUS_OPT_MIN_INTERVAL_HOURS", "6") or 6)
 AUTONOMOUS_OPT_DAYS = int(os.environ.get("AUTONOMOUS_OPT_DAYS", "60") or 60)
@@ -30206,7 +30253,7 @@ def _opt_migrate_tables():
 #   autotrade_trades, strategy_config, and optimization_results.
 # - Uses bounded heuristics + persisted diagnostics, not fake AI reporting.
 # =========================================================
-EVOLUTION_ENABLED = str(os.environ.get("EVOLUTION_ENABLED", "0" if RENDER_NO_LAG_MODE else "1")).strip().lower() in ("1", "true", "yes", "on")
+EVOLUTION_ENABLED = str(os.environ.get("EVOLUTION_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 EVOLUTION_HOURLY_INTERVAL_MIN = int(os.environ.get("EVOLUTION_HOURLY_INTERVAL_MIN", "60") or 60)
 EVOLUTION_DAILY_INTERVAL_HOURS = int(os.environ.get("EVOLUTION_DAILY_INTERVAL_HOURS", "24") or 24)
 EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS = float(os.environ.get("EVOLUTION_AUTO_APPLY_COOLDOWN_HOURS", "24") or 24)
@@ -33566,7 +33613,7 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 # - Evaluates whether symbols later moved enough to count as missed opportunities
 # - Applies only bounded, evidence-based screen-side adjustments
 # =========================================================
-SCAN_INTELLIGENCE_ENABLED = str(os.environ.get("SCAN_INTELLIGENCE_ENABLED", "0" if RENDER_NO_LAG_MODE else "1")).strip().lower() in ("1", "true", "yes", "on")
+SCAN_INTELLIGENCE_ENABLED = str(os.environ.get("SCAN_INTELLIGENCE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 SCAN_INTELLIGENCE_INTERVAL_MIN = int(os.environ.get("SCAN_INTELLIGENCE_INTERVAL_MIN", "180") or 180)
 SCAN_INTELLIGENCE_HORIZON_HOURS = float(os.environ.get("SCAN_INTELLIGENCE_HORIZON_HOURS", "6") or 6)
 SCAN_INTELLIGENCE_MAX_SYMBOLS = int(os.environ.get("SCAN_INTELLIGENCE_MAX_SYMBOLS", "24") or 24)
@@ -41374,7 +41421,7 @@ def build_help_html(title: str, sections: list) -> str:
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
-FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size", "health", "status", "equity", "trade_close", "why"}
+FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "start", "screen", "size", "health", "status", "equity", "trade_close", "why"}
 
 
 def _command_args_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[str]:
@@ -41674,6 +41721,11 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
         if not msg:
             return
         txt = str(msg.text or '').strip()
+        if txt.startswith('/'):
+            try:
+                _mark_user_activity()
+            except Exception:
+                pass
         if not txt.startswith('/'):
             return
         cmd = txt.split()[0][1:].split('@')[0].strip().lower()
@@ -41721,6 +41773,196 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
             raise ApplicationHandlerStop
         if cmd == 'health':
             await health_cmd(update, context)
+            raise ApplicationHandlerStop
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        return
+
+
+async def _instant_reply(update: Update, text: str, parse_mode: Optional[str] = None, reply_markup=None) -> bool:
+    """Very short timeout Telegram reply for owner/admin commands.
+
+    This prevents one slow Telegram send from holding the command path for minutes.
+    It is used only for tiny instant replies/snapshots; larger reports still use
+    send_long_message.
+    """
+    try:
+        if not update or not getattr(update, 'message', None):
+            return False
+        await asyncio.wait_for(
+            update.message.reply_text(
+                str(text or ''),
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
+                read_timeout=max(1.0, TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC),
+                write_timeout=max(1.0, TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC),
+                connect_timeout=2.0,
+                pool_timeout=0.5,
+            ),
+            timeout=max(1.5, TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC + 0.75),
+        )
+        return True
+    except TypeError:
+        try:
+            await asyncio.wait_for(
+                update.message.reply_text(str(text or ''), parse_mode=parse_mode, disable_web_page_preview=True, reply_markup=reply_markup),
+                timeout=max(1.5, TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC + 0.75),
+            )
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _owner_or_admin_from_update(update: Update) -> bool:
+    try:
+        uid = int(getattr(getattr(update, 'effective_user', None), 'id', 0) or 0)
+        return bool(uid and (uid == int(AUTOTRADE_OWNER_UID or 0) or is_admin_user(uid)))
+    except Exception:
+        return False
+
+
+async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """No-network /screen for owner/admin: cache or ticker snapshot only.
+
+    Fresh executable rebuild is queued in the background, but this command never
+    waits for OHLCV/Bybit/DB-heavy scans. This restores the v45/v49 fast UX while
+    keeping setup generation autonomous in the background.
+    """
+    try:
+        uid = int(getattr(update.effective_user, 'id', 0) or 0)
+        scan_session = str(scan_session_name_utc() or '').upper().strip()
+        live_session = current_session_utc()
+        try:
+            loc_label = 'Melbourne (Australia)'
+            loc_time = datetime.now(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        except Exception:
+            loc_label, loc_time = 'Melbourne (Australia)', datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+        try:
+            _schedule_screen_cache_refresh(uid, scan_session)
+        except Exception:
+            pass
+        cache_keys = [f"uid:{uid}::{scan_session}", f"global::{scan_session}"]
+        try:
+            for _k, _v in list(_SCREEN_CACHE.items()):
+                if str(_k).startswith((f"uid:{uid}::", "global::")) and (_v or {}).get('body'):
+                    cache_keys.append(_k)
+        except Exception:
+            pass
+        try:
+            cache_entry, age = _screen_choose_best_cache(cache_keys)
+        except Exception:
+            cache_entry, age = {}, 999999.0
+        if cache_entry and str((cache_entry or {}).get('body') or '').strip():
+            try:
+                cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
+            except Exception:
+                cache_ts = 0.0
+            header = (
+                "*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{_screen_when_line('Cached scan built', cache_ts)}"
+                "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
+            )
+            keyboard = [
+                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                for (sym, sid) in ((cache_entry or {}).get('kb') or [])
+            ]
+            await send_long_message(
+                update,
+                _screen_markdown_to_html((header + "\n" + str((cache_entry or {}).get('body') or '')).strip()),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            )
+            return
+        # No full cache: use only cached tickers. No fetch_futures_tickers here.
+        best = get_cached_futures_tickers() or {}
+        if best:
+            body, kb, _ = _screen_quick_ticker_snapshot_body(best, scan_session)
+            header = (
+                "*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{_screen_when_line('Ticker snapshot', time.time())}"
+                "_Showing instant ticker snapshot while full executable scan warms up._\n"
+            )
+            await send_long_message(
+                update,
+                _screen_markdown_to_html((header + "\n" + body).strip()),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+        await _instant_reply(update, "🔎 /screen cache is warming up. Fresh scan is queued; commands are responsive.")
+    except Exception:
+        try:
+            await _instant_reply(update, "🔎 /screen is warming up. Fresh scan is queued; commands are responsive.")
+        except Exception:
+            pass
+
+
+async def _owner_instant_command_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Highest-priority owner/admin lane for responsiveness.
+
+    Runs before billing/channel guards and before all heavy handlers.  It handles
+    only tiny owner/admin commands and stops propagation after replying.
+    """
+    try:
+        msg = getattr(update, 'message', None)
+        if not msg:
+            return
+        txt = str(msg.text or '').strip()
+        if txt.startswith('/'):
+            try:
+                _mark_user_activity()
+            except Exception:
+                pass
+        if not txt.startswith('/'):
+            return
+        cmd = txt.split()[0][1:].split('@')[0].strip().lower()
+        if cmd not in OWNER_INSTANT_COMMANDS:
+            return
+        if not _owner_or_admin_from_update(update):
+            return
+        _mark_user_activity()
+        try:
+            parts = txt.split()
+            context.args = parts[1:] if len(parts) > 1 else []
+        except Exception:
+            pass
+        if cmd == 'start':
+            await _instant_reply(update, "✅ PulseFutures is live.\n\nQuick commands: /screen /status /equity /autotrade_debug")
+            raise ApplicationHandlerStop
+        if cmd == 'status':
+            try:
+                sess = current_session_utc()
+            except Exception:
+                sess = scan_session_name_utc() or 'UNKNOWN'
+            try:
+                hb = _EMAIL_LOOP_HEARTBEAT or {}
+                last_tick = float(hb.get('last_tick_ts') or 0.0)
+                age = int(max(0, time.time() - last_tick)) if last_tick > 0 else -1
+            except Exception:
+                age = -1
+            txt_status = (
+                "✅ PulseFutures status: LIVE\n"
+                f"Session: {sess}\n"
+                f"Email loop: {'alive' if age >= 0 and age < 900 else 'warming'}"
+                + (f" ({age}s ago)" if age >= 0 else "")
+                + "\nCommands are using the instant lane."
+            )
+            await _instant_reply(update, txt_status)
+            raise ApplicationHandlerStop
+        if cmd == 'equity':
+            await _instant_equity_cmd(update, context)
+            raise ApplicationHandlerStop
+        if cmd == 'screen':
+            await _owner_instant_screen_cmd(update, context)
             raise ApplicationHandlerStop
     except ApplicationHandlerStop:
         raise
@@ -43926,13 +44168,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             snap = await to_thread_heavy(_accounting_snapshot, uid, user, is_admin=status_is_admin, timeout=8)
     except Exception:
-        # yver60: command must return even if a worker/exchange call is stuck.
-        ctx = _trading_day_context(user)
-        snap = {
-            'equity': float(user.get('equity') or 0.0), 'cap': float(daily_cap_usd(user) or 0.0),
-            'pnl_today': 0.0, 'used_today': 0.0, 'remaining_today': float('inf'), 'over_by': 0.0,
-            'today_basis': f"Anchored trading day ({ctx['tz_name']}, starts {ctx['anchor_hhmm']})",
-        }
+        if is_admin:
+            snap = _accounting_snapshot_cached(uid, user, is_admin=status_is_admin, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC)
+        else:
+            snap = _accounting_snapshot(uid, user, is_admin=status_is_admin)
     equity = float(snap.get('equity') or 0.0)
     cap = float(snap.get('cap') or 0.0)
     pnl_today = float(snap.get('pnl_today') or 0.0)
@@ -55088,37 +55327,12 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         snap = await to_thread_fast(_accounting_snapshot_cached, owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, force_refresh=True, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
     except Exception:
-        # yver60: never run a live/exchange refresh synchronously on the Telegram event loop.
-        # Use stale cached admin snapshot, or a small safe placeholder, so /autotrade_debug
-        # cannot freeze later commands while Render/Bybit is slow.
-        snap = cache_get(f'accounting_snapshot_fast:{int(owner)}:admin')
-        if not isinstance(snap, dict):
-            ctx = _trading_day_context(user)
-            snap = {
-                'is_admin': True, 'equity': float(user.get('equity') or 0.0), 'pnl_today': 0.0,
-                'cap': 0.0, 'current_total_open_risk': 0.0, 'current_day_open_risk': 0.0,
-                'carried_open_risk': 0.0, 'open_positions_now': 0, 'positions_opened_today': 0,
-                'positions_closed_today': 0, 'closed_today_rows': [], 'inherited_open_positions': 0,
-                'external_open_positions': 0, 'external_open_risk': 0.0, 'external_open_pnl': 0.0,
-                'today_window_label': f"{ctx['start_local'].strftime('%Y-%m-%d %H:%M')} → {ctx['end_local'].strftime('%Y-%m-%d %H:%M')} {ctx['tz_name']}",
-                'used_today': 0.0, 'remaining_today': float('inf'), 'risk_reset_credit': 0.0,
-            }
+        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, force_refresh=True)
     equity = float(snap.get('equity') or 0.0)
     try:
         mday = await to_thread_fast(_autotrade_day_risk_metrics_cached, int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, force_refresh=True, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
     except Exception:
-        # yver60: stale/empty metrics only; no synchronous Bybit call inside command handler.
-        mday = {}
-        try:
-            pref = f'autotrade_day_metrics_fast:{int(owner)}:'
-            for _k, _v in list(_CACHE.items()):
-                if str(_k).startswith(pref) and isinstance((_v or (None, None))[1], dict):
-                    mday = dict((_v or (0, {}))[1] or {})
-                    break
-        except Exception:
-            mday = {}
-        if not isinstance(mday, dict):
-            mday = {}
+        mday = _autotrade_day_risk_metrics_cached(int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, force_refresh=True)
     # Ver12: debug closed/PnL should match /autotrade_report. The quick risk snapshot
     # can miss exchange-derived/provisional closes, so reconcile against the same report rows.
     try:
@@ -56808,10 +57022,10 @@ def user_location_and_time(user: dict):
 # =========================================================
 # /screen fast cache (per-instance)
 # =========================================================
-SCREEN_CACHE_TTL_SEC = int(os.environ.get("SCREEN_CACHE_TTL_SEC", str(300 if RENDER_NO_LAG_MODE else MAX_STALE_SCAN_SEC)) or (300 if RENDER_NO_LAG_MODE else MAX_STALE_SCAN_SEC))  # seconds
-SCREEN_STALE_CACHE_MAX_SEC = int(os.environ.get("SCREEN_STALE_CACHE_MAX_SEC", str(900 if RENDER_NO_LAG_MODE else MAX_STALE_SCAN_SEC)) or (900 if RENDER_NO_LAG_MODE else MAX_STALE_SCAN_SEC))  # force fresh rebuild when stale
-SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", str(300 if RENDER_NO_LAG_MODE else MAX_STALE_SCAN_SEC)) or (300 if RENDER_NO_LAG_MODE else MAX_STALE_SCAN_SEC))
-SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", str(240 if RENDER_NO_LAG_MODE else MAX_STALE_SCAN_SEC)) or (240 if RENDER_NO_LAG_MODE else MAX_STALE_SCAN_SEC))
+SCREEN_CACHE_TTL_SEC = int(os.environ.get("SCREEN_CACHE_TTL_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)  # seconds
+SCREEN_STALE_CACHE_MAX_SEC = int(os.environ.get("SCREEN_STALE_CACHE_MAX_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)  # force fresh rebuild when stale
+SCREEN_CACHE_WARMUP_INTERVAL_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_INTERVAL_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)
+SCREEN_CACHE_WARMUP_MIN_AGE_SEC = int(os.environ.get("SCREEN_CACHE_WARMUP_MIN_AGE_SEC", str(MAX_STALE_SCAN_SEC)) or MAX_STALE_SCAN_SEC)
 SCREEN_MIN_CONF = 72  # do not show setups below this confidence on /screen
 _SCREEN_CACHE: dict[str, dict] = {}
 _SCREEN_LOCK = asyncio.Lock()
@@ -59629,19 +59843,21 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = max(15, min(30, int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "25") or 25)))
-EMAIL_SEND_TIMEOUT_SEC = max(20, min(35, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "30") or 30)))
-ALERT_JOB_MAX_RUNTIME_SEC = max(25, min(55, int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "45") or 45)))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
+EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "55"))
+if bool(globals().get("PULSEFUTURES_FORCE_NO_LAG_MODE", True)):
+    ALERT_JOB_MAX_RUNTIME_SEC = min(int(ALERT_JOB_MAX_RUNTIME_SEC or 55), 55)
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
-AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = max(300, int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "300") or 300))
-AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = max(30, int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "45") or 45))
+AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC", "60") or 60)
+AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC", "20") or 20)
 ALERT_JOB_MIN_INTERVAL_SEC = int(os.environ.get("ALERT_JOB_MIN_INTERVAL_SEC", str(AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)) or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC)
-ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "0" if RENDER_NO_LAG_MODE else "2"))
-ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "0" if RENDER_NO_LAG_MODE else "2"))
+ALERT_JOB_BIGMOVE_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_MAX_USERS", "2"))
+ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_MAX_USERS", "2"))
 ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC = int(os.environ.get("ALERT_JOB_BIGMOVE_DEFERRED_GRACE_SEC", "12"))
-ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "1" if RENDER_NO_LAG_MODE else "6"))
+ALERT_JOB_NOTIFY_MAX_USERS = int(os.environ.get("ALERT_JOB_NOTIFY_MAX_USERS", "6"))
 ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING = env_bool("ALERT_JOB_SKIP_BIGMOVE_WHEN_GOAL_RUNNING", False)
 ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT", "0.70") or 0.70)
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
@@ -59650,7 +59866,7 @@ BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", 
 # Ver22: autonomous setup discovery must stay hot. A 10-minute rebuild floor made /screen
 # look like the trigger because manual /screen used the dedicated screen lane while the
 # email lane waited on stale/empty pools. Keep it short by default.
-EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "180" if RENDER_NO_LAG_MODE else "60"))
+EMAIL_POOL_REBUILD_MIN_SEC = int(os.environ.get("EMAIL_POOL_REBUILD_MIN_SEC", "60"))
 AUTOTRADE_REPORT_CACHE_TTL_SEC = int(os.environ.get("AUTOTRADE_REPORT_CACHE_TTL_SEC", "45"))
 AUTOTRADE_REPORT_TIMEOUT_SEC = int(os.environ.get("AUTOTRADE_REPORT_TIMEOUT_SEC", "60"))
 PERFORMANCE_REPORT_CACHE_TTL_SEC = int(os.environ.get("PERFORMANCE_REPORT_CACHE_TTL_SEC", "300"))
@@ -59801,17 +60017,30 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         if not email_config_ok():
             return
 
+        # yver61: responsiveness first. If owner/user is actively sending commands,
+        # defer this autonomous tick. The next scheduled tick will try again; manual
+        # commands must never wait behind the email/setup pipeline.
+        try:
+            if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) and _recent_user_activity(int(globals().get('HEAVY_USER_ACTIVITY_DEFER_SEC', 360) or 360)):
+                try:
+                    db_log_setup_pipeline_event(0, stage='autonomous_setup_pipeline_tick', status='deferred_user_activity', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='email', details={'reason': 'recent_user_activity_no_lag_mode'})
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
         # Trade-signal emails may be notify_on-gated,
         # but Big-Move Alerts should go to anyone who has an email saved.
 
         try:
-            users_notify = await to_thread_fast(list_users_notify_on, timeout=10)
+            users_notify = await to_thread_fast(list_users_notify_on, timeout=6)
         except Exception as e:
             logger.exception("list_users_notify_on failed: %s", e)
             users_notify = []
 
         try:
-            users_bigmove = await to_thread_fast(list_users_with_email, timeout=10)
+            users_bigmove = await to_thread_fast(list_users_with_email, timeout=6)
         except Exception as e:
             logger.exception("list_users_with_email failed: %s", e)
             users_bigmove = []
@@ -63526,15 +63755,15 @@ def main():
         .connection_pool_size(int(os.getenv('TELEGRAM_CONNECTION_POOL_SIZE', '256') or 256))
         .pool_timeout(float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0))
         .connect_timeout(float(os.getenv('TELEGRAM_CONNECT_TIMEOUT_SEC', '3.0') or 3.0))
-        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '30.0') or 30.0))
-        .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '10.0') or 10.0))
+        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '8.0') or 8.0))
+        .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '5.0') or 5.0))
     )
     # PTB >=20.6 deprecates passing getUpdates timeouts to run_polling().
     # Configure them on ApplicationBuilder to remove the warning and keep polling stable.
     for _method, _value in (
-        ('get_updates_connect_timeout', float(os.getenv('TELEGRAM_POLL_CONNECT_TIMEOUT_SEC', '10') or 10)),
+        ('get_updates_connect_timeout', float(os.getenv('TELEGRAM_POLL_CONNECT_TIMEOUT_SEC', '5') or 5)),
         ('get_updates_read_timeout', float(os.getenv('TELEGRAM_POLL_READ_TIMEOUT_SEC', '35') or 35)),
-        ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '20') or 20)),
+        ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '8') or 8)),
         ('get_updates_pool_timeout', float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0)),
     ):
         try:
@@ -63542,6 +63771,9 @@ def main():
         except Exception:
             pass
     app = builder.build()
+
+    # yver60: owner/admin priority lane must run before all guard/heavy handlers.
+    app.add_handler(MessageHandler(filters.COMMAND, _owner_instant_command_router), group=-100)
 
     # Fast-lane for ultra-light commands that must feel instant (/help, /size, etc.)
     app.add_handler(MessageHandler(filters.COMMAND, _fast_path_command_router), group=-2)
@@ -63726,12 +63958,18 @@ def main():
         # interval is safely longer than the wrapper timeout. Default becomes 3m
         # instead of 2m, which avoids Render/APScheduler max_instances skipped-run
         # warnings during cold or slow ticks.
-        interval_sec = max(300 if RENDER_NO_LAG_MODE else 180, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + (180 if RENDER_NO_LAG_MODE else 90))
+        if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)):
+            # No-lag mode: one short autonomous setup/email tick every 10 minutes.
+            # This prevents alert_job from sitting on the event loop and blocking
+            # /screen /status /equity during Render cold or slow network periods.
+            interval_sec = max(600, int(ALERT_JOB_MAX_RUNTIME_SEC or 55) + 300)
+        else:
+            interval_sec = max(240, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 120)
     
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
-            first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
+            first=(180 if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) else max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2))),
             name="alert_job",
             job_kwargs={
                 "max_instances": 1,
@@ -63750,19 +63988,20 @@ def main():
             int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 300),
             int(AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC or 90) + 120,
         )
-        app.job_queue.run_repeating(
-            autonomous_screen_sync_job,
-            interval=auto_screen_interval_sec,
-            first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
-            name="autonomous_screen_sync_job",
-            job_kwargs={
-                "max_instances": 1,
-                "coalesce": True,
-                "misfire_grace_time": 900,
-            },
-        )
+        if (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_AUTONOMOUS_SCREEN_SYNC_JOB", False):
+            app.job_queue.run_repeating(
+                autonomous_screen_sync_job,
+                interval=auto_screen_interval_sec,
+                first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
+                name="autonomous_screen_sync_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 900,
+                },
+            )
 
-        if SETUP_COMBO_REVIEW_ENABLED and (not RENDER_NO_LAG_MODE):
+        if SETUP_COMBO_REVIEW_ENABLED:
             app.job_queue.run_repeating(
                 setup_combo_review_job,
                 interval=7 * 24 * 3600,
@@ -63775,7 +64014,7 @@ def main():
                 },
             )
 
-        if SETUP_COMBO_DAILY_SAFETY_ENABLED and (not RENDER_NO_LAG_MODE):
+        if SETUP_COMBO_DAILY_SAFETY_ENABLED:
             app.job_queue.run_repeating(
                 setup_combo_daily_safety_job,
                 interval=24 * 3600,
@@ -63788,7 +64027,7 @@ def main():
                 },
             )
 
-        if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)) and (not RENDER_NO_LAG_MODE):
+        if bool(globals().get('SETUP_COMBO_INTRADAY_SAFETY_ENABLED', True)):
             try:
                 _intraday_interval = max(3600, int(float(globals().get('SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS', 3) or 3) * 3600))
                 app.job_queue.run_repeating(
@@ -63808,7 +64047,7 @@ def main():
                 except Exception:
                     pass
 
-        if SETUP_COMBO_POLICY_CATCHUP_ENABLED and (not RENDER_NO_LAG_MODE) and (SETUP_COMBO_REVIEW_ENABLED or SETUP_COMBO_DAILY_SAFETY_ENABLED):
+        if (not PULSEFUTURES_SAFE_CORE_MODE) and SETUP_COMBO_POLICY_CATCHUP_ENABLED and (SETUP_COMBO_REVIEW_ENABLED or SETUP_COMBO_DAILY_SAFETY_ENABLED):
             app.job_queue.run_once(
                 setup_combo_policy_catchup_job,
                 when=90,
@@ -63869,27 +64108,24 @@ def main():
                 except Exception:
                     pass
 
-        app.job_queue.run_repeating(
-            screen_cache_warmup_job,
-            interval=max(300 if RENDER_NO_LAG_MODE else 60, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC)),
-            first=max(45 if RENDER_NO_LAG_MODE else 20, min(90, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
-            name="screen_cache_warmup_job",
-            job_kwargs={
-                "max_instances": 1,
-                "coalesce": True,
-                # Ver22: Render can pause the event loop for >60s during deploy/cold-start
-                # pressure. A short grace produced noisy APScheduler missed-run warnings
-                # even though the next cache warmup runs normally. Give this non-critical
-                # cache job a wider grace window and coalesce missed runs.
-                "misfire_grace_time": 300,
-            },
-        )
+        if (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_SCREEN_CACHE_WARMUP_JOB", False):
+            app.job_queue.run_repeating(
+                screen_cache_warmup_job,
+                interval=int(SCREEN_CACHE_WARMUP_INTERVAL_SEC),
+                first=max(20, min(60, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
+                name="screen_cache_warmup_job",
+                job_kwargs={
+                    "max_instances": 1,
+                    "coalesce": True,
+                    "misfire_grace_time": 300,
+                },
+            )
 
         # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
-            interval=max(int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 150), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 45),
-            first=90,
+            interval=(max(300, int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 180) if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) else max(int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 150), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 45)),
+            first=(240 if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) else 90),
             name="autotrade_exit_guardian_job",
             job_kwargs={
                 "max_instances": 1,
@@ -63902,7 +64138,7 @@ def main():
         app.job_queue.run_repeating(
             autotrade_job,
             interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 10),
-            first=45,
+            first=(120 if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) else 45),
             name="autotrade_job",
             job_kwargs={
                 "max_instances": 1,
@@ -63912,7 +64148,7 @@ def main():
         )
 
         # Autonomous optimizer loop (zero-touch governance)
-        if AUTONOMOUS_OPT_ENABLED and (not RENDER_NO_LAG_MODE):
+        if AUTONOMOUS_OPT_ENABLED and (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_AUTONOMOUS_OPTIMIZE_JOB", False):
             app.job_queue.run_repeating(
                 autonomous_optimize_job,
                 interval=max(3600, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 3600)),
@@ -63925,7 +64161,7 @@ def main():
                 },
             )
 
-        if EVOLUTION_ENABLED and (not RENDER_NO_LAG_MODE):
+        if EVOLUTION_ENABLED and (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_EVOLUTION_JOBS", False):
             app.job_queue.run_repeating(
                 evolution_hourly_job,
                 interval=max(900, int(EVOLUTION_HOURLY_INTERVAL_MIN * 60)),
@@ -63950,8 +64186,10 @@ def main():
             )
 
         try:
+            if PULSEFUTURES_SAFE_CORE_MODE:
+                raise RuntimeError('safe_core_skip_market_adaptive')
             _market_cfg = load_strategy_config(force=False)
-            if (not RENDER_NO_LAG_MODE) and _cfg_bool((_market_cfg or {}).get("market_adaptive_enabled", True), True):
+            if _cfg_bool((_market_cfg or {}).get("market_adaptive_enabled", True), True):
                 app.job_queue.run_repeating(
                     market_adaptive_daily_job,
                     interval=max(21600, int(float((_market_cfg or {}).get("market_adaptive_interval_hours", 24.0) or 24.0) * 3600)),
@@ -63967,8 +64205,10 @@ def main():
             pass
 
         try:
+            if PULSEFUTURES_SAFE_CORE_MODE:
+                raise RuntimeError('safe_core_skip_goal_profile')
             _goal_cfg = load_strategy_config(force=False)
-            if (not RENDER_NO_LAG_MODE) and _cfg_bool((_goal_cfg or {}).get("goal_profile_enabled", True), True):
+            if _cfg_bool((_goal_cfg or {}).get("goal_profile_enabled", True), True):
                 app.job_queue.run_repeating(
                     goal_profile_job,
                     interval=max(21600, int(float((_goal_cfg or {}).get("goal_profile_interval_hours", 24.0) or 24.0) * 3600)),
@@ -63983,7 +64223,7 @@ def main():
         except Exception:
             pass
 
-        if SCAN_INTELLIGENCE_ENABLED and (not RENDER_NO_LAG_MODE):
+        if SCAN_INTELLIGENCE_ENABLED and (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_SCAN_INTELLIGENCE_JOB", False):
             app.job_queue.run_repeating(
                 scan_intelligence_job,
                 interval=max(3600, int(SCAN_INTELLIGENCE_INTERVAL_MIN * 60)),
@@ -63997,8 +64237,10 @@ def main():
             )
 
         try:
+            if PULSEFUTURES_SAFE_CORE_MODE:
+                raise RuntimeError('safe_core_skip_nonessential_family_jobs')
             _family_cfg = load_strategy_config(force=False)
-            if (not RENDER_NO_LAG_MODE) and _cfg_bool((_family_cfg or {}).get("family_regime_refresh_enabled", True), True):
+            if _cfg_bool((_family_cfg or {}).get("family_regime_refresh_enabled", True), True):
                 app.job_queue.run_repeating(
                     research_regime_refresh_job,
                     interval=max(3600, int(float((_family_cfg or {}).get("family_regime_refresh_interval_hours", 4.0) or 4.0) * 3600)),
@@ -64010,7 +64252,7 @@ def main():
                         "misfire_grace_time": 900,
                     },
                 )
-            if (not RENDER_NO_LAG_MODE) and _cfg_bool((_family_cfg or {}).get("family_allocator_enabled", True), True):
+            if _cfg_bool((_family_cfg or {}).get("family_allocator_enabled", True), True):
                 app.job_queue.run_repeating(
                     research_allocator_job,
                     interval=max(21600, int(float((_family_cfg or {}).get("family_allocator_interval_hours", 24.0) or 24.0) * 3600)),
@@ -64022,9 +64264,8 @@ def main():
                         "misfire_grace_time": 1800,
                     },
                 )
-            if not RENDER_NO_LAG_MODE:
-                app.job_queue.run_repeating(
-                    research_framework_watchdog_job,
+            app.job_queue.run_repeating(
+                research_framework_watchdog_job,
                 interval=1800,
                 first=480,
                 name="research_framework_watchdog_job",
@@ -64034,7 +64275,7 @@ def main():
                     "misfire_grace_time": 300,
                 },
             )
-            if (not RENDER_NO_LAG_MODE) and _cfg_bool((_family_cfg or {}).get("family_autotune_enabled", True), True):
+            if _cfg_bool((_family_cfg or {}).get("family_autotune_enabled", True), True):
                 app.job_queue.run_repeating(
                     family_autotune_job,
                     interval=max(7200, int(float((_family_cfg or {}).get("family_autotune_interval_hours", 6.0) or 6.0) * 3600)),
