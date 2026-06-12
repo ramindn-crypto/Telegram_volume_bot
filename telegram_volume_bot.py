@@ -1,3 +1,4 @@
+# Ver97: restores user-configured/broad Melbourne blackout schedule after Ver96 mistake. Keeps all blackout windows in autotrade_config, merges required windows back if Ver96 overwrote them, and preserves command-firewall/no-lag + /why blackout visibility. No strategy/risk/KEEP/F8/TP/SL/trading changes.
 # Ver95: prevents BigMove from starving the normal setup/email scan: BigMove payload/F8 setup handling is fire-and-forget with an in-flight guard, so session pool generation always proceeds; /why now shows pool/build events when no reject stats exist. No strategy/risk/KEEP/TP/SL/trading changes.
 # Ver94: BigMove/F8 setup conversion no longer depends on the heavy routed setup builder. If the normal builder times out, a lightweight F8 continuation setup is created in the background, then still passes the same presend KEEP/context/executable gates before setup email, /screen, DB, and AutoTrade. No Telegram command-lane, risk, TP/SL, or policy loosening.
 # Ver93: /screen safe renderer always includes market context (Pulse + Leaders + Losers) and avoids returning positions-only or cache-warming output when ticker data can be fetched in the deferred worker. No strategy/risk/policy/F8/TP/SL/trading changes.
@@ -12,7 +13,7 @@
 # yver61: yver60 emergency no-lag patch. Hard safe-core by default, all non-essential background schedulers disabled unless explicitly enabled, alert loop shortened and de-overlapped, owner commands remain instant. No strategy/risk/setup/autotrade policy changes.
 # yver62: fixes fresh KEEP/OPEN handoff across session change so /setup_audit KEEP rows enter /screen, setup email and AutoTrade within entry_window even when ASIA→LON/NY changes.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
-# yver96: fixes setup starvation from legacy broad blackout windows: resets broad 03:00/05:00/13:00/SAT-SUN blackout defaults back to 10:00-10:45 only, keeps command firewall, and makes /why show active blackout/config gates clearly.
+# yver96: reverted by Ver97. Do not remove user-configured broad blackout windows.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -659,8 +660,9 @@ AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY = 'ver20_blackout_policy_version
 AUTOTRADE_CFG_VER57_BLACKOUT_SYNC_VERSION_KEY = 'ver57_blackout_sync_version'
 AUTOTRADE_CFG_VER29_DAY_BLACKOUT_POLICY_VERSION_KEY = 'ver29_day_blackout_policy_version'
 AUTOTRADE_CFG_VER96_BLACKOUT_UNSTARVE_VERSION_KEY = 'ver96_blackout_unstarve_version'
+AUTOTRADE_CFG_VER97_BLACKOUT_RESTORE_VERSION_KEY = 'ver97_blackout_restore_version'
 SETUP_CFG_SHADOW_SCAN_ENABLED_KEY = 'setup_shadow_scan_enabled'
-VER29_RECOMMENDED_BLACKOUT_WINDOWS = '10:00-10:45'  # yver96: no broad hidden setup-starvation windows by default
+VER29_RECOMMENDED_BLACKOUT_WINDOWS = '03:00-04:00,05:00-12:00,13:00-14:00,SAT 14:00-SUN 12:00'
 AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY = 'require_setup_email_for_entry'
 SETUP_POLICY_CLEAN_START_MARKER_TS_KEY = 'setup_policy_clean_start_marker_ts'
 AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY = 'max_position_hours_enabled'
@@ -704,9 +706,9 @@ AUTOTRADE_MAX_POSITION_HOURS_ENABLED = env_bool('AUTOTRADE_MAX_POSITION_HOURS_EN
 AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18)
 AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', '600') or 600)
 AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
-AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
+AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS) or '').split(',') if x.strip())
 SETUP_GENERATION_BLACKOUT_ENABLED = env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True)
-SETUP_GENERATION_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
+SETUP_GENERATION_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS) or '').split(',') if x.strip())
 # Ver54 forward-test mode: keep NORMAL and REVERSE setups/trades observable.
 # Default ON for this build because the current test goal is to compare NOR vs REV
 # without the bot closing positions for ASIA handover, max-hold, or carryover cleanup.
@@ -879,9 +881,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55') or 55),
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True) else 0,
         AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY: 1 if env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True) else 0,
-        AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY: str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
+        AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY: str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS) or VER29_RECOMMENDED_BLACKOUT_WINDOWS),
         SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY: 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0,
-        SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
+        SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS) or VER29_RECOMMENDED_BLACKOUT_WINDOWS),
         SETUP_CFG_SHADOW_SCAN_ENABLED_KEY: 1 if env_bool('SETUP_SHADOW_SCAN_ENABLED', True) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18),
@@ -1717,9 +1719,9 @@ def _autotrade_entry_blackout_enabled() -> bool:
 
 def _autotrade_entry_blackout_windows() -> str:
     try:
-        raw = _autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45'))
+        raw = _autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS))
     except Exception:
-        raw = os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45')
+        raw = os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS)
     return _normalise_melbourne_blackout_windows(raw, default='10:00-10:45')
 
 
@@ -1734,9 +1736,9 @@ def _setup_generation_blackout_enabled() -> bool:
 
 def _setup_generation_blackout_windows() -> str:
     try:
-        raw = _autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45'))
+        raw = _autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS))
     except Exception:
-        raw = os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45')
+        raw = os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS)
     return _normalise_melbourne_blackout_windows(raw, default='10:00-10:45')
 
 def _setup_shadow_scan_enabled() -> bool:
@@ -2135,7 +2137,7 @@ def _autotrade_apply_ver20_blackout_policy_defaults() -> None:
         first_apply = str(_autotrade_config_get(AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY, '') or '').strip().lower() != target_version
         if not first_apply:
             return
-        default_w = _normalise_melbourne_blackout_windows(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45'), '10:00-10:45')
+        default_w = _normalise_melbourne_blackout_windows(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS), '10:00-10:45')
         setup_w = _normalise_melbourne_blackout_windows(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', default_w), default_w)
         _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
         _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, default_w)
@@ -2160,14 +2162,14 @@ def _autotrade_apply_ver57_blackout_config_sync() -> None:
         if str(_autotrade_config_get(AUTOTRADE_CFG_VER57_BLACKOUT_SYNC_VERSION_KEY, '') or '').strip().lower() == target_version:
             return
         try:
-            entry_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45')), '10:00-10:45')
+            entry_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS)), '10:00-10:45')
             if entry_w:
                 _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
                 _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, entry_w)
         except Exception:
             pass
         try:
-            setup_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45')), '10:00-10:45')
+            setup_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS)), '10:00-10:45')
             if setup_w:
                 _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
                 _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, setup_w)
@@ -2229,45 +2231,51 @@ def _autotrade_apply_ver29_day_aware_blackout_defaults() -> None:
 
 
 
-def _autotrade_apply_ver96_blackout_unstarve_defaults() -> None:
-    """yver96: remove legacy broad blackout windows that starved NY setup generation.
 
-    The earlier day-aware defaults included 03:00-04:00, 05:00-12:00,
-    13:00-14:00 and SAT 14:00-SUN 12:00 Melbourne. In the no-lag forward-test
-    build those windows made the email/setup loop report no_setups_generated with
-    Symbols processed=0, which looks like a broken scanner and suppresses fresh
-    setup evidence. Keep the short ASIA reset protection (10:00-10:45) but remove
-    broad hidden windows from both setup-generation and entry blackout configs.
+def _autotrade_apply_ver97_blackout_restore_defaults() -> None:
+    """Ver97: restore user-configured/broad blackout windows after Ver96 mistake.
+
+    Ver96 incorrectly treated the broad blackout schedule as legacy/starvation and
+    could overwrite autotrade_config to 10:00-10:45 only. The blackout schedule is
+    intentional user/runtime configuration. This migration merges the required
+    evidence-based windows back into both setup-generation and entry blackout
+    config, preserving any extra windows already present.
     """
     try:
-        target_version = 'yver96_2026_06_13_blackout_unstarve'
-        if str(_autotrade_config_get(AUTOTRADE_CFG_VER96_BLACKOUT_UNSTARVE_VERSION_KEY, '') or '').strip().lower() == target_version:
+        target_version = 'ver97_2026_06_13_restore_configured_blackouts'
+        if str(_autotrade_config_get(AUTOTRADE_CFG_VER97_BLACKOUT_RESTORE_VERSION_KEY, '') or '').strip().lower() == target_version:
             return
-        safe_w = _normalise_melbourne_blackout_windows(
-            os.environ.get('PULSEFUTURES_SAFE_BLACKOUT_WINDOWS', os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45')),
-            '10:00-10:45',
-        ) or '10:00-10:45'
-        legacy_tokens = ('03:00-04:00', '05:00-12:00', '13:00-14:00', 'SAT 14:00-SUN 12:00')
-        def _needs_reset(value: str) -> bool:
-            v = str(value or '').upper()
-            return (not v.strip()) or any(tok in v for tok in legacy_tokens)
-        try:
-            cur_setup = _normalise_melbourne_blackout_windows(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, ''), safe_w)
-        except Exception:
-            cur_setup = ''
-        try:
-            cur_entry = _normalise_melbourne_blackout_windows(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, ''), safe_w)
-        except Exception:
-            cur_entry = ''
-        if _needs_reset(cur_setup):
-            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, safe_w)
-        if _needs_reset(cur_entry):
-            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, safe_w)
+
+        required = _normalise_melbourne_blackout_windows(
+            os.environ.get('VER29_RECOMMENDED_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS),
+            VER29_RECOMMENDED_BLACKOUT_WINDOWS,
+        ) or VER29_RECOMMENDED_BLACKOUT_WINDOWS
+
+        def _merge_windows(current_value: str) -> str:
+            try:
+                current = _normalise_melbourne_blackout_windows(str(current_value or ''), required)
+            except Exception:
+                current = ''
+            merged = []
+            for source in (current, required):
+                for w in _split_blackout_windows(source):
+                    ww = str(w or '').strip()
+                    if ww and ww not in merged:
+                        merged.append(ww)
+            return ','.join(merged) if merged else required
+
+        cur_setup_raw = str(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, '') or '')
+        cur_entry_raw = str(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, '') or '')
+        setup_w = _merge_windows(cur_setup_raw)
+        entry_w = _merge_windows(cur_entry_raw)
+
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, setup_w)
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, entry_w)
         _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
         _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
-        _autotrade_config_set(AUTOTRADE_CFG_VER96_BLACKOUT_UNSTARVE_VERSION_KEY, target_version)
+        _autotrade_config_set(AUTOTRADE_CFG_VER97_BLACKOUT_RESTORE_VERSION_KEY, target_version)
         try:
-            logger.warning('yver96 blackout unstarve applied: setup_windows=%s entry_windows=%s', str(_setup_generation_blackout_windows()), str(_autotrade_entry_blackout_windows()))
+            logger.warning('Ver97 restored blackout windows: setup_windows=%s entry_windows=%s', str(_setup_generation_blackout_windows()), str(_autotrade_entry_blackout_windows()))
         except Exception:
             pass
     except Exception:
@@ -7762,7 +7770,7 @@ try:
     _autotrade_apply_ver20_blackout_policy_defaults()
     _autotrade_apply_ver57_blackout_config_sync()
     _autotrade_apply_ver29_day_aware_blackout_defaults()
-    _autotrade_apply_ver96_blackout_unstarve_defaults()
+    _autotrade_apply_ver97_blackout_restore_defaults()
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
     _autotrade_apply_ver58_time_exit_runtime_defaults()
