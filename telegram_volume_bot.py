@@ -1,5 +1,4 @@
 # yver61: yver60 emergency no-lag patch. Hard safe-core by default, all non-essential background schedulers disabled unless explicitly enabled, alert loop shortened and de-overlapped, owner commands remain instant. No strategy/risk/setup/autotrade policy changes.
-# yver63: fixes setup-email → AutoTrade handoff by mirroring every sent setup email to AUTOTRADE_OWNER_UID, triggering immediate owner AutoTrade after email, allowing emailed setups across session changes inside entry_window, and blocking DISABLE-policy rows from sent email batches.
 # yver62: fixes fresh KEEP/OPEN handoff across session change so /setup_audit KEEP rows enter /screen, setup email and AutoTrade within entry_window even when ASIA→LON/NY changes.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
@@ -1795,7 +1794,9 @@ def _autotrade_recent_email_gate_allows_setup(uid: int, s: Any, session_label: s
             try:
                 if str(row.get('setup_id') or '').strip() != sid:
                     continue
-                # yver63: same exact setup_id can execute across session changes until entry window expires.
+                src = str(row.get('source_session') or row.get('session') or '').upper().strip()
+                if sess and src and src not in {'', sess}:
+                    continue
                 ts = float(row.get('emailed_ts') or row.get('email_logged_ts') or 0.0)
                 if ts >= cutoff:
                     try:
@@ -1812,13 +1813,21 @@ def _autotrade_recent_email_gate_allows_setup(uid: int, s: Any, session_label: s
     try:
         with sqlite3.connect(DB_PATH) as conn:
             cur = conn.cursor()
-            # yver63: exact setup_id + recent emailed_ts is sufficient. Do not require
-            # the emailed row session to equal the current live session, because a valid
-            # ASIA setup may still be inside the 60m entry window after LON starts.
-            row = cur.execute(
-                "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND setup_id=? AND emailed_ts>=?",
-                (uid_i, sid, float(cutoff)),
-            ).fetchone()
+            if sess:
+                row = cur.execute(
+                    """
+                    SELECT MAX(emailed_ts)
+                    FROM emailed_setups
+                    WHERE user_id=? AND setup_id=? AND emailed_ts>=?
+                      AND (UPPER(COALESCE(session,''))=? OR COALESCE(session,'')='')
+                    """,
+                    (uid_i, sid, float(cutoff), sess),
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND setup_id=? AND emailed_ts>=?",
+                    (uid_i, sid, float(cutoff)),
+                ).fetchone()
         ts = float((row[0] if row else 0.0) or 0.0)
         if ts >= cutoff:
             try:
@@ -13245,11 +13254,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
                     continue
                 obj = item[0]
                 src_session_u = str(getattr(obj, 'source_session', '') or '').upper().strip()
-                source_kind_u = str(getattr(obj, 'source_kind', '') or '').lower().strip()
-                emailed_ts_u = float(getattr(obj, 'email_logged_ts', 0.0) or getattr(obj, 'emailed_ts', 0.0) or 0.0)
-                # yver63: do not drop a just-emailed setup because the market session changed
-                # (ASIA→LON/NY). Once emailed, it remains executable for entry_window minutes.
-                if req_session_u and src_session_u and src_session_u not in {'', req_session_u} and source_kind_u not in {'emailed_setups', 'recent_email_cache', 'recent_email_lane'} and emailed_ts_u <= 0:
+                if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                     try:
                         _admin_setup_lifecycle_merge(int(uid), str(getattr(obj, 'setup_id', '') or ''), session=src_session_u, symbol=str(getattr(obj, 'symbol', '') or ''), side=str(getattr(obj, 'side', '') or ''), state=_admin_setup_state_from_reason('session_mismatch'), last_reason=f'session_mismatch ({src_session_u}->{req_session_u})')
                     except Exception:
@@ -13299,9 +13304,7 @@ def _autotrade_select_db_setups(uid: int, session_label: str, lookback_hours: in
             for obj in (fallback_items or []):
                 try:
                     src_session_u = str(getattr(obj, 'source_session', '') or '').upper().strip()
-                    source_kind_u = str(getattr(obj, 'source_kind', '') or '').lower().strip()
-                    emailed_ts_u = float(getattr(obj, 'email_logged_ts', 0.0) or getattr(obj, 'emailed_ts', 0.0) or 0.0)
-                    if req_session_u and src_session_u and src_session_u not in {'', req_session_u} and source_kind_u not in {'emailed_setups', 'recent_email_cache', 'recent_email_lane'} and emailed_ts_u <= 0:
+                    if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
                         continue
                     now_ts = float(time.time())
                     canonical_ts = float(getattr(obj, 'email_logged_ts', 0.0) or getattr(obj, 'emailed_ts', 0.0) or getattr(obj, 'created_ts', 0.0) or 0.0)
@@ -25003,7 +25006,7 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
         except Exception:
             owner_uid = 0
         try:
-            if uid > 0 and owner_uid > 0 and owner_uid not in target_uids:
+            if uid > 0 and owner_uid > 0 and owner_uid not in target_uids and is_admin_user(int(uid)):
                 target_uids.append(owner_uid)
         except Exception:
             pass
@@ -58339,7 +58342,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
             # being ahead of autotrade.
             try:
                 owner_uid_for_at = int(AUTOTRADE_OWNER_UID or 0)
-                if owner_uid_for_at > 0 and _autotrade_ready():
+                if owner_uid_for_at > 0 and _autotrade_ready() and (int(uid) == owner_uid_for_at or is_admin_user(int(uid))):
                     _LAST_AUTOTRADE_DECISION[owner_uid_for_at] = {
                         "status": "QUEUED",
                         "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -58349,7 +58352,7 @@ async def _screen_sync_pipeline_async(uid: int, user: dict, live_session: str, s
                         "trigger": "screen_or_autonomous_sync",
                     }
                     _safe_create_task(
-                        _trigger_autotrade_after_email_async(int(owner_uid_for_at), str(target_session or ""), list(actionable or [])),
+                        _trigger_autotrade_after_email_async(int(uid), str(target_session or ""), list(actionable or [])),
                         "autotrade_after_screen_sync_email",
                     )
             except Exception:
@@ -59155,11 +59158,7 @@ def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, s
             owner_uid = 0
         target_uids = [uid]
         try:
-            # yver63: AutoTrade consumes AUTOTRADE_OWNER_UID. Mirror every confirmed/assumed
-            # setup email into the owner lane, even when the Telegram/email recipient uid
-            # is not marked admin. Without this, the email is sent but AutoTrade sees no
-            # recent emailed_setups row and /autotrade_last stays at no_setups.
-            if owner_uid > 0 and owner_uid not in target_uids:
+            if owner_uid > 0 and owner_uid not in target_uids and is_admin_user(uid):
                 target_uids.append(owner_uid)
         except Exception:
             pass
@@ -59589,9 +59588,7 @@ def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut
             # owner uid so autotrade always consumes the same setup that was actually emailed.
             target_uids = [int(uid)]
             try:
-                # yver63: mirror setup-email delivery to the live AutoTrade owner for all
-                # recipients. The owner lane is the execution source of truth.
-                if owner_uid > 0 and int(owner_uid) not in target_uids:
+                if owner_uid > 0 and int(owner_uid) not in target_uids and is_admin_user(int(uid)):
                     target_uids.append(int(owner_uid))
             except Exception:
                 pass
@@ -61383,7 +61380,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 autotrade_note = "queued_for_immediate_autotrade"
                 try:
                     owner_uid_for_at = int(AUTOTRADE_OWNER_UID or 0)
-                    if owner_uid_for_at > 0 and _autotrade_ready():
+                    if owner_uid_for_at > 0 and _autotrade_ready() and (int(uid) == owner_uid_for_at or is_admin_user(int(uid))):
                         _LAST_AUTOTRADE_DECISION[owner_uid_for_at] = {
                             "status": "QUEUED",
                             "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -61392,7 +61389,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             "mode": str(_autotrade_runtime_mode()).lower(),
                         }
                         _safe_create_task(
-                            _trigger_autotrade_after_email_async(int(owner_uid_for_at), str(sess.get("name") or sess_name or ""), list(chosen_list or [])),
+                            _trigger_autotrade_after_email_async(int(uid), str(sess.get("name") or sess_name or ""), list(chosen_list or [])),
                             "autotrade_after_email",
                         )
                 except Exception:
@@ -63458,25 +63455,17 @@ async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chos
             # Do not pull the latest generic executable queue here; otherwise AutoTrade can
             # open rows that were not in the email, then the emailed rows show as duplicates.
             db_setups = []
-            attempts_meta = []
             for _s in list(chosen_list or []):
                 try:
                     _s_eff = _setup_route_unless_delivery_locked(_s, sess, owner_uid, source_kind=str(getattr(_s, 'source_kind', '') or 'emailed_setups'))
-                    # yver63: after a setup email is confirmed, execute the exact delivered
-                    # row through the DB/email structural gate. Re-running only the volatile
-                    # live scanner gate can turn a SENT email into no autotrade.
-                    ok_s, _why_s = _autotrade_db_signal_structurally_valid(_s_eff, session_name=sess)
+                    ok_s, _why_s = is_executable_setup_eligible(_s_eff, session_name=sess)
                     if ok_s:
                         db_setups.append(_s_eff)
-                    else:
-                        try:
-                            attempts_meta.append({'setup_id': str(getattr(_s_eff, 'setup_id', '') or getattr(_s_eff, 'id', '') or ''), 'symbol': str(getattr(_s_eff, 'symbol', '') or ''), 'side': str(getattr(_s_eff, 'side', '') or ''), 'source_kind': str(getattr(_s_eff, 'source_kind', '') or ''), 'status': 'SKIP', 'reason': str(_why_s or '')})
-                        except Exception:
-                            pass
                 except Exception:
                     continue
             attempted = 0
             placed_count = 0
+            attempts_meta = []
             ok = False
             reason = 'no_setups_after_email'
             max_batch_places = max(0, int(globals().get('AUTOTRADE_AFTER_EMAIL_MAX_PLACEMENTS_PER_BATCH', 0) or 0))  # 0 = unlimited/all eligible
