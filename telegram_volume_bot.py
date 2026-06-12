@@ -35,6 +35,7 @@ from typing import Any  # yver130 early import required before early helper anno
 # yver129: locks AutoTrade to the same delivered KEEP+WATCH lane as subscribers: future AutoTrade entries require an actual recent setup email/delivery within AUTOTRADE_ENTRY_WINDOW_MIN, remove broad executable/fresh-queue fallbacks from email-triggered AutoTrade, and keep the setting Telegram-configurable.
 # yver126: fixes /dayrisk_reset so AutoTrade debug uses the reset credit from the same realised-PnL/open-risk basis, and fixes /setup_audit_keep_watch multi-window table to use full historical generated+executable rows rather than the short executable-only slice.
 # yver124: /setup_audit_keep_watch now renders a multi-window table (Last 24h, 7d, 14d, Overall from database) with Keep/Watch combo counts and WR=TP/(TP+SL).
+# yver75: hard no-lag owner command lane; owner/admin commands ACK fire-and-forget before any heavy work, heavy report outputs are built in worker threads where possible, and background command concurrency is clamped to prevent Telegram command starvation. No strategy/risk/policy changes.
 # yver123: fixes WR methodology (TP/SL only for setup audits; AutoTrade realised WR counts TP or positive OTHER as wins and SL or negative OTHER as losses), tightens compare matching to avoid stale/legacy setup DIFF rows, rounds PnL displays, and clarifies active sessions in /autotrade_debug.
 # yver121: AutoTrade candidate deadline lock. KEEP+WATCH executable setups are tradable only inside AUTOTRADE_ENTRY_WINDOW_MIN (default 60m); the old 24h fallback is capped to that deadline and no longer bypassed by keep-all mode.
 # yver116: AutoTrade timeout reconciliation display hardening and longer placement budget.
@@ -3098,8 +3099,8 @@ OWNER_DEFERRED_COMMAND_TIMEOUT_SEC = int(os.getenv("OWNER_DEFERRED_COMMAND_TIMEO
 # Ver73: deferred commands already ACK first; do not make report/debug outputs wait
 # behind a previous report for minutes.  Keep a small concurrency cap so 10 pressed
 # commands stay responsive without stampeding the live AutoTrade/email executors.
-OWNER_DEFERRED_COMMAND_DELAY_SEC = float(os.getenv("OWNER_DEFERRED_COMMAND_DELAY_SEC", "0.05") or 0.05)
-OWNER_DEFERRED_COMMAND_MAX_CONCURRENT = int(os.getenv("OWNER_DEFERRED_COMMAND_MAX_CONCURRENT", "4") or 4)
+OWNER_DEFERRED_COMMAND_DELAY_SEC = float(os.getenv("OWNER_DEFERRED_COMMAND_DELAY_SEC", "1.25") or 1.25)
+OWNER_DEFERRED_COMMAND_MAX_CONCURRENT = int(os.getenv("OWNER_DEFERRED_COMMAND_MAX_CONCURRENT", "1") or 1)
 # Ver73: 1s was too aggressive on Render/Telegram and could drop the visible ACK;
 # the command path still returns quickly, but the owner sees the accepted message.
 TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC = float(os.getenv("TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC", "2.0") or 2.0)
@@ -41918,7 +41919,8 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
             await _instant_status_cmd(update, context)
             raise ApplicationHandlerStop
         if cmd == 'equity':
-            await _instant_equity_cmd(update, context)
+            if await _owner_defer_command(update, context, cmd, '_instant_equity_cmd'):
+                raise ApplicationHandlerStop
             raise ApplicationHandlerStop
         if cmd == 'trade_close':
             await _instant_trade_close_cmd(update, context)
@@ -42029,6 +42031,196 @@ def _owner_or_admin_from_update(update: Update) -> bool:
         return False
 
 
+def _owner_fire_and_forget_reply(update: Update, text: str, parse_mode=None, reply_markup=None) -> None:
+    """Schedule a Telegram reply without making the command handler wait.
+
+    yver75: the previous no-lag lane still awaited the ACK send. If Telegram or
+    the connection pool was slow, /autotrade_debug and even /start could sit with
+    no visible response. This helper schedules the ACK and returns immediately;
+    the priority router then raises ApplicationHandlerStop before any heavy path.
+    """
+    try:
+        _safe_create_task(
+            _instant_reply(update, str(text or ''), parse_mode=parse_mode, reply_markup=reply_markup),
+            label='owner-fire-and-forget-ack',
+        )
+    except Exception:
+        pass
+
+
+def _owner_parse_hours_arg(args_snapshot: list[str], default: int = 24, min_h: int = 1, max_h: int = 168) -> int:
+    try:
+        if args_snapshot and str(args_snapshot[0]).strip():
+            return int(clamp(int(float(str(args_snapshot[0]).strip())), int(min_h), int(max_h)))
+    except Exception:
+        pass
+    return int(default)
+
+
+def _autotrade_debug_fast_text_sync(owner: int, request_uid: int | None = None) -> str:
+    """Fast, thread-safe AutoTrade debug snapshot for the no-lag lane.
+
+    It avoids the old async debug side-effects and direct live exchange refreshes.
+    The goal is a reliable diagnostic snapshot without blocking Telegram command
+    processing. Live trading/report logic is unchanged.
+    """
+    owner = int(owner or request_uid or AUTOTRADE_OWNER_UID or 0)
+    user = get_user(owner) or {}
+    now_utc = datetime.now(timezone.utc)
+    sess = current_session_utc(now_utc)
+    ready = _autotrade_ready()
+    sess_allowed = (sess != 'NONE') and _autotrade_allowed_session(sess)
+    try:
+        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, force_refresh=False)
+    except Exception:
+        snap = {}
+    equity = float((snap or {}).get('equity') or 0.0)
+    try:
+        mday = _autotrade_day_risk_metrics_cached(owner, float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, force_refresh=False)
+    except Exception:
+        mday = {}
+    try:
+        cap_mode, cap_value = _autotrade_daily_cap_settings()
+    except Exception:
+        cap_mode, cap_value = 'PCT', float(AUTOTRADE_DAILY_RISK_CAP_PCT)
+    try:
+        cap_usd = float(equity) * float(cap_value) / 100.0 if str(cap_mode).upper() == 'PCT' else float(cap_value)
+    except Exception:
+        cap_usd = 0.0
+    try:
+        open_risk = float((mday or {}).get('open_risk_now') or (snap or {}).get('current_total_open_risk') or 0.0)
+    except Exception:
+        open_risk = 0.0
+    try:
+        realised = float((mday or {}).get('realized_pnl_today') or (snap or {}).get('pnl_today') or 0.0)
+    except Exception:
+        realised = 0.0
+    daily_used = max(0.0, float(open_risk) - float(realised))
+    remaining = max(0.0, float(cap_usd) - float(daily_used)) if cap_usd > 0 else float('inf')
+    try:
+        opened_today = int((mday or {}).get('opened_today_count') or (snap or {}).get('positions_opened_today') or 0)
+        closed_today = int((mday or {}).get('closed_today_count') or (snap or {}).get('positions_closed_today') or 0)
+        open_now = int((mday or {}).get('open_positions_now') or (snap or {}).get('open_positions_now') or 0)
+    except Exception:
+        opened_today = closed_today = open_now = 0
+    try:
+        email_gate = _email_runtime_limits_snapshot(owner, user)
+    except Exception:
+        email_gate = {}
+    try:
+        open_rows = list((snap or {}).get('open_positions') or (mday or {}).get('open_positions') or [])
+    except Exception:
+        open_rows = []
+    lines = [
+        '🧪 AutoTrade Debug',
+        HDR,
+        f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Entries: {'ON' if _autotrade_entries_enabled() else 'OFF'} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
+        f"Trading day: {str((snap or {}).get('today_window_label') or '-')}",
+        f"Keep-all test: {'ON' if bool(AUTOTRADE_KEEP_ALL_TEST_MODE) else 'OFF'} | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(_autotrade_entry_window_min())}m",
+        SEP,
+        f"EquityAT: ${equity:.2f}",
+        f"Daily cap (AT): {str(cap_mode).upper()} {float(cap_value):.2f}{'%' if str(cap_mode).upper() == 'PCT' else ''} (≈ ${cap_usd:.2f})",
+        f"Opened today (AT): {opened_today}/∞ | Closed today (AT): {closed_today} | Open now (AT): {open_now}",
+        f"Open risk now (AT): ${open_risk:.2f}",
+        f"Realised net today (AT): ${realised:+.2f}",
+        f"Daily risk used (AT) (open risk - realised net): ${daily_used:.2f}",
+        f"Daily risk remaining (AT): {'∞' if not math.isfinite(float(remaining)) else '$' + format(float(remaining), '.2f')}",
+        SEP,
+        'Email / AutoTrade entry gate',
+        f"AutoTrade lane filter: KEEP-only policy {'ON' if AUTOTRADE_KEEP_POLICY_ONLY else 'OFF'}",
+        f"Recipient: {str((email_gate or {}).get('recipient_masked') or '(none)')}",
+        f"Alerts: {'ON' if bool((email_gate or {}).get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool((email_gate or {}).get('smtp_ready', True)) else 'NOT_READY'}",
+        f"Email/AutoTrade gate: {'OPEN' if bool((email_gate or {}).get('gate_open', True)) else 'BLOCKED'}",
+        SEP,
+        f"Open AutoTrade Positions: {open_now}",
+    ]
+    if not open_rows:
+        lines.append('• None')
+    else:
+        for r in open_rows[:8]:
+            try:
+                sym = str(r.get('symbol') or r.get('base') or '-').replace('USDT','')
+                side = str(r.get('side') or '-').upper()
+                risk = float(r.get('risk_usd') or r.get('risk') or 0.0)
+                pnl = float(r.get('pnl') or r.get('unrealized_pnl') or r.get('pnl_usdt') or 0.0)
+                lines.append(f"• {sym} {side} | Risk ${risk:.2f} | PnL ${pnl:+.2f}")
+            except Exception:
+                continue
+    lines.append('')
+    lines.append('Note: no-lag snapshot; heavy exchange reconciliation is kept out of the Telegram command path.')
+    return '\n'.join(lines)
+
+
+def _autotrade_last_text_sync(owner: int) -> str:
+    dec = _LAST_AUTOTRADE_DECISION.get(int(owner)) or {}
+    hist = list(_LAST_AUTOTRADE_ATTEMPTS.get(int(owner)) or [])
+    dec_attempts = list(dec.get('attempted_candidates') or []) if isinstance(dec, dict) else []
+    if not hist and dec_attempts:
+        hist = dec_attempts
+    lines = ['AutoTrade — Last Attempts', HDR]
+    if not hist and not dec:
+        lines.append('No attempts recorded yet.')
+        return '\n'.join(lines)
+    if dec:
+        lines.append(f"Last decision: {str(dec.get('status') or '—')}" + (f" | {str(dec.get('reason') or '')}" if str(dec.get('reason') or '') else ''))
+        if dec.get('when'):
+            try:
+                lines.append(f"Decision time: {_fmt_iso_to_local(str(dec.get('when')))}")
+            except Exception:
+                lines.append(f"Decision time: {dec.get('when')}")
+        if dec.get('trigger'):
+            lines.append(f"Trigger: {dec.get('trigger')}")
+        lines.append(HDR)
+    for i, a in enumerate(hist[:8], start=1):
+        try:
+            sym = str(a.get('symbol') or a.get('symbol_sent') or a.get('symbol_raw') or '—')
+            side = str(a.get('side') or '—')
+            status = str(a.get('status') or '').upper() or '—'
+            reason = str(a.get('reason') or '').strip()
+            lines.append(f"{i}) {sym} {side} | {status}" + (f" | {reason}" if reason else ''))
+        except Exception:
+            continue
+    return '\n'.join(lines)
+
+
+def _owner_deferred_direct_sync_text(cmd: str, args_snapshot: list[str], request_uid: int) -> tuple[str, object | None] | None:
+    """Build selected heavy command outputs entirely in a worker thread.
+
+    Returning None falls back to the original async command.
+    """
+    cmd = str(cmd or '').strip().lower()
+    args_snapshot = list(args_snapshot or [])
+    owner = int(AUTOTRADE_OWNER_UID or request_uid or 0)
+    if cmd == 'why':
+        return (_reject_report_for_uid(int(request_uid)), None)
+    if cmd == 'autotrade_last':
+        return (_autotrade_last_text_sync(owner), None)
+    if cmd == 'autotrade_debug':
+        return (_autotrade_debug_fast_text_sync(owner, request_uid), None)
+    if cmd == 'autotrade_report':
+        h = _owner_parse_hours_arg(args_snapshot, default=24, min_h=1, max_h=168)
+        return (_autotrade_report_text_cached(owner, h), ParseMode.HTML)
+    if cmd in {'setup_audit', 'setup_quality'}:
+        try:
+            if args_snapshot and str(args_snapshot[0]).lower() in {'h', 'help', '?', 'guide'}:
+                return (_setup_audit_help_text(), ParseMode.HTML)
+            if args_snapshot and str(args_snapshot[0]).lower() in {'overall', 'alltime', 'all-time'}:
+                return (_setup_audit_overall_text(owner), ParseMode.HTML)
+            if args_snapshot and str(args_snapshot[0]).lower() in {'compare', 'reconcile', 'traded', 'autotrade'}:
+                cmp_h = 24
+                if len(args_snapshot) >= 2:
+                    try:
+                        cmp_h = int(clamp(int(float(str(args_snapshot[1]))), 1, 168))
+                    except Exception:
+                        cmp_h = 24
+                return (_setup_audit_compare_text(owner, cmp_h), ParseMode.HTML)
+            h = _owner_parse_hours_arg(args_snapshot, default=24, min_h=1, max_h=168)
+            return (_setup_audit_text(owner, 0, h), ParseMode.HTML)
+        except Exception as e:
+            return (f"⚠️ /setup_audit failed in no-lag worker: {type(e).__name__}: {str(e)[:180]}", None)
+    return None
+
+
 _OWNER_DEFERRED_COMMAND_SEMAPHORE = None
 _OWNER_DEFERRED_COMMAND_SEQ = 0
 
@@ -42063,6 +42255,28 @@ async def _owner_deferred_command_runner(cmd: str, handler_name: str, update: Up
                 context.args = list(args_snapshot or [])
             except Exception:
                 pass
+            try:
+                request_uid = int(getattr(getattr(update, 'effective_user', None), 'id', 0) or 0)
+            except Exception:
+                request_uid = 0
+            direct = None
+            try:
+                direct = await to_thread_bg(
+                    _owner_deferred_direct_sync_text,
+                    str(cmd or ''),
+                    list(args_snapshot or []),
+                    int(request_uid),
+                    timeout=max(30, int(OWNER_DEFERRED_COMMAND_TIMEOUT_SEC or 900)),
+                )
+            except Exception:
+                direct = None
+            if direct is not None:
+                try:
+                    text, pm = direct
+                except Exception:
+                    text, pm = str(direct), None
+                await send_long_message(update, str(text or 'No data found.'), parse_mode=pm, disable_web_page_preview=True)
+                return
             handler = globals().get(str(handler_name or ''))
             if not handler:
                 try:
@@ -42090,11 +42304,11 @@ async def _owner_deferred_command_runner(cmd: str, handler_name: str, update: Up
 
 
 async def _owner_defer_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str, handler_name: str) -> bool:
-    """Instantly ACK a heavy owner/admin command and queue its full output.
+    """ACK and queue a heavy owner/admin command without waiting for Telegram.
 
-    Returns True only when the ACK was visibly accepted by Telegram.  If the ACK
-    cannot be sent quickly, the router lets the normal handler continue instead
-    of swallowing the command and making the user wait in silence.
+    yver75: returns True immediately after scheduling the ACK and background runner.
+    This prevents fallback to the normal CommandHandler path, which was the source
+    of the remaining visible lag when Telegram ACK sending or /autotrade_report was slow.
     """
     global _OWNER_DEFERRED_COMMAND_SEQ
     try:
@@ -42111,12 +42325,10 @@ async def _owner_defer_command(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
     label = str(cmd or 'command').strip() or 'command'
-    ack_ok = await _instant_reply(
+    _owner_fire_and_forget_reply(
         update,
         f"⏳ /{label} accepted. The bot is working in the background and will post the output when ready."
     )
-    if not ack_ok:
-        return False
     _safe_create_task(
         _owner_deferred_command_runner(label, handler_name, update, context, args_snapshot, seq),
         label=f"owner-deferred-command:{label}:{seq}",
@@ -42269,7 +42481,7 @@ async def _owner_instant_command_router(update: Update, context: ContextTypes.DE
         except Exception:
             pass
         if cmd == 'start':
-            await _instant_reply(update, "✅ PulseFutures is live.\n\nQuick commands: /screen /status /equity /autotrade_debug")
+            _owner_fire_and_forget_reply(update, "✅ PulseFutures is live.\n\nQuick commands: /screen /status /equity /autotrade_debug")
             raise ApplicationHandlerStop
         if cmd == 'status':
             try:
@@ -42289,10 +42501,11 @@ async def _owner_instant_command_router(update: Update, context: ContextTypes.DE
                 + (f" ({age}s ago)" if age >= 0 else "")
                 + "\nCommands are using the instant lane."
             )
-            await _instant_reply(update, txt_status)
+            _owner_fire_and_forget_reply(update, txt_status)
             raise ApplicationHandlerStop
         if cmd == 'equity':
-            await _instant_equity_cmd(update, context)
+            if await _owner_defer_command(update, context, cmd, '_instant_equity_cmd'):
+                raise ApplicationHandlerStop
             raise ApplicationHandlerStop
         if cmd == 'screen':
             # Ver72 strict no-lag: even /screen should ACK first, then post the
