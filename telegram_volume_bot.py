@@ -1,3 +1,4 @@
+# Ver91: command-firewall screen override so /screen cannot fall back to the old heavy/ticker-only handler; it uses the safe cache/DB/live-position snapshot handler in the background. No strategy/risk/policy/trading changes.
 # Ver90: full Telegram command firewall. Every slash command is intercepted before all legacy handlers, sends an immediate ACK, then runs the original command handler in a bounded background worker. Manual commands no longer run Bybit/OHLCV/report work in the Telegram update path. No strategy/risk/policy/F8/TP/SL/AutoTrade trading logic changes.
 # Ver79: no-lag polish from Ver78. /screen active-position fallback now uses live Bybit position rows only (no stale DB OPEN fallback), dedupes rows, and BigMove/F8 failures now record the exact presend gate reason instead of only f8_setup_email_failed_or_empty. No strategy/risk/policy changes.
 # Ver78: no-lag polish from Ver77. Keeps instant ACK path. /screen now prefers recent/open AutoTrade positions over stale ticker-only cache, and /setup_audit deferred path falls back to the existing cached/background report wrapper instead of rebuilding synchronously. No strategy/risk/policy changes.
@@ -64614,6 +64615,16 @@ def _command_firewall_refresh_registry(app) -> None:
         if cb:
             reg[str(key).lower()] = cb
 
+    # Ver91 hard override: the discovered CommandHandler('screen') is intentionally
+    # replaced by the safe no-lag screen renderer. This prevents /screen from using
+    # old scan/ticker-only code while the global firewall is active.
+    try:
+        cb = globals().get('_owner_instant_screen_cmd')
+        if cb:
+            reg['screen'] = cb
+    except Exception:
+        pass
+
     _COMMAND_FIREWALL_REGISTRY = reg
     try:
         logger.warning("Ver90 command firewall registry loaded: %s commands", len(_COMMAND_FIREWALL_REGISTRY))
@@ -64668,7 +64679,14 @@ async def _command_firewall_worker(cmd: str, args_snapshot: list[str], update: U
             except Exception:
                 pass
 
-            handler = _COMMAND_FIREWALL_REGISTRY.get(str(cmd or '').strip().lower())
+            # Ver91: /screen must never call the legacy screen handler from the
+            # command registry. The legacy handler can trigger ticker/full-scan paths and
+            # can also hide live AutoTrade positions behind a ticker-only warming screen.
+            # Always route /screen through the safe cache/DB/live-position snapshot body.
+            if str(cmd or '').strip().lower() == 'screen':
+                handler = globals().get('_owner_instant_screen_cmd')
+            else:
+                handler = _COMMAND_FIREWALL_REGISTRY.get(str(cmd or '').strip().lower())
             if not handler:
                 handler = globals().get('unknown_command')
             if not handler:
