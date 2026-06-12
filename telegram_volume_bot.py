@@ -1,4 +1,6 @@
 # yver52: adds F9 Persistent Leaders research family on top of yver51. F9 records leader/loser daily membership, generates WATCH/audit-only persistent-leader continuation BUY setups after a 2-day leader streak, and cannot promote to KEEP until enough decided evidence is collected; existing F1-F8 setup/email/AutoTrade flow is unchanged.
+# yver53: restores instant /start and /screen owner fast-lane by bypassing DB/access middleware for owner/admin quick replies; full scans still refresh in background. No strategy/risk/F9 changes.
+# yver52b: runtime/cache hardening: detailed /setup_audit no longer shows misleading stale cache older than 90s; alert/guardian scheduler overlap warnings removed via effective runtime cap + lock-check instances; transient Telegram send timeouts logged as INFO.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
@@ -28235,7 +28237,7 @@ async def send_long_message(
                             pass
                 except (TimedOut, NetworkError) as e:
                     try:
-                        logger.warning('Telegram send failed (pre-table network): %s', e)
+                        logger.info('Telegram send transient network timeout (pre-table): %s', e)
                     except Exception:
                         pass
                     await asyncio.sleep(1)
@@ -28378,8 +28380,8 @@ async def send_long_message(
                 except Exception as e2:
                     logger.warning("Telegram plain fallback failed: %s", e2)
             else:
-                logger.warning("Telegram send failed (network): %s", e)
-                await asyncio.sleep(2)
+                logger.info("Telegram send transient network timeout: %s", e)
+                await asyncio.sleep(1)
                 try:
                     await _send(parse_mode)
                 except Exception as e2:
@@ -28389,7 +28391,7 @@ async def send_long_message(
                         except Exception as e3:
                             logger.warning("Telegram plain fallback after network retry failed: %s", e3)
                     else:
-                        logger.warning("Telegram retry failed (network): %s", e2)
+                        logger.info("Telegram retry transient network failure: %s", e2)
 
         except Exception as e:
             if _is_parse_entity_error(e):
@@ -41655,7 +41657,7 @@ def build_help_html(title: str, sections: list) -> str:
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
-FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size", "health", "status", "equity", "trade_close", "why"}
+FAST_PATH_COMMANDS = {"start", "screen", "help", "commands", "help_admin", "size", "health", "status", "equity", "trade_close", "why"}
 
 
 def _command_args_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[str]:
@@ -41948,6 +41950,119 @@ async def _instant_trade_close_cmd(update: Update, context: ContextTypes.DEFAULT
     except Exception:
         await update.message.reply_text("⚠️ Could not close the trade instantly. Please try again.")
 
+
+async def _instant_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner/admin zero-DB /start reply.
+
+    yver53: /start must acknowledge immediately even if SQLite or background scan
+    lanes are busy after deployment. The full command system remains available through
+    normal handlers for non-owner users; this fast path is only used by owner/admin.
+    """
+    try:
+        await update.message.reply_text(
+            "✅ PulseFutures is live.\n\n"
+            "Fast checks:\n"
+            "/screen\n"
+            "/autotrade_debug\n"
+            "/email_decision\n"
+            "/setup_audit 2\n"
+        )
+    except Exception:
+        pass
+
+
+async def _instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner/admin zero-DB /screen reply.
+
+    Returns latest in-memory/global cache or a cached ticker snapshot immediately and
+    queues the real executable refresh in the dedicated background lane. It avoids
+    get_user(), has_active_access(), SQLite, OHLCV, Bybit and email-sync work in the
+    Telegram update path so /screen feels instant after deployments.
+    """
+    try:
+        uid = int(getattr(getattr(update, 'effective_user', None), 'id', 0) or 0)
+    except Exception:
+        uid = 0
+    try:
+        live_session = current_session_utc()
+    except Exception:
+        live_session = 'UNKNOWN'
+    try:
+        scan_session = str(scan_session_name_utc() or '').upper()
+    except Exception:
+        scan_session = str(live_session or '').upper()
+    try:
+        tz = ZoneInfo(str(globals().get('TIMEZONE') or os.environ.get('TIMEZONE') or 'Australia/Melbourne'))
+        loc_label = 'Melbourne (Australia)'
+        loc_time = datetime.now(tz).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        loc_label, loc_time = 'Melbourne (Australia)', datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    try:
+        _schedule_screen_cache_refresh(uid, scan_session)
+    except Exception:
+        pass
+
+    try:
+        cache_keys = [f"uid:{uid}::{scan_session}", f"global::{scan_session}"]
+        for _k, _v in list((_SCREEN_CACHE or {}).items()):
+            if str(_k).startswith((f"uid:{uid}::", "global::")) and (_v or {}).get('body'):
+                cache_keys.append(_k)
+        cache_entry, age = _screen_choose_best_cache(cache_keys)
+        if (cache_entry or {}).get('body'):
+            cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
+            note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
+            if age <= float(globals().get('SCREEN_CACHE_TTL_SEC', 60) or 60):
+                note = "_Showing latest cached scan._\n"
+            header = (
+                f"*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{_screen_when_line('Cached scan built', cache_ts)}"
+                f"{note}"
+            )
+            keyboard = [
+                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
+                for (sym, sid) in ((cache_entry or {}).get('kb') or [])
+            ]
+            await send_long_message(
+                update,
+                _screen_markdown_to_html((header + "\n" + str((cache_entry or {}).get('body') or '')).strip()),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+            )
+            return
+    except Exception:
+        pass
+
+    try:
+        quick_best = get_cached_futures_tickers() or {}
+        if quick_best:
+            body, kb, _ = _screen_quick_ticker_snapshot_body(quick_best, scan_session)
+            header = (
+                f"*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{_screen_when_line('Ticker snapshot', time.time())}"
+                f"_Showing instant ticker snapshot while full executable scan warms up._\n"
+            )
+            await send_long_message(
+                update,
+                _screen_markdown_to_html((header + "\n" + body).strip()),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+    except Exception:
+        pass
+
+    try:
+        await update.message.reply_text("🔎 /screen received instantly. Cache is warming up and the executable refresh is queued.")
+    except Exception:
+        pass
+
+
 async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ultra-light command lane so /help and /size never wait behind heavier middleware."""
     try:
@@ -41966,6 +42081,20 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
             context.args = _parts[1:] if len(_parts) > 1 else []
         except Exception:
             pass
+
+        # yver53 owner/admin instant lane: bypass slow DB/subscription/global guard
+        # for the two commands the owner uses to verify the service after deploy.
+        try:
+            _uid_fast = int(update.effective_user.id)
+            _owner_like = (_uid_fast == int(AUTOTRADE_OWNER_UID or 0)) or bool(is_admin_user(_uid_fast))
+        except Exception:
+            _owner_like = False
+        if _owner_like and cmd == 'start':
+            await _instant_start_cmd(update, context)
+            raise ApplicationHandlerStop
+        if _owner_like and cmd == 'screen':
+            await _instant_screen_cmd(update, context)
+            raise ApplicationHandlerStop
 
         if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
             ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
@@ -51420,12 +51549,14 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v21:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v52b:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
-        fresh_ttl=45,
-        stale_ttl=6 * 3600,
+        fresh_ttl=60,
+        # yver52b: detailed setup_audit cache older than 90s can be misleading
+        # because new rows arrive constantly; show an ack instead of stale tables.
+        stale_ttl=90,
         background_timeout=600,
     )
 
@@ -59910,7 +60041,10 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
+# yver52b: cap this job's effective runtime even if Render env has an older high value.
+# A 280s alert_job caused APScheduler overlap warnings and delayed Telegram command replies.
+_ALERT_JOB_MAX_RUNTIME_ENV_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
+ALERT_JOB_MAX_RUNTIME_SEC = min(max(60, _ALERT_JOB_MAX_RUNTIME_ENV_SEC), int(os.environ.get("ALERT_JOB_EFFECTIVE_MAX_RUNTIME_CAP_SEC", "120") or 120))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
@@ -60706,10 +60840,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # Ver110: Big-Move is important, but it must not consume the entire
             # alert_job runtime and starve the normal session setup/email/autotrade pool.
             if _bigmove_session_reserve_hit():
-                logger.warning("alert_job bigmove queue reserved session budget after %.1fs", time.time() - job_started_ts)
+                logger.info("alert_job bigmove queue reserved session budget after %.1fs", time.time() - job_started_ts)
                 break
             if _job_budget_exhausted():
-                logger.warning("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
+                logger.info("alert_job bigmove queue budget exhausted after %.1fs", time.time() - job_started_ts)
                 break
             try:
                 uid = int(u.get("user_id") or u.get("id") or 0)
@@ -60744,7 +60878,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # even when no user is currently inside those sessions.
         # -----------------------------------------------------
         if _job_budget_exhausted():
-            logger.warning("alert_job runtime budget exhausted before session pools after %.1fs", time.time() - job_started_ts)
+            logger.info("alert_job runtime budget exhausted before session pools after %.1fs", time.time() - job_started_ts)
             return
 
         notify_runtime = []
@@ -60951,7 +61085,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             notify_runtime = notify_runtime[:_notify_max]
         for meta in notify_runtime:
             if _job_budget_exhausted():
-                logger.warning("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
+                logger.info("alert_job notify loop budget exhausted after %.1fs", time.time() - job_started_ts)
                 return
             user = dict(meta.get("user") or {})
             uid = int(meta.get("uid") or 0)
@@ -64231,7 +64365,10 @@ def main():
             first=90,
             name="autotrade_exit_guardian_job",
             job_kwargs={
-                "max_instances": 1,
+                # yver52b: guardian owns AUTOTRADE_GUARDIAN_LOCK; allow a second
+                # scheduler instance to fast-return on the lock instead of APScheduler
+                # logging max_instances warnings on Render.
+                "max_instances": 2,
                 "coalesce": True,
                 "misfire_grace_time": 120,
             },
