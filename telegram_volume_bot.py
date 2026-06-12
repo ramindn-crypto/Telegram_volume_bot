@@ -1,3 +1,4 @@
+# yver45: based on yver35; ONLY change is min liquidity floor from $15M to $10M for normal setup/executable gates and BigMove/F8 alert/setup defaults.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -87,7 +88,7 @@ from typing import Any  # yver130 early import required before early helper anno
 # - Ver54 yver54: forward-test keep-all mode for NORMAL/REVERSE comparison: disables automatic flat/max-hold/carryover closes by default, extends setup entry life for test observation, and lets scheduled AutoTrade continue placing multiple eligible queued setups per tick while retaining SL/TP, risk caps, duplicate guards and exchange safety checks.
 # - Ver53 yver53: fixes post-unblock execution gaps: removes MON from combo identity (NOR/REV only), routes weak combos to REV earlier, lets AutoTrade execute already queued/emailed setups during setup-generation blackout, retries Bybit leverage at exchange max, and continues candidate attempts after leverage/setup-specific skips.
 # - yver61: AutoTrade risk caps are controlled only by /autotrade_config; /dailycap is manual-only; AutoTrade reports use one clear Reason column with pre-ASIA closes renamed.
-# - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
+# - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (10M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
 # - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
 # - Ver44: Hard-fixed UNKNOWN Family-Session-Strategy policy fallback so new NOR/REV/MON combos always enter WATCH probation instead of being blocked as UNKNOWN; cleaned /why stale UNKNOWN policy gate noise.
@@ -3106,13 +3107,13 @@ SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMB
 # Ver49: anti-starvation correction.  Ver48 still allowed stale Render/env values and
 # the final WATCH gate to starve the executable pool for hours.  Keep WR-first
 # controls, but make the scout lane practical: Conf>=83, Dyn>=70, RR>=1.30,
-# Vol>=15M. Broad global BUY/SELL side history is advisory only; combo/symbol/hour
+# Vol>=10M. Broad global BUY/SELL side history is advisory only; combo/symbol/hour
 # evidence and disabled policy rows remain enforceable.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = env_bool("SETUP_COMBO_WATCH_SCOUT_ENABLED", True)
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_CONF", "83") or 84)
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_RR", "1.30") or 1.40)
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "10000000") or 10000000)
 SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
 # Ver32 WR-first final gate: the executable lane itself is now quality-gated,
 # not only the downstream email/autotrade consumer.  This keeps /setup_audit,
@@ -3126,7 +3127,7 @@ SETUP_FINAL_SCOUT_ENABLED = env_bool("SETUP_FINAL_SCOUT_ENABLED", True)
 SETUP_FINAL_SCOUT_MIN_CONF = int(os.environ.get("SETUP_FINAL_SCOUT_MIN_CONF", "83") or 84)
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
 SETUP_FINAL_SCOUT_MIN_RR = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_RR", "1.30") or 1.40)
-SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "10000000") or 10000000)
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = True  # Ver44: hard safety; unknown/new strategy combos enter WATCH probation, never hard-block as UNKNOWN
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
@@ -3140,7 +3141,7 @@ SETUP_KEEP_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_KEEP_MIN_DYNAMIC_SCOR
 SETUP_REVERSE_PROBATION_MIN_CONF = int(os.environ.get("SETUP_REVERSE_PROBATION_MIN_CONF", "85") or 85)
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE", "60") or 60)
 SETUP_BASELINE_DISCOVERY_MIN_RR = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_RR", "1.25") or 1.25)
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_VOL_USD", "10000000") or 10000000)
 # Ver35: /setup_audit is an analytical report and must not disappear just because
 # the live execution gate is strict. Execution/email/autotrade still use the final
 # quality gate; audit keeps visibility of stored setup outcomes for learning.
@@ -3735,7 +3736,7 @@ SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple(x.strip() for x in str(os.environ.get
     "10:00,11:00,13:00,19:00"
 ) or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = int(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_CONF", "83") or 83)
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "10000000") or 10000000)
 # Ver48: global BUY/SELL edge can be noisy and stale after introducing NORMAL/REVERSE strategy routing.
 # Keep combo/symbol/hour blocks strict, but make broad global-side blocking advisory by default.
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = env_bool("SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED", False)
@@ -3754,20 +3755,20 @@ SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE = float(os.environ.get("SETUP_EDGE_GUA
 # scout lane could help.  The system needs controlled forward-testing now, not a
 # frozen bot.  Keep real blockers (disabled combos, bad SL/TP/RR, weak symbol/combo/
 # hour, cooldown, risk caps), but lower the discovery lane just enough to persist
-# measurable setups for /setup_audit and AutoTrade learning.  Minimum liquidity stays
-# 15M, not 10M.
+# measurable setups for /setup_audit and AutoTrade learning.  Minimum liquidity is now
+# 10M.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = True
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 82
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 55.0
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.25
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 10000000.0
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 84
 SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
 SETUP_FINAL_SCOUT_ENABLED = True
 SETUP_FINAL_SCOUT_MIN_CONF = 82
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 55.0
 SETUP_FINAL_SCOUT_MIN_RR = 1.25
-SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 10000000.0
 SETUP_FINAL_ADAPTIVE_MIN_CONF = 84
 SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
 SETUP_KEEP_MIN_CONF = 80
@@ -3775,9 +3776,9 @@ SETUP_KEEP_MIN_DYNAMIC_SCORE = 45.0
 SETUP_REVERSE_PROBATION_MIN_CONF = 80
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 45.0
 SETUP_BASELINE_DISCOVERY_MIN_RR = 1.25
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 10000000.0
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = 78
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 15000000.0
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 10000000.0
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = False
 
 # Ver57: clean-start legacy ignore + fresh safety ON.
@@ -3831,7 +3832,7 @@ def _setup_policy_row_is_clean_start_legacy(pol: dict | None) -> bool:
         return False
 
 # Ver51 FINAL_PIPELINE_LOCKED: forward-test starvation guard.
-# Keep liquidity at 15M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
+# Keep liquidity at 10M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
 # floors freeze the executable queue at zero during live sessions.  The daily/weekly
 # policy will still learn and tighten from results.
 SETUP_FINAL_MIN_CONF = 84
@@ -3842,7 +3843,7 @@ SETUP_FINAL_SCOUT_ENABLED = True
 SETUP_FINAL_SCOUT_MIN_CONF = 78
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 35.0
 SETUP_FINAL_SCOUT_MIN_RR = 1.20
-SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 10000000.0
 SETUP_COMBO_WATCH_MIN_CONF = 84
 SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = 50.0
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 82
@@ -3851,17 +3852,17 @@ SETUP_COMBO_WATCH_SCOUT_ENABLED = True
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 78
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 35.0
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.20
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 10000000.0
 SETUP_KEEP_MIN_CONF = 78
 SETUP_KEEP_MIN_DYNAMIC_SCORE = 35.0
 SETUP_REVERSE_PROBATION_MIN_CONF = 78
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 35.0
 SETUP_BASELINE_DISCOVERY_MIN_RR = 1.20
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 10000000.0
 FINAL_PIPELINE_LOCKED_ENABLED = env_bool("FINAL_PIPELINE_LOCKED_ENABLED", True)
 FINAL_PIPELINE_LOCKED_MIN_CONF = int(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_CONF", "78") or 78)
 FINAL_PIPELINE_LOCKED_MIN_RR = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_RR", "1.20") or 1.20)
-FINAL_PIPELINE_LOCKED_MIN_VOL_USD = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_VOL_USD", "15000000") or 15000000)
+FINAL_PIPELINE_LOCKED_MIN_VOL_USD = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_VOL_USD", "10000000") or 10000000)
 FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE", "35") or 35)
 
 # Ver52 EXECUTABLE_QUEUE_UNBLOCK: hard runtime override.
@@ -3873,7 +3874,7 @@ FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_L
 VER52_EXECUTABLE_QUEUE_UNBLOCK = True
 VER52_MIN_CONF = 72
 VER52_MIN_RR = 1.05
-VER52_MIN_VOL_USD = 15000000.0
+VER52_MIN_VOL_USD = 10000000.0
 VER52_MIN_DYNAMIC_SCORE = 0.0
 SETUP_FINAL_MIN_CONF = 82
 SETUP_FINAL_MIN_DYNAMIC_SCORE = 35.0
@@ -5482,7 +5483,15 @@ MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "72"))
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
 # Production quality floor: no setup display/email/autotrade below this 24h futures volume.
+# yver45: stale/default-style 15M env/config values are migrated down to 10M.
 SETUP_MIN_24H_VOL_USD = float(os.environ.get("SETUP_MIN_24H_VOL_USD", "10000000") or 10000000)
+try:
+    if abs(float(MIN_FUT_VOL_USD or 0.0) - 15_000_000.0) < 1.0:
+        MIN_FUT_VOL_USD = 10_000_000.0
+    if abs(float(SETUP_MIN_24H_VOL_USD or 0.0) - 15_000_000.0) < 1.0:
+        SETUP_MIN_24H_VOL_USD = 10_000_000.0
+except Exception:
+    pass
 MIN_FUT_VOL_USD = max(float(MIN_FUT_VOL_USD or 0.0), float(SETUP_MIN_24H_VOL_USD or 0.0), 10_000_000.0)
 MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP", os.environ.get("MIN_RR_TP", "1.45"))))
 MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as final target
@@ -5507,6 +5516,11 @@ def _setup_volume_ok(setup_or_vol) -> bool:
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
+try:
+    if abs(float(EMAIL_MIN_FUT_VOL_USD or 0.0) - 15_000_000.0) < 1.0:
+        EMAIL_MIN_FUT_VOL_USD = 10_000_000.0
+except Exception:
+    pass
 
 # ✅ Production scan breadth + loosened trigger only for screen (NOT email)
 # Hard API-load guard: live setup generation must never fan out across hundreds of symbols.
@@ -7047,7 +7061,7 @@ def _strategy_config_apply_ver08_quality_patch() -> None:
         cfg['family_allocator_enforce_live'] = False
 
         # Quality floors: reduce raw noise, but avoid the too-tight Ver08 1-3/day profile.
-        cfg['min_fut_vol_usd'] = max(15_000_000.0, float(cfg.get('min_fut_vol_usd', 0) or 0.0))
+        cfg['min_fut_vol_usd'] = 10_000_000.0
         cfg['quality_score_min_screen'] = max(63.0, float(cfg.get('quality_score_min_screen', 0) or 0.0))
         cfg['quality_score_min_email'] = 70.0
         cfg['min_rr_tp'] = 1.35
@@ -7090,7 +7104,11 @@ def apply_strategy_config(cfg: dict) -> None:
 
     # Liquidity + RR
     try:
-        MIN_FUT_VOL_USD = max(_setup_min_volume_floor_usd(), float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD) or 0.0))
+        # yver45: migrate old/persisted 15M default down to the requested 10M floor.
+        cfg_vol = float(cfg.get("min_fut_vol_usd", 10_000_000.0) or 10_000_000.0)
+        if abs(cfg_vol - 15_000_000.0) < 1.0:
+            cfg_vol = 10_000_000.0
+        MIN_FUT_VOL_USD = max(_setup_min_volume_floor_usd(), float(cfg_vol or 10_000_000.0))
         EMAIL_MIN_FUT_VOL_USD = float(MIN_FUT_VOL_USD)
     except Exception:
         pass
@@ -14399,43 +14417,9 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if sl_for_order <= 0:
         sl_for_order = intended_sl
     if side == 'BUY' and sl_for_order >= price_ref:
-        try:
-            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'reject_reason': 'stop_invalid_after_tick_rounding_for_buy',
-                'live_entry': float(price_ref),
-                'rounded_sl': float(sl_for_order),
-            })
-        except Exception:
-            pass
-        try:
-            _admin_setup_lifecycle_merge(
-                int(uid), setup_id,
-                state=_admin_setup_state_from_reason('stale_deadline'),
-                last_reason=f'setup_invalidated_by_price_after_rounding BUY entry={float(price_ref):.10g} sl={float(sl_for_order):.10g}'
-            )
-        except Exception:
-            pass
-        return (False, 'setup_invalidated_by_price_buy')
+        return (False, 'stop_invalid_after_tick_rounding_for_buy')
     if side == 'SELL' and sl_for_order <= price_ref:
-        try:
-            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
-            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
-                'reject_reason': 'stop_invalid_after_tick_rounding_for_sell',
-                'live_entry': float(price_ref),
-                'rounded_sl': float(sl_for_order),
-            })
-        except Exception:
-            pass
-        try:
-            _admin_setup_lifecycle_merge(
-                int(uid), setup_id,
-                state=_admin_setup_state_from_reason('stale_deadline'),
-                last_reason=f'setup_invalidated_by_price_after_rounding SELL entry={float(price_ref):.10g} sl={float(sl_for_order):.10g}'
-            )
-        except Exception:
-            pass
-        return (False, 'setup_invalidated_by_price_sell')
+        return (False, 'stop_invalid_after_tick_rounding_for_sell')
 
     equity = _effective_equity_for_risk(get_user(uid) or {}, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
     if equity <= 0:
@@ -18526,14 +18510,9 @@ def db_init():
     if "sessions_unlimited" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN sessions_unlimited INTEGER NOT NULL DEFAULT 0")
     
-    # NEW: Big-move alert emails (raw market-event email, even if not a valid setup)
+    # NEW: Big-move alert emails (even if not a valid setup)
     if "bigmove_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
-
-    # ver36: split raw Big-Move alert emails from BigMove/F8 setup emails.
-    # Users can turn raw alert emails OFF while keeping F8 setup emails ON.
-    if "bigmove_setup_email_on" not in cols:
-        cur.execute("ALTER TABLE users ADD COLUMN bigmove_setup_email_on INTEGER NOT NULL DEFAULT 1")
     
     # Big-move alert defaults: 15m >= 1.5%, 1H >= 3%, 4H >= 5% in the same direction.
     if "bigmove_alert_15m" not in cols:
@@ -18588,7 +18567,7 @@ def db_init():
     if "spike_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_alert_on INTEGER NOT NULL DEFAULT 1")
 
-    # default volume gate: 15M
+    # default volume gate: 10M
     if "spike_min_vol_usd" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
 
@@ -19813,7 +19792,7 @@ def _safe_float(x, default: float = 0.0) -> float:
 BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "1.5") or 1.5)
 BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") or 3.0)
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
-BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0)
+BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "10000000") or 10_000_000.0)
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "7200") or 7200)  # Ver15: same-symbol/same-direction F8 cooldown (opposite direction still allowed)
 # Guard against stale Render env BIGMOVE_COOLDOWN_SEC=0 from older no-cooldown builds.
@@ -20312,23 +20291,10 @@ def _user_bigmove_thresholds(user: dict | None) -> tuple[float, float, float]:
     return float(p15), float(p1), float(p4)
 
 
-def _user_bigmove_setup_email_on(user: dict | None) -> bool:
-    """Whether confirmed BigMove/F8 candidates may still become normal setup emails.
-
-    This is intentionally separate from bigmove_alert_on, which controls only the
-    raw market-event Big-Move notification email. Default ON preserves F8 setups.
-    """
-    try:
-        return bool(int((user or {}).get("bigmove_setup_email_on", 1) or 0))
-    except Exception:
-        return True
-
-
 def _user_bigmove_min_vol_usd(user: dict | None, default: float = BIGMOVE_DEFAULT_MIN_VOL_USD) -> float:
     """Resolve big-move min volume with backward-compatible fallback.
 
-    Commercial floor: keep big-move alerts at or above 15M 24h volume unless a
-    future code change intentionally introduces a lower supported floor.
+    Commercial floor: keep big-move alerts at or above 10M 24h volume.
     """
     floor = float(BIGMOVE_MIN_SUPPORTED_VOL_USD)
     try:
@@ -21096,7 +21062,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
 
 def _spike_reversal_candidates(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 15_000_000.0,
+    min_vol_usd: float = 10_000_000.0,
     wick_ratio_min: float = 0.55,
     atr_mult_min: float = 1.20,
     max_items: int = 10,
@@ -21244,7 +21210,7 @@ def _spike_reversal_candidates(
 
 def _spike_reversal_warnings(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 15_000_000.0,
+    min_vol_usd: float = 10_000_000.0,
     atr_mult_min: float = 1.05,
     body_ratio_min: float = 0.50,
     lookback_1h: int = 8,
@@ -41172,7 +41138,7 @@ Trade Journal
 /limits emaildaycap 
 • Set max number of emails per day
 
-/bigmove_alert on|off|setup_on|setup_off [15m%] [1H%] [4H%]
+/bigmove_alert on|off [15m%] [1H%] [4H%]
 • Big move alerts in either direction (UP or DOWN)
 • Defaults: 15m=2%, 1H=4%, 4H=6%, Min Vol=18M
 • Email sends only after the next 15m candle confirms the same direction
@@ -43089,7 +43055,6 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cur_on = int(user.get("bigmove_alert_on", 1) or 0)
-    cur_setup_on = 1 if _user_bigmove_setup_email_on(user) else 0
     cur_p15, cur_p1, cur_p4 = _user_bigmove_thresholds(user)
     cur_min_vol = max(BIGMOVE_MIN_SUPPORTED_VOL_USD, _user_bigmove_min_vol_usd(user, BIGMOVE_DEFAULT_MIN_VOL_USD))
 
@@ -43097,10 +43062,9 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         updated_ts = float(user.get("bigmove_alert_updated_ts", 0.0) or 0.0)
         updated_reason = str(user.get("bigmove_alert_update_reason", "") or "").strip()
         lines = [
-            "📣 Big-Move / F8 Setup Controls",
+            "📣 Big-Move Alert Emails",
             f"{HDR}",
-            f"Raw Big-Move Alert Emails: {'ON' if cur_on else 'OFF'}",
-            f"BigMove/F8 Setup Emails: {'ON' if cur_setup_on else 'OFF'}",
+            f"Status: {'ON' if cur_on else 'OFF'}",
             f"Thresholds: |15m| ≥ {cur_p15:g}% AND |1H| ≥ {cur_p1:g}% AND |4H| ≥ {cur_p4:g}% (same direction only)",
             f"Min Vol (24H): {cur_min_vol/1e6:.1f}M",
         ]
@@ -43110,10 +43074,8 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Reason: {updated_reason}")
         lines.extend([
             "",
-            "Raw alert ON: /bigmove_alert on 1.5 3 5",
-            "Raw alert OFF: /bigmove_alert off",
-            "F8 setup emails ON: /bigmove_alert setup_on",
-            "F8 setup emails OFF: /bigmove_alert setup_off",
+            "Set: /bigmove_alert on 1.5 3 5",
+            "Off: /bigmove_alert off",
         ])
         await update.message.reply_text("\n".join(lines))
         return
@@ -43121,18 +43083,8 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.args[0].strip().lower()
 
     if mode in {"off", "0", "disable"}:
-        _record_bigmove_settings_change(uid, False, cur_p15, cur_p1, cur_p4, cur_min_vol, "command_off via /bigmove_alert; raw alert emails disabled, F8 setup emails unchanged")
-        await update.message.reply_text("✅ Raw Big-Move alert emails: OFF\n✅ BigMove/F8 setup emails remain: " + ("ON" if cur_setup_on else "OFF"))
-        return
-
-    if mode in {"setup_on", "setupon", "setup-enable", "setup_enable", "f8_on", "f8on"}:
-        update_user(uid, bigmove_setup_email_on=1, bigmove_alert_updated_ts=float(time.time()), bigmove_alert_update_reason="command_setup_on via /bigmove_alert")
-        await update.message.reply_text("✅ BigMove/F8 setup emails: ON\nRaw Big-Move alert emails are unchanged: " + ("ON" if cur_on else "OFF"))
-        return
-
-    if mode in {"setup_off", "setupoff", "setup-disable", "setup_disable", "f8_off", "f8off"}:
-        update_user(uid, bigmove_setup_email_on=0, bigmove_alert_updated_ts=float(time.time()), bigmove_alert_update_reason="command_setup_off via /bigmove_alert")
-        await update.message.reply_text("✅ BigMove/F8 setup emails: OFF\nRaw Big-Move alert emails are unchanged: " + ("ON" if cur_on else "OFF"))
+        _record_bigmove_settings_change(uid, False, cur_p15, cur_p1, cur_p4, cur_min_vol, "command_off via /bigmove_alert")
+        await update.message.reply_text("✅ Big-move alert emails: OFF")
         return
 
     if mode in {"on", "1", "enable"}:
@@ -43149,10 +43101,10 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)")
                 return
         _record_bigmove_settings_change(uid, True, p15, p1, p4, min_vol, f"command_on via /bigmove_alert (15m>={p15:.2f}% AND 1H>={p1:.2f}% AND 4H>={p4:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
-        await update.message.reply_text(f"✅ Raw Big-Move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)\nBigMove/F8 setup emails remain: " + ("ON" if cur_setup_on else "OFF"))
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
         return
 
-    await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%> OR /bigmove_alert off OR /bigmove_alert setup_on OR /bigmove_alert setup_off")
+    await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)  OR  /bigmove_alert off")
 
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -48456,7 +48408,7 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         scout_enabled = bool(globals().get('SETUP_COMBO_WATCH_SCOUT_ENABLED', True))
         scout_min_conf = int(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_CONF', 84) or 84)
         scout_min_rr = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_RR', 1.40) or 1.40)
-        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
+        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 10000000) or 10000000)
         # Ver47: do not kill 84-86 confidence candidates before dynamic risk is
         # calculated. They may pass only via the stronger near/scout dynamic-score
         # lane; sub-scout confidence is still blocked immediately.
@@ -48619,7 +48571,7 @@ def _setup_execution_quality_baseline_allows(setup_or_row, session_name: str = '
         # Ver50 controlled discovery floor: after relaxing baseline Conf/Dyn, keep
         # geometry/liquidity quality strict enough for real forward testing.
         min_base_rr = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_RR', 1.25) or 1.25)
-        min_base_vol = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_VOL_USD', 15000000.0) or 15000000.0)
+        min_base_vol = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_VOL_USD', 10000000.0) or 10000000.0)
         meta['baseline_discovery_min_rr'] = float(min_base_rr)
         meta['baseline_discovery_min_vol_usd'] = float(min_base_vol)
         if rr < min_base_rr:
@@ -48684,7 +48636,7 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
 
     This is not a quality bypass. It is the final fallback when older WATCH/dynamic/
     micro-edge gates would otherwise leave the executable queue at zero.  It requires:
-    valid symbol/side/session, valid single TP/SL geometry, minimum 15M volume,
+    valid symbol/side/session, valid single TP/SL geometry, minimum 10M volume,
     RR>=1.20, confidence>=78, projected risk/TP dollars, and no true disabled-normal
     policy state.  NORMAL setups in disabled combos still must be routed to REVERSE first.
     """
@@ -48722,7 +48674,7 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
         if side == 'SELL' and not (tp < entry < sl):
             return False, f'{reason_prefix}_invalid_sell_geometry', meta
 
-        min_vol = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_VOL_USD', 15000000.0) or 15000000.0)
+        min_vol = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_VOL_USD', 10000000.0) or 10000000.0)
         min_rr = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_RR', 1.20) or 1.20)
         min_conf = int(globals().get('FINAL_PIPELINE_LOCKED_MIN_CONF', 78) or 78)
         min_dyn = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE', 35.0) or 35.0)
@@ -49016,7 +48968,7 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         scout_min_conf = int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)
         scout_dyn = float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 84) or 84)
         scout_rr = float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.40) or 1.40)
-        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
+        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 10000000) or 10000000)
         fut_vol = float(meta.get('fut_vol_usd') or _autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or 0.0)
         rr = float(meta.get('rr') or 0.0)
         if conf < final_adaptive_min_conf:
@@ -49410,7 +49362,7 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         except Exception:
             pass
         try:
-            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 15000000) or 15000000)
+            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 10000000) or 10000000)
             if min_vol > 0 and vol_v > 0 and vol_v < min_vol and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
                 return False, f'strict_min_volume_block vol=${vol_v/1_000_000:.1f}M<{min_vol/1_000_000:.0f}M'
         except Exception:
@@ -55249,10 +55201,14 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
-    # Ver37: keep /autotrade_debug concise per user request.
     lines = [
         '🧪 AutoTrade Debug',
         HDR,
+        f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Entries: {'ON' if _autotrade_entry_enabled() else 'OFF'} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
+        f"Trading day: {snap.get('today_window_label')}",
+        "Configured sessions: ASIA/LON/NY active by default; current Session line only shows the active session/time block right now.",
+        (f"Keep-all test: ON | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(_autotrade_entry_window_min())}m" if _autotrade_keep_all_test_mode() else None),
+        (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry blackout: {'ON' if _autotrade_entry_blackout_enabled() else 'OFF'} | Setup blackout: {'ON' if _setup_generation_blackout_enabled() else 'OFF'}" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
         SEP,
         f"EquityAT: ${equity:.2f}",
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
@@ -55265,7 +55221,32 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Realised net today (AT): ${_debug_realised_display:+.2f}",
         f"Daily risk used (AT) (open risk - realised net): ${_debug_daily_used_display:.2f}",
         ('Daily risk remaining (AT): ∞' if not math.isfinite(float(_debug_remaining_display)) else f"Daily risk remaining (AT): ${float(_debug_remaining_display):.2f}"),
+        SEP,
+        'Email / AutoTrade entry gate',
+        f"AutoTrade lane filter: {('KEEP+WATCH policy ON' if _autotrade_allow_watch_policy() else 'KEEP-only policy ON') if _autotrade_require_keep_policy() else 'policy filter OFF'}",
+        f"AutoTrade capital guard: daily loss stop {'ON' if _autotrade_daily_realized_loss_stop_enabled() else 'OFF'} {_autotrade_daily_realized_loss_stop_pct():.1f}% | realised-combo {'ON' if _autotrade_require_realized_combo_edge() else 'OFF'} | context feed {'ON' if _autotrade_context_feed_guard_enabled() else 'OFF'}",
+        f"AutoTrade capital gate: {'OPEN' if _autotrade_daily_realized_loss_stop_allows(int(owner))[0] else 'BLOCKED'} | {_autotrade_daily_realized_loss_stop_allows(int(owner))[1]}",
+        f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
+        f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
+        f"Session email cap: {session_cap_txt} (configured)",
+        f"Emails sent in session: {int(email_gate.get('sent_in_session', 0) or 0)}",
+        f"Daily email cap: {day_cap_txt} (configured)",
+        f"Emails sent today: {int(email_gate.get('sent_today', 0) or 0)}",
+        f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
+        f"Email/AutoTrade gate: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
+        f"Recent emailed setups (unique, 12h): {emailed_recent}",
+        f"Recent executable setups (unique sym/side, 12h): {exec_recent}",
     ]
+    try:
+        lines.append(f"Recent sent setup-email batches (12h): {int(sent_email_batches_recent or 0)}")
+    except Exception:
+        pass
+    try:
+        reset_ts = float(_autotrade_cooldown_reset_ts() or 0.0)
+        if reset_ts > 0:
+            lines.append(f"Cooldown reset marker: {_fmt_dt_local(datetime.fromtimestamp(reset_ts, tz=timezone.utc))}")
+    except Exception:
+        pass
     if reasons and not ready:
         lines.extend([SEP, 'Blocking reasons'])
         for r in reasons[:6]:
@@ -59691,10 +59672,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         def _build_bigmove_payload_for_user(uid: int, tz):
             try:
                 uu = get_user(int(uid)) or {}
-                alert_on = int(uu.get("bigmove_alert_on", 1) or 0)
-                setup_email_on = 1 if _user_bigmove_setup_email_on(uu) else 0
-                if not alert_on and not setup_email_on:
-                    return {"status": "SKIP", "reasons": ["bigmove_alert_and_f8_setup_email_off"]}
+                on = int(uu.get("bigmove_alert_on", 1) or 0)
+                if not on:
+                    return {"status": "SKIP", "reasons": ["bigmove_alert_off"]}
 
                 try:
                     p15, p1, p4 = _user_bigmove_thresholds(uu)
@@ -59863,8 +59843,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     "top_dir": str(top_dir or ""),
                     "top_tf": str(top_tf or ""),
                     "top_move": float(top_move or 0.0),
-                    "alert_email_on": bool(alert_on),
-                    "setup_email_on": bool(setup_email_on),
                     "reasons": [
                         f"candidates={len(filtered)}",
                         f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%",
@@ -60124,86 +60102,70 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 top_dir = str(payload.get('top_dir') or '')
                 top_tf = str(payload.get('top_tf') or '')
                 top_move = float(payload.get('top_move') or 0.0)
-                alert_email_on = bool(payload.get('alert_email_on', True))
-                setup_email_on = bool(payload.get('setup_email_on', True))
 
-                raw_alert_ok = True
-                raw_alert_sent = False
-                if alert_email_on:
+                try:
+                    ok = await _send_email_async(
+                        int(EMAIL_SEND_TIMEOUT_SEC),
+                        subject,
+                        body,
+                        user_id_for_debug=int(uid),
+                        bypass_user_email_master=True,
+                        enforce_trade_window=False,
+                    )
+                except Exception as e:
+                    ok = False
                     try:
-                        raw_alert_ok = await _send_email_async(
-                            int(EMAIL_SEND_TIMEOUT_SEC),
-                            subject,
-                            body,
-                            user_id_for_debug=int(uid),
-                            bypass_user_email_master=True,
-                            enforce_trade_window=False,
-                        )
-                        raw_alert_sent = bool(raw_alert_ok)
-                    except Exception as e:
-                        raw_alert_ok = False
-                        try:
-                            _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
-                        except Exception:
-                            pass
+                        _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
+                    except Exception:
+                        pass
 
                 _LAST_BIGMOVE_DECISION[int(uid)] = {
-                    "status": ("SENT" if raw_alert_sent else ("SETUP_ONLY" if (not alert_email_on and setup_email_on) else ("SKIP" if not setup_email_on else "ERROR"))),
+                    "status": "SENT" if ok else "ERROR",
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "subject": subject if alert_email_on else "",
+                    "subject": subject,
                     "reasons": (
-                        [f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", f"sent_raw_alert_{tag}"]
-                        if raw_alert_sent else
-                        ([f"raw_bigmove_alert_email_off", f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%"] if (not alert_email_on and setup_email_on) else [f"send_email_failed_or_timeout_{tag}", _LAST_SMTP_ERROR.get(int(uid), "send_email_failed")])
+                        [f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", f"sent_{tag}"]
+                        if ok else
+                        [f"send_email_failed_or_timeout_{tag}", _LAST_SMTP_ERROR.get(int(uid), "send_email_failed")]
                     ),
                 }
-
-                bm_sess = _bigmove_autotrade_session_name()
-                setup_email_setups = []
-                setup_email_sent = False
-                if setup_email_on and raw_alert_ok:
+                if ok:
+                    for c in filtered[:8]:
+                        try:
+                            mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
+                        except Exception:
+                            pass
+                    bm_sess = _bigmove_autotrade_session_name()
+                    setup_email_setups = []
+                    setup_email_sent = False
                     try:
                         setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
                     except Exception:
                         setup_email_setups, setup_email_sent = [], False
                     try:
                         if setup_email_sent:
-                            _LAST_BIGMOVE_DECISION[int(uid)]["status"] = "SETUP_SENT" if not raw_alert_sent else "SENT"
                             _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
                         else:
                             _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
                     except Exception:
                         pass
-                elif not setup_email_on:
                     try:
-                        _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_off')
+                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
+                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                                "status": "QUEUED",
+                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
+                                "session": str(bm_sess or ""),
+                                "mode": str(_autotrade_runtime_mode()).lower(),
+                                "trigger": "bigmove_setup_email_immediate",
+                            }
+                            _safe_create_task(
+                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
+                                "autotrade_after_bigmove_setup_email",
+                            )
                     except Exception:
                         pass
-
-                if raw_alert_sent or setup_email_sent:
-                    for c in filtered[:8]:
-                        try:
-                            mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
-                        except Exception:
-                            pass
-
-                try:
-                    owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                    if setup_email_sent and owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                            "status": "QUEUED",
-                            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                            "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade",
-                            "session": str(bm_sess or ""),
-                            "mode": str(_autotrade_runtime_mode()).lower(),
-                            "trigger": "bigmove_setup_email_immediate",
-                        }
-                        _safe_create_task(
-                            _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
-                            "autotrade_after_bigmove_setup_email",
-                        )
-                except Exception:
-                    pass
             except Exception as e:
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[int(uid)] = {
@@ -60230,9 +60192,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             pass
         users_bigmove = list(users_bigmove or [])
         try:
-            # ver36: raw Big-Move alert emails and BigMove/F8 setup emails are separate.
-            # Keep users in this lane if either raw alerts are ON or F8 setup emails are ON.
-            users_bigmove = [u for u in users_bigmove if (int((u or {}).get('bigmove_alert_on', 1) or 0) == 1 or _user_bigmove_setup_email_on(u))]
+            users_bigmove = [u for u in users_bigmove if int((u or {}).get('bigmove_alert_on', 1) or 0) == 1]
         except Exception:
             users_bigmove = list(users_bigmove or [])
         _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)
@@ -61152,10 +61112,6 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         bigm_on = 1
     try:
-        bigm_setup_on = 1 if _user_bigmove_setup_email_on(user) else 0
-    except Exception:
-        bigm_setup_on = 1
-    try:
         bigm_p15, bigm_p1, bigm_p4 = _user_bigmove_thresholds(user)
     except Exception:
         bigm_p15, bigm_p1, bigm_p4 = BIGMOVE_DEFAULT_15M_PCT, BIGMOVE_DEFAULT_1H_PCT, BIGMOVE_DEFAULT_4H_PCT
@@ -61170,9 +61126,8 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     bigm_updated_reason = str(user.get("bigmove_alert_update_reason", "") or "").strip()
 
     lines.append("")
-    lines.append("⚡ Big-Move / F8 Setup Settings")
-    lines.append(f"Raw Alert Emails: {'ON' if bigm_on else 'OFF'}")
-    lines.append(f"F8 Setup Emails: {'ON' if bigm_setup_on else 'OFF'}")
+    lines.append("⚡ Big-Move Alert Settings")
+    lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
     lines.append(f"Thresholds: |15m| ≥ {bigm_p15:g}% AND |1H| ≥ {bigm_p1:g}% AND |4H| ≥ {bigm_p4:g}% (same direction only)")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
     lines.append(f"Payload timeout: {int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60)}s")
