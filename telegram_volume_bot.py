@@ -1,3 +1,4 @@
+# Ver95: prevents BigMove from starving the normal setup/email scan: BigMove payload/F8 setup handling is fire-and-forget with an in-flight guard, so session pool generation always proceeds; /why now shows pool/build events when no reject stats exist. No strategy/risk/KEEP/TP/SL/trading changes.
 # Ver94: BigMove/F8 setup conversion no longer depends on the heavy routed setup builder. If the normal builder times out, a lightweight F8 continuation setup is created in the background, then still passes the same presend KEEP/context/executable gates before setup email, /screen, DB, and AutoTrade. No Telegram command-lane, risk, TP/SL, or policy loosening.
 # Ver93: /screen safe renderer always includes market context (Pulse + Leaders + Losers) and avoids returning positions-only or cache-warming output when ticker data can be fetched in the deferred worker. No strategy/risk/policy/F8/TP/SL/trading changes.
 # Ver92: fixes autonomous setup starvation after command-firewall/no-lag mode. User command activity no longer switches the core setup/email/AutoTrade pipeline to light-only, and screen cache warmup no longer defers just because commands were pressed. Telegram commands remain instant; no strategy/risk/policy/F8/TP/SL/trading changes.
@@ -27332,9 +27333,11 @@ def _no_reject_stats_fallback_report(uid: int) -> str:
     except Exception:
         sess = ''
     try:
-        build_ev = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
+        build_ev = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='build_priority_pool_fallback', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or _latest_setup_pipeline_event(0, stage='build_priority_pool_fallback', mode='email') or {}
+        pool_ev = _latest_setup_pipeline_event(0, stage='email_pool_session', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session_skip', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session_cache', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session', mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session_skip', mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session_cache', mode='email') or {}
         exec_ev = _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', session=sess, mode='email') or _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', mode='email') or {}
         screen_ev = _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', session=sess, mode='screen') or _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', mode='screen') or {}
+        bm_build_ev = _latest_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', session=sess, mode='bigmove_setup_email') or _latest_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', session=sess, mode='bigmove_setup_email') or _latest_setup_pipeline_event(int(uid), stage='bigmove_setup_email_delivery', session=sess, mode='bigmove_setup_email') or {}
         def _one(label, ev):
             if not ev:
                 return
@@ -27355,15 +27358,25 @@ def _no_reject_stats_fallback_report(uid: int) -> str:
                         parts.append(f"{k}={det.get(k)}")
             top = det.get('top_reasons') or det.get('top_rejects') or det.get('top_exec_rejects') or []
             if top:
-                parts.append('top=' + ', '.join([str(x) for x in top[:4]]))
+                try:
+                    if isinstance(top, dict):
+                        top_items = [f"{k}={v}" for k, v in list(top.items())[:4]]
+                    else:
+                        top_items = [str(x) for x in list(top)[:4]]
+                    if top_items:
+                        parts.append('top=' + ', '.join(top_items))
+                except Exception:
+                    pass
             err = str(det.get('error') or '').strip()
             if err:
                 parts.append(err[:160])
             lines.append(f"{label}: " + " | ".join(parts))
         lines.append(SEP)
         _one('Email build', build_ev)
+        _one('Email pool', pool_ev)
         _one('Email executable', exec_ev)
         _one('Screen executable', screen_ev)
+        _one('BigMove/F8 setup', bm_build_ev)
     except Exception:
         pass
     if len(lines) <= 2:
@@ -57775,32 +57788,36 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         except Exception:
             spike_warnings = []
 
-    # Store diagnostics for /why, then ALWAYS reset context
+    # Store diagnostics for /why, then ALWAYS reset context.
+    # Ver95: email/autonomous scans often run with uid=None. Previously that meant
+    # reject diagnostics were not stored at all, so /why showed Last scan='-' even
+    # when the background scanner had just evaluated symbols. Always update the
+    # shared diagnostics bucket; update the per-user bucket only when uid is known.
     try:
+        counts = {
+            str(k): int(v)
+            for k, v in dict(_rej_ctx or {}).items()
+            if not str(k).startswith("__")
+        }
+        payload = {
+            "ts": time.time(),
+            "mode": str(mode or ''),
+            "session": str(session_name or ''),
+            "allow": list(_rej_ctx.get("__allow__") or []),
+            "counts": counts,
+            "per_symbol": dict((_rej_ctx.get("__per__") or {})),
+        }
+        try:
+            shared_bucket = _LAST_REJECTS_SHARED if isinstance(_LAST_REJECTS_SHARED, dict) else {}
+            if str(mode or '').strip():
+                shared_bucket[str(mode).strip().lower()] = dict(payload)
+            shared_bucket["latest"] = dict(payload)
+            _LAST_REJECTS_SHARED.clear()
+            _LAST_REJECTS_SHARED.update(shared_bucket)
+        except Exception:
+            pass
         if uid is not None:
-            counts = {
-                str(k): int(v)
-                for k, v in dict(_rej_ctx or {}).items()
-                if not str(k).startswith("__")
-            }
-            payload = {
-                "ts": time.time(),
-                "mode": str(mode or ''),
-                "session": str(session_name or ''),
-                "allow": list(_rej_ctx.get("__allow__") or []),
-                "counts": counts,
-                "per_symbol": dict((_rej_ctx.get("__per__") or {})),
-            }
             try:
-                shared_bucket = _LAST_REJECTS_SHARED if isinstance(_LAST_REJECTS_SHARED, dict) else {}
-                if str(mode or '').strip():
-                    shared_bucket[str(mode).strip().lower()] = dict(payload)
-                shared_bucket["latest"] = dict(payload)
-                _LAST_REJECTS_SHARED.clear()
-                _LAST_REJECTS_SHARED.update(shared_bucket)
-            except Exception:
-                pass
-            if uid is not None:
                 bucket = _LAST_REJECTS.get(int(uid)) or {}
                 if isinstance(bucket, dict) and any(k in bucket for k in ("screen", "email", "latest")):
                     bucket = dict(bucket)
@@ -57810,6 +57827,8 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                     bucket[str(mode).strip().lower()] = payload
                 bucket["latest"] = payload
                 _LAST_REJECTS[int(uid)] = bucket
+            except Exception:
+                pass
     finally:
         try:
             _REJECT_CTX.reset(_rej_token)
@@ -60791,6 +60810,12 @@ _SMTP_CONN = None          # cached SMTP connection
 _SMTP_CONN_IS_SSL = None   # bool
 _SMTP_CONN_TS = 0.0        # last-used timestamp
 
+# Ver95: BigMove work must not block/starve the normal setup/email scan lane.
+_BIGMOVE_PAYLOAD_TASKS: dict[int, float] = {}
+_BIGMOVE_F8_TASKS: dict[str, float] = {}
+BIGMOVE_ASYNC_INFLIGHT_TTL_SEC = int(os.environ.get('BIGMOVE_ASYNC_INFLIGHT_TTL_SEC', '90') or 90)
+
+
 
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
     return await to_thread_email(fn, *args, timeout=timeout_sec, **kwargs)
@@ -61513,38 +61538,60 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             pass
                     bm_sess = _bigmove_autotrade_session_name()
-                    setup_email_setups = []
-                    setup_email_sent = False
+                    # Ver95: F8 setup-email conversion/sending must not block the
+                    # BigMove payload task either. Queue it and let /email_decision
+                    # show the eventual result from _send_bigmove_setup_email_after_alert.
                     try:
-                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
-                    except Exception:
-                        setup_email_setups, setup_email_sent = [], False
-                    try:
-                        if setup_email_sent:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
+                        f8_key = f"{int(uid)}:{str(bm_sess or '')}:{','.join([str((c or {}).get('symbol') or '') for c in list(filtered or [])[:8]])}"
+                        now_f8 = float(time.time())
+                        last_f8 = float((_BIGMOVE_F8_TASKS or {}).get(f8_key, 0.0) or 0.0)
+                        if last_f8 > 0 and (now_f8 - last_f8) < float(BIGMOVE_ASYNC_INFLIGHT_TTL_SEC):
+                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_already_inflight')
                         else:
-                            _existing_f8_reasons = [str(x) for x in (_LAST_BIGMOVE_DECISION[int(uid)].get('reasons') or [])]
-                            if not any(x.startswith('f8_setup_') for x in _existing_f8_reasons):
-                                _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
-                    except Exception:
-                        pass
-                    try:
-                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                                "status": "QUEUED",
-                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
-                                "session": str(bm_sess or ""),
-                                "mode": str(_autotrade_runtime_mode()).lower(),
-                                "trigger": "bigmove_setup_email_immediate",
-                            }
-                            _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
-                                "autotrade_after_bigmove_setup_email",
-                            )
-                    except Exception:
-                        pass
+                            _BIGMOVE_F8_TASKS[f8_key] = now_f8
+
+                            async def _bm_f8_runner(_key=f8_key, _uid=int(uid), _sess=str(bm_sess or ''), _filtered=list(filtered or []), _best=dict(best_fut or {}), _tag=str(tag or 'pre_session')):
+                                try:
+                                    _setup_email_setups, _setup_email_sent = await _send_bigmove_setup_email_after_alert(int(_uid), str(_sess or ''), list(_filtered or []), _best or {}, tag=str(_tag or 'pre_session'))
+                                    try:
+                                        if _setup_email_sent:
+                                            _LAST_BIGMOVE_DECISION[int(_uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(_setup_email_setups or [])}")
+                                        else:
+                                            _existing_f8_reasons = [str(x) for x in (_LAST_BIGMOVE_DECISION[int(_uid)].get('reasons') or [])]
+                                            if not any(x.startswith('f8_setup_') for x in _existing_f8_reasons):
+                                                _LAST_BIGMOVE_DECISION[int(_uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
+                                    except Exception:
+                                        pass
+                                    try:
+                                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+                                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
+                                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                                                "status": "QUEUED",
+                                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if _setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
+                                                "session": str(_sess or ""),
+                                                "mode": str(_autotrade_runtime_mode()).lower(),
+                                                "trigger": "bigmove_setup_email_immediate",
+                                            }
+                                            _safe_create_task(
+                                                _trigger_autotrade_after_bigmove_email_async(int(_uid), str(_sess or ""), list(_filtered or []), _best or {}, tag=str(_tag or "pre_session")),
+                                                "autotrade_after_bigmove_setup_email",
+                                            )
+                                    except Exception:
+                                        pass
+                                finally:
+                                    try:
+                                        _BIGMOVE_F8_TASKS.pop(str(_key), None)
+                                    except Exception:
+                                        pass
+
+                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_queued_async')
+                            _safe_create_task(_bm_f8_runner(), 'bigmove_f8_setup_email_async')
+                    except Exception as _f8q_exc:
+                        try:
+                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f'f8_setup_queue_error:{type(_f8q_exc).__name__}: {_f8q_exc}')
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[int(uid)] = {
@@ -61603,14 +61650,46 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # deferred it until after heavy scans; if scans timed out or exhausted
             # the runtime budget, no Big-Move email was ever sent even though
             # /email_test worked. Run it now in the dedicated email executor.
-            if _job_budget_exhausted():
-                _LAST_BIGMOVE_DECISION[uid] = {
-                    "status": "SKIP",
+            # Ver95: do not await BigMove work in the main alert job.
+            # BigMove payload confirmation, SMTP, and F8 setup conversion can take
+            # 15-60s; when awaited here they consume the alert-job budget before
+            # the normal session setup pool runs, causing Last scan='-' and no
+            # setup generation for the whole session. Queue it and immediately
+            # continue to the setup/email pool builder.
+            try:
+                now_bm = float(time.time())
+                last_bm = float((_BIGMOVE_PAYLOAD_TASKS or {}).get(int(uid), 0.0) or 0.0)
+                if last_bm > 0 and (now_bm - last_bm) < float(BIGMOVE_ASYNC_INFLIGHT_TTL_SEC):
+                    _LAST_BIGMOVE_DECISION[int(uid)] = {
+                        "status": "QUEUED",
+                        "when": datetime.now(tz).isoformat(timespec="seconds"),
+                        "reasons": ["bigmove_payload_already_inflight", f"age_sec={now_bm-last_bm:.0f}"],
+                    }
+                    continue
+                _BIGMOVE_PAYLOAD_TASKS[int(uid)] = now_bm
+
+                async def _bm_payload_runner(_uid=int(uid), _tz=tz, _tag='pre_session'):
+                    try:
+                        await _send_bigmove_payload_for_user(int(_uid), _tz, tag=str(_tag))
+                    finally:
+                        try:
+                            _BIGMOVE_PAYLOAD_TASKS.pop(int(_uid), None)
+                        except Exception:
+                            pass
+
+                _LAST_BIGMOVE_DECISION[int(uid)] = {
+                    "status": "QUEUED",
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": ["pre_session_bigmove_budget_exhausted"],
+                    "reasons": ["bigmove_payload_queued_async", "session_setup_pool_not_blocked"],
+                }
+                _safe_create_task(_bm_payload_runner(), 'bigmove_payload_async')
+            except Exception as _bmq_exc:
+                _LAST_BIGMOVE_DECISION[int(uid)] = {
+                    "status": "ERROR",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": [f"bigmove_queue_error:{type(_bmq_exc).__name__}: {_bmq_exc}"],
                 }
                 continue
-            await _send_bigmove_payload_for_user(int(uid), tz, tag='pre_session')
 
 
         # -----------------------------------------------------
