@@ -1,3 +1,4 @@
+# Ver93: /screen safe renderer always includes market context (Pulse + Leaders + Losers) and avoids returning positions-only or cache-warming output when ticker data can be fetched in the deferred worker. No strategy/risk/policy/F8/TP/SL/trading changes.
 # Ver92: fixes autonomous setup starvation after command-firewall/no-lag mode. User command activity no longer switches the core setup/email/AutoTrade pipeline to light-only, and screen cache warmup no longer defers just because commands were pressed. Telegram commands remain instant; no strategy/risk/policy/F8/TP/SL/trading changes.
 # Ver91: command-firewall screen override so /screen cannot fall back to the old heavy/ticker-only handler; it uses the safe cache/DB/live-position snapshot handler in the background. No strategy/risk/policy/trading changes.
 # Ver90: full Telegram command firewall. Every slash command is intercepted before all legacy handlers, sends an immediate ACK, then runs the original command handler in a bounded background worker. Manual commands no longer run Bybit/OHLCV/report work in the Telegram update path. No strategy/risk/policy/F8/TP/SL/AutoTrade trading logic changes.
@@ -42504,11 +42505,12 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
                         f"{HDR}\n"
                         f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                         f"{_screen_when_line('Active position snapshot', time.time())}"
-                        "_Showing currently live AutoTrade positions. Live setup/email/AutoTrade pipeline continues in the background._\n"
+                        "_Showing currently live AutoTrade positions plus Pulse/Leaders/Losers. Live setup/email/AutoTrade pipeline continues in the background._\n"
                     )
+                    screen_body = _screen_append_market_context(str(open_body or ''), best_for_db or {})
                     await send_long_message(
                         update,
-                        _screen_markdown_to_html((header + "\n" + str(open_body or '')).strip()),
+                        _screen_markdown_to_html((header + "\n" + screen_body).strip()),
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True,
                     )
@@ -42532,8 +42534,15 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
             return
-        # No full cache: use only cached tickers / DB. No fetch_futures_tickers here.
+        # No full cache: prefer cached tickers, but because /screen now runs in
+        # the deferred command worker, allow one bounded ticker fetch so the user
+        # still sees Pulse/Leaders/Losers instead of a useless warming message.
         best = get_cached_futures_tickers() or {}
+        if not best:
+            try:
+                best = await to_thread_fast(fetch_futures_tickers, timeout=8) or {}
+            except Exception:
+                best = get_cached_futures_tickers() or {}
 
         # Ver73: before falling back to the ticker-only warming screen, read the
         # recent setup-email/executable lane from DB.  This is lightweight and keeps
@@ -42584,11 +42593,12 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
                 f"{HDR}\n"
                 f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
                 f"{_screen_when_line('Active position snapshot', time.time())}"
-                "_Showing currently live AutoTrade positions. Live setup/email/AutoTrade pipeline continues in the background._\n"
+                "_Showing currently live AutoTrade positions plus Pulse/Leaders/Losers. Live setup/email/AutoTrade pipeline continues in the background._\n"
             )
+            screen_body = _screen_append_market_context(str(open_body or ''), best or {})
             await send_long_message(
                 update,
-                _screen_markdown_to_html((header + "\n" + str(open_body or '')).strip()),
+                _screen_markdown_to_html((header + "\n" + screen_body).strip()),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
@@ -57876,6 +57886,43 @@ def _screen_quick_ticker_snapshot_body(best_fut: Dict[str, MarketVol], session: 
         return "\n".join(body), [], []
     except Exception:
         return "_Screen cache is warming up. A fresh scan has been queued._", [], []
+
+
+
+def _screen_market_context_from_tickers(best_fut: Dict[str, MarketVol]) -> str:
+    """Build only the Pulse/Leaders/Losers market context from cached/fetched tickers.
+
+    Ver93: safe /screen may be showing active positions or an empty setup lane, but
+    the user still expects the normal /screen market context. This helper is pure
+    formatting and does not create setups or touch trading logic.
+    """
+    try:
+        best_fut = best_fut or {}
+        if not best_fut:
+            return ""
+        items = list((best_fut or {}).items())
+        items = [(str(b).upper(), mv) for b, mv in items if mv]
+        min_ctx_vol = float(_screen_context_volume_floor_usd())
+        items = [(b, mv) for b, mv in items if float(usd_notional(mv) or 0.0) >= min_ctx_vol]
+        leaders = sorted(items, key=lambda kv: float(getattr(kv[1], 'percentage', 0.0) or 0.0), reverse=True)[:5]
+        losers = sorted(items, key=lambda kv: float(getattr(kv[1], 'percentage', 0.0) or 0.0))[:5]
+        return _screen_market_context_table(best_fut, leaders=leaders, losers=losers) or ""
+    except Exception:
+        return ""
+
+
+def _screen_append_market_context(body: str, best_fut: dict) -> str:
+    """Append market context unless the body already has it."""
+    try:
+        base = str(body or '').strip()
+        if '*Market Context*' in base or 'Market Context' in base:
+            return base
+        ctx = _screen_market_context_from_tickers(best_fut or {})
+        if ctx:
+            return (base + "\n\n" + ctx).strip() if base else ctx.strip()
+        return base
+    except Exception:
+        return str(body or '').strip()
 
 async def _refresh_screen_cache_async():
     """Refreshes _SCREEN_CACHE in the background (best effort)."""
