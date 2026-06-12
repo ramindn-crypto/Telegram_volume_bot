@@ -1,4 +1,4 @@
-# yver50: separates raw Big-Move alert emails from F8 setup generation; /bigmove_alert off suppresses only raw market-event emails, while F8 setup emails/AutoTrade can still run through the normal executable gate.
+# yver51: scheduler-overlap warning fix on top of yver50. alert_job and autonomous_screen_sync_job now allow one extra fast lock-check instance (max_instances=2), so a slow real tick does not produce Render/APScheduler skipped-run warnings; locks still prevent overlapping real work. BigMove raw-alert email toggle remains separated from F8 setup generation/email/AutoTrade.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
@@ -63752,7 +63752,12 @@ def main():
             first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
             name="alert_job",
             job_kwargs={
-                "max_instances": 1,
+                # yver51: allow one extra fast lock-check instance. If the real
+                # alert_job is still running, _alert_job_async_internal() sees
+                # ALERT_LOCK and returns immediately, avoiding APScheduler
+                # "maximum number of running instances reached" warnings while
+                # still preventing overlapping real email/setup work.
+                "max_instances": 2,
                 "coalesce": True,
                 "misfire_grace_time": 300,
             },
@@ -63774,7 +63779,11 @@ def main():
             first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
             name="autonomous_screen_sync_job",
             job_kwargs={
-                "max_instances": 1,
+                # yver51: same pattern as alert_job. The job body owns
+                # _AUTONOMOUS_SCREEN_SYNC_LOCK, so a second scheduled instance
+                # only records/returns when the real screen-sync lane is busy;
+                # no duplicate setup/email/autotrade work is allowed.
+                "max_instances": 2,
                 "coalesce": True,
                 "misfire_grace_time": 900,
             },
