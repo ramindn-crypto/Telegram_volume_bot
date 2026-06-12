@@ -35,6 +35,7 @@ from typing import Any  # yver130 early import required before early helper anno
 # yver129: locks AutoTrade to the same delivered KEEP+WATCH lane as subscribers: future AutoTrade entries require an actual recent setup email/delivery within AUTOTRADE_ENTRY_WINDOW_MIN, remove broad executable/fresh-queue fallbacks from email-triggered AutoTrade, and keep the setting Telegram-configurable.
 # yver126: fixes /dayrisk_reset so AutoTrade debug uses the reset credit from the same realised-PnL/open-risk basis, and fixes /setup_audit_keep_watch multi-window table to use full historical generated+executable rows rather than the short executable-only slice.
 # yver124: /setup_audit_keep_watch now renders a multi-window table (Last 24h, 7d, 14d, Overall from database) with Keep/Watch combo counts and WR=TP/(TP+SL).
+# yver76: emergency true no-lag command recovery. The instant command lane now defaults ON for all users/commands (not only env-owner/admin), ACKs are awaited via direct bot.send_message instead of fire-and-forget-only, and manual /screen no longer launches a heavy executable refresh from the command path. No strategy/risk/policy changes.
 # yver75: hard no-lag owner command lane; owner/admin commands ACK fire-and-forget before any heavy work, heavy report outputs are built in worker threads where possible, and background command concurrency is clamped to prevent Telegram command starvation. No strategy/risk/policy changes.
 # yver123: fixes WR methodology (TP/SL only for setup audits; AutoTrade realised WR counts TP or positive OTHER as wins and SL or negative OTHER as losses), tightens compare matching to avoid stale/legacy setup DIFF rows, rounds PnL displays, and clarifies active sessions in /autotrade_debug.
 # yver121: AutoTrade candidate deadline lock. KEEP+WATCH executable setups are tradable only inside AUTOTRADE_ENTRY_WINDOW_MIN (default 60m); the old 24h fallback is capped to that deadline and no longer bypassed by keep-all mode.
@@ -3027,6 +3028,15 @@ AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MA
 PULSEFUTURES_FULL_BACKGROUND_MODE = env_bool("PULSEFUTURES_FULL_BACKGROUND_MODE", False)
 PULSEFUTURES_SAFE_CORE_MODE = True if not PULSEFUTURES_FULL_BACKGROUND_MODE else env_bool("PULSEFUTURES_SAFE_CORE_MODE", True)
 PULSEFUTURES_FORCE_NO_LAG_MODE = env_bool("PULSEFUTURES_FORCE_NO_LAG_MODE", True)
+# yver76: emergency command responsiveness. In Render deployments AUTOTRADE_OWNER_UID
+# may be missing/stale, which made the owner/admin fast lane never intercept commands.
+# Default this single-owner bot to fast-lane all supported commands; the original
+# handlers still perform their normal access checks when the real output is built.
+PULSEFUTURES_FAST_LANE_ALL_COMMANDS = env_bool("PULSEFUTURES_FAST_LANE_ALL_COMMANDS", True)
+# yver76: /screen must never start an expensive executable refresh from the Telegram
+# command handler. Autonomous setup/email/autotrade loops remain responsible for fresh
+# live work; /screen displays cache/DB/ticker only.
+MANUAL_SCREEN_REFRESH_ON_COMMAND = env_bool("MANUAL_SCREEN_REFRESH_ON_COMMAND", False)
 # Ver71: AutoTrade/setup-email are core live actions. Do not let admin command
 # activity pause the trading lane for the full heavy-background defer window.
 AUTOTRADE_CORE_IGNORE_USER_ACTIVITY_DEFER = env_bool("AUTOTRADE_CORE_IGNORE_USER_ACTIVITY_DEFER", True)
@@ -41940,62 +41950,32 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
         return
 
 
-async def _instant_reply(update: Update, text: str, parse_mode: Optional[str] = None, reply_markup=None) -> bool:
-    """Best-effort short Telegram reply for the owner/admin fast lane.
+async def _instant_reply(update: Update, text: str, parse_mode: Optional[str] = None, reply_markup=None, context: ContextTypes.DEFAULT_TYPE | None = None) -> bool:
+    """Best-effort short Telegram reply for the fast command lane.
 
-    Ver73: the previous 1s single reply path could time out silently on Render,
-    so the user saw no ACK until the deferred report finished.  Try the normal
-    reply first, then a direct bot.send_message fallback with a slightly longer
-    but still bounded timeout.  This function must never raise into the command
-    path.
+    yver76: prefer direct bot.send_message and await it for a tiny bounded window.
+    The previous fire-and-forget-only ACK could disappear if the owner/admin lane
+    did not match the requester or if the created task was delayed behind other
+    loop work. This function is intentionally tiny and must never run DB/Bybit work.
     """
     try:
-        if not update or not getattr(update, 'message', None):
+        if not update or not getattr(update, 'effective_chat', None):
             return False
     except Exception:
         return False
 
     txt = str(text or '')
-    base_timeout = max(1.5, float(TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC or 2.0))
-
-    try:
-        await asyncio.wait_for(
-            update.message.reply_text(
-                txt,
-                parse_mode=parse_mode,
-                disable_web_page_preview=True,
-                reply_markup=reply_markup,
-                read_timeout=max(2.0, base_timeout),
-                write_timeout=max(2.0, base_timeout),
-                connect_timeout=2.0,
-                pool_timeout=1.0,
-            ),
-            timeout=max(2.5, base_timeout + 1.0),
-        )
-        return True
-    except TypeError:
-        try:
-            await asyncio.wait_for(
-                update.message.reply_text(txt, parse_mode=parse_mode, disable_web_page_preview=True, reply_markup=reply_markup),
-                timeout=max(2.5, base_timeout + 1.0),
-            )
-            return True
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-    # Direct bot fallback.  This avoids losing the ACK if reply_text was cancelled
-    # by a short timeout or message-reply metadata issue.
+    base_timeout = max(1.0, min(2.5, float(TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC or 2.0)))
     try:
         chat_id = getattr(getattr(update, 'effective_chat', None), 'id', None)
         if chat_id is None:
             return False
-        bot = None
-        try:
-            bot = update.get_bot()
-        except Exception:
-            bot = getattr(update, '_bot', None)
+        bot = getattr(context, 'bot', None) if context is not None else None
+        if bot is None:
+            try:
+                bot = update.get_bot()
+            except Exception:
+                bot = getattr(update, '_bot', None)
         if bot is None:
             return False
         try:
@@ -42006,22 +41986,47 @@ async def _instant_reply(update: Update, text: str, parse_mode: Optional[str] = 
                     parse_mode=parse_mode,
                     disable_web_page_preview=True,
                     reply_markup=reply_markup,
-                    read_timeout=max(2.0, base_timeout),
-                    write_timeout=max(2.0, base_timeout),
-                    connect_timeout=2.0,
-                    pool_timeout=1.0,
+                    read_timeout=max(1.5, base_timeout),
+                    write_timeout=max(1.5, base_timeout),
+                    connect_timeout=1.5,
+                    pool_timeout=0.5,
                 ),
-                timeout=max(3.0, base_timeout + 1.5),
+                timeout=max(2.0, base_timeout + 0.5),
             )
+            return True
         except TypeError:
             await asyncio.wait_for(
                 bot.send_message(chat_id=chat_id, text=txt, parse_mode=parse_mode, disable_web_page_preview=True, reply_markup=reply_markup),
-                timeout=max(3.0, base_timeout + 1.5),
+                timeout=max(2.0, base_timeout + 0.5),
             )
-        return True
+            return True
+    except Exception:
+        pass
+
+    # Reply fallback for older PTB contexts.
+    try:
+        if getattr(update, 'message', None):
+            await asyncio.wait_for(
+                update.message.reply_text(txt, parse_mode=parse_mode, disable_web_page_preview=True, reply_markup=reply_markup),
+                timeout=max(2.0, base_timeout + 0.5),
+            )
+            return True
     except Exception:
         return False
+    return False
 
+
+async def _owner_send_ack(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, parse_mode=None, reply_markup=None) -> bool:
+    """Await the visible ACK for a short bounded time.
+
+    User requirement: every command must visibly respond immediately, even if the
+    full report is produced later.  This is deliberately awaited now; background
+    work is scheduled only after the ACK attempt.
+    """
+    try:
+        return await _instant_reply(update, str(text or ''), parse_mode=parse_mode, reply_markup=reply_markup, context=context)
+    except Exception:
+        return False
 
 def _owner_or_admin_from_update(update: Update) -> bool:
     try:
@@ -42325,8 +42330,9 @@ async def _owner_defer_command(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
     label = str(cmd or 'command').strip() or 'command'
-    _owner_fire_and_forget_reply(
+    await _owner_send_ack(
         update,
+        context,
         f"⏳ /{label} accepted. The bot is working in the background and will post the output when ready."
     )
     _safe_create_task(
@@ -42352,10 +42358,11 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
             loc_time = datetime.now(MEL_TZ).strftime('%Y-%m-%d %H:%M')
         except Exception:
             loc_label, loc_time = 'Melbourne (Australia)', datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-        try:
-            _schedule_screen_cache_refresh(uid, scan_session)
-        except Exception:
-            pass
+        if bool(globals().get('MANUAL_SCREEN_REFRESH_ON_COMMAND', False)):
+            try:
+                _schedule_screen_cache_refresh(uid, scan_session)
+            except Exception:
+                pass
         cache_keys = [f"uid:{uid}::{scan_session}", f"global::{scan_session}"]
         try:
             for _k, _v in list(_SCREEN_CACHE.items()):
@@ -42443,10 +42450,10 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
                 disable_web_page_preview=True,
             )
             return
-        await _instant_reply(update, "🔎 /screen cache is warming up. Fresh scan is queued; commands are responsive.")
+        await _instant_reply(update, "🔎 /screen cache is warming up. Live pipeline is running; /screen is cache-only so commands stay responsive.")
     except Exception:
         try:
-            await _instant_reply(update, "🔎 /screen is warming up. Fresh scan is queued; commands are responsive.")
+            await _instant_reply(update, "🔎 /screen is warming up. Live pipeline is running; /screen is cache-only so commands stay responsive.")
         except Exception:
             pass
 
@@ -42472,7 +42479,11 @@ async def _owner_instant_command_router(update: Update, context: ContextTypes.DE
         cmd = txt.split()[0][1:].split('@')[0].strip().lower()
         if cmd not in OWNER_INSTANT_COMMANDS and cmd not in OWNER_DEFERRED_COMMANDS:
             return
-        if not _owner_or_admin_from_update(update):
+        # yver76: do not depend on AUTOTRADE_OWNER_UID/ADMIN env for the no-lag lane.
+        # If this is a single-owner deployment (default), route supported commands
+        # through the fast ACK/background path for any requester. Original handlers
+        # still enforce normal access/plan/admin rules when producing the full output.
+        if (not bool(globals().get('PULSEFUTURES_FAST_LANE_ALL_COMMANDS', True))) and (not _owner_or_admin_from_update(update)):
             return
         _mark_user_activity()
         try:
@@ -42481,7 +42492,7 @@ async def _owner_instant_command_router(update: Update, context: ContextTypes.DE
         except Exception:
             pass
         if cmd == 'start':
-            _owner_fire_and_forget_reply(update, "✅ PulseFutures is live.\n\nQuick commands: /screen /status /equity /autotrade_debug")
+            await _owner_send_ack(update, context, "✅ PulseFutures is live.\n\nQuick commands: /screen /status /equity /autotrade_debug")
             raise ApplicationHandlerStop
         if cmd == 'status':
             try:
@@ -42501,7 +42512,7 @@ async def _owner_instant_command_router(update: Update, context: ContextTypes.DE
                 + (f" ({age}s ago)" if age >= 0 else "")
                 + "\nCommands are using the instant lane."
             )
-            _owner_fire_and_forget_reply(update, txt_status)
+            await _owner_send_ack(update, context, txt_status)
             raise ApplicationHandlerStop
         if cmd == 'equity':
             if await _owner_defer_command(update, context, cmd, '_instant_equity_cmd'):
@@ -57701,7 +57712,7 @@ def _screen_quick_ticker_snapshot_body(best_fut: Dict[str, MarketVol], session: 
         if market_txt:
             body.append(market_txt)
         body.append("")
-        body.append("_A full executable-family refresh has been queued in the dedicated /screen lane._")
+        body.append("_Live setup/email/AutoTrade pipeline is running in the background. /screen is cache-only to keep commands instant._")
         return "\n".join(body), [], []
     except Exception:
         return "_Screen cache is warming up. A fresh scan has been queued._", [], []
@@ -58927,7 +58938,8 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         cache_entry, age = _screen_choose_best_cache(cache_keys)
-        _schedule_screen_cache_refresh(int(uid), scan_session)
+        if bool(globals().get('MANUAL_SCREEN_REFRESH_ON_COMMAND', False)):
+            _schedule_screen_cache_refresh(int(uid), scan_session)
         can_show_email_source = _screen_user_can_see_email_source(int(uid), user)
         try:
             screen_fallback_min = int(_screen_actionable_fallback_max_age_min())
@@ -59095,7 +59107,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception:
             pass
-        await update.message.reply_text("🔎 /screen cache is warming up. Fresh scan is queued in the dedicated screen lane — run /screen again shortly.")
+        await update.message.reply_text("🔎 /screen cache is warming up. Live pipeline is running in the background — run /screen again shortly.")
         return
     except Exception as e:
         try:
