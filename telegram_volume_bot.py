@@ -1,5 +1,5 @@
 # yver52: adds F9 Persistent Leaders research family on top of yver51. F9 records leader/loser daily membership, generates WATCH/audit-only persistent-leader continuation BUY setups after a 2-day leader streak, and cannot promote to KEEP until enough decided evidence is collected; existing F1-F8 setup/email/AutoTrade flow is unchanged.
-# yver53: restores instant /start and /screen owner fast-lane by bypassing DB/access middleware for owner/admin quick replies; full scans still refresh in background. No strategy/risk/F9 changes.
+# yver54: hard responsiveness patch. Adds true group=-100 instant command handlers, no DB/channel guard before ACK, short Telegram send timeouts for fast commands, user-activity deferral for heavy jobs, and keeps all strategy/F1-F9/email/AutoTrade logic unchanged.
 # yver52b: runtime/cache hardening: detailed /setup_audit no longer shows misleading stale cache older than 90s; alert/guardian scheduler overlap warnings removed via effective runtime cap + lock-check instances; transient Telegram send timeouts logged as INFO.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
@@ -4071,6 +4071,47 @@ def _recent_user_activity(window_sec: int | None = None) -> bool:
         return (float(time.time()) - float(_USER_ACTIVITY_TS or 0.0)) <= max(1, win)
     except Exception:
         return False
+
+# yver54: Telegram command ACK path must never wait behind slow retries or DB/network gates.
+# Use very short API timeouts for the first user-facing response and never retry inside
+# the update handler. If Telegram itself is briefly unavailable, the handler exits quickly
+# so the next command/update is not stuck for minutes.
+FAST_TELEGRAM_SEND_TIMEOUT_SEC = float(os.getenv("FAST_TELEGRAM_SEND_TIMEOUT_SEC", "2.8") or 2.8)
+FAST_TELEGRAM_API_TIMEOUT_SEC = float(os.getenv("FAST_TELEGRAM_API_TIMEOUT_SEC", "2.2") or 2.2)
+
+async def _fast_send_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *, parse_mode: str | None = None, disable_web_page_preview: bool = True, reply_markup=None) -> bool:
+    try:
+        chat = getattr(update, 'effective_chat', None)
+        if not chat:
+            return False
+        body = str(text or '')
+        if len(body) > 3900:
+            body = body[:3850].rstrip() + "\n…"
+        coro = context.bot.send_message(
+            chat_id=int(chat.id),
+            text=body,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+            reply_markup=reply_markup,
+            connect_timeout=FAST_TELEGRAM_API_TIMEOUT_SEC,
+            read_timeout=FAST_TELEGRAM_API_TIMEOUT_SEC,
+            write_timeout=FAST_TELEGRAM_API_TIMEOUT_SEC,
+            pool_timeout=0.5,
+        )
+        await asyncio.wait_for(coro, timeout=max(1.0, FAST_TELEGRAM_SEND_TIMEOUT_SEC))
+        return True
+    except Exception as e:
+        try:
+            logger.info("fast Telegram send skipped/failed quickly: %s: %s", type(e).__name__, e)
+        except Exception:
+            pass
+        return False
+
+async def _activity_marker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _mark_user_activity()
+    except Exception:
+        pass
 
 
 def _goal_profile_quiet_window_ok(now_ts: float | None = None) -> bool:
@@ -32013,7 +32054,7 @@ async def edge_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cached = _admin_status_cache_get(cache_key, ttl=45.0)
         if cached:
-            await send_long_message(update, cached, parse_mode=None)
+            await _fast_send_text(update, context, cached, parse_mode=None)
             return
     except Exception:
         pass
@@ -33571,7 +33612,7 @@ async def lessons_learned_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         txt = await to_thread_bg(_lessons_learned_text, True, timeout=max(10, HEAVY_ADMIN_COMMAND_TIMEOUT_SEC))
         _admin_status_cache_put(cache_name, txt)
-        await send_long_message(update, txt, parse_mode=None)
+        await _fast_send_text(update, context, txt, parse_mode=None)
     except Exception:
         if cached_txt:
             await send_long_message(update, cached_txt, parse_mode=None)
@@ -41884,20 +41925,20 @@ async def _instant_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     task = _safe_create_task(to_thread_fast(_instant_status_text_sync, uid), 'instant_status')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=max(1.0, float(os.getenv('INSTANT_STATUS_TIMEOUT_SEC', '1.2') or 1.2)))
-        await send_long_message(update, txt, parse_mode=None)
+        await _fast_send_text(update, context, txt, parse_mode=None)
     except asyncio.TimeoutError:
         cached = _instant_cache_get(_INSTANT_STATUS_TEXT_CACHE, uid, max_age_sec=900)
         if cached:
-            await send_long_message(update, cached + "\n\n⏳ Fresh status is still refreshing in the background.", parse_mode=None)
+            await _fast_send_text(update, context, cached + "\n\n⏳ Fresh status is still refreshing in the background.", parse_mode=None)
         else:
-            await update.message.reply_text("⏳ Status is refreshing in the background. I’ll send it as soon as it is ready.")
+            await _fast_send_text(update, context, "⏳ Status is refreshing in the background. I’ll send it as soon as it is ready.")
             _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), 'reply_later')
     except Exception:
         cached = _instant_cache_get(_INSTANT_STATUS_TEXT_CACHE, uid, max_age_sec=900)
         if cached:
-            await send_long_message(update, cached, parse_mode=None)
+            await _fast_send_text(update, context, cached, parse_mode=None)
         else:
-            await update.message.reply_text("⚠️ Status snapshot is warming up. Try again in a few seconds.")
+            await _fast_send_text(update, context, "⚠️ Status snapshot is warming up. Try again in a few seconds.")
 
 
 async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -41910,14 +41951,14 @@ async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             user = get_user_cached_fast(uid, ttl=300) or {}
         txt = f"Manual Equity: ${float((user or {}).get('equity') or 0.0):.2f}"
         _instant_cache_set(_INSTANT_EQUITY_TEXT_CACHE, uid, txt)
-        await update.message.reply_text(txt)
+        await _fast_send_text(update, context, txt)
         return
     try:
         eq = float(args[0])
         if eq < 0:
             raise ValueError()
     except Exception:
-        await update.message.reply_text("Usage: /equity 1000")
+        await _fast_send_text(update, context, "Usage: /equity 1000")
         return
 
     async def _write_equity():
@@ -41931,9 +41972,9 @@ async def _instant_equity_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     task = _safe_create_task(_write_equity(), 'instant_equity_write')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
-        await update.message.reply_text(txt)
+        await _fast_send_text(update, context, txt)
     except asyncio.TimeoutError:
-        await update.message.reply_text("⏳ Equity update is queued. I’ll confirm as soon as it is saved.")
+        await _fast_send_text(update, context, "⏳ Equity update is queued. I’ll confirm as soon as it is saved.")
         _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), 'reply_later')
 
 
@@ -41943,32 +41984,25 @@ async def _instant_trade_close_cmd(update: Update, context: ContextTypes.DEFAULT
     task = _safe_create_task(to_thread_fast(_instant_trade_close_sync, uid, raw), 'instant_trade_close')
     try:
         txt = await asyncio.wait_for(asyncio.shield(task), timeout=max(1.0, float(os.getenv('INSTANT_TRADE_CLOSE_TIMEOUT_SEC', '1.5') or 1.5)))
-        await update.message.reply_text(txt)
+        await _fast_send_text(update, context, txt)
     except asyncio.TimeoutError:
-        await update.message.reply_text("⏳ Trade close is queued. I’ll confirm as soon as the journal write finishes.")
+        await _fast_send_text(update, context, "⏳ Trade close is queued. I’ll confirm as soon as the journal write finishes.")
         _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), 'reply_later')
     except Exception:
-        await update.message.reply_text("⚠️ Could not close the trade instantly. Please try again.")
+        await _fast_send_text(update, context, "⚠️ Could not close the trade instantly. Please try again.")
 
 
 async def _instant_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner/admin zero-DB /start reply.
-
-    yver53: /start must acknowledge immediately even if SQLite or background scan
-    lanes are busy after deployment. The full command system remains available through
-    normal handlers for non-owner users; this fast path is only used by owner/admin.
-    """
-    try:
-        await update.message.reply_text(
-            "✅ PulseFutures is live.\n\n"
-            "Fast checks:\n"
-            "/screen\n"
-            "/autotrade_debug\n"
-            "/email_decision\n"
-            "/setup_audit 2\n"
-        )
-    except Exception:
-        pass
+    """Zero-DB /start ACK. yver54: no owner DB lookup, no channel check, no long send retry."""
+    await _fast_send_text(
+        update, context,
+        "✅ PulseFutures is live.\n\n"
+        "Fast checks:\n"
+        "/screen\n"
+        "/autotrade_debug\n"
+        "/email_decision\n"
+        "/setup_audit 2\n"
+    )
 
 
 async def _instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -42025,10 +42059,10 @@ async def _instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
                 [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
                 for (sym, sid) in ((cache_entry or {}).get('kb') or [])
             ]
-            await send_long_message(
-                update,
-                _screen_markdown_to_html((header + "\n" + str((cache_entry or {}).get('body') or '')).strip()),
-                parse_mode=ParseMode.HTML,
+            await _fast_send_text(
+                update, context,
+                _telegram_html_to_plain_for_fallback(_screen_markdown_to_html((header + "\n" + str((cache_entry or {}).get('body') or '')).strip())),
+                parse_mode=None,
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
             )
@@ -42047,10 +42081,10 @@ async def _instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"{_screen_when_line('Ticker snapshot', time.time())}"
                 f"_Showing instant ticker snapshot while full executable scan warms up._\n"
             )
-            await send_long_message(
-                update,
-                _screen_markdown_to_html((header + "\n" + body).strip()),
-                parse_mode=ParseMode.HTML,
+            await _fast_send_text(
+                update, context,
+                _telegram_html_to_plain_for_fallback(_screen_markdown_to_html((header + "\n" + body).strip())),
+                parse_mode=None,
                 disable_web_page_preview=True,
             )
             return
@@ -42058,7 +42092,7 @@ async def _instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
     try:
-        await update.message.reply_text("🔎 /screen received instantly. Cache is warming up and the executable refresh is queued.")
+        await _fast_send_text(update, context, "🔎 /screen received instantly. Cache is warming up and the executable refresh is queued.")
     except Exception:
         pass
 
@@ -42077,30 +42111,23 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
             return
 
         try:
+            _mark_user_activity()
+        except Exception:
+            pass
+        try:
             _parts = txt.split()
             context.args = _parts[1:] if len(_parts) > 1 else []
         except Exception:
             pass
 
-        # yver53 owner/admin instant lane: bypass slow DB/subscription/global guard
-        # for the two commands the owner uses to verify the service after deploy.
-        try:
-            _uid_fast = int(update.effective_user.id)
-            _owner_like = (_uid_fast == int(AUTOTRADE_OWNER_UID or 0)) or bool(is_admin_user(_uid_fast))
-        except Exception:
-            _owner_like = False
-        if _owner_like and cmd == 'start':
+        # yver54: ACK-first fast lane. Do not call is_admin_user(), channel membership,
+        # SQLite, Bybit, or long Telegram retry logic before answering these commands.
+        if cmd == 'start':
             await _instant_start_cmd(update, context)
             raise ApplicationHandlerStop
-        if _owner_like and cmd == 'screen':
+        if cmd == 'screen':
             await _instant_screen_cmd(update, context)
             raise ApplicationHandlerStop
-
-        if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
-            ok = await _is_user_subscribed(context.bot, int(update.effective_user.id))
-            if not ok:
-                await _reply_subscribe_required(update, context)
-                raise ApplicationHandlerStop
 
         if cmd == 'help':
             await send_long_message(update, HELP_TEXT, parse_mode=None, disable_web_page_preview=True)
@@ -42136,6 +42163,39 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
         raise
     except Exception:
         return
+
+async def _ultra_start_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _mark_user_activity()
+    except Exception:
+        pass
+    await _instant_start_cmd(update, context)
+    raise ApplicationHandlerStop
+
+async def _ultra_screen_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _mark_user_activity()
+    except Exception:
+        pass
+    await _instant_screen_cmd(update, context)
+    raise ApplicationHandlerStop
+
+async def _ultra_status_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _mark_user_activity()
+    except Exception:
+        pass
+    await _instant_status_cmd(update, context)
+    raise ApplicationHandlerStop
+
+async def _ultra_equity_stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _mark_user_activity()
+    except Exception:
+        pass
+    await _instant_equity_cmd(update, context)
+    raise ApplicationHandlerStop
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Plain text help (no tables, no HTML builder)
@@ -60039,12 +60099,12 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 # =========================================================
 
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
-EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
+EMAIL_BUILD_POOL_TIMEOUT_SEC = min(25, int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "25") or 25))
 EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
 # yver52b: cap this job's effective runtime even if Render env has an older high value.
 # A 280s alert_job caused APScheduler overlap warnings and delayed Telegram command replies.
 _ALERT_JOB_MAX_RUNTIME_ENV_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
-ALERT_JOB_MAX_RUNTIME_SEC = min(max(60, _ALERT_JOB_MAX_RUNTIME_ENV_SEC), int(os.environ.get("ALERT_JOB_EFFECTIVE_MAX_RUNTIME_CAP_SEC", "120") or 120))
+ALERT_JOB_MAX_RUNTIME_SEC = min(max(35, _ALERT_JOB_MAX_RUNTIME_ENV_SEC), int(os.environ.get("ALERT_JOB_EFFECTIVE_MAX_RUNTIME_CAP_SEC", "55") or 55))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
@@ -63738,6 +63798,11 @@ async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
     produced without waiting for the admin/user to press /screen.
     """
     job_started_ts = float(time.time())
+    try:
+        if _recent_user_activity(25):
+            return
+    except Exception:
+        pass
 
     def _budget_left() -> float:
         try:
@@ -63902,12 +63967,18 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
+        # yver54: if an interactive command just arrived, do not compete with it.
+        # The next scheduled tick will continue setup/email work; this prevents
+        # /start, /screen, /status and /equity from waiting behind background scans.
+        if _recent_user_activity(20):
+            _hb_touch('email', ok=True, details='defer_recent_user_activity')
+            return
         # yver47: hard guard the wrapper as well as the internal budget.
         # On Render, a cold scan/email tick can otherwise still be running when
         # APScheduler fires the next interval, producing noisy
         # "maximum number of running instances reached" warnings and delaying
         # the next email/setup loop.
-        timeout_sec = max(45.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 25.0)
+        timeout_sec = max(20.0, min(60.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 55) + 8.0))
         await asyncio.wait_for(_alert_job_async_internal(context), timeout=timeout_sec)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
@@ -63990,15 +64061,15 @@ def main():
         .connection_pool_size(int(os.getenv('TELEGRAM_CONNECTION_POOL_SIZE', '256') or 256))
         .pool_timeout(float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0))
         .connect_timeout(float(os.getenv('TELEGRAM_CONNECT_TIMEOUT_SEC', '3.0') or 3.0))
-        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '30.0') or 30.0))
-        .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '10.0') or 10.0))
+        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '12.0') or 12.0))
+        .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '4.0') or 4.0))
     )
     # PTB >=20.6 deprecates passing getUpdates timeouts to run_polling().
     # Configure them on ApplicationBuilder to remove the warning and keep polling stable.
     for _method, _value in (
         ('get_updates_connect_timeout', float(os.getenv('TELEGRAM_POLL_CONNECT_TIMEOUT_SEC', '10') or 10)),
-        ('get_updates_read_timeout', float(os.getenv('TELEGRAM_POLL_READ_TIMEOUT_SEC', '35') or 35)),
-        ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '20') or 20)),
+        ('get_updates_read_timeout', float(os.getenv('TELEGRAM_POLL_READ_TIMEOUT_SEC', '20') or 20)),
+        ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '8') or 8)),
         ('get_updates_pool_timeout', float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0)),
     ):
         try:
@@ -64007,8 +64078,16 @@ def main():
             pass
     app = builder.build()
 
+    # yver54: absolute first-touch activity marker and instant stop-handlers.
+    # These run before billing/channel/global guards and before any heavy command handler.
+    app.add_handler(MessageHandler(filters.ALL, _activity_marker, block=False), group=-1000)
+    app.add_handler(CommandHandler("start", _ultra_start_stop_cmd, block=True), group=-100)
+    app.add_handler(CommandHandler("screen", _ultra_screen_stop_cmd, block=True), group=-100)
+    app.add_handler(CommandHandler("status", _ultra_status_stop_cmd, block=True), group=-100)
+    app.add_handler(CommandHandler("equity", _ultra_equity_stop_cmd, block=True), group=-100)
+
     # Fast-lane for ultra-light commands that must feel instant (/help, /size, etc.)
-    app.add_handler(MessageHandler(filters.COMMAND, _fast_path_command_router), group=-2)
+    app.add_handler(MessageHandler(filters.COMMAND, _fast_path_command_router, block=True), group=-2)
 
     # Global access + Pro gating (runs before any other command handler)
     app.add_handler(MessageHandler(filters.COMMAND, _command_guard), group=-1)
