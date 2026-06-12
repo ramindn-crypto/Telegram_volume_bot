@@ -1,4 +1,3 @@
-# yver51: scheduler-overlap warning fix on top of yver50. alert_job and autonomous_screen_sync_job now allow one extra fast lock-check instance (max_instances=2), so a slow real tick does not produce Render/APScheduler skipped-run warnings; locks still prevent overlapping real work. BigMove raw-alert email toggle remains separated from F8 setup generation/email/AutoTrade.
 # yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
@@ -43076,7 +43075,6 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📣 Big-Move Alert Emails",
             f"{HDR}",
             f"Status: {'ON' if cur_on else 'OFF'}",
-            "Scope: raw BigMove alert emails only; F8 setup generation/AutoTrade stays active",
             f"Thresholds: |15m| ≥ {cur_p15:g}% AND |1H| ≥ {cur_p1:g}% AND |4H| ≥ {cur_p4:g}% (same direction only)",
             f"Min Vol (24H): {cur_min_vol/1e6:.1f}M",
         ]
@@ -43096,7 +43094,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if mode in {"off", "0", "disable"}:
         _record_bigmove_settings_change(uid, False, cur_p15, cur_p1, cur_p4, cur_min_vol, "command_off via /bigmove_alert")
-        await update.message.reply_text("✅ Big-move alert emails: OFF\nF8 setup generation and KEEP-only AutoTrade remain active.")
+        await update.message.reply_text("✅ Big-move alert emails: OFF")
         return
 
     if mode in {"on", "1", "enable"}:
@@ -43113,7 +43111,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)")
                 return
         _record_bigmove_settings_change(uid, True, p15, p1, p4, min_vol, f"command_on via /bigmove_alert (15m>={p15:.2f}% AND 1H>={p1:.2f}% AND 4H>={p4:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)\nF8 setup generation remains active regardless of this raw-alert toggle.")
+        await update.message.reply_text(f"✅ Big-move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
         return
 
     await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)  OR  /bigmove_alert off")
@@ -59831,12 +59829,12 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 pass
         MARKET_VOL_MEDIAN_USD = _median(_all_vols)
 
-        def _build_bigmove_payload_for_user(uid: int, tz, ignore_alert_on: bool = False):
+        def _build_bigmove_payload_for_user(uid: int, tz):
             try:
                 uu = get_user(int(uid)) or {}
                 on = int(uu.get("bigmove_alert_on", 1) or 0)
-                if (not on) and (not bool(ignore_alert_on)):
-                    return {"status": "SKIP", "reasons": ["bigmove_alert_off", "f8_setup_generation_still_active"]}
+                if not on:
+                    return {"status": "SKIP", "reasons": ["bigmove_alert_off"]}
 
                 try:
                     p15, p1, p4 = _user_bigmove_thresholds(uu)
@@ -60245,9 +60243,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             try:
                 payload_timeout = max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60))
                 try:
-                    # yver50: build the BigMove candidate payload even when raw
-                    # /bigmove_alert emails are OFF, so F8 setup generation remains live.
-                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, True, timeout=payload_timeout)
+                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=payload_timeout)
                 except asyncio.TimeoutError:
                     payload = {"status": "SKIP", "reasons": [f"bigmove_payload_timeout>{payload_timeout}s"]}
                 pstatus = str((payload or {}).get('status') or '').upper().strip()
@@ -60268,56 +60264,32 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 top_move = float(payload.get('top_move') or 0.0)
 
                 try:
-                    user_now = get_user(int(uid)) or {}
-                    raw_bigmove_alert_on = int(user_now.get("bigmove_alert_on", 1) or 0) == 1
-                except Exception:
-                    raw_bigmove_alert_on = True
-
-                ok = False
-                if raw_bigmove_alert_on:
+                    ok = await _send_email_async(
+                        int(EMAIL_SEND_TIMEOUT_SEC),
+                        subject,
+                        body,
+                        user_id_for_debug=int(uid),
+                        bypass_user_email_master=True,
+                        enforce_trade_window=False,
+                    )
+                except Exception as e:
+                    ok = False
                     try:
-                        ok = await _send_email_async(
-                            int(EMAIL_SEND_TIMEOUT_SEC),
-                            subject,
-                            body,
-                            user_id_for_debug=int(uid),
-                            bypass_user_email_master=True,
-                            enforce_trade_window=False,
-                        )
-                    except Exception as e:
-                        ok = False
-                        try:
-                            _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
-                        except Exception:
-                            pass
+                        _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
+                    except Exception:
+                        pass
 
-                    _LAST_BIGMOVE_DECISION[int(uid)] = {
-                        "status": "SENT" if ok else "ERROR",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "subject": subject,
-                        "reasons": (
-                            [f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", f"sent_{tag}"]
-                            if ok else
-                            [f"send_email_failed_or_timeout_{tag}", _LAST_SMTP_ERROR.get(int(uid), "send_email_failed")]
-                        ),
-                    }
-                else:
-                    _LAST_BIGMOVE_DECISION[int(uid)] = {
-                        "status": "SKIP",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "subject": subject,
-                        "reasons": [
-                            "raw_bigmove_alert_email_off",
-                            "f8_setup_generation_continues",
-                            f"candidates={len(filtered)}",
-                            f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%",
-                        ],
-                    }
-
-                if ok or (not raw_bigmove_alert_on):
-                    # Mark the BigMove event as processed after either a raw alert send
-                    # or setup-only processing.  This prevents repeated F8 setup-only
-                    # attempts from the same confirmed BigMove candle when raw alerts are OFF.
+                _LAST_BIGMOVE_DECISION[int(uid)] = {
+                    "status": "SENT" if ok else "ERROR",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "subject": subject,
+                    "reasons": (
+                        [f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", f"sent_{tag}"]
+                        if ok else
+                        [f"send_email_failed_or_timeout_{tag}", _LAST_SMTP_ERROR.get(int(uid), "send_email_failed")]
+                    ),
+                }
+                if ok:
                     for c in filtered[:8]:
                         try:
                             mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
@@ -60327,7 +60299,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     setup_email_setups = []
                     setup_email_sent = False
                     try:
-                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or ("alert_off_setup_only" if not raw_bigmove_alert_on else "pre_session")))
+                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
                     except Exception:
                         setup_email_setups, setup_email_sent = [], False
                     try:
@@ -60343,13 +60315,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
                                 "status": "QUEUED",
                                 "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else ("bigmove_alert_off_setup_only_waiting_for_immediate_autotrade" if not raw_bigmove_alert_on else "bigmove_alert_sent_waiting_for_immediate_autotrade"),
+                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
                                 "session": str(bm_sess or ""),
                                 "mode": str(_autotrade_runtime_mode()).lower(),
                                 "trigger": "bigmove_setup_email_immediate",
                             }
                             _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or ("alert_off_setup_only" if not raw_bigmove_alert_on else "pre_session"))),
+                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
                                 "autotrade_after_bigmove_setup_email",
                             )
                     except Exception:
@@ -60379,14 +60351,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         users_bigmove = list(users_bigmove or [])
-        # yver50: do NOT filter users_bigmove by bigmove_alert_on here.
-        # /bigmove_alert controls only the raw market-event email.  F8 setup
-        # generation, setup-email delivery and AutoTrade must remain live and are
-        # still gated later by KEEP/policy/blackout/context/entry rules.
         try:
-            users_bigmove = list(users_bigmove or [])
+            users_bigmove = [u for u in users_bigmove if int((u or {}).get('bigmove_alert_on', 1) or 0) == 1]
         except Exception:
-            users_bigmove = []
+            users_bigmove = list(users_bigmove or [])
         _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)
         if int(_bigmove_user_limit or 0) > 0:
             users_bigmove = users_bigmove[:int(_bigmove_user_limit)]
@@ -61177,7 +61145,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 continue
             try:
                 try:
-                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, True, timeout=max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60)))
+                    payload = await to_thread_email(_build_bigmove_payload_for_user, int(uid), tz, timeout=max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60)))
                 except asyncio.TimeoutError:
                     payload = {"status": "SKIP", "reasons": [f"bigmove_payload_timeout>{max(20, int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60))}s"]}
                 pstatus = str((payload or {}).get('status') or '').upper().strip()
@@ -61197,46 +61165,26 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 top_tf = str(payload.get('top_tf') or '')
                 top_move = float(payload.get('top_move') or 0.0)
 
-                try:
-                    user_now = get_user(int(uid)) or {}
-                    raw_bigmove_alert_on = int(user_now.get("bigmove_alert_on", 1) or 0) == 1
-                except Exception:
-                    raw_bigmove_alert_on = True
+                ok = await _send_email_async(
+                    EMAIL_SEND_TIMEOUT_SEC,
+                    subject,
+                    body,
+                    user_id_for_debug=uid,
+                    enforce_trade_window=False,
+                    bypass_user_email_master=True,
+                )
 
-                ok = False
-                if raw_bigmove_alert_on:
-                    ok = await _send_email_async(
-                        EMAIL_SEND_TIMEOUT_SEC,
-                        subject,
-                        body,
-                        user_id_for_debug=uid,
-                        enforce_trade_window=False,
-                        bypass_user_email_master=True,
-                    )
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "SENT" if ok else "FAIL",
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "reasons": (
+                        [f"ok ({len(filtered)} candidate(s))", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", "sent_after_session_pools"]
+                        if ok else
+                        ["send_email_failed_or_timeout_after_defer", _LAST_SMTP_ERROR.get(uid, "send_email_failed")]
+                    ),
+                }
 
-                    _LAST_BIGMOVE_DECISION[uid] = {
-                        "status": "SENT" if ok else "FAIL",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "reasons": (
-                            [f"ok ({len(filtered)} candidate(s))", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", "sent_after_session_pools"]
-                            if ok else
-                            ["send_email_failed_or_timeout_after_defer", _LAST_SMTP_ERROR.get(uid, "send_email_failed")]
-                        ),
-                    }
-                else:
-                    _LAST_BIGMOVE_DECISION[uid] = {
-                        "status": "SKIP",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "reasons": [
-                            "raw_bigmove_alert_email_off",
-                            "f8_setup_generation_continues",
-                            f"candidates={len(filtered)}",
-                            f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%",
-                            "deferred_after_session_pools",
-                        ],
-                    }
-
-                if ok or (not raw_bigmove_alert_on):
+                if ok:
                     for c in filtered[:8]:
                         try:
                             mark_bigmove_emailed(uid, c["symbol"], c["direction"])
@@ -61246,7 +61194,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     setup_email_setups = []
                     setup_email_sent = False
                     try:
-                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=("deferred_alert_off_setup_only" if not raw_bigmove_alert_on else "deferred"))
+                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred")
                     except Exception:
                         setup_email_setups, setup_email_sent = [], False
                     try:
@@ -61262,13 +61210,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                             _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
                                 "status": "QUEUED",
                                 "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else ("bigmove_alert_off_setup_only_waiting_for_immediate_autotrade" if not raw_bigmove_alert_on else "bigmove_alert_sent_waiting_for_immediate_autotrade"),
+                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
                                 "session": str(bm_sess or ""),
                                 "mode": str(_autotrade_runtime_mode()).lower(),
                                 "trigger": "bigmove_setup_email_immediate",
                             }
                             _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=("deferred_alert_off_setup_only" if not raw_bigmove_alert_on else "deferred")),
+                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred"),
                                 "autotrade_after_bigmove_setup_email_deferred",
                             )
                     except Exception:
@@ -61402,7 +61350,6 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append("")
     lines.append("⚡ Big-Move Alert Settings")
     lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
-    lines.append("Scope: raw BigMove alert emails only; F8 setup generation/AutoTrade stays active")
     lines.append(f"Thresholds: |15m| ≥ {bigm_p15:g}% AND |1H| ≥ {bigm_p1:g}% AND |4H| ≥ {bigm_p4:g}% (same direction only)")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
     lines.append(f"Payload timeout: {int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60)}s")
@@ -63752,12 +63699,7 @@ def main():
             first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
             name="alert_job",
             job_kwargs={
-                # yver51: allow one extra fast lock-check instance. If the real
-                # alert_job is still running, _alert_job_async_internal() sees
-                # ALERT_LOCK and returns immediately, avoiding APScheduler
-                # "maximum number of running instances reached" warnings while
-                # still preventing overlapping real email/setup work.
-                "max_instances": 2,
+                "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 300,
             },
@@ -63779,11 +63721,7 @@ def main():
             first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
             name="autonomous_screen_sync_job",
             job_kwargs={
-                # yver51: same pattern as alert_job. The job body owns
-                # _AUTONOMOUS_SCREEN_SYNC_LOCK, so a second scheduled instance
-                # only records/returns when the real screen-sync lane is busy;
-                # no duplicate setup/email/autotrade work is allowed.
-                "max_instances": 2,
+                "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 900,
             },
