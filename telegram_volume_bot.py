@@ -1,4 +1,5 @@
 # Ver74: BigMove/F8 setup bridge fix from Ver73. Preserves confirmed BigMove continuation side when NOR→REV routing would create a leader/loser context conflict, and honors delivery_lane_locked so emailed/executable F8 rows are not re-routed before presend/AutoTrade gates. No lag-path, risk, TP/SL, or KEEP-policy loosening.
+# Ver77: no-lag polish from Ver76. Keeps instant ACK path, raises deferred output concurrency, removes artificial delayed output, and makes /screen show active AutoTrade OPEN positions even when current-session setup cache is empty/expired. No strategy/risk/policy changes.
 # Ver73: emergency no-lag hardening from Ver72. Fixes lost instant ACK fallback, removes single-command output bottleneck, and makes /screen read recent emailed/AT_OPEN setup lane before ticker snapshot. No strategy/risk/policy changes.
 # yver61: yver60 emergency no-lag patch. Hard safe-core by default, all non-essential background schedulers disabled unless explicitly enabled, alert loop shortened and de-overlapped, owner commands remain instant. No strategy/risk/setup/autotrade policy changes.
 # yver62: fixes fresh KEEP/OPEN handoff across session change so /setup_audit KEEP rows enter /screen, setup email and AutoTrade within entry_window even when ASIA→LON/NY changes.
@@ -3106,11 +3107,11 @@ OWNER_DEFERRED_COMMAND_HANDLERS = {
 }
 OWNER_DEFERRED_COMMANDS = set(OWNER_DEFERRED_COMMAND_HANDLERS.keys())
 OWNER_DEFERRED_COMMAND_TIMEOUT_SEC = int(os.getenv("OWNER_DEFERRED_COMMAND_TIMEOUT_SEC", "900") or 900)
-# Ver73: deferred commands already ACK first; do not make report/debug outputs wait
-# behind a previous report for minutes.  Keep a small concurrency cap so 10 pressed
-# commands stay responsive without stampeding the live AutoTrade/email executors.
-OWNER_DEFERRED_COMMAND_DELAY_SEC = float(os.getenv("OWNER_DEFERRED_COMMAND_DELAY_SEC", "1.25") or 1.25)
-OWNER_DEFERRED_COMMAND_MAX_CONCURRENT = int(os.getenv("OWNER_DEFERRED_COMMAND_MAX_CONCURRENT", "1") or 1)
+# Ver77: deferred commands already ACK first; do not make quick reports/debug wait
+# behind one heavy report.  A modest concurrency cap keeps 10 pressed commands
+# responsive while live AutoTrade/email use their own dedicated executors.
+OWNER_DEFERRED_COMMAND_DELAY_SEC = float(os.getenv("OWNER_DEFERRED_COMMAND_DELAY_SEC", "0.05") or 0.05)
+OWNER_DEFERRED_COMMAND_MAX_CONCURRENT = int(os.getenv("OWNER_DEFERRED_COMMAND_MAX_CONCURRENT", "4") or 4)
 # Ver73: 1s was too aggressive on Render/Telegram and could drop the visible ACK;
 # the command path still returns quickly, but the owner sees the accepted message.
 TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC = float(os.getenv("TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC", "2.0") or 2.0)
@@ -42342,6 +42343,62 @@ async def _owner_defer_command(update: Update, context: ContextTypes.DEFAULT_TYP
     return True
 
 
+def _screen_open_autotrade_positions_body_sync(uid: int, max_rows: int = 6) -> str:
+    """Lightweight /screen fallback for active AutoTrade positions.
+
+    yver77: /screen is intentionally cache-only, so it can miss older LON setups
+    after a session change even though AutoTrade positions are still live.  This
+    helper uses the existing fast accounting cache and never performs a forced
+    exchange refresh.  If the cache is cold/slow it simply returns empty and
+    /screen falls back to the ticker snapshot.
+    """
+    try:
+        owner = int(AUTOTRADE_OWNER_UID or uid or 0)
+    except Exception:
+        owner = int(uid or 0)
+    try:
+        user = get_user(owner) or {}
+    except Exception:
+        user = {}
+    try:
+        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=max(10, int(FAST_ADMIN_SNAPSHOT_TTL_SEC)), force_refresh=False)
+    except Exception:
+        snap = {}
+    try:
+        equity = float((snap or {}).get('equity') or 0.0)
+    except Exception:
+        equity = 0.0
+    try:
+        mday = _autotrade_day_risk_metrics_cached(owner, float(equity), ttl=max(10, int(FAST_ADMIN_METRICS_TTL_SEC)), force_refresh=False)
+    except Exception:
+        mday = {}
+    try:
+        rows = list((snap or {}).get('open_positions') or (mday or {}).get('open_positions') or [])
+    except Exception:
+        rows = []
+    if not rows:
+        return ''
+    lines = []
+    lines.append('*Top Trade Setups*')
+    lines.append(HDR)
+    lines.append('_No fresh current-session setup cache yet. Showing active AutoTrade positions already opened by the setup pipeline._')
+    lines.append('')
+    lines.append('*Open AutoTrade Positions*')
+    lines.append('```')
+    lines.append(f"{'SYM':<10} {'Side':<6} {'Risk$':>8} {'PnL$':>9}")
+    for r in rows[:max(1, int(max_rows or 6))]:
+        try:
+            sym = str(r.get('symbol') or r.get('base') or '-').upper().replace('USDT','')[:10]
+            side = str(r.get('side') or '-').upper()[:6]
+            risk = float(r.get('risk_usd') or r.get('risk') or 0.0)
+            pnl = float(r.get('pnl') or r.get('unrealized_pnl') or r.get('pnl_usdt') or 0.0)
+            lines.append(f"{sym:<10} {side:<6} {risk:>8.2f} {pnl:>+9.2f}")
+        except Exception:
+            continue
+    lines.append('```')
+    return '\n'.join(lines).strip()
+
+
 async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """No-network /screen for owner/admin: cache or ticker snapshot only.
 
@@ -42431,6 +42488,32 @@ async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAUL
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))] for (sym, sid) in (kb_db or [])]) if kb_db else None,
+            )
+            return
+
+        # yver77: if the current-session setup queue is empty/expired, still show
+        # active AutoTrade OPEN positions instead of a misleading setup-free screen.
+        try:
+            open_body = await to_thread_fast(
+                _screen_open_autotrade_positions_body_sync,
+                int(uid or 0),
+                timeout=2,
+            )
+        except Exception:
+            open_body = ''
+        if str(open_body or '').strip():
+            header = (
+                "*PulseFutures — Market Scan*\n"
+                f"{HDR}\n"
+                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
+                f"{_screen_when_line('Active position snapshot', time.time())}"
+                "_Showing active AutoTrade positions from the fast cache. Live setup/email/AutoTrade pipeline continues in the background._\n"
+            )
+            await send_long_message(
+                update,
+                _screen_markdown_to_html((header + "\n" + str(open_body or '')).strip()),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
             )
             return
 
