@@ -61587,12 +61587,25 @@ def _log_transient_telegram_error(err: Exception | None) -> None:
         if now - float(_TELEGRAM_TRANSIENT_ERROR_LAST_LOG_TS or 0.0) >= window:
             suppressed = int(_TELEGRAM_TRANSIENT_ERROR_SUPPRESSED or 0)
             suffix = f" | suppressed={suppressed}" if suppressed else ""
-            logger.warning(
-                "Telegram polling transient network error ignored; polling will retry automatically: %s: %s%s",
-                type(err).__name__ if err else "UnknownError",
-                err,
-                suffix,
+            msg = (
+                "Telegram polling transient network error ignored; polling will retry automatically: "
+                f"{type(err).__name__ if err else 'UnknownError'}: {err}{suffix}"
             )
+
+            # Ver49: expected Telegram getUpdates edge/network blips (502 Bad Gateway,
+            # httpx.ReadError, timeouts) are not bot failures and PTB retries them
+            # automatically. Render showed them as WARNING and looked unhealthy, so keep
+            # the counter/throttle but make the default log level DEBUG. Operators can
+            # temporarily raise this with TELEGRAM_TRANSIENT_ERROR_LOG_LEVEL=INFO or WARNING.
+            lvl_name = str(os.getenv("TELEGRAM_TRANSIENT_ERROR_LOG_LEVEL", "DEBUG") or "DEBUG").upper()
+            lvl = getattr(logging, lvl_name, logging.DEBUG)
+            if lvl >= logging.WARNING:
+                logger.log(lvl, msg)
+            elif lvl >= logging.INFO:
+                logger.info(msg)
+            else:
+                logger.debug(msg)
+
             _TELEGRAM_TRANSIENT_ERROR_LAST_LOG_TS = now
             _TELEGRAM_TRANSIENT_ERROR_SUPPRESSED = 0
         else:
