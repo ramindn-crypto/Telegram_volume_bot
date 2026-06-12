@@ -1,20 +1,3 @@
-# Ver98: restores full /why reject diagnostics by persisting raw scan reject payloads to SQLite and always combining the last meaningful raw reject report with current blackout/pipeline status; no strategy/risk/trading changes.
-# Ver97: restores user-configured/broad Melbourne blackout schedule after Ver96 mistake. Keeps all blackout windows in autotrade_config, merges required windows back if Ver96 overwrote them, and preserves command-firewall/no-lag + /why blackout visibility. No strategy/risk/KEEP/F8/TP/SL/trading changes.
-# Ver95: prevents BigMove from starving the normal setup/email scan: BigMove payload/F8 setup handling is fire-and-forget with an in-flight guard, so session pool generation always proceeds; /why now shows pool/build events when no reject stats exist. No strategy/risk/KEEP/TP/SL/trading changes.
-# Ver94: BigMove/F8 setup conversion no longer depends on the heavy routed setup builder. If the normal builder times out, a lightweight F8 continuation setup is created in the background, then still passes the same presend KEEP/context/executable gates before setup email, /screen, DB, and AutoTrade. No Telegram command-lane, risk, TP/SL, or policy loosening.
-# Ver93: /screen safe renderer always includes market context (Pulse + Leaders + Losers) and avoids returning positions-only or cache-warming output when ticker data can be fetched in the deferred worker. No strategy/risk/policy/F8/TP/SL/trading changes.
-# Ver92: fixes autonomous setup starvation after command-firewall/no-lag mode. User command activity no longer switches the core setup/email/AutoTrade pipeline to light-only, and screen cache warmup no longer defers just because commands were pressed. Telegram commands remain instant; no strategy/risk/policy/F8/TP/SL/trading changes.
-# Ver91: command-firewall screen override so /screen cannot fall back to the old heavy/ticker-only handler; it uses the safe cache/DB/live-position snapshot handler in the background. No strategy/risk/policy/trading changes.
-# Ver90: full Telegram command firewall. Every slash command is intercepted before all legacy handlers, sends an immediate ACK, then runs the original command handler in a bounded background worker. Manual commands no longer run Bybit/OHLCV/report work in the Telegram update path. No strategy/risk/policy/F8/TP/SL/AutoTrade trading logic changes.
-# Ver79: no-lag polish from Ver78. /screen active-position fallback now uses live Bybit position rows only (no stale DB OPEN fallback), dedupes rows, and BigMove/F8 failures now record the exact presend gate reason instead of only f8_setup_email_failed_or_empty. No strategy/risk/policy changes.
-# Ver78: no-lag polish from Ver77. Keeps instant ACK path. /screen now prefers recent/open AutoTrade positions over stale ticker-only cache, and /setup_audit deferred path falls back to the existing cached/background report wrapper instead of rebuilding synchronously. No strategy/risk/policy changes.
-# Ver74: BigMove/F8 setup bridge fix from Ver73. Preserves confirmed BigMove continuation side when NOR→REV routing would create a leader/loser context conflict, and honors delivery_lane_locked so emailed/executable F8 rows are not re-routed before presend/AutoTrade gates. No lag-path, risk, TP/SL, or KEEP-policy loosening.
-# Ver77: no-lag polish from Ver76. Keeps instant ACK path, raises deferred output concurrency, removes artificial delayed output, and makes /screen show active AutoTrade OPEN positions even when current-session setup cache is empty/expired. No strategy/risk/policy changes.
-# Ver73: emergency no-lag hardening from Ver72. Fixes lost instant ACK fallback, removes single-command output bottleneck, and makes /screen read recent emailed/AT_OPEN setup lane before ticker snapshot. No strategy/risk/policy changes.
-# yver61: yver60 emergency no-lag patch. Hard safe-core by default, all non-essential background schedulers disabled unless explicitly enabled, alert loop shortened and de-overlapped, owner commands remain instant. No strategy/risk/setup/autotrade policy changes.
-# yver62: fixes fresh KEEP/OPEN handoff across session change so /setup_audit KEEP rows enter /screen, setup email and AutoTrade within entry_window even when ASIA→LON/NY changes.
-# yver48: adds last-chance /setup_audit KEEP+OPEN rescue so fresh matrix-approved setups cannot be missed when executable/email pools are empty; no strategy/risk/policy loosening.
-# yver96: reverted by Ver97. Do not remove user-configured broad blackout windows.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -47,8 +30,6 @@ from typing import Any  # yver130 early import required before early helper anno
 # yver129: locks AutoTrade to the same delivered KEEP+WATCH lane as subscribers: future AutoTrade entries require an actual recent setup email/delivery within AUTOTRADE_ENTRY_WINDOW_MIN, remove broad executable/fresh-queue fallbacks from email-triggered AutoTrade, and keep the setting Telegram-configurable.
 # yver126: fixes /dayrisk_reset so AutoTrade debug uses the reset credit from the same realised-PnL/open-risk basis, and fixes /setup_audit_keep_watch multi-window table to use full historical generated+executable rows rather than the short executable-only slice.
 # yver124: /setup_audit_keep_watch now renders a multi-window table (Last 24h, 7d, 14d, Overall from database) with Keep/Watch combo counts and WR=TP/(TP+SL).
-# yver76: emergency true no-lag command recovery. The instant command lane now defaults ON for all users/commands (not only env-owner/admin), ACKs are awaited via direct bot.send_message instead of fire-and-forget-only, and manual /screen no longer launches a heavy executable refresh from the command path. No strategy/risk/policy changes.
-# yver75: hard no-lag owner command lane; owner/admin commands ACK fire-and-forget before any heavy work, heavy report outputs are built in worker threads where possible, and background command concurrency is clamped to prevent Telegram command starvation. No strategy/risk/policy changes.
 # yver123: fixes WR methodology (TP/SL only for setup audits; AutoTrade realised WR counts TP or positive OTHER as wins and SL or negative OTHER as losses), tightens compare matching to avoid stale/legacy setup DIFF rows, rounds PnL displays, and clarifies active sessions in /autotrade_debug.
 # yver121: AutoTrade candidate deadline lock. KEEP+WATCH executable setups are tradable only inside AUTOTRADE_ENTRY_WINDOW_MIN (default 60m); the old 24h fallback is capped to that deadline and no longer bypassed by keep-all mode.
 # yver116: AutoTrade timeout reconciliation display hardening and longer placement budget.
@@ -106,7 +87,7 @@ from typing import Any  # yver130 early import required before early helper anno
 # - Ver54 yver54: forward-test keep-all mode for NORMAL/REVERSE comparison: disables automatic flat/max-hold/carryover closes by default, extends setup entry life for test observation, and lets scheduled AutoTrade continue placing multiple eligible queued setups per tick while retaining SL/TP, risk caps, duplicate guards and exchange safety checks.
 # - Ver53 yver53: fixes post-unblock execution gaps: removes MON from combo identity (NOR/REV only), routes weak combos to REV earlier, lets AutoTrade execute already queued/emailed setups during setup-generation blackout, retries Bybit leverage at exchange max, and continues candidate attempts after leverage/setup-specific skips.
 # - yver61: AutoTrade risk caps are controlled only by /autotrade_config; /dailycap is manual-only; AutoTrade reports use one clear Reason column with pre-ASIA closes renamed.
-# - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (10M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
+# - Ver52 EXECUTABLE_QUEUE_UNBLOCK: fixes the remaining zero-executable-pool issue by forcing one shared controlled scout gate (15M+ volume, valid SL/TP, RR>=1.05, Conf>=72) before legacy baseline/WATCH gates, preserving cooldowns/risk caps/disabled-normal policy while allowing screen/email/autotrade to share the same executable queue.
 # - Ver51 FINAL_PIPELINE_LOCKED: one shared starvation-safe executable gate for /screen, /email_decision, /why and AutoTrade. Keeps 15M min volume, valid SL/TP/RR, cooldowns and risk caps, but removes hidden conf/dynamic/micro-edge starvation so qualified scout setups can persist, email and autotrade from the same executable queue.
 # - Ver46: Final email/autotrade sync guard: every setup email (including BigMove/F8 setup emails) is revalidated through the same routed executable gate immediately before sending, and the after-email AutoTrade trigger only persists/attempts the same valid routed rows. This prevents emailed setups from later being skipped by AutoTrade for micro-edge/final-gate reasons.
 # - Ver44: Hard-fixed UNKNOWN Family-Session-Strategy policy fallback so new NOR/REV/MON combos always enter WATCH probation instead of being blocked as UNKNOWN; cleaned /why stale UNKNOWN policy gate noise.
@@ -660,8 +641,6 @@ SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY = 'setup_generation_blackout_windows'
 AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY = 'ver20_blackout_policy_version'
 AUTOTRADE_CFG_VER57_BLACKOUT_SYNC_VERSION_KEY = 'ver57_blackout_sync_version'
 AUTOTRADE_CFG_VER29_DAY_BLACKOUT_POLICY_VERSION_KEY = 'ver29_day_blackout_policy_version'
-AUTOTRADE_CFG_VER96_BLACKOUT_UNSTARVE_VERSION_KEY = 'ver96_blackout_unstarve_version'
-AUTOTRADE_CFG_VER97_BLACKOUT_RESTORE_VERSION_KEY = 'ver97_blackout_restore_version'
 SETUP_CFG_SHADOW_SCAN_ENABLED_KEY = 'setup_shadow_scan_enabled'
 VER29_RECOMMENDED_BLACKOUT_WINDOWS = '03:00-04:00,05:00-12:00,13:00-14:00,SAT 14:00-SUN 12:00'
 AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY = 'require_setup_email_for_entry'
@@ -707,9 +686,9 @@ AUTOTRADE_MAX_POSITION_HOURS_ENABLED = env_bool('AUTOTRADE_MAX_POSITION_HOURS_EN
 AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18)
 AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', '600') or 600)
 AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
-AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS) or '').split(',') if x.strip())
+AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
 SETUP_GENERATION_BLACKOUT_ENABLED = env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True)
-SETUP_GENERATION_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS) or '').split(',') if x.strip())
+SETUP_GENERATION_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '').split(',') if x.strip())
 # Ver54 forward-test mode: keep NORMAL and REVERSE setups/trades observable.
 # Default ON for this build because the current test goal is to compare NOR vs REV
 # without the bot closing positions for ASIA handover, max-hold, or carryover cleanup.
@@ -882,9 +861,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55') or 55),
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True) else 0,
         AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY: 1 if env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True) else 0,
-        AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY: str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS) or VER29_RECOMMENDED_BLACKOUT_WINDOWS),
+        AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY: str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
         SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY: 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0,
-        SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS) or VER29_RECOMMENDED_BLACKOUT_WINDOWS),
+        SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45') or '10:00-10:45'),
         SETUP_CFG_SHADOW_SCAN_ENABLED_KEY: 1 if env_bool('SETUP_SHADOW_SCAN_ENABLED', True) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18),
@@ -897,9 +876,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY: 1 if env_bool('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True) else 0,
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True) else 0,
         AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: float(os.environ.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', '3.0') or 3.0),
-        AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', False) else 0,
+        AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True) else 0,
         AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1 if env_bool('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True) else 0,
-        AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1 if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', False) else 0,
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1 if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True) else 0,
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5') or 5),
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0') or 60.0),
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25') or 0.25),
@@ -1194,15 +1173,10 @@ def _autotrade_daily_realized_loss_stop_pct() -> float:
 
 
 def _autotrade_require_realized_combo_edge() -> bool:
-    # yver46: setup/email/AutoTrade must be synced to /setup_matrix KEEP.
-    # The old realised-combo self-block can hide a matrix KEEP setup from email/AutoTrade,
-    # so it is disabled by default. Re-enable only with explicit env override.
     try:
-        if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE_FORCE_ENABLED', False):
-            return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', False)
-        return False
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY, 'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)
     except Exception:
-        return False
+        return bool(globals().get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True))
 
 
 def _autotrade_context_feed_guard_enabled() -> bool:
@@ -1213,15 +1187,10 @@ def _autotrade_context_feed_guard_enabled() -> bool:
 
 
 def _autotrade_strict_keep_edge_enabled() -> bool:
-    # yver46: do not let the secondary 60%/AvgR strict gate override /setup_matrix KEEP.
-    # This was the reason a KEEP+OPEN row such as F1-LON-NOR-BUY could appear in
-    # /setup_audit but not be emailed/autotraded. Re-enable only with explicit env override.
     try:
-        if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_FORCE_ENABLED', False):
-            return _autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', False)
-        return False
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)
     except Exception:
-        return False
+        return env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)
 
 
 def _autotrade_strict_keep_edge_min_decided() -> int:
@@ -1720,9 +1689,9 @@ def _autotrade_entry_blackout_enabled() -> bool:
 
 def _autotrade_entry_blackout_windows() -> str:
     try:
-        raw = _autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS))
+        raw = _autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45'))
     except Exception:
-        raw = os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS)
+        raw = os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45')
     return _normalise_melbourne_blackout_windows(raw, default='10:00-10:45')
 
 
@@ -1737,9 +1706,9 @@ def _setup_generation_blackout_enabled() -> bool:
 
 def _setup_generation_blackout_windows() -> str:
     try:
-        raw = _autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS))
+        raw = _autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45'))
     except Exception:
-        raw = os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS)
+        raw = os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45')
     return _normalise_melbourne_blackout_windows(raw, default='10:00-10:45')
 
 def _setup_shadow_scan_enabled() -> bool:
@@ -2138,7 +2107,7 @@ def _autotrade_apply_ver20_blackout_policy_defaults() -> None:
         first_apply = str(_autotrade_config_get(AUTOTRADE_CFG_VER20_BLACKOUT_POLICY_VERSION_KEY, '') or '').strip().lower() != target_version
         if not first_apply:
             return
-        default_w = _normalise_melbourne_blackout_windows(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS), '10:00-10:45')
+        default_w = _normalise_melbourne_blackout_windows(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45'), '10:00-10:45')
         setup_w = _normalise_melbourne_blackout_windows(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', default_w), default_w)
         _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
         _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, default_w)
@@ -2163,14 +2132,14 @@ def _autotrade_apply_ver57_blackout_config_sync() -> None:
         if str(_autotrade_config_get(AUTOTRADE_CFG_VER57_BLACKOUT_SYNC_VERSION_KEY, '') or '').strip().lower() == target_version:
             return
         try:
-            entry_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS)), '10:00-10:45')
+            entry_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-10:45')), '10:00-10:45')
             if entry_w:
                 _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
                 _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, entry_w)
         except Exception:
             pass
         try:
-            setup_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS)), '10:00-10:45')
+            setup_w = _normalise_melbourne_blackout_windows(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-10:45')), '10:00-10:45')
             if setup_w:
                 _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
                 _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, setup_w)
@@ -2230,57 +2199,6 @@ def _autotrade_apply_ver29_day_aware_blackout_defaults() -> None:
     except Exception:
         pass
 
-
-
-
-def _autotrade_apply_ver97_blackout_restore_defaults() -> None:
-    """Ver97: restore user-configured/broad blackout windows after Ver96 mistake.
-
-    Ver96 incorrectly treated the broad blackout schedule as legacy/starvation and
-    could overwrite autotrade_config to 10:00-10:45 only. The blackout schedule is
-    intentional user/runtime configuration. This migration merges the required
-    evidence-based windows back into both setup-generation and entry blackout
-    config, preserving any extra windows already present.
-    """
-    try:
-        target_version = 'ver97_2026_06_13_restore_configured_blackouts'
-        if str(_autotrade_config_get(AUTOTRADE_CFG_VER97_BLACKOUT_RESTORE_VERSION_KEY, '') or '').strip().lower() == target_version:
-            return
-
-        required = _normalise_melbourne_blackout_windows(
-            os.environ.get('VER29_RECOMMENDED_BLACKOUT_WINDOWS', VER29_RECOMMENDED_BLACKOUT_WINDOWS),
-            VER29_RECOMMENDED_BLACKOUT_WINDOWS,
-        ) or VER29_RECOMMENDED_BLACKOUT_WINDOWS
-
-        def _merge_windows(current_value: str) -> str:
-            try:
-                current = _normalise_melbourne_blackout_windows(str(current_value or ''), required)
-            except Exception:
-                current = ''
-            merged = []
-            for source in (current, required):
-                for w in _split_blackout_windows(source):
-                    ww = str(w or '').strip()
-                    if ww and ww not in merged:
-                        merged.append(ww)
-            return ','.join(merged) if merged else required
-
-        cur_setup_raw = str(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, '') or '')
-        cur_entry_raw = str(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, '') or '')
-        setup_w = _merge_windows(cur_setup_raw)
-        entry_w = _merge_windows(cur_entry_raw)
-
-        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, setup_w)
-        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, entry_w)
-        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
-        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
-        _autotrade_config_set(AUTOTRADE_CFG_VER97_BLACKOUT_RESTORE_VERSION_KEY, target_version)
-        try:
-            logger.warning('Ver97 restored blackout windows: setup_windows=%s entry_windows=%s', str(_setup_generation_blackout_windows()), str(_autotrade_entry_blackout_windows()))
-        except Exception:
-            pass
-    except Exception:
-        pass
 
 def _autotrade_apply_ver15_time_exit_policy_defaults() -> None:
     """Ver15: make the 09:55 flat reliable after deployment/reset.
@@ -3084,106 +3002,6 @@ AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC
 AUTONOMOUS_SCREEN_SYNC_FIRST_SEC = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_FIRST_SEC", "45") or 55)
 AUTONOMOUS_SCREEN_SYNC_MAX_USERS = int(os.environ.get("AUTONOMOUS_SCREEN_SYNC_MAX_USERS", "1") or 1)
 
-# yver60: stability-first mode. Keep live setup/email/autotrade core, but do not
-# schedule non-essential research/optimizer/cache warmup jobs that can block or
-# starve Telegram command responses on a small Render worker. Set to false only
-# after the bot has been stable for a full day.
-# yver61: responsiveness first. Ignore old Render env values that may have left heavy
-# background jobs ON. Full/background research mode must be explicitly re-enabled.
-PULSEFUTURES_FULL_BACKGROUND_MODE = env_bool("PULSEFUTURES_FULL_BACKGROUND_MODE", False)
-PULSEFUTURES_SAFE_CORE_MODE = True if not PULSEFUTURES_FULL_BACKGROUND_MODE else env_bool("PULSEFUTURES_SAFE_CORE_MODE", True)
-PULSEFUTURES_FORCE_NO_LAG_MODE = env_bool("PULSEFUTURES_FORCE_NO_LAG_MODE", True)
-# Ver92: command activity must not starve the live setup/email/AutoTrade scanner.
-# Keep the instant Telegram command lane separate from the autonomous trading pipeline.
-AUTONOMOUS_SETUP_LIGHT_ON_USER_ACTIVITY = env_bool("AUTONOMOUS_SETUP_LIGHT_ON_USER_ACTIVITY", False)
-SCREEN_WARMUP_DEFER_ON_USER_ACTIVITY = env_bool("SCREEN_WARMUP_DEFER_ON_USER_ACTIVITY", False)
-# yver76: emergency command responsiveness. In Render deployments AUTOTRADE_OWNER_UID
-# may be missing/stale, which made the owner/admin fast lane never intercept commands.
-# Default this single-owner bot to fast-lane all supported commands; the original
-# handlers still perform their normal access checks when the real output is built.
-PULSEFUTURES_FAST_LANE_ALL_COMMANDS = env_bool("PULSEFUTURES_FAST_LANE_ALL_COMMANDS", True)
-# yver76: /screen must never start an expensive executable refresh from the Telegram
-# command handler. Autonomous setup/email/autotrade loops remain responsible for fresh
-# live work; /screen displays cache/DB/ticker only.
-MANUAL_SCREEN_REFRESH_ON_COMMAND = env_bool("MANUAL_SCREEN_REFRESH_ON_COMMAND", False)
-# Ver71: AutoTrade/setup-email are core live actions. Do not let admin command
-# activity pause the trading lane for the full heavy-background defer window.
-AUTOTRADE_CORE_IGNORE_USER_ACTIVITY_DEFER = env_bool("AUTOTRADE_CORE_IGNORE_USER_ACTIVITY_DEFER", True)
-PULSEFUTURES_SKIP_NONESSENTIAL_JOBS = env_bool("PULSEFUTURES_SKIP_NONESSENTIAL_JOBS", True)
-OWNER_INSTANT_COMMANDS = {"start", "screen", "status", "equity"}
-# Ver72 hard no-lag: these read/report commands must never make Telegram wait.
-# They ACK immediately in the owner/admin priority router, then post the full
-# existing command output from the background. No live strategy/risk gates change.
-OWNER_DEFERRED_COMMAND_HANDLERS = {
-    "why": "why_no_setups_cmd",
-    "email_decision": "email_decision_cmd",
-    "email_pipeline_status": "email_pipeline_status_cmd",
-    "autotrade_debug": "autotrade_debug_cmd",
-    "autotrade_last": "autotrade_last_cmd",
-    "autotrade_report": "autotrade_report_cmd",
-    "autotrade_closed": "autotrade_closed_cmd",
-    "autotradeclosed": "autotrade_closed_cmd",
-    "autotrade_report_overall": "autotrade_report_overall_cmd",
-    "autotrade_report_overal": "autotrade_report_overall_cmd",
-    "autoytrade_report_overall": "autoytrade_report_overall_cmd",
-    "autoytrade_report_overal": "autoytrade_report_overall_cmd",
-    "autotrade_report_matrix": "autoytrade_report_overall_cmd",
-    "performance_report": "performance_report_cmd",
-    "trade_lifecycle": "trade_lifecycle_cmd",
-    "trade_lifecycle_detail": "trade_lifecycle_detail_cmd",
-    "setup_audit": "setup_audit_cmd",
-    "setup_quality": "setup_audit_cmd",
-    "setup_audit_overall": "setup_audit_overall_cmd",
-    "setup_audit_keep_watch": "setup_audit_keep_watch_cmd",
-    "setup_audit_keep": "setup_audit_keep_cmd",
-    "setup_keep_watch_summary": "setup_audit_keep_watch_cmd",
-    "setup_audit_compare": "setup_audit_compare_cmd",
-    "setup_audit_reconcile": "setup_audit_compare_cmd",
-    "setup_matrix": "setup_matrix_cmd",
-    "setup_edge_matrix": "setup_matrix_cmd",
-    "setup_deep_analysis": "setup_deep_analysis_cmd",
-    "setup_edge_deep": "setup_deep_analysis_cmd",
-    "setup_matrix_deep": "setup_deep_analysis_cmd",
-    "dev_status": "dev_status_cmd",
-    "framework_status": "dev_status_cmd",
-    "health_sys": "health_sys_cmd",
-    "learning_status": "learning_status_cmd",
-    "optimizer_status": "learning_status_cmd",
-    "edge_status": "edge_status_cmd",
-    "winrate": "winrate_cmd",
-    "ny_winrate": "ny_winrate_cmd",
-    "nywinrate": "ny_winrate_cmd",
-    "lessons_learned": "lessons_learned_cmd",
-    "report_daily": "report_daily_cmd",
-    "report_weekly": "report_weekly_cmd",
-    "report_overall": "report_overall_cmd",
-    "signals_daily": "signals_daily_cmd",
-    "signals_weekly": "signals_weekly_cmd",
-    "open_trades": "open_trades_cmd",
-    "cooldowns": "cooldowns_cmd",
-    "cooldown": "cooldown_cmd",
-    "setups_log": "setups_log_cmd",
-    "params_show": "cmd_params_show",
-    "optimize_report": "cmd_optimize_report",
-    "self_optimize_report": "cmd_self_optimize_report",
-    "autopilot_report": "cmd_self_optimize_report",
-    "adaptive_status": "market_adaptive_status_cmd",
-    "goal_status": "goal_profile_status_cmd",
-    "goalstatus": "goal_profile_status_cmd",
-    "backtest": "cmd_backtest",
-    "universe_backtest": "cmd_universe_backtest",
-}
-OWNER_DEFERRED_COMMANDS = set(OWNER_DEFERRED_COMMAND_HANDLERS.keys())
-OWNER_DEFERRED_COMMAND_TIMEOUT_SEC = int(os.getenv("OWNER_DEFERRED_COMMAND_TIMEOUT_SEC", "900") or 900)
-# Ver77: deferred commands already ACK first; do not make quick reports/debug wait
-# behind one heavy report.  A modest concurrency cap keeps 10 pressed commands
-# responsive while live AutoTrade/email use their own dedicated executors.
-OWNER_DEFERRED_COMMAND_DELAY_SEC = float(os.getenv("OWNER_DEFERRED_COMMAND_DELAY_SEC", "0.05") or 0.05)
-OWNER_DEFERRED_COMMAND_MAX_CONCURRENT = int(os.getenv("OWNER_DEFERRED_COMMAND_MAX_CONCURRENT", "4") or 4)
-# Ver73: 1s was too aggressive on Render/Telegram and could drop the visible ACK;
-# the command path still returns quickly, but the owner sees the accepted message.
-TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC = float(os.getenv("TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC", "2.0") or 2.0)
-
 # 07May_v01: DB-backed family/session edge governance.
 # The review table is always persisted. Live blocking is deliberately limited to
 # statistically weak/losing combinations only; WATCH rows remain allowed by default.
@@ -3288,13 +3106,13 @@ SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMB
 # Ver49: anti-starvation correction.  Ver48 still allowed stale Render/env values and
 # the final WATCH gate to starve the executable pool for hours.  Keep WR-first
 # controls, but make the scout lane practical: Conf>=83, Dyn>=70, RR>=1.30,
-# Vol>=10M. Broad global BUY/SELL side history is advisory only; combo/symbol/hour
+# Vol>=15M. Broad global BUY/SELL side history is advisory only; combo/symbol/hour
 # evidence and disabled policy rows remain enforceable.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = env_bool("SETUP_COMBO_WATCH_SCOUT_ENABLED", True)
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_CONF", "83") or 84)
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_RR", "1.30") or 1.40)
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "10000000") or 10000000)
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
 SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
 # Ver32 WR-first final gate: the executable lane itself is now quality-gated,
 # not only the downstream email/autotrade consumer.  This keeps /setup_audit,
@@ -3308,7 +3126,7 @@ SETUP_FINAL_SCOUT_ENABLED = env_bool("SETUP_FINAL_SCOUT_ENABLED", True)
 SETUP_FINAL_SCOUT_MIN_CONF = int(os.environ.get("SETUP_FINAL_SCOUT_MIN_CONF", "83") or 84)
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
 SETUP_FINAL_SCOUT_MIN_RR = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_RR", "1.30") or 1.40)
-SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "10000000") or 10000000)
+SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = True  # Ver44: hard safety; unknown/new strategy combos enter WATCH probation, never hard-block as UNKNOWN
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
@@ -3322,7 +3140,7 @@ SETUP_KEEP_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_KEEP_MIN_DYNAMIC_SCOR
 SETUP_REVERSE_PROBATION_MIN_CONF = int(os.environ.get("SETUP_REVERSE_PROBATION_MIN_CONF", "85") or 85)
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE", "60") or 60)
 SETUP_BASELINE_DISCOVERY_MIN_RR = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_RR", "1.25") or 1.25)
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_VOL_USD", "10000000") or 10000000)
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_VOL_USD", "15000000") or 15000000)
 # Ver35: /setup_audit is an analytical report and must not disappear just because
 # the live execution gate is strict. Execution/email/autotrade still use the final
 # quality gate; audit keeps visibility of stored setup outcomes for learning.
@@ -3917,7 +3735,7 @@ SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple(x.strip() for x in str(os.environ.get
     "10:00,11:00,13:00,19:00"
 ) or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = int(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_CONF", "83") or 83)
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "10000000") or 10000000)
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "15000000") or 15000000)
 # Ver48: global BUY/SELL edge can be noisy and stale after introducing NORMAL/REVERSE strategy routing.
 # Keep combo/symbol/hour blocks strict, but make broad global-side blocking advisory by default.
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = env_bool("SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED", False)
@@ -3936,20 +3754,20 @@ SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE = float(os.environ.get("SETUP_EDGE_GUA
 # scout lane could help.  The system needs controlled forward-testing now, not a
 # frozen bot.  Keep real blockers (disabled combos, bad SL/TP/RR, weak symbol/combo/
 # hour, cooldown, risk caps), but lower the discovery lane just enough to persist
-# measurable setups for /setup_audit and AutoTrade learning.  Minimum liquidity is now
-# 10M.
+# measurable setups for /setup_audit and AutoTrade learning.  Minimum liquidity stays
+# 15M, not 10M.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = True
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 82
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 55.0
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.25
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 10000000.0
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 84
 SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
 SETUP_FINAL_SCOUT_ENABLED = True
 SETUP_FINAL_SCOUT_MIN_CONF = 82
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 55.0
 SETUP_FINAL_SCOUT_MIN_RR = 1.25
-SETUP_FINAL_SCOUT_MIN_VOL_USD = 10000000.0
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
 SETUP_FINAL_ADAPTIVE_MIN_CONF = 84
 SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
 SETUP_KEEP_MIN_CONF = 80
@@ -3957,9 +3775,9 @@ SETUP_KEEP_MIN_DYNAMIC_SCORE = 45.0
 SETUP_REVERSE_PROBATION_MIN_CONF = 80
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 45.0
 SETUP_BASELINE_DISCOVERY_MIN_RR = 1.25
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 10000000.0
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = 78
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 10000000.0
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 15000000.0
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = False
 
 # Ver57: clean-start legacy ignore + fresh safety ON.
@@ -4013,7 +3831,7 @@ def _setup_policy_row_is_clean_start_legacy(pol: dict | None) -> bool:
         return False
 
 # Ver51 FINAL_PIPELINE_LOCKED: forward-test starvation guard.
-# Keep liquidity at 10M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
+# Keep liquidity at 15M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
 # floors freeze the executable queue at zero during live sessions.  The daily/weekly
 # policy will still learn and tighten from results.
 SETUP_FINAL_MIN_CONF = 84
@@ -4024,7 +3842,7 @@ SETUP_FINAL_SCOUT_ENABLED = True
 SETUP_FINAL_SCOUT_MIN_CONF = 78
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 35.0
 SETUP_FINAL_SCOUT_MIN_RR = 1.20
-SETUP_FINAL_SCOUT_MIN_VOL_USD = 10000000.0
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
 SETUP_COMBO_WATCH_MIN_CONF = 84
 SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = 50.0
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 82
@@ -4033,17 +3851,17 @@ SETUP_COMBO_WATCH_SCOUT_ENABLED = True
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 78
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 35.0
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.20
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 10000000.0
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
 SETUP_KEEP_MIN_CONF = 78
 SETUP_KEEP_MIN_DYNAMIC_SCORE = 35.0
 SETUP_REVERSE_PROBATION_MIN_CONF = 78
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 35.0
 SETUP_BASELINE_DISCOVERY_MIN_RR = 1.20
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 10000000.0
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
 FINAL_PIPELINE_LOCKED_ENABLED = env_bool("FINAL_PIPELINE_LOCKED_ENABLED", True)
 FINAL_PIPELINE_LOCKED_MIN_CONF = int(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_CONF", "78") or 78)
 FINAL_PIPELINE_LOCKED_MIN_RR = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_RR", "1.20") or 1.20)
-FINAL_PIPELINE_LOCKED_MIN_VOL_USD = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_VOL_USD", "10000000") or 10000000)
+FINAL_PIPELINE_LOCKED_MIN_VOL_USD = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_VOL_USD", "15000000") or 15000000)
 FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE", "35") or 35)
 
 # Ver52 EXECUTABLE_QUEUE_UNBLOCK: hard runtime override.
@@ -4055,7 +3873,7 @@ FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_L
 VER52_EXECUTABLE_QUEUE_UNBLOCK = True
 VER52_MIN_CONF = 72
 VER52_MIN_RR = 1.05
-VER52_MIN_VOL_USD = 10000000.0
+VER52_MIN_VOL_USD = 15000000.0
 VER52_MIN_DYNAMIC_SCORE = 0.0
 SETUP_FINAL_MIN_CONF = 82
 SETUP_FINAL_MIN_DYNAMIC_SCORE = 35.0
@@ -4212,7 +4030,7 @@ def _run_async_in_new_loop(coro_fn, *args, **kwargs):
 
 # Fast-command activity hint so background jobs can yield briefly to user-facing commands.
 _USER_ACTIVITY_TS = 0.0
-USER_ACTIVITY_COOLDOWN_SEC = int(os.getenv("USER_ACTIVITY_COOLDOWN_SEC", "180") or 180)
+USER_ACTIVITY_COOLDOWN_SEC = int(os.getenv("USER_ACTIVITY_COOLDOWN_SEC", "60") or 60)
 FAST_ADMIN_SNAPSHOT_TTL_SEC = int(os.getenv("FAST_ADMIN_SNAPSHOT_TTL_SEC", "20") or 20)
 FAST_ADMIN_METRICS_TTL_SEC = int(os.getenv("FAST_ADMIN_METRICS_TTL_SEC", "20") or 20)
 FAST_ADMIN_COMMAND_TIMEOUT_SEC = int(os.getenv("FAST_ADMIN_COMMAND_TIMEOUT_SEC", "4") or 4)
@@ -5088,26 +4906,11 @@ def _setup_route_candidate_for_executable_lane(setup, session_name: str = '', us
     router before `is_executable_setup_eligible()` is called.  Earlier builds checked
     the raw NORMAL setup first, so weak NORMAL combos were rejected before they could
     be converted into their intended REVERSE test lane.
-
-    Ver74 fix: when a setup was already locked by a delivery bridge (setup email,
-    BigMove/F8, screen cache or AutoTrade handoff), preserve the exact delivered
-    side/strategy.  The downstream executable/policy gates still run; this only
-    prevents a second presend pass from re-routing an already-built F8 row into the
-    opposite side.
     """
     try:
-        if bool(_setup_strategy_attr(setup, 'delivery_lane_locked', False)):
-            routed = setup
-        else:
-            try:
-                routed = _setup_adaptive_strategy_route_setup(setup, session_name=session_name, user_id=int(user_id or 0))
-            except Exception:
-                routed = setup
+        routed = _setup_adaptive_strategy_route_setup(setup, session_name=session_name, user_id=int(user_id or 0))
     except Exception:
-        try:
-            routed = _setup_adaptive_strategy_route_setup(setup, session_name=session_name, user_id=int(user_id or 0))
-        except Exception:
-            routed = setup
+        routed = setup
     try:
         sess = str(session_name or '').upper().strip()
         if sess:
@@ -5468,7 +5271,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Commands that should force a fresh access check (never use cache)
         # (/screen is the only one you said can be slow; we keep it strict/fresh here)
-        FORCE_FRESH = set()  # yver60: do not make /screen wait on a fresh access DB check
+        FORCE_FRESH = {"screen"}
 
         # 0) Channel subscription gate (optional)
         if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
@@ -5617,27 +5420,6 @@ class RedactSecretsFilter(logging.Filter):
         record.args = ()
         return True
 
-class RenderNoLagNoiseFilter(logging.Filter):
-    """Suppress expected Render/APScheduler deploy/cold-start noise.
-
-    These warnings were causing confusion and are not trading failures. Real
-    exceptions from our code are still shown.
-    """
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            msg = record.getMessage()
-            name = str(getattr(record, "name", "") or "")
-        except Exception:
-            return True
-        if name.startswith("apscheduler"):
-            if "Run time of job" in msg and "was missed by" in msg:
-                return False
-            if "Execution of job" in msg and "maximum number of running instances reached" in msg:
-                known = ("alert_job", "autonomous_screen_sync_job", "autotrade_exit_guardian_job", "evolution_hourly_job", "scan_intelligence_job", "screen_cache_warmup_job")
-                if any(k in msg for k in known):
-                    return False
-        return True
-
 
 def setup_logging():
     # Let Render control via LOG_LEVEL, default INFO
@@ -5648,31 +5430,12 @@ def setup_logging():
     for noisy in ("httpx", "telegram", "telegram.ext", "apscheduler"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    # Redact secrets from ALL logs and keep Render clean from expected
-    # APScheduler deploy/cold-start noise.
+    # Redact secrets from ALL logs
     secrets = [
         os.environ.get("TELEGRAM_TOKEN", ""),
         os.environ.get("EMAIL_PASS", ""),
     ]
-    _redact_filter = RedactSecretsFilter(secrets)
-    _render_nolag_filter = RenderNoLagNoiseFilter() if 'RenderNoLagNoiseFilter' in globals() else None
-    _root_logger = logging.getLogger()
-    _root_logger.addFilter(_redact_filter)
-    if _render_nolag_filter:
-        _root_logger.addFilter(_render_nolag_filter)
-    for _handler in list(_root_logger.handlers or []):
-        try:
-            _handler.addFilter(_redact_filter)
-            if _render_nolag_filter:
-                _handler.addFilter(_render_nolag_filter)
-        except Exception:
-            pass
-    if _render_nolag_filter:
-        for _lname in ("apscheduler", "apscheduler.executors.default", "apscheduler.scheduler"):
-            try:
-                logging.getLogger(_lname).addFilter(_render_nolag_filter)
-            except Exception:
-                pass
+    logging.getLogger().addFilter(RedactSecretsFilter(secrets))
 
 
 # Call once at import time (after TOKEN/envs exist)
@@ -5719,15 +5482,7 @@ MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "72"))
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
 MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "10000000"))
 # Production quality floor: no setup display/email/autotrade below this 24h futures volume.
-# yver45: stale/default-style 15M env/config values are migrated down to 10M.
 SETUP_MIN_24H_VOL_USD = float(os.environ.get("SETUP_MIN_24H_VOL_USD", "10000000") or 10000000)
-try:
-    if abs(float(MIN_FUT_VOL_USD or 0.0) - 15_000_000.0) < 1.0:
-        MIN_FUT_VOL_USD = 10_000_000.0
-    if abs(float(SETUP_MIN_24H_VOL_USD or 0.0) - 15_000_000.0) < 1.0:
-        SETUP_MIN_24H_VOL_USD = 10_000_000.0
-except Exception:
-    pass
 MIN_FUT_VOL_USD = max(float(MIN_FUT_VOL_USD or 0.0), float(SETUP_MIN_24H_VOL_USD or 0.0), 10_000_000.0)
 MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP", os.environ.get("MIN_RR_TP", "1.45"))))
 MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as final target
@@ -5752,11 +5507,6 @@ def _setup_volume_ok(setup_or_vol) -> bool:
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
 EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
-try:
-    if abs(float(EMAIL_MIN_FUT_VOL_USD or 0.0) - 15_000_000.0) < 1.0:
-        EMAIL_MIN_FUT_VOL_USD = 10_000_000.0
-except Exception:
-    pass
 
 # ✅ Production scan breadth + loosened trigger only for screen (NOT email)
 # Hard API-load guard: live setup generation must never fan out across hundreds of symbols.
@@ -5830,16 +5580,13 @@ def _setup_audit_row_inside_delivery_window(row: dict) -> bool:
 
 
 def _setup_audit_row_matches_active_session(row: dict, session_name: str = '') -> bool:
-    """Return whether an audit row is still deliverable in the live lane.
+    """Keep Policy=current/actionable, not historical policy.
 
-    yver62: do NOT drop a fresh KEEP/OPEN setup only because the wall-clock
-    session changed after generation. The entry window is the delivery contract
-    for /screen, setup email and AutoTrade. Historical/expired rows remain
-    session-aware so old ASIA rows do not leak into later sessions.
+    A setup from a previous session can remain visible for audit/learning, but it
+    should not be labelled KEEP/WATCH if the live email/autotrade loop is already
+    operating in another market session.
     """
     try:
-        if _setup_audit_row_inside_delivery_window(dict(row or {})):
-            return True
         sess = str(session_name or (row or {}).get('session') or (row or {}).get('source_session') or '').upper().strip()
         live = str(current_session_utc(datetime.now(timezone.utc)) or '').upper().strip()
         if live in {'ASIA', 'LON', 'NY'} and sess in {'ASIA', 'LON', 'NY'}:
@@ -5847,30 +5594,6 @@ def _setup_audit_row_matches_active_session(row: dict, session_name: str = '') -
         return True
     except Exception:
         return True
-
-
-def _fresh_setup_policy_session(setup_or_row, fallback_session: str = '') -> str:
-    """Effective policy/evidence session for a fresh setup.
-
-    A setup generated at 18:05 as F2-ASIA-NOR must keep using ASIA combo policy
-    during its 60m entry window, even if the current runtime session becomes LON.
-    The delivery bucket may be LON, but policy/executable quality must be checked
-    against the setup's own source session.
-    """
-    try:
-        fb = str(fallback_session or '').upper().strip()
-        src = ''
-        if isinstance(setup_or_row, dict):
-            src = str(setup_or_row.get('source_session') or setup_or_row.get('session') or '').upper().strip()
-            ts = float(_setup_audit_row_ts(setup_or_row) or setup_or_row.get('created_ts') or setup_or_row.get('signal_created_ts') or 0.0)
-        else:
-            src = str(getattr(setup_or_row, 'source_session', '') or getattr(setup_or_row, 'session', '') or '').upper().strip()
-            ts = float(getattr(setup_or_row, 'created_ts', 0.0) or getattr(setup_or_row, 'signal_created_ts', 0.0) or getattr(setup_or_row, 'executable_ts', 0.0) or 0.0)
-        if src in {'ASIA', 'LON', 'NY'} and ts > 0 and (float(time.time()) - ts) <= float(_setup_delivery_actionable_window_sec()):
-            return src
-        return src if src in {'ASIA', 'LON', 'NY'} else fb
-    except Exception:
-        return str(fallback_session or '').upper().strip()
 
 SCREEN_UNIVERSE_N = int(os.environ.get("SCREEN_UNIVERSE_N", str(SCAN_SYMBOL_LIMIT)) or SCAN_SYMBOL_LIMIT)
 SCREEN_TRIGGER_LOOSEN = 0.82    # 15% easier trigger on /screen only
@@ -7324,7 +7047,7 @@ def _strategy_config_apply_ver08_quality_patch() -> None:
         cfg['family_allocator_enforce_live'] = False
 
         # Quality floors: reduce raw noise, but avoid the too-tight Ver08 1-3/day profile.
-        cfg['min_fut_vol_usd'] = 10_000_000.0
+        cfg['min_fut_vol_usd'] = max(15_000_000.0, float(cfg.get('min_fut_vol_usd', 0) or 0.0))
         cfg['quality_score_min_screen'] = max(63.0, float(cfg.get('quality_score_min_screen', 0) or 0.0))
         cfg['quality_score_min_email'] = 70.0
         cfg['min_rr_tp'] = 1.35
@@ -7367,11 +7090,7 @@ def apply_strategy_config(cfg: dict) -> None:
 
     # Liquidity + RR
     try:
-        # yver45: migrate old/persisted 15M default down to the requested 10M floor.
-        cfg_vol = float(cfg.get("min_fut_vol_usd", 10_000_000.0) or 10_000_000.0)
-        if abs(cfg_vol - 15_000_000.0) < 1.0:
-            cfg_vol = 10_000_000.0
-        MIN_FUT_VOL_USD = max(_setup_min_volume_floor_usd(), float(cfg_vol or 10_000_000.0))
+        MIN_FUT_VOL_USD = max(_setup_min_volume_floor_usd(), float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD) or 0.0))
         EMAIL_MIN_FUT_VOL_USD = float(MIN_FUT_VOL_USD)
     except Exception:
         pass
@@ -7771,7 +7490,6 @@ try:
     _autotrade_apply_ver20_blackout_policy_defaults()
     _autotrade_apply_ver57_blackout_config_sync()
     _autotrade_apply_ver29_day_aware_blackout_defaults()
-    _autotrade_apply_ver97_blackout_restore_defaults()
     _autotrade_apply_ver15_time_exit_policy_defaults()
     _autotrade_apply_ver17_time_risk_policy_defaults()
     _autotrade_apply_ver58_time_exit_runtime_defaults()
@@ -14681,9 +14399,43 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     if sl_for_order <= 0:
         sl_for_order = intended_sl
     if side == 'BUY' and sl_for_order >= price_ref:
-        return (False, 'stop_invalid_after_tick_rounding_for_buy')
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'reject_reason': 'stop_invalid_after_tick_rounding_for_buy',
+                'live_entry': float(price_ref),
+                'rounded_sl': float(sl_for_order),
+            })
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(
+                int(uid), setup_id,
+                state=_admin_setup_state_from_reason('stale_deadline'),
+                last_reason=f'setup_invalidated_by_price_after_rounding BUY entry={float(price_ref):.10g} sl={float(sl_for_order):.10g}'
+            )
+        except Exception:
+            pass
+        return (False, 'setup_invalidated_by_price_buy')
     if side == 'SELL' and sl_for_order <= price_ref:
-        return (False, 'stop_invalid_after_tick_rounding_for_sell')
+        try:
+            _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+            _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+                'reject_reason': 'stop_invalid_after_tick_rounding_for_sell',
+                'live_entry': float(price_ref),
+                'rounded_sl': float(sl_for_order),
+            })
+        except Exception:
+            pass
+        try:
+            _admin_setup_lifecycle_merge(
+                int(uid), setup_id,
+                state=_admin_setup_state_from_reason('stale_deadline'),
+                last_reason=f'setup_invalidated_by_price_after_rounding SELL entry={float(price_ref):.10g} sl={float(sl_for_order):.10g}'
+            )
+        except Exception:
+            pass
+        return (False, 'setup_invalidated_by_price_sell')
 
     equity = _effective_equity_for_risk(get_user(uid) or {}, prefer_live=(str(_autotrade_runtime_mode()).lower() == 'live'))
     if equity <= 0:
@@ -16938,7 +16690,7 @@ def _admin_status_cache_put(name: str, value: Any) -> None:
 HEAVY_ADMIN_CACHE_TTL_SEC = int(os.getenv("HEAVY_ADMIN_CACHE_TTL_SEC", "75") or 75)
 HEAVY_ADMIN_STALE_TTL_SEC = int(os.getenv("HEAVY_ADMIN_STALE_TTL_SEC", "900") or 900)
 HEAVY_ADMIN_COMMAND_TIMEOUT_SEC = int(os.getenv("HEAVY_ADMIN_COMMAND_TIMEOUT_SEC", "8") or 8)
-HEAVY_USER_ACTIVITY_DEFER_SEC = int(os.getenv("HEAVY_USER_ACTIVITY_DEFER_SEC", "360") or 360)
+HEAVY_USER_ACTIVITY_DEFER_SEC = int(os.getenv("HEAVY_USER_ACTIVITY_DEFER_SEC", "180") or 180)
 LOG_WARN_THROTTLE_SEC = int(os.getenv("LOG_WARN_THROTTLE_SEC", "120") or 120)
 _LOG_WARN_THROTTLE_UNTIL: dict[str, float] = {}
 
@@ -16974,10 +16726,7 @@ def _live_trade_runtime_busy(window_sec: int | None = None) -> bool:
     optimizer/backtest work.
     """
     try:
-        # Ver71: live AutoTrade/SLTP repair is a core safety/action lane, not a
-        # heavy research job. User commands should not pause it for 6 minutes;
-        # keep screen/scan/optimizer pressure checks below to avoid real contention.
-        if (not bool(globals().get('AUTOTRADE_CORE_IGNORE_USER_ACTIVITY_DEFER', True))) and _recent_user_activity(window_sec if window_sec is not None else HEAVY_USER_ACTIVITY_DEFER_SEC):
+        if _recent_user_activity(window_sec if window_sec is not None else HEAVY_USER_ACTIVITY_DEFER_SEC):
             return True
         if SCAN_LOCK.locked() or _SCREEN_LOCK.locked():
             return True
@@ -18016,126 +17765,6 @@ def _note_status(status: str, base: str, mv: "MarketVol", extra: str = "") -> No
     return
 
 
-
-
-def _reject_diag_migrate_tables() -> None:
-    """Persist full /why reject snapshots so diagnostics survive restarts/blackout periods."""
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute("""CREATE TABLE IF NOT EXISTS scan_reject_diagnostics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_ts REAL NOT NULL DEFAULT 0,
-                user_id INTEGER NOT NULL DEFAULT 0,
-                mode TEXT NOT NULL DEFAULT '',
-                session TEXT NOT NULL DEFAULT '',
-                payload_json TEXT NOT NULL DEFAULT '{}'
-            )""")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_scan_reject_diag_user_ts ON scan_reject_diagnostics(user_id, created_ts)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_scan_reject_diag_mode_session_ts ON scan_reject_diagnostics(mode, session, created_ts)")
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _reject_diag_payload_meaningful(payload: dict | None) -> bool:
-    try:
-        if not isinstance(payload, dict):
-            return False
-        if payload.get('counts'):
-            return True
-        if payload.get('per_symbol'):
-            return True
-        if payload.get('allow'):
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _reject_diag_save_payload(payload: dict, uid: int | None = None) -> None:
-    """Save the same rich reject payload used by /why.
-
-    Ver98: /why became too short after deploys/blackout because _LAST_REJECTS is
-    in-memory only. Saving the payload lets /why show the last real raw scan even
-    while current setup generation is intentionally blacked out.
-    """
-    try:
-        if not _reject_diag_payload_meaningful(payload):
-            return
-        _reject_diag_migrate_tables()
-        user_id = int(uid or 0)
-        created_ts = float(payload.get('ts') or time.time())
-        mode = str(payload.get('mode') or '').strip().lower()
-        session = str(payload.get('session') or '').strip().upper()
-        # Trim extreme payloads but keep the exact old /why information.
-        safe_payload = dict(payload)
-        try:
-            counts = dict(safe_payload.get('counts') or {})
-            if len(counts) > 220:
-                counts = dict(sorted(counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:220])
-                safe_payload['counts'] = counts
-        except Exception:
-            pass
-        try:
-            per = dict(safe_payload.get('per_symbol') or {})
-            if len(per) > 120:
-                keep = list(per.items())[:120]
-                safe_payload['per_symbol'] = dict(keep)
-        except Exception:
-            pass
-        with sqlite3.connect(DB_PATH) as conn:
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO scan_reject_diagnostics(created_ts,user_id,mode,session,payload_json) VALUES(?,?,?,?,?)",
-                (created_ts, user_id, mode, session, json.dumps(safe_payload, default=str, separators=(',', ':'))),
-            )
-            # Keep DB small. These diagnostics are operational, not long-term evidence.
-            cutoff = time.time() - 7 * 86400
-            c.execute("DELETE FROM scan_reject_diagnostics WHERE created_ts<?", (float(cutoff),))
-            conn.commit()
-    except Exception:
-        pass
-
-
-def _reject_diag_latest_payload(uid: int = 0, max_age_hours: float = 72.0) -> dict:
-    """Return latest meaningful raw reject payload for /why, including shared uid=0 scans."""
-    try:
-        _reject_diag_migrate_tables()
-        ids = []
-        try:
-            if int(uid or 0) > 0:
-                ids.append(int(uid))
-        except Exception:
-            pass
-        try:
-            owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
-            if owner_uid > 0 and owner_uid not in ids:
-                ids.append(owner_uid)
-        except Exception:
-            pass
-        if 0 not in ids:
-            ids.append(0)
-        qmarks = ','.join('?' for _ in ids)
-        cutoff = float(time.time()) - max(3600.0, float(max_age_hours or 72.0) * 3600.0)
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
-            rows = c.execute(
-                f"SELECT payload_json FROM scan_reject_diagnostics WHERE created_ts>=? AND user_id IN ({qmarks}) ORDER BY created_ts DESC LIMIT 80",
-                (cutoff, *ids),
-            ).fetchall() or []
-        for r in rows:
-            try:
-                payload = json.loads(str(r['payload_json'] or '{}'))
-                if _reject_diag_payload_meaningful(payload):
-                    return payload
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return {}
-
 def _setup_pipeline_recent_gate_summary(uid: int = 0, session: str = '', lookback_min: int = 45) -> dict:
     """Summarise post-generation executable gate events for /why.
 
@@ -18261,16 +17890,6 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
             if isinstance(_v, dict) and (_v.get("counts") or _v.get("per_symbol") or _v.get("allow")):
                 candidates.append(_v)
 
-    # Ver98: also load the last meaningful raw scan from SQLite. This keeps /why
-    # complete after a redeploy and during blackout windows where the current scan
-    # is intentionally skipped.
-    try:
-        _persisted = _reject_diag_latest_payload(int(uid), max_age_hours=72.0)
-        if isinstance(_persisted, dict) and (_persisted.get("counts") or _persisted.get("per_symbol") or _persisted.get("allow")):
-            candidates.append(_persisted)
-    except Exception:
-        pass
-
     def _ts(_r: dict) -> float:
         try:
             return float((_r or {}).get("ts") or 0.0)
@@ -18367,19 +17986,6 @@ def _reject_report_for_uid(uid: int, top_n: int = 12) -> str:
             extra.append(f"Updated: {_when} Melbourne")
         if extra:
             lines.append(" • ".join(extra))
-        try:
-            age_min = (time.time() - float(_tsv or 0.0)) / 60.0 if _tsv > 0 else 0.0
-            if age_min >= 30.0:
-                lines.append(f"Showing last meaningful raw scan ({age_min:.0f}m old); current scan may be blacked out, empty, or warming.")
-        except Exception:
-            pass
-    except Exception:
-        pass
-    try:
-        _sblk, _swhy = _setup_generation_blackout_now()
-        _eblk, _ewhy = _autotrade_entry_blackout_now()
-        lines.append(f"Setup blackout now: {'ACTIVE' if _sblk else 'OPEN'}" + (f" | {_swhy}" if _sblk and _swhy else "") + f" | windows={_setup_generation_blackout_windows()}")
-        lines.append(f"Entry blackout now: {'ACTIVE' if _eblk else 'OPEN'}" + (f" | {_ewhy}" if _eblk and _ewhy else "") + f" | windows={_autotrade_entry_blackout_windows()}")
     except Exception:
         pass
     if allow_set_unique:
@@ -18920,9 +18526,14 @@ def db_init():
     if "sessions_unlimited" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN sessions_unlimited INTEGER NOT NULL DEFAULT 0")
     
-    # NEW: Big-move alert emails (even if not a valid setup)
+    # NEW: Big-move alert emails (raw market-event email, even if not a valid setup)
     if "bigmove_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN bigmove_alert_on INTEGER NOT NULL DEFAULT 1")
+
+    # ver36: split raw Big-Move alert emails from BigMove/F8 setup emails.
+    # Users can turn raw alert emails OFF while keeping F8 setup emails ON.
+    if "bigmove_setup_email_on" not in cols:
+        cur.execute("ALTER TABLE users ADD COLUMN bigmove_setup_email_on INTEGER NOT NULL DEFAULT 1")
     
     # Big-move alert defaults: 15m >= 1.5%, 1H >= 3%, 4H >= 5% in the same direction.
     if "bigmove_alert_15m" not in cols:
@@ -18977,7 +18588,7 @@ def db_init():
     if "spike_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_alert_on INTEGER NOT NULL DEFAULT 1")
 
-    # default volume gate: 10M
+    # default volume gate: 15M
     if "spike_min_vol_usd" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
 
@@ -20202,7 +19813,7 @@ def _safe_float(x, default: float = 0.0) -> float:
 BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "1.5") or 1.5)
 BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") or 3.0)
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
-BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "10000000") or 10_000_000.0)
+BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0)
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "7200") or 7200)  # Ver15: same-symbol/same-direction F8 cooldown (opposite direction still allowed)
 # Guard against stale Render env BIGMOVE_COOLDOWN_SEC=0 from older no-cooldown builds.
@@ -20701,10 +20312,23 @@ def _user_bigmove_thresholds(user: dict | None) -> tuple[float, float, float]:
     return float(p15), float(p1), float(p4)
 
 
+def _user_bigmove_setup_email_on(user: dict | None) -> bool:
+    """Whether confirmed BigMove/F8 candidates may still become normal setup emails.
+
+    This is intentionally separate from bigmove_alert_on, which controls only the
+    raw market-event Big-Move notification email. Default ON preserves F8 setups.
+    """
+    try:
+        return bool(int((user or {}).get("bigmove_setup_email_on", 1) or 0))
+    except Exception:
+        return True
+
+
 def _user_bigmove_min_vol_usd(user: dict | None, default: float = BIGMOVE_DEFAULT_MIN_VOL_USD) -> float:
     """Resolve big-move min volume with backward-compatible fallback.
 
-    Commercial floor: keep big-move alerts at or above 10M 24h volume.
+    Commercial floor: keep big-move alerts at or above 15M 24h volume unless a
+    future code change intentionally introduces a lower supported floor.
     """
     floor = float(BIGMOVE_MIN_SUPPORTED_VOL_USD)
     try:
@@ -21224,44 +20848,17 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
             session=str(session_name or '').upper().strip(),
         )
 
-        # yver127: BigMove/F8 candidates normally pass through the same NOR→REV
-        # router BEFORE becoming an emailed/executable delivery lane.  Ver74 adds a
-        # safety correction for confirmed BigMove alerts: if the router flips the
-        # continuation signal into the opposite side and that opposite side is then
-        # blocked by the real-time leader/loser context guard (e.g. HMSTR DOWN ->
-        # REV BUY on a loser), preserve the original confirmed continuation side.
-        # The preserved row still goes through the same executable, KEEP-policy,
-        # cooldown, risk and AutoTrade gates; this is not a policy bypass.
+        # yver127: BigMove/F8 candidates must pass through the same NOR→REV
+        # router BEFORE becoming an emailed/executable delivery lane.  Previously
+        # a raw disabled F8-ASIA-NOR-SELL could be emailed and then AutoTrade
+        # correctly skipped it as final_combo_disabled, while /setup_audit showed
+        # the routed F8-ASIA-REV-BUY.  Route first, then lock the delivered lane.
         try:
             owner_for_policy = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
         except Exception:
             owner_for_policy = 0
         try:
-            _raw_bigmove_setup = copy.deepcopy(s)
-        except Exception:
-            _raw_bigmove_setup = s
-        try:
             s = _setup_route_candidate_for_executable_lane(s, session_name=session_name, user_id=owner_for_policy)
-        except Exception:
-            pass
-        try:
-            routed_ok, routed_why, routed_meta = _setup_directional_context_guard_allows_setup(s, session_name=session_name, user_id=owner_for_policy)
-            raw_ok, raw_why, raw_meta = _setup_directional_context_guard_allows_setup(_raw_bigmove_setup, session_name=session_name, user_id=owner_for_policy)
-            raw_side = str(getattr(_raw_bigmove_setup, 'side', '') or '').upper().strip()
-            raw_dir = str(c.get('direction') or '').upper().strip()
-            raw_matches_alert = bool((raw_dir == 'UP' and raw_side == 'BUY') or (raw_dir == 'DOWN' and raw_side == 'SELL'))
-            if (not routed_ok) and raw_ok and raw_matches_alert and str(routed_why or '').startswith('directional_context_blocks'):
-                s = _raw_bigmove_setup
-                try:
-                    _setup_strategy_set_attr(s, 'setup_strategy', 'NORMAL')
-                    _setup_strategy_set_attr(s, 'strategy', 'NORMAL')
-                    _setup_strategy_set_attr(s, 'strategy_mode', 'NORMAL')
-                    _setup_strategy_set_attr(s, 'strategy_reason', f'bigmove_continuation_preserved_after_reverse_context_block:{str(routed_why or "")[:180]}')
-                    _setup_strategy_set_attr(s, 'bigmove_reverse_context_blocked', True)
-                    _setup_strategy_set_attr(s, 'bigmove_reverse_block_reason', str(routed_why or '')[:240])
-                    _setup_strategy_set_attr(s, 'bigmove_raw_context_reason', str(raw_why or '')[:240])
-                except Exception:
-                    pass
         except Exception:
             pass
 
@@ -21294,117 +20891,6 @@ def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None
     except Exception:
         return None
 
-
-
-def _bigmove_candidate_to_autotrade_setup_fast(candidate: dict, best_fut: dict | None = None, session_name: str = '') -> Optional[Setup]:
-    """Timeout-safe BigMove/F8 setup builder.
-
-    The normal BigMove builder can call the strategy router/research finalizer, which is
-    useful but not allowed to make the F8 setup-email leg disappear under load. This fast
-    builder creates the same continuation setup from the confirmed BigMove alert and then
-    lets the existing presend KEEP/context/executable gates decide delivery/trading.
-    """
-    try:
-        c = dict(candidate or {})
-        sym = str(c.get('symbol') or '').upper().strip()
-        if not sym:
-            return None
-        plan = _bigmove_autotrade_price_plan(c, best_fut)
-        if not bool((plan or {}).get('ok')):
-            return None
-        mv = _bigmove_candidate_marketvol(c, best_fut)
-        fut_vol = float(c.get('vol') or (usd_notional(mv) if mv is not None else 0.0) or 0.0)
-        ch15 = float(c.get('confirm_15m_pct', c.get('ch15', 0.0)) or 0.0)
-        ch1 = float(c.get('ch1', 0.0) or 0.0)
-        ch4 = float(c.get('ch4', 0.0) or 0.0)
-        ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0) if mv is not None else 0.0
-        direction = str(c.get('direction') or '').upper().strip()
-        side = str((plan or {}).get('side') or '').upper().strip()
-        if side not in {'BUY', 'SELL'}:
-            side = 'BUY' if direction == 'UP' else 'SELL'
-        conf = _bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, fut_vol, 0.0)
-        conf = int(clamp(max(float(conf), 82.0), 68.0, 96.0))
-        setup_id = f"BMAT-{sym}-{side}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-        sess_u = str(session_name or '').upper().strip()
-        market_symbol = _bigmove_candidate_market_symbol(c, best_fut)
-        now_ts = float(time.time())
-        s = Setup(
-            setup_id=setup_id,
-            symbol=sym,
-            market_symbol=market_symbol,
-            side=side,
-            conf=int(conf),
-            entry=float((plan or {}).get('entry') or 0.0),
-            sl=float((plan or {}).get('sl') or 0.0),
-            tp=float((plan or {}).get('tp') or 0.0),
-            alt_target_a=0.0,
-            alt_target_b=0.0,
-            fut_vol_usd=float(fut_vol),
-            ch24=float(ch24),
-            ch4=float(ch4),
-            ch1=float(ch1),
-            ch15=float(ch15),
-            ema_support_period=0,
-            ema_support_dist_pct=0.0,
-            pullback_ema_period=0,
-            pullback_ema_dist_pct=0.0,
-            pullback_ready=True,
-            pullback_bypass_hot=True,
-            leader_base_override=True,
-            engine='F8',
-            is_trailing_alt_target_b=False,
-            created_ts=now_ts,
-            family_id=BIGMOVE_FAMILY_ID,
-            family_name=BIGMOVE_FAMILY_NAME,
-            session=sess_u,
-        )
-        try:
-            _setup_strategy_set_attr(s, 'setup_strategy', 'NORMAL')
-            _setup_strategy_set_attr(s, 'strategy', 'NORMAL')
-            _setup_strategy_set_attr(s, 'strategy_mode', 'NORMAL')
-            _setup_strategy_set_attr(s, 'strategy_reason', 'bigmove_fast_builder_timeout_safe_continuation')
-        except Exception:
-            pass
-        try:
-            setattr(s, 'atr_pct', float((plan or {}).get('atr_pct') or 0.0))
-            setattr(s, 'quality_score', 0.0)
-            setattr(s, 'source_kind', 'emailed_setups')
-            setattr(s, 'source_session', sess_u)
-            setattr(s, 'delivery_lane_locked', True)
-            setattr(s, 'email_logged_ts', now_ts)
-            setattr(s, 'emailed_ts', now_ts)
-            setattr(s, 'bigmove_signal', True)
-            setattr(s, 'bigmove_alert_autotrade', True)
-            setattr(s, 'bigmove_direction', direction)
-            setattr(s, 'bigmove_sl_model', str((plan or {}).get('sl_model') or ''))
-            setattr(s, 'bigmove_sl_pct', float((plan or {}).get('sl_pct') or 0.0))
-            setattr(s, 'bigmove_tp_pct', float((plan or {}).get('tp_pct') or 0.0))
-            setattr(s, 'bigmove_rr', float((plan or {}).get('rr') or BIGMOVE_AUTOTRADE_RR))
-            setattr(s, 'risk_source', 'autotrade_config')
-            setattr(s, 'bigmove_routed_side', side)
-            setattr(s, 'bigmove_routed_strategy', 'NORMAL')
-            setattr(s, 'why', f"Confirmed Big-Move alert {direction} | Fast F8 continuation {side} | SL {float((plan or {}).get('sl_pct') or 0.0):.2f}% ({(plan or {}).get('sl_model')}) | TP {float((plan or {}).get('tp_pct') or 0.0):.2f}% (~{float((plan or {}).get('rr') or BIGMOVE_AUTOTRADE_RR):.2f}R)")
-        except Exception:
-            pass
-        return s
-    except Exception:
-        return None
-
-
-def _bigmove_candidates_to_autotrade_setups_fast(candidates: list, best_fut: dict | None = None, session_name: str = '') -> list:
-    out = []
-    try:
-        max_n = max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 1))
-    except Exception:
-        max_n = 8
-    for c in list(candidates or [])[:max_n]:
-        try:
-            s = _bigmove_candidate_to_autotrade_setup_fast(c, best_fut, session_name=session_name)
-            if s is not None:
-                out.append(s)
-        except Exception:
-            continue
-    return out
 
 def _bigmove_candidates_to_autotrade_setups(candidates: list, best_fut: dict | None = None, session_name: str = '') -> list:
     out = []
@@ -21483,15 +20969,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             }
             return
 
-        try:
-            setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(fresh_candidates or []), best_fut or {}, sess, timeout=8)
-        except Exception:
-            setup_list = []
-        if not setup_list:
-            try:
-                setup_list = _bigmove_candidates_to_autotrade_setups_fast(list(fresh_candidates or []), best_fut or {}, sess)
-            except Exception:
-                setup_list = []
+        setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(fresh_candidates or []), best_fut or {}, sess, timeout=8)
         if not setup_list:
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
                 'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
@@ -21618,7 +21096,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
 
 def _spike_reversal_candidates(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 10_000_000.0,
+    min_vol_usd: float = 15_000_000.0,
     wick_ratio_min: float = 0.55,
     atr_mult_min: float = 1.20,
     max_items: int = 10,
@@ -21766,7 +21244,7 @@ def _spike_reversal_candidates(
 
 def _spike_reversal_warnings(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 10_000_000.0,
+    min_vol_usd: float = 15_000_000.0,
     atr_mult_min: float = 1.05,
     body_ratio_min: float = 0.50,
     lookback_1h: int = 8,
@@ -25396,17 +24874,8 @@ def db_list_executable_setups(user_id: int, session_name: str = '', ts_from: flo
     where_session = ''
     sess = str(session_name or '').upper().strip()
     if sess:
-        # yver62: fresh executable rows remain valid until entry_window expires even
-        # when the live session rolls over (for example ASIA KEEP at 18:05, LON at
-        # 18:13).  Since ts_from is already the entry-window cutoff, allow any
-        # fresh row while preserving strict session filtering when explicitly disabled.
-        if env_bool('ALLOW_FRESH_CROSS_SESSION_EXECUTABLES', True):
-            where_session = ' AND (UPPER(COALESCE(x.session, "")) = ? OR x.executable_ts >= ?) '
-            params.append(sess)
-            params.append(float(ts_from))
-        else:
-            where_session = ' AND UPPER(COALESCE(x.session, "")) = ? '
-            params.append(sess)
+        where_session = ' AND UPPER(COALESCE(x.session, "")) = ? '
+        params.append(sess)
     fetch_limit = max(int(limit or 10), min(max(int(limit or 10) * 6, int(limit or 10) + 30), 250))
     params.append(int(fetch_limit))
     cur.execute(
@@ -27522,13 +26991,6 @@ def _no_reject_stats_fallback_report(uid: int) -> str:
     except Exception:
         pass
     try:
-        _sblk, _swhy = _setup_generation_blackout_now()
-        _eblk, _ewhy = _autotrade_entry_blackout_now()
-        lines.append(f"Setup blackout now: {'ACTIVE' if _sblk else 'OPEN'}" + (f" | {_swhy}" if _sblk and _swhy else "") + f" | windows={_setup_generation_blackout_windows()}")
-        lines.append(f"Entry blackout now: {'ACTIVE' if _eblk else 'OPEN'}" + (f" | {_ewhy}" if _eblk and _ewhy else "") + f" | windows={_autotrade_entry_blackout_windows()}")
-    except Exception:
-        pass
-    try:
         recent_universe = list(dict.fromkeys([str(x).upper().strip() for x in (globals().get('_LAST_SCAN_UNIVERSE') or []) if str(x).strip()]))
         if recent_universe:
             lines.append(f"Universe: {len(recent_universe)} symbols")
@@ -27540,12 +27002,9 @@ def _no_reject_stats_fallback_report(uid: int) -> str:
     except Exception:
         sess = ''
     try:
-        build_ev = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='build_priority_pool_fallback', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or _latest_setup_pipeline_event(0, stage='build_priority_pool_fallback', mode='email') or {}
-        pool_ev = _latest_setup_pipeline_event(0, stage='email_pool_session', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session_skip', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session_cache', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session', mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session_skip', mode='email') or _latest_setup_pipeline_event(0, stage='email_pool_session_cache', mode='email') or {}
+        build_ev = _latest_setup_pipeline_event(0, stage='build_priority_pool', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='build_priority_pool', mode='email') or {}
         exec_ev = _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', session=sess, mode='email') or _latest_setup_pipeline_event(int(uid), stage='email_executable_pool', mode='email') or {}
         screen_ev = _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', session=sess, mode='screen') or _latest_setup_pipeline_event(int(uid), stage='screen_executable_pool', mode='screen') or {}
-        bm_build_ev = _latest_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', session=sess, mode='bigmove_setup_email') or _latest_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', session=sess, mode='bigmove_setup_email') or _latest_setup_pipeline_event(int(uid), stage='bigmove_setup_email_delivery', session=sess, mode='bigmove_setup_email') or {}
-        blackout_ev = _latest_setup_pipeline_event(int(uid), stage='setup_email_blackout', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='executable_setup_generation_blackout', session=sess, mode='email') or _latest_setup_pipeline_event(0, stage='executable_setup_generation_blackout', mode='email') or {}
         def _one(label, ev):
             if not ev:
                 return
@@ -27566,26 +27025,15 @@ def _no_reject_stats_fallback_report(uid: int) -> str:
                         parts.append(f"{k}={det.get(k)}")
             top = det.get('top_reasons') or det.get('top_rejects') or det.get('top_exec_rejects') or []
             if top:
-                try:
-                    if isinstance(top, dict):
-                        top_items = [f"{k}={v}" for k, v in list(top.items())[:4]]
-                    else:
-                        top_items = [str(x) for x in list(top)[:4]]
-                    if top_items:
-                        parts.append('top=' + ', '.join(top_items))
-                except Exception:
-                    pass
+                parts.append('top=' + ', '.join([str(x) for x in top[:4]]))
             err = str(det.get('error') or '').strip()
             if err:
                 parts.append(err[:160])
             lines.append(f"{label}: " + " | ".join(parts))
         lines.append(SEP)
         _one('Email build', build_ev)
-        _one('Email pool', pool_ev)
         _one('Email executable', exec_ev)
         _one('Screen executable', screen_ev)
-        _one('Blackout gate', blackout_ev)
-        _one('BigMove/F8 setup', bm_build_ev)
     except Exception:
         pass
     if len(lines) <= 2:
@@ -41724,7 +41172,7 @@ Trade Journal
 /limits emaildaycap 
 • Set max number of emails per day
 
-/bigmove_alert on|off [15m%] [1H%] [4H%]
+/bigmove_alert on|off|setup_on|setup_off [15m%] [1H%] [4H%]
 • Big move alerts in either direction (UP or DOWN)
 • Defaults: 15m=2%, 1H=4%, 4H=6%, Min Vol=18M
 • Email sends only after the next 15m candle confirms the same direction
@@ -41943,7 +41391,7 @@ def build_help_html(title: str, sections: list) -> str:
 # =========================================================
 # TELEGRAM COMMANDS
 # =========================================================
-FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "start", "screen", "size", "health", "status", "equity", "trade_close", "why"}
+FAST_PATH_COMMANDS = {"help", "commands", "help_admin", "size", "health", "status", "equity", "trade_close", "why"}
 
 
 def _command_args_from_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> list[str]:
@@ -42243,11 +41691,6 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
         if not msg:
             return
         txt = str(msg.text or '').strip()
-        if txt.startswith('/'):
-            try:
-                _mark_user_activity()
-            except Exception:
-                pass
         if not txt.startswith('/'):
             return
         cmd = txt.split()[0][1:].split('@')[0].strip().lower()
@@ -42282,8 +41725,7 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
             await _instant_status_cmd(update, context)
             raise ApplicationHandlerStop
         if cmd == 'equity':
-            if await _owner_defer_command(update, context, cmd, '_instant_equity_cmd'):
-                raise ApplicationHandlerStop
+            await _instant_equity_cmd(update, context)
             raise ApplicationHandlerStop
         if cmd == 'trade_close':
             await _instant_trade_close_cmd(update, context)
@@ -42297,755 +41739,6 @@ async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAUL
         if cmd == 'health':
             await health_cmd(update, context)
             raise ApplicationHandlerStop
-    except ApplicationHandlerStop:
-        raise
-    except Exception:
-        return
-
-
-async def _instant_reply(update: Update, text: str, parse_mode: Optional[str] = None, reply_markup=None, context: ContextTypes.DEFAULT_TYPE | None = None) -> bool:
-    """Best-effort short Telegram reply for the fast command lane.
-
-    yver76: prefer direct bot.send_message and await it for a tiny bounded window.
-    The previous fire-and-forget-only ACK could disappear if the owner/admin lane
-    did not match the requester or if the created task was delayed behind other
-    loop work. This function is intentionally tiny and must never run DB/Bybit work.
-    """
-    try:
-        if not update or not getattr(update, 'effective_chat', None):
-            return False
-    except Exception:
-        return False
-
-    txt = str(text or '')
-    base_timeout = max(1.0, min(2.5, float(TELEGRAM_INSTANT_REPLY_TIMEOUT_SEC or 2.0)))
-    try:
-        chat_id = getattr(getattr(update, 'effective_chat', None), 'id', None)
-        if chat_id is None:
-            return False
-        bot = getattr(context, 'bot', None) if context is not None else None
-        if bot is None:
-            try:
-                bot = update.get_bot()
-            except Exception:
-                bot = getattr(update, '_bot', None)
-        if bot is None:
-            return False
-        try:
-            await asyncio.wait_for(
-                bot.send_message(
-                    chat_id=chat_id,
-                    text=txt,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=True,
-                    reply_markup=reply_markup,
-                    read_timeout=max(1.5, base_timeout),
-                    write_timeout=max(1.5, base_timeout),
-                    connect_timeout=1.5,
-                    pool_timeout=0.5,
-                ),
-                timeout=max(2.0, base_timeout + 0.5),
-            )
-            return True
-        except TypeError:
-            await asyncio.wait_for(
-                bot.send_message(chat_id=chat_id, text=txt, parse_mode=parse_mode, disable_web_page_preview=True, reply_markup=reply_markup),
-                timeout=max(2.0, base_timeout + 0.5),
-            )
-            return True
-    except Exception:
-        pass
-
-    # Reply fallback for older PTB contexts.
-    try:
-        if getattr(update, 'message', None):
-            await asyncio.wait_for(
-                update.message.reply_text(txt, parse_mode=parse_mode, disable_web_page_preview=True, reply_markup=reply_markup),
-                timeout=max(2.0, base_timeout + 0.5),
-            )
-            return True
-    except Exception:
-        return False
-    return False
-
-
-async def _owner_send_ack(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, parse_mode=None, reply_markup=None) -> bool:
-    """Await the visible ACK for a short bounded time.
-
-    User requirement: every command must visibly respond immediately, even if the
-    full report is produced later.  This is deliberately awaited now; background
-    work is scheduled only after the ACK attempt.
-    """
-    try:
-        return await _instant_reply(update, str(text or ''), parse_mode=parse_mode, reply_markup=reply_markup, context=context)
-    except Exception:
-        return False
-
-def _owner_or_admin_from_update(update: Update) -> bool:
-    try:
-        uid = int(getattr(getattr(update, 'effective_user', None), 'id', 0) or 0)
-        return bool(uid and (uid == int(AUTOTRADE_OWNER_UID or 0) or is_admin_user(uid)))
-    except Exception:
-        return False
-
-
-def _owner_fire_and_forget_reply(update: Update, text: str, parse_mode=None, reply_markup=None) -> None:
-    """Schedule a Telegram reply without making the command handler wait.
-
-    yver75: the previous no-lag lane still awaited the ACK send. If Telegram or
-    the connection pool was slow, /autotrade_debug and even /start could sit with
-    no visible response. This helper schedules the ACK and returns immediately;
-    the priority router then raises ApplicationHandlerStop before any heavy path.
-    """
-    try:
-        _safe_create_task(
-            _instant_reply(update, str(text or ''), parse_mode=parse_mode, reply_markup=reply_markup),
-            label='owner-fire-and-forget-ack',
-        )
-    except Exception:
-        pass
-
-
-def _owner_parse_hours_arg(args_snapshot: list[str], default: int = 24, min_h: int = 1, max_h: int = 168) -> int:
-    try:
-        if args_snapshot and str(args_snapshot[0]).strip():
-            return int(clamp(int(float(str(args_snapshot[0]).strip())), int(min_h), int(max_h)))
-    except Exception:
-        pass
-    return int(default)
-
-
-def _autotrade_debug_fast_text_sync(owner: int, request_uid: int | None = None) -> str:
-    """Fast, thread-safe AutoTrade debug snapshot for the no-lag lane.
-
-    It avoids the old async debug side-effects and direct live exchange refreshes.
-    The goal is a reliable diagnostic snapshot without blocking Telegram command
-    processing. Live trading/report logic is unchanged.
-    """
-    owner = int(owner or request_uid or AUTOTRADE_OWNER_UID or 0)
-    user = get_user(owner) or {}
-    now_utc = datetime.now(timezone.utc)
-    sess = current_session_utc(now_utc)
-    ready = _autotrade_ready()
-    sess_allowed = (sess != 'NONE') and _autotrade_allowed_session(sess)
-    try:
-        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, force_refresh=False)
-    except Exception:
-        snap = {}
-    equity = float((snap or {}).get('equity') or 0.0)
-    try:
-        mday = _autotrade_day_risk_metrics_cached(owner, float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, force_refresh=False)
-    except Exception:
-        mday = {}
-    try:
-        cap_mode, cap_value = _autotrade_daily_cap_settings()
-    except Exception:
-        cap_mode, cap_value = 'PCT', float(AUTOTRADE_DAILY_RISK_CAP_PCT)
-    try:
-        cap_usd = float(equity) * float(cap_value) / 100.0 if str(cap_mode).upper() == 'PCT' else float(cap_value)
-    except Exception:
-        cap_usd = 0.0
-    try:
-        open_risk = float((mday or {}).get('open_risk_now') or (snap or {}).get('current_total_open_risk') or 0.0)
-    except Exception:
-        open_risk = 0.0
-    try:
-        realised = float((mday or {}).get('realized_pnl_today') or (snap or {}).get('pnl_today') or 0.0)
-    except Exception:
-        realised = 0.0
-    daily_used = max(0.0, float(open_risk) - float(realised))
-    remaining = max(0.0, float(cap_usd) - float(daily_used)) if cap_usd > 0 else float('inf')
-    try:
-        opened_today = int((mday or {}).get('opened_today_count') or (snap or {}).get('positions_opened_today') or 0)
-        closed_today = int((mday or {}).get('closed_today_count') or (snap or {}).get('positions_closed_today') or 0)
-        open_now = int((mday or {}).get('open_positions_now') or (snap or {}).get('open_positions_now') or 0)
-    except Exception:
-        opened_today = closed_today = open_now = 0
-    try:
-        email_gate = _email_runtime_limits_snapshot(owner, user)
-    except Exception:
-        email_gate = {}
-    try:
-        open_rows = list((snap or {}).get('open_positions') or (mday or {}).get('open_positions') or [])
-    except Exception:
-        open_rows = []
-    lines = [
-        '🧪 AutoTrade Debug',
-        HDR,
-        f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Entries: {'ON' if _autotrade_entries_enabled() else 'OFF'} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
-        f"Trading day: {str((snap or {}).get('today_window_label') or '-')}",
-        f"Keep-all test: {'ON' if bool(AUTOTRADE_KEEP_ALL_TEST_MODE) else 'OFF'} | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(_autotrade_entry_window_min())}m",
-        SEP,
-        f"EquityAT: ${equity:.2f}",
-        f"Daily cap (AT): {str(cap_mode).upper()} {float(cap_value):.2f}{'%' if str(cap_mode).upper() == 'PCT' else ''} (≈ ${cap_usd:.2f})",
-        f"Opened today (AT): {opened_today}/∞ | Closed today (AT): {closed_today} | Open now (AT): {open_now}",
-        f"Open risk now (AT): ${open_risk:.2f}",
-        f"Realised net today (AT): ${realised:+.2f}",
-        f"Daily risk used (AT) (open risk - realised net): ${daily_used:.2f}",
-        f"Daily risk remaining (AT): {'∞' if not math.isfinite(float(remaining)) else '$' + format(float(remaining), '.2f')}",
-        SEP,
-        'Email / AutoTrade entry gate',
-        f"AutoTrade lane filter: KEEP-only policy {'ON' if AUTOTRADE_KEEP_POLICY_ONLY else 'OFF'}",
-        f"Recipient: {str((email_gate or {}).get('recipient_masked') or '(none)')}",
-        f"Alerts: {'ON' if bool((email_gate or {}).get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool((email_gate or {}).get('smtp_ready', True)) else 'NOT_READY'}",
-        f"Email/AutoTrade gate: {'OPEN' if bool((email_gate or {}).get('gate_open', True)) else 'BLOCKED'}",
-        SEP,
-        f"Open AutoTrade Positions: {open_now}",
-    ]
-    if not open_rows:
-        lines.append('• None')
-    else:
-        for r in open_rows[:8]:
-            try:
-                sym = str(r.get('symbol') or r.get('base') or '-').replace('USDT','')
-                side = str(r.get('side') or '-').upper()
-                risk = float(r.get('risk_usd') or r.get('risk') or 0.0)
-                pnl = float(r.get('pnl') or r.get('unrealized_pnl') or r.get('pnl_usdt') or 0.0)
-                lines.append(f"• {sym} {side} | Risk ${risk:.2f} | PnL ${pnl:+.2f}")
-            except Exception:
-                continue
-    lines.append('')
-    lines.append('Note: no-lag snapshot; heavy exchange reconciliation is kept out of the Telegram command path.')
-    return '\n'.join(lines)
-
-
-def _autotrade_last_text_sync(owner: int) -> str:
-    dec = _LAST_AUTOTRADE_DECISION.get(int(owner)) or {}
-    hist = list(_LAST_AUTOTRADE_ATTEMPTS.get(int(owner)) or [])
-    dec_attempts = list(dec.get('attempted_candidates') or []) if isinstance(dec, dict) else []
-    if not hist and dec_attempts:
-        hist = dec_attempts
-    lines = ['AutoTrade — Last Attempts', HDR]
-    if not hist and not dec:
-        lines.append('No attempts recorded yet.')
-        return '\n'.join(lines)
-    if dec:
-        lines.append(f"Last decision: {str(dec.get('status') or '—')}" + (f" | {str(dec.get('reason') or '')}" if str(dec.get('reason') or '') else ''))
-        if dec.get('when'):
-            try:
-                lines.append(f"Decision time: {_fmt_iso_to_local(str(dec.get('when')))}")
-            except Exception:
-                lines.append(f"Decision time: {dec.get('when')}")
-        if dec.get('trigger'):
-            lines.append(f"Trigger: {dec.get('trigger')}")
-        lines.append(HDR)
-    for i, a in enumerate(hist[:8], start=1):
-        try:
-            sym = str(a.get('symbol') or a.get('symbol_sent') or a.get('symbol_raw') or '—')
-            side = str(a.get('side') or '—')
-            status = str(a.get('status') or '').upper() or '—'
-            reason = str(a.get('reason') or '').strip()
-            lines.append(f"{i}) {sym} {side} | {status}" + (f" | {reason}" if reason else ''))
-        except Exception:
-            continue
-    return '\n'.join(lines)
-
-
-def _owner_deferred_direct_sync_text(cmd: str, args_snapshot: list[str], request_uid: int) -> tuple[str, object | None] | None:
-    """Build selected heavy command outputs entirely in a worker thread.
-
-    Returning None falls back to the original async command.
-    """
-    cmd = str(cmd or '').strip().lower()
-    args_snapshot = list(args_snapshot or [])
-    owner = int(AUTOTRADE_OWNER_UID or request_uid or 0)
-    if cmd == 'why':
-        return (_reject_report_for_uid(int(request_uid)), None)
-    if cmd == 'autotrade_last':
-        return (_autotrade_last_text_sync(owner), None)
-    if cmd == 'autotrade_debug':
-        return (_autotrade_debug_fast_text_sync(owner, request_uid), None)
-    if cmd == 'autotrade_report':
-        h = _owner_parse_hours_arg(args_snapshot, default=24, min_h=1, max_h=168)
-        return (_autotrade_report_text_cached(owner, h), ParseMode.HTML)
-    if cmd in {'setup_audit', 'setup_quality'}:
-        # Ver78: do not rebuild setup audits synchronously inside the no-lag
-        # deferred worker.  The original setup_audit_cmd already has the correct
-        # cached-or-background report wrapper and posts stale cache instantly when
-        # available.  Rebuilding here was why /setup_audit 2 could hold the
-        # deferred output lane for ~2 minutes even though the Telegram ACK was instant.
-        try:
-            if args_snapshot and str(args_snapshot[0]).lower() in {'h', 'help', '?', 'guide'}:
-                return (_setup_audit_help_text(), ParseMode.HTML)
-        except Exception:
-            pass
-        return None
-    return None
-
-
-_OWNER_DEFERRED_COMMAND_SEMAPHORE = None
-_OWNER_DEFERRED_COMMAND_SEQ = 0
-
-
-def _owner_deferred_command_semaphore():
-    """Create the no-lag deferred command semaphore lazily inside the running loop."""
-    global _OWNER_DEFERRED_COMMAND_SEMAPHORE
-    try:
-        if _OWNER_DEFERRED_COMMAND_SEMAPHORE is None:
-            _OWNER_DEFERRED_COMMAND_SEMAPHORE = asyncio.Semaphore(max(1, int(OWNER_DEFERRED_COMMAND_MAX_CONCURRENT or 1)))
-        return _OWNER_DEFERRED_COMMAND_SEMAPHORE
-    except Exception:
-        return asyncio.Semaphore(1)
-
-
-async def _owner_deferred_command_runner(cmd: str, handler_name: str, update: Update, context: ContextTypes.DEFAULT_TYPE, args_snapshot: list[str], seq: int) -> None:
-    """Run a heavy owner/admin command after the instant ACK has been sent.
-
-    Ver72 purpose: user commands must never wait for Bybit/SQLite/OHLCV/report work.
-    The original handler remains the single source of truth for the actual report;
-    this wrapper only moves it behind an immediate acknowledgement and serialises
-    bounded report work so 10 pressed commands cannot block the command lane.
-    """
-    try:
-        await asyncio.sleep(max(0.0, float(OWNER_DEFERRED_COMMAND_DELAY_SEC or 0.0)))
-    except Exception:
-        pass
-    sem = _owner_deferred_command_semaphore()
-    async with sem:
-        try:
-            try:
-                context.args = list(args_snapshot or [])
-            except Exception:
-                pass
-            try:
-                request_uid = int(getattr(getattr(update, 'effective_user', None), 'id', 0) or 0)
-            except Exception:
-                request_uid = 0
-            direct = None
-            try:
-                direct = await to_thread_bg(
-                    _owner_deferred_direct_sync_text,
-                    str(cmd or ''),
-                    list(args_snapshot or []),
-                    int(request_uid),
-                    timeout=max(30, int(OWNER_DEFERRED_COMMAND_TIMEOUT_SEC or 900)),
-                )
-            except Exception:
-                direct = None
-            if direct is not None:
-                try:
-                    text, pm = direct
-                except Exception:
-                    text, pm = str(direct), None
-                await send_long_message(update, str(text or 'No data found.'), parse_mode=pm, disable_web_page_preview=True)
-                return
-            handler = globals().get(str(handler_name or ''))
-            if not handler:
-                try:
-                    await update.message.reply_text(f"⚠️ /{cmd} background handler is not available.")
-                except Exception:
-                    pass
-                return
-            await asyncio.wait_for(handler(update, context), timeout=max(30, int(OWNER_DEFERRED_COMMAND_TIMEOUT_SEC or 900)))
-        except asyncio.TimeoutError:
-            try:
-                await update.message.reply_text(f"⚠️ /{cmd} is still running in the background and exceeded the safe response window. Try again shortly.")
-            except Exception:
-                pass
-        except ApplicationHandlerStop:
-            pass
-        except Exception as e:
-            try:
-                logger.exception("deferred owner command /%s failed: %s", cmd, e)
-            except Exception:
-                pass
-            try:
-                await update.message.reply_text(f"⚠️ /{cmd} background run failed: {type(e).__name__}: {str(e)[:180]}")
-            except Exception:
-                pass
-
-
-async def _owner_defer_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str, handler_name: str) -> bool:
-    """ACK and queue a heavy owner/admin command without waiting for Telegram.
-
-    yver75: returns True immediately after scheduling the ACK and background runner.
-    This prevents fallback to the normal CommandHandler path, which was the source
-    of the remaining visible lag when Telegram ACK sending or /autotrade_report was slow.
-    """
-    global _OWNER_DEFERRED_COMMAND_SEQ
-    try:
-        _OWNER_DEFERRED_COMMAND_SEQ += 1
-        seq = int(_OWNER_DEFERRED_COMMAND_SEQ)
-    except Exception:
-        seq = 0
-    try:
-        args_snapshot = list((str(update.message.text or '').split()[1:]) if getattr(update, 'message', None) else (context.args or []))
-    except Exception:
-        args_snapshot = list(context.args or [])
-    try:
-        context.args = list(args_snapshot)
-    except Exception:
-        pass
-    label = str(cmd or 'command').strip() or 'command'
-    await _owner_send_ack(
-        update,
-        context,
-        f"⏳ /{label} accepted. The bot is working in the background and will post the output when ready."
-    )
-    _safe_create_task(
-        _owner_deferred_command_runner(label, handler_name, update, context, args_snapshot, seq),
-        label=f"owner-deferred-command:{label}:{seq}",
-    )
-    return True
-
-
-def _screen_open_autotrade_positions_body_sync(uid: int, max_rows: int = 6) -> str:
-    """Lightweight /screen fallback for active AutoTrade positions.
-
-    Ver79: the previous fallback could read stale OPEN rows from the local journal
-    and showed closed/duplicate positions on /screen (for example BTC/SOL/BEAT
-    while /autotrade_debug showed only WLD/LINK live).  This fallback now uses the
-    same live Bybit position rows that AutoTrade/debug use.  It runs only after the
-    instant ACK/background handoff, so it cannot block Telegram command intake.
-    """
-    try:
-        owner = int(AUTOTRADE_OWNER_UID or uid or 0)
-    except Exception:
-        owner = int(uid or 0)
-    try:
-        live_positions = list(_bybit_get_open_positions_linear() or [])
-    except Exception:
-        live_positions = []
-    if not live_positions:
-        return ''
-    try:
-        bot_positions, external_positions, _journal_open = _autotrade_collect_live_position_rows(
-            int(owner or uid or 0), positions=live_positions, fallback_unmatched_as_owned=True
-        )
-    except Exception:
-        bot_positions, external_positions = [], []
-    rows = []
-    seen = set()
-    for p, tr in list(bot_positions or []):
-        try:
-            sym_full = str(_pos_symbol(p) or (tr or {}).get('symbol') or '').upper().strip()
-            side = str(_pos_side_text(p) or (tr or {}).get('side') or '').upper().strip()
-            if not sym_full or not side:
-                continue
-            key = (sym_full.replace('USDT',''), side)
-            if key in seen:
-                continue
-            seen.add(key)
-            risk = float(_estimate_position_risk_usd(p) or (tr or {}).get('risk_usd') or (tr or {}).get('risk') or 0.0)
-            pnl = float(_pos_unreal_pnl(p) or 0.0)
-            rows.append({'symbol': sym_full, 'side': side, 'risk_usd': risk, 'pnl': pnl})
-        except Exception:
-            continue
-    if not rows:
-        return ''
-    lines = []
-    lines.append('*Top Trade Setups*')
-    lines.append(HDR)
-    lines.append('_No fresh current-session setup cache yet. Showing currently live AutoTrade positions._')
-    lines.append('')
-    lines.append('*Open AutoTrade Positions*')
-    lines.append('```')
-    lines.append(f"{'SYM':<10} {'Side':<6} {'Risk$':>8} {'PnL$':>9}")
-    for r in rows[:max(1, int(max_rows or 6))]:
-        try:
-            sym = str(r.get('symbol') or '-').upper().replace('USDT','')[:10]
-            side = str(r.get('side') or '-').upper()[:6]
-            risk = float(r.get('risk_usd') or r.get('risk') or 0.0)
-            pnl = float(r.get('pnl') or r.get('unrealized_pnl') or r.get('pnl_usdt') or 0.0)
-            lines.append(f"{sym:<10} {side:<6} {risk:>8.2f} {pnl:>+9.2f}")
-        except Exception:
-            continue
-    lines.append('```')
-    return '\n'.join(lines).strip()
-
-
-async def _owner_instant_screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """No-network /screen for owner/admin: cache or ticker snapshot only.
-
-    Fresh executable rebuild is queued in the background, but this command never
-    waits for OHLCV/Bybit/DB-heavy scans. This restores the v45/v49 fast UX while
-    keeping setup generation autonomous in the background.
-    """
-    try:
-        uid = int(getattr(update.effective_user, 'id', 0) or 0)
-        scan_session = str(scan_session_name_utc() or '').upper().strip()
-        live_session = current_session_utc()
-        try:
-            loc_label = 'Melbourne (Australia)'
-            loc_time = datetime.now(MEL_TZ).strftime('%Y-%m-%d %H:%M')
-        except Exception:
-            loc_label, loc_time = 'Melbourne (Australia)', datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-        if bool(globals().get('MANUAL_SCREEN_REFRESH_ON_COMMAND', False)):
-            try:
-                _schedule_screen_cache_refresh(uid, scan_session)
-            except Exception:
-                pass
-        cache_keys = [f"uid:{uid}::{scan_session}", f"global::{scan_session}"]
-        try:
-            for _k, _v in list(_SCREEN_CACHE.items()):
-                if str(_k).startswith((f"uid:{uid}::", "global::")) and (_v or {}).get('body'):
-                    cache_keys.append(_k)
-        except Exception:
-            pass
-        try:
-            cache_entry, age = _screen_choose_best_cache(cache_keys)
-        except Exception:
-            cache_entry, age = {}, 999999.0
-        if cache_entry and str((cache_entry or {}).get('body') or '').strip():
-            try:
-                cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
-            except Exception:
-                cache_ts = 0.0
-            cache_body_s = str((cache_entry or {}).get('body') or '')
-            cache_is_ticker_only = (
-                ('Executable scan is warming up' in cache_body_s)
-                or ('No confirmed setup shown' in cache_body_s)
-                or ('Live setup/email/AutoTrade pipeline is running in the background' in cache_body_s and 'AT_OPEN' not in cache_body_s and 'Open AutoTrade Positions' not in cache_body_s)
-            )
-            if cache_is_ticker_only:
-                # Ver78: do not let a stale ticker-only cache hide active/recent
-                # setup lane rows.  This was visible at 23:55: /screen returned
-                # the cached market snapshot while WLD/LINK were still open.
-                try:
-                    best_for_db = get_cached_futures_tickers() or {}
-                except Exception:
-                    best_for_db = {}
-                try:
-                    body_db, kb_db, shown_db = await to_thread_fast(
-                        _screen_recent_db_body_and_kb,
-                        int(uid or 0),
-                        str(scan_session or ''),
-                        best_for_db or {},
-                        max_age_min=_screen_actionable_fallback_max_age_min(),
-                        include_email_source=True,
-                        timeout=2,
-                    )
-                except Exception:
-                    body_db, kb_db, shown_db = '', [], []
-                if body_db:
-                    header = (
-                        "*PulseFutures — Market Scan*\n"
-                        f"{HDR}\n"
-                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                        f"{_screen_when_line('Recent setup lane', time.time())}"
-                        "_Showing the latest emailed/executable setup lane while the full scan refreshes._\n"
-                    )
-                    await send_long_message(
-                        update,
-                        _screen_markdown_to_html((header + "\n" + str(body_db or '')).strip()),
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))] for (sym, sid) in (kb_db or [])]) if kb_db else None,
-                    )
-                    return
-                try:
-                    open_body = await to_thread_fast(
-                        _screen_open_autotrade_positions_body_sync,
-                        int(uid or 0),
-                        timeout=2,
-                    )
-                except Exception:
-                    open_body = ''
-                if str(open_body or '').strip():
-                    header = (
-                        "*PulseFutures — Market Scan*\n"
-                        f"{HDR}\n"
-                        f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                        f"{_screen_when_line('Active position snapshot', time.time())}"
-                        "_Showing currently live AutoTrade positions plus Pulse/Leaders/Losers. Live setup/email/AutoTrade pipeline continues in the background._\n"
-                    )
-                    screen_body = _screen_append_market_context(str(open_body or ''), best_for_db or {})
-                    await send_long_message(
-                        update,
-                        _screen_markdown_to_html((header + "\n" + screen_body).strip()),
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                    return
-            header = (
-                "*PulseFutures — Market Scan*\n"
-                f"{HDR}\n"
-                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                f"{_screen_when_line('Cached scan built', cache_ts)}"
-                "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
-            )
-            keyboard = [
-                [InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))]
-                for (sym, sid) in ((cache_entry or {}).get('kb') or [])
-            ]
-            await send_long_message(
-                update,
-                _screen_markdown_to_html((header + "\n" + cache_body_s).strip()),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
-            )
-            return
-        # No full cache: prefer cached tickers, but because /screen now runs in
-        # the deferred command worker, allow one bounded ticker fetch so the user
-        # still sees Pulse/Leaders/Losers instead of a useless warming message.
-        best = get_cached_futures_tickers() or {}
-        if not best:
-            try:
-                best = await to_thread_fast(fetch_futures_tickers, timeout=8) or {}
-            except Exception:
-                best = get_cached_futures_tickers() or {}
-
-        # Ver73: before falling back to the ticker-only warming screen, read the
-        # recent setup-email/executable lane from DB.  This is lightweight and keeps
-        # /screen synced with the exact setups already emailed/opened by AutoTrade
-        # (for example WLD/BTC AT_OPEN) even when the full scan cache is warming.
-        try:
-            body_db, kb_db, shown_db = await to_thread_fast(
-                _screen_recent_db_body_and_kb,
-                int(uid or 0),
-                str(scan_session or ''),
-                best or {},
-                max_age_min=_screen_actionable_fallback_max_age_min(),
-                include_email_source=True,
-                timeout=3,
-            )
-        except Exception:
-            body_db, kb_db, shown_db = '', [], []
-        if body_db:
-            header = (
-                "*PulseFutures — Market Scan*\n"
-                f"{HDR}\n"
-                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                f"{_screen_when_line('Recent setup lane', time.time())}"
-                "_Showing the latest emailed/executable setup lane while the full scan refreshes._\n"
-            )
-            await send_long_message(
-                update,
-                _screen_markdown_to_html((header + "\n" + str(body_db or '')).strip()),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(text=f"📈 {sym} • {sid}", url=tv_chart_url(sym))] for (sym, sid) in (kb_db or [])]) if kb_db else None,
-            )
-            return
-
-        # yver77: if the current-session setup queue is empty/expired, still show
-        # active AutoTrade OPEN positions instead of a misleading setup-free screen.
-        try:
-            open_body = await to_thread_fast(
-                _screen_open_autotrade_positions_body_sync,
-                int(uid or 0),
-                timeout=2,
-            )
-        except Exception:
-            open_body = ''
-        if str(open_body or '').strip():
-            header = (
-                "*PulseFutures — Market Scan*\n"
-                f"{HDR}\n"
-                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                f"{_screen_when_line('Active position snapshot', time.time())}"
-                "_Showing currently live AutoTrade positions plus Pulse/Leaders/Losers. Live setup/email/AutoTrade pipeline continues in the background._\n"
-            )
-            screen_body = _screen_append_market_context(str(open_body or ''), best or {})
-            await send_long_message(
-                update,
-                _screen_markdown_to_html((header + "\n" + screen_body).strip()),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-            return
-
-        if best:
-            body, kb, _ = _screen_quick_ticker_snapshot_body(best, scan_session)
-            header = (
-                "*PulseFutures — Market Scan*\n"
-                f"{HDR}\n"
-                f"*Session:* `{live_session}` | *{loc_label}:* `{loc_time}`\n"
-                f"{_screen_when_line('Ticker snapshot', time.time())}"
-                "_Showing instant ticker snapshot while full executable scan warms up._\n"
-            )
-            await send_long_message(
-                update,
-                _screen_markdown_to_html((header + "\n" + body).strip()),
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-            return
-        await _instant_reply(update, "🔎 /screen cache is warming up. Live pipeline is running; /screen is cache-only so commands stay responsive.")
-    except Exception:
-        try:
-            await _instant_reply(update, "🔎 /screen is warming up. Live pipeline is running; /screen is cache-only so commands stay responsive.")
-        except Exception:
-            pass
-
-
-async def _owner_instant_command_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Highest-priority owner/admin lane for responsiveness.
-
-    Runs before billing/channel guards and before all heavy handlers.  It handles
-    only tiny owner/admin commands and stops propagation after replying.
-    """
-    try:
-        msg = getattr(update, 'message', None)
-        if not msg:
-            return
-        txt = str(msg.text or '').strip()
-        if txt.startswith('/'):
-            try:
-                _mark_user_activity()
-            except Exception:
-                pass
-        if not txt.startswith('/'):
-            return
-        cmd = txt.split()[0][1:].split('@')[0].strip().lower()
-        if cmd not in OWNER_INSTANT_COMMANDS and cmd not in OWNER_DEFERRED_COMMANDS:
-            return
-        # yver76: do not depend on AUTOTRADE_OWNER_UID/ADMIN env for the no-lag lane.
-        # If this is a single-owner deployment (default), route supported commands
-        # through the fast ACK/background path for any requester. Original handlers
-        # still enforce normal access/plan/admin rules when producing the full output.
-        if (not bool(globals().get('PULSEFUTURES_FAST_LANE_ALL_COMMANDS', True))) and (not _owner_or_admin_from_update(update)):
-            return
-        _mark_user_activity()
-        try:
-            parts = txt.split()
-            context.args = parts[1:] if len(parts) > 1 else []
-        except Exception:
-            pass
-        if cmd == 'start':
-            await _owner_send_ack(update, context, "✅ PulseFutures is live.\n\nQuick commands: /screen /status /equity /autotrade_debug")
-            raise ApplicationHandlerStop
-        if cmd == 'status':
-            try:
-                sess = current_session_utc()
-            except Exception:
-                sess = scan_session_name_utc() or 'UNKNOWN'
-            try:
-                hb = _EMAIL_LOOP_HEARTBEAT or {}
-                last_tick = float(hb.get('last_tick_ts') or 0.0)
-                age = int(max(0, time.time() - last_tick)) if last_tick > 0 else -1
-            except Exception:
-                age = -1
-            txt_status = (
-                "✅ PulseFutures status: LIVE\n"
-                f"Session: {sess}\n"
-                f"Email loop: {'alive' if age >= 0 and age < 900 else 'warming'}"
-                + (f" ({age}s ago)" if age >= 0 else "")
-                + "\nCommands are using the instant lane."
-            )
-            await _owner_send_ack(update, context, txt_status)
-            raise ApplicationHandlerStop
-        if cmd == 'equity':
-            if await _owner_defer_command(update, context, cmd, '_instant_equity_cmd'):
-                raise ApplicationHandlerStop
-            raise ApplicationHandlerStop
-        if cmd == 'screen':
-            # Ver72 strict no-lag: even /screen should ACK first, then post the
-            # cached/ticker snapshot from the deferred lane. This avoids one long
-            # Telegram table send delaying the next command in a burst.
-            if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)):
-                if await _owner_defer_command(update, context, cmd, '_owner_instant_screen_cmd'):
-                    raise ApplicationHandlerStop
-                return
-            else:
-                await _owner_instant_screen_cmd(update, context)
-                raise ApplicationHandlerStop
-        if cmd in OWNER_DEFERRED_COMMANDS:
-            handler_name = str(OWNER_DEFERRED_COMMAND_HANDLERS.get(cmd) or '')
-            if await _owner_defer_command(update, context, cmd, handler_name):
-                raise ApplicationHandlerStop
-            return
     except ApplicationHandlerStop:
         raise
     except Exception:
@@ -43690,7 +42383,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT = {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)):.2f}",
             f"AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) else 'false'}",
             f"AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED = {'true' if bool(summary.get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_STRICT_KEEP_EDGE_ENABLED = {'true' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', False)) else 'false'}",
+            f"AUTOTRADE_STRICT_KEEP_EDGE_ENABLED = {'true' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)) else 'false'}",
             f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED = {int(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 5))}",
             f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 60.0)):.1f}",
             f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', 0.25)):+.2f}",
@@ -43743,7 +42436,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
             "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (audit-match default)",
             "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
-            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_FORCE_ENABLED true   (advanced: re-enable secondary strict KEEP edge; default OFF for setup/email/AutoTrade sync)",
+            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true   (syncs /screen + email + AutoTrade to high-edge KEEP lanes)",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 60",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 5",
             "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.25",
@@ -44396,6 +43089,7 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cur_on = int(user.get("bigmove_alert_on", 1) or 0)
+    cur_setup_on = 1 if _user_bigmove_setup_email_on(user) else 0
     cur_p15, cur_p1, cur_p4 = _user_bigmove_thresholds(user)
     cur_min_vol = max(BIGMOVE_MIN_SUPPORTED_VOL_USD, _user_bigmove_min_vol_usd(user, BIGMOVE_DEFAULT_MIN_VOL_USD))
 
@@ -44403,9 +43097,10 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         updated_ts = float(user.get("bigmove_alert_updated_ts", 0.0) or 0.0)
         updated_reason = str(user.get("bigmove_alert_update_reason", "") or "").strip()
         lines = [
-            "📣 Big-Move Alert Emails",
+            "📣 Big-Move / F8 Setup Controls",
             f"{HDR}",
-            f"Status: {'ON' if cur_on else 'OFF'}",
+            f"Raw Big-Move Alert Emails: {'ON' if cur_on else 'OFF'}",
+            f"BigMove/F8 Setup Emails: {'ON' if cur_setup_on else 'OFF'}",
             f"Thresholds: |15m| ≥ {cur_p15:g}% AND |1H| ≥ {cur_p1:g}% AND |4H| ≥ {cur_p4:g}% (same direction only)",
             f"Min Vol (24H): {cur_min_vol/1e6:.1f}M",
         ]
@@ -44415,8 +43110,10 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"Reason: {updated_reason}")
         lines.extend([
             "",
-            "Set: /bigmove_alert on 1.5 3 5",
-            "Off: /bigmove_alert off",
+            "Raw alert ON: /bigmove_alert on 1.5 3 5",
+            "Raw alert OFF: /bigmove_alert off",
+            "F8 setup emails ON: /bigmove_alert setup_on",
+            "F8 setup emails OFF: /bigmove_alert setup_off",
         ])
         await update.message.reply_text("\n".join(lines))
         return
@@ -44424,8 +43121,18 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.args[0].strip().lower()
 
     if mode in {"off", "0", "disable"}:
-        _record_bigmove_settings_change(uid, False, cur_p15, cur_p1, cur_p4, cur_min_vol, "command_off via /bigmove_alert")
-        await update.message.reply_text("✅ Big-move alert emails: OFF")
+        _record_bigmove_settings_change(uid, False, cur_p15, cur_p1, cur_p4, cur_min_vol, "command_off via /bigmove_alert; raw alert emails disabled, F8 setup emails unchanged")
+        await update.message.reply_text("✅ Raw Big-Move alert emails: OFF\n✅ BigMove/F8 setup emails remain: " + ("ON" if cur_setup_on else "OFF"))
+        return
+
+    if mode in {"setup_on", "setupon", "setup-enable", "setup_enable", "f8_on", "f8on"}:
+        update_user(uid, bigmove_setup_email_on=1, bigmove_alert_updated_ts=float(time.time()), bigmove_alert_update_reason="command_setup_on via /bigmove_alert")
+        await update.message.reply_text("✅ BigMove/F8 setup emails: ON\nRaw Big-Move alert emails are unchanged: " + ("ON" if cur_on else "OFF"))
+        return
+
+    if mode in {"setup_off", "setupoff", "setup-disable", "setup_disable", "f8_off", "f8off"}:
+        update_user(uid, bigmove_setup_email_on=0, bigmove_alert_updated_ts=float(time.time()), bigmove_alert_update_reason="command_setup_off via /bigmove_alert")
+        await update.message.reply_text("✅ BigMove/F8 setup emails: OFF\nRaw Big-Move alert emails are unchanged: " + ("ON" if cur_on else "OFF"))
         return
 
     if mode in {"on", "1", "enable"}:
@@ -44442,10 +43149,10 @@ async def bigmove_alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)")
                 return
         _record_bigmove_settings_change(uid, True, p15, p1, p4, min_vol, f"command_on via /bigmove_alert (15m>={p15:.2f}% AND 1H>={p1:.2f}% AND 4H>={p4:.2f}%, same_direction_only, min_vol={min_vol/1e6:.1f}M)")
-        await update.message.reply_text(f"✅ Big-move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)")
+        await update.message.reply_text(f"✅ Raw Big-Move alert emails: ON (15m≥{p15:g}% AND 1H≥{p1:g}% AND 4H≥{p4:g}% | same direction only | Min Vol {min_vol/1e6:.1f}M)\nBigMove/F8 setup emails remain: " + ("ON" if cur_setup_on else "OFF"))
         return
 
-    await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%>  (e.g., /bigmove_alert on 1.5 3 5)  OR  /bigmove_alert off")
+    await update.message.reply_text("Usage: /bigmove_alert on <15m%> <1H%> <4H%> OR /bigmove_alert off OR /bigmove_alert setup_on OR /bigmove_alert setup_off")
 
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -49749,7 +48456,7 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         scout_enabled = bool(globals().get('SETUP_COMBO_WATCH_SCOUT_ENABLED', True))
         scout_min_conf = int(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_CONF', 84) or 84)
         scout_min_rr = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_RR', 1.40) or 1.40)
-        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 10000000) or 10000000)
+        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
         # Ver47: do not kill 84-86 confidence candidates before dynamic risk is
         # calculated. They may pass only via the stronger near/scout dynamic-score
         # lane; sub-scout confidence is still blocked immediately.
@@ -49912,7 +48619,7 @@ def _setup_execution_quality_baseline_allows(setup_or_row, session_name: str = '
         # Ver50 controlled discovery floor: after relaxing baseline Conf/Dyn, keep
         # geometry/liquidity quality strict enough for real forward testing.
         min_base_rr = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_RR', 1.25) or 1.25)
-        min_base_vol = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_VOL_USD', 10000000.0) or 10000000.0)
+        min_base_vol = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_VOL_USD', 15000000.0) or 15000000.0)
         meta['baseline_discovery_min_rr'] = float(min_base_rr)
         meta['baseline_discovery_min_vol_usd'] = float(min_base_vol)
         if rr < min_base_rr:
@@ -49977,7 +48684,7 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
 
     This is not a quality bypass. It is the final fallback when older WATCH/dynamic/
     micro-edge gates would otherwise leave the executable queue at zero.  It requires:
-    valid symbol/side/session, valid single TP/SL geometry, minimum 10M volume,
+    valid symbol/side/session, valid single TP/SL geometry, minimum 15M volume,
     RR>=1.20, confidence>=78, projected risk/TP dollars, and no true disabled-normal
     policy state.  NORMAL setups in disabled combos still must be routed to REVERSE first.
     """
@@ -50015,7 +48722,7 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
         if side == 'SELL' and not (tp < entry < sl):
             return False, f'{reason_prefix}_invalid_sell_geometry', meta
 
-        min_vol = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_VOL_USD', 10000000.0) or 10000000.0)
+        min_vol = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_VOL_USD', 15000000.0) or 15000000.0)
         min_rr = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_RR', 1.20) or 1.20)
         min_conf = int(globals().get('FINAL_PIPELINE_LOCKED_MIN_CONF', 78) or 78)
         min_dyn = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE', 35.0) or 35.0)
@@ -50309,7 +49016,7 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         scout_min_conf = int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)
         scout_dyn = float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 84) or 84)
         scout_rr = float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.40) or 1.40)
-        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 10000000) or 10000000)
+        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
         fut_vol = float(meta.get('fut_vol_usd') or _autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or 0.0)
         rr = float(meta.get('rr') or 0.0)
         if conf < final_adaptive_min_conf:
@@ -50703,7 +49410,7 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         except Exception:
             pass
         try:
-            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 10000000) or 10000000)
+            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 15000000) or 15000000)
             if min_vol > 0 and vol_v > 0 and vol_v < min_vol and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
                 return False, f'strict_min_volume_block vol=${vol_v/1_000_000:.1f}M<{min_vol/1_000_000:.0f}M'
         except Exception:
@@ -56542,14 +55249,10 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
+    # Ver37: keep /autotrade_debug concise per user request.
     lines = [
         '🧪 AutoTrade Debug',
         HDR,
-        f"Ready: {'✅' if ready else '❌'} | Mode: {str(_autotrade_runtime_mode()).lower()} | Entries: {'ON' if _autotrade_entry_enabled() else 'OFF'} | Session: {sess} ({'allowed' if sess_allowed else 'blocked'})",
-        f"Trading day: {snap.get('today_window_label')}",
-        "Configured sessions: ASIA/LON/NY active by default; current Session line only shows the active session/time block right now.",
-        (f"Keep-all test: ON | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(_autotrade_entry_window_min())}m" if _autotrade_keep_all_test_mode() else None),
-        (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry blackout: {'ON' if _autotrade_entry_blackout_enabled() else 'OFF'} | Setup blackout: {'ON' if _setup_generation_blackout_enabled() else 'OFF'}" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
         SEP,
         f"EquityAT: ${equity:.2f}",
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
@@ -56562,32 +55265,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Realised net today (AT): ${_debug_realised_display:+.2f}",
         f"Daily risk used (AT) (open risk - realised net): ${_debug_daily_used_display:.2f}",
         ('Daily risk remaining (AT): ∞' if not math.isfinite(float(_debug_remaining_display)) else f"Daily risk remaining (AT): ${float(_debug_remaining_display):.2f}"),
-        SEP,
-        'Email / AutoTrade entry gate',
-        f"AutoTrade lane filter: {('KEEP+WATCH policy ON' if _autotrade_allow_watch_policy() else 'KEEP-only policy ON') if _autotrade_require_keep_policy() else 'policy filter OFF'}",
-        f"AutoTrade capital guard: daily loss stop {'ON' if _autotrade_daily_realized_loss_stop_enabled() else 'OFF'} {_autotrade_daily_realized_loss_stop_pct():.1f}% | realised-combo {'ON' if _autotrade_require_realized_combo_edge() else 'OFF'} | context feed {'ON' if _autotrade_context_feed_guard_enabled() else 'OFF'}",
-        f"AutoTrade capital gate: {'OPEN' if _autotrade_daily_realized_loss_stop_allows(int(owner))[0] else 'BLOCKED'} | {_autotrade_daily_realized_loss_stop_allows(int(owner))[1]}",
-        f"Recipient: {str(email_gate.get('recipient_masked') or '(none)')}",
-        f"Alerts: {'ON' if bool(email_gate.get('alerts_on')) else 'OFF'} | SMTP: {'READY' if bool(email_gate.get('smtp_ready')) else 'NOT READY'}",
-        f"Session email cap: {session_cap_txt} (configured)",
-        f"Emails sent in session: {int(email_gate.get('sent_in_session', 0) or 0)}",
-        f"Daily email cap: {day_cap_txt} (configured)",
-        f"Emails sent today: {int(email_gate.get('sent_today', 0) or 0)}",
-        f"Email gap: {int(email_gate.get('gap_min', 0) or 0)}m" + (f" (remaining {_fmt_dur(gap_remaining)})" if gap_remaining > 0 else ''),
-        f"Email/AutoTrade gate: {'OPEN' if bool(email_gate.get('gate_open')) else 'BLOCKED'}" + (f" | {gate_reason}" if gate_reason else ''),
-        f"Recent emailed setups (unique, 12h): {emailed_recent}",
-        f"Recent executable setups (unique sym/side, 12h): {exec_recent}",
     ]
-    try:
-        lines.append(f"Recent sent setup-email batches (12h): {int(sent_email_batches_recent or 0)}")
-    except Exception:
-        pass
-    try:
-        reset_ts = float(_autotrade_cooldown_reset_ts() or 0.0)
-        if reset_ts > 0:
-            lines.append(f"Cooldown reset marker: {_fmt_dt_local(datetime.fromtimestamp(reset_ts, tz=timezone.utc))}")
-    except Exception:
-        pass
     if reasons and not ready:
         lines.extend([SEP, 'Blocking reasons'])
         for r in reasons[:6]:
@@ -57997,47 +56675,32 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         except Exception:
             spike_warnings = []
 
-    # Store diagnostics for /why, then ALWAYS reset context.
-    # Ver95: email/autonomous scans often run with uid=None. Previously that meant
-    # reject diagnostics were not stored at all, so /why showed Last scan='-' even
-    # when the background scanner had just evaluated symbols. Always update the
-    # shared diagnostics bucket; update the per-user bucket only when uid is known.
+    # Store diagnostics for /why, then ALWAYS reset context
     try:
-        counts = {
-            str(k): int(v)
-            for k, v in dict(_rej_ctx or {}).items()
-            if not str(k).startswith("__")
-        }
-        payload = {
-            "ts": time.time(),
-            "mode": str(mode or ''),
-            "session": str(session_name or ''),
-            "allow": list(_rej_ctx.get("__allow__") or []),
-            "counts": counts,
-            "per_symbol": dict((_rej_ctx.get("__per__") or {})),
-        }
-        try:
-            shared_bucket = _LAST_REJECTS_SHARED if isinstance(_LAST_REJECTS_SHARED, dict) else {}
-            if str(mode or '').strip():
-                shared_bucket[str(mode).strip().lower()] = dict(payload)
-            shared_bucket["latest"] = dict(payload)
-            _LAST_REJECTS_SHARED.clear()
-            _LAST_REJECTS_SHARED.update(shared_bucket)
-        except Exception:
-            pass
-        try:
-            _reject_diag_save_payload(payload, uid=0 if uid is None else int(uid))
-        except Exception:
-            pass
-        # Always save autonomous/shared scans as uid=0 as well, so owner /why can
-        # still find the last meaningful raw scan after a restart.
-        try:
-            if uid is not None:
-                _reject_diag_save_payload(payload, uid=0)
-        except Exception:
-            pass
         if uid is not None:
+            counts = {
+                str(k): int(v)
+                for k, v in dict(_rej_ctx or {}).items()
+                if not str(k).startswith("__")
+            }
+            payload = {
+                "ts": time.time(),
+                "mode": str(mode or ''),
+                "session": str(session_name or ''),
+                "allow": list(_rej_ctx.get("__allow__") or []),
+                "counts": counts,
+                "per_symbol": dict((_rej_ctx.get("__per__") or {})),
+            }
             try:
+                shared_bucket = _LAST_REJECTS_SHARED if isinstance(_LAST_REJECTS_SHARED, dict) else {}
+                if str(mode or '').strip():
+                    shared_bucket[str(mode).strip().lower()] = dict(payload)
+                shared_bucket["latest"] = dict(payload)
+                _LAST_REJECTS_SHARED.clear()
+                _LAST_REJECTS_SHARED.update(shared_bucket)
+            except Exception:
+                pass
+            if uid is not None:
                 bucket = _LAST_REJECTS.get(int(uid)) or {}
                 if isinstance(bucket, dict) and any(k in bucket for k in ("screen", "email", "latest")):
                     bucket = dict(bucket)
@@ -58047,8 +56710,6 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                     bucket[str(mode).strip().lower()] = payload
                 bucket["latest"] = payload
                 _LAST_REJECTS[int(uid)] = bucket
-            except Exception:
-                pass
     finally:
         try:
             _REJECT_CTX.reset(_rej_token)
@@ -58241,47 +56902,10 @@ def _screen_quick_ticker_snapshot_body(best_fut: Dict[str, MarketVol], session: 
         if market_txt:
             body.append(market_txt)
         body.append("")
-        body.append("_Live setup/email/AutoTrade pipeline is running in the background. /screen is cache-only to keep commands instant._")
+        body.append("_A full executable-family refresh has been queued in the dedicated /screen lane._")
         return "\n".join(body), [], []
     except Exception:
         return "_Screen cache is warming up. A fresh scan has been queued._", [], []
-
-
-
-def _screen_market_context_from_tickers(best_fut: Dict[str, MarketVol]) -> str:
-    """Build only the Pulse/Leaders/Losers market context from cached/fetched tickers.
-
-    Ver93: safe /screen may be showing active positions or an empty setup lane, but
-    the user still expects the normal /screen market context. This helper is pure
-    formatting and does not create setups or touch trading logic.
-    """
-    try:
-        best_fut = best_fut or {}
-        if not best_fut:
-            return ""
-        items = list((best_fut or {}).items())
-        items = [(str(b).upper(), mv) for b, mv in items if mv]
-        min_ctx_vol = float(_screen_context_volume_floor_usd())
-        items = [(b, mv) for b, mv in items if float(usd_notional(mv) or 0.0) >= min_ctx_vol]
-        leaders = sorted(items, key=lambda kv: float(getattr(kv[1], 'percentage', 0.0) or 0.0), reverse=True)[:5]
-        losers = sorted(items, key=lambda kv: float(getattr(kv[1], 'percentage', 0.0) or 0.0))[:5]
-        return _screen_market_context_table(best_fut, leaders=leaders, losers=losers) or ""
-    except Exception:
-        return ""
-
-
-def _screen_append_market_context(body: str, best_fut: dict) -> str:
-    """Append market context unless the body already has it."""
-    try:
-        base = str(body or '').strip()
-        if '*Market Context*' in base or 'Market Context' in base:
-            return base
-        ctx = _screen_market_context_from_tickers(best_fut or {})
-        if ctx:
-            return (base + "\n\n" + ctx).strip() if base else ctx.strip()
-        return base
-    except Exception:
-        return str(body or '').strip()
 
 async def _refresh_screen_cache_async():
     """Refreshes _SCREEN_CACHE in the background (best effort)."""
@@ -58858,24 +57482,19 @@ def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_ag
                         continue
                     src_session_u = str(getattr(item, 'source_session', '') or getattr(item, 'session', '') or '').upper().strip()
                     if sess and src_session_u and src_session_u not in {'', sess}:
-                        try:
-                            _fresh_src_ok = (float(time.time()) - float(getattr(item, 'created_ts', 0.0) or getattr(item, 'signal_created_ts', 0.0) or getattr(item, 'executable_ts', 0.0) or 0.0)) <= float(_setup_delivery_actionable_window_sec())
-                        except Exception:
-                            _fresh_src_ok = False
-                        if not _fresh_src_ok:
-                            continue
+                        continue
                     try:
                         if source_name == 'emailed':
                             ok_basic = _basic_valid(item)
                             ok_final, _why_final, _meta_final = _setup_final_quality_gate_allows_setup(item, session_name=sess, user_id=int(uid)) if ok_basic else (False, 'screen_emailed_basic_invalid', {})
                             ok_exec = bool(ok_basic and ok_final)
                         else:
-                            ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=_fresh_setup_policy_session(item, sess))
+                            ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=sess)
                     except Exception:
                         ok_exec = False
                     if not ok_exec:
                         continue
-                    keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=_fresh_setup_policy_session(item, sess), user_id=int(uid), lane='screen')
+                    keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=sess, user_id=int(uid), lane='screen')
                     if not keep_ok:
                         continue
                     if source_name != 'emailed' and not _screen_attach_email_delivery_or_skip(int(uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
@@ -58987,21 +57606,16 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
                             continue
                         src_session_u = str(getattr(item, 'source_session', '') or '').upper().strip()
                         if req_session_u and src_session_u and src_session_u not in {'', req_session_u}:
-                            try:
-                                _fresh_src_ok = (float(time.time()) - float(getattr(item, 'created_ts', 0.0) or getattr(item, 'signal_created_ts', 0.0) or getattr(item, 'executable_ts', 0.0) or 0.0)) <= float(_setup_delivery_actionable_window_sec())
-                            except Exception:
-                                _fresh_src_ok = False
-                            if not _fresh_src_ok:
-                                continue
+                            continue
                         if source_name == 'emailed':
                             ok_exec = _basic_valid(item)
                         else:
                             try:
-                                ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=_fresh_setup_policy_session(item, req_session_u or src_session_u or _session))
+                                ok_exec, _why_exec = is_executable_setup_eligible(item, session_name=req_session_u or src_session_u or _session)
                             except Exception:
                                 ok_exec, _why_exec = False, 'screen_lane_exec_gate_exception'
                         if ok_exec:
-                            keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=_fresh_setup_policy_session(item, req_session_u or src_session_u or _session), user_id=int(_uid), lane='screen')
+                            keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(item, session_name=(req_session_u or src_session_u or _session), user_id=int(_uid), lane='screen')
                             if not keep_ok:
                                 continue
                             if source_name != 'emailed' and not _screen_attach_email_delivery_or_skip(int(_uid), item, lookback_hours=max(1.0, float(max_age_min) / 60.0)):
@@ -59069,7 +57683,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
         setups = []
 
     if not setups and _exec_ready and not _screen_requires_emailed_delivery_for_setup():
-        _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=_fresh_setup_policy_session((_exec_ready or [None])[0], str(session or '')), user_id=int(uid), lane='screen')
+        _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=str(session or ''), user_id=int(uid), lane='screen')
         setups = list(_screen_keep_ready[:max(1, int(SETUPS_N))])
     elif not setups and _exec_ready and _screen_requires_emailed_delivery_for_setup():
         _screen_keep_ready = _filter_user_visible_keep_setups(list(_exec_ready or []), session_name=str(session or ''), user_id=int(uid), lane='screen')
@@ -59080,7 +57694,7 @@ def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
     # /screen is an action dashboard, not a dump. Also enforce the production 24h-volume floor.
     try:
         setups = [s for s in list(setups or []) if _setup_volume_ok(s)]
-        setups = [x for x in list(setups or []) if _setup_user_visible_keep_policy_allows(x, session_name=_fresh_setup_policy_session(x, str(session or '')), user_id=int(uid), lane='screen')[0]]
+        setups = _filter_user_visible_keep_setups(setups, session_name=str(session or ''), user_id=int(uid), lane='screen')
     except Exception:
         setups = list(setups or [])
     try:
@@ -59504,8 +58118,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         cache_entry, age = _screen_choose_best_cache(cache_keys)
-        if bool(globals().get('MANUAL_SCREEN_REFRESH_ON_COMMAND', False)):
-            _schedule_screen_cache_refresh(int(uid), scan_session)
+        _schedule_screen_cache_refresh(int(uid), scan_session)
         can_show_email_source = _screen_user_can_see_email_source(int(uid), user)
         try:
             screen_fallback_min = int(_screen_actionable_fallback_max_age_min())
@@ -59673,7 +58286,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception:
             pass
-        await update.message.reply_text("🔎 /screen cache is warming up. Live pipeline is running in the background — run /screen again shortly.")
+        await update.message.reply_text("🔎 /screen cache is warming up. Fresh scan is queued in the dedicated screen lane — run /screen again shortly.")
         return
     except Exception as e:
         try:
@@ -60356,13 +58969,11 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
     seen = set()
     for raw in list(setups or []):
         try:
-            policy_sess = _fresh_setup_policy_session(raw, sess)
-            eff = _setup_route_candidate_for_executable_lane(raw, policy_sess, int(gate_uid or uid or 0))
+            eff = _setup_route_candidate_for_executable_lane(raw, sess, int(gate_uid or uid or 0))
             try:
-                if not getattr(eff, 'source_session', None):
-                    setattr(eff, 'source_session', policy_sess)
+                setattr(eff, 'source_session', sess)
                 if not getattr(eff, 'session', None):
-                    setattr(eff, 'session', policy_sess)
+                    setattr(eff, 'session', sess)
             except Exception:
                 pass
             sym = str(getattr(eff, 'symbol', '') or '').upper().strip()
@@ -60375,7 +58986,7 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
             if key in seen:
                 continue
             seen.add(key)
-            ok, why = is_executable_setup_eligible(eff, session_name=policy_sess)
+            ok, why = is_executable_setup_eligible(eff, session_name=sess)
             if not ok:
                 reasons[str(why or 'not_executable')] += 1
                 try:
@@ -60383,7 +58994,7 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
                 except Exception:
                     pass
                 continue
-            keep_ok, keep_why, keep_meta = _setup_user_visible_keep_policy_allows(eff, session_name=policy_sess, user_id=int(gate_uid or uid or 0), lane=str(lane or 'email'))
+            keep_ok, keep_why, keep_meta = _setup_user_visible_keep_policy_allows(eff, session_name=sess, user_id=int(gate_uid or uid or 0), lane=str(lane or 'email'))
             if not keep_ok:
                 reasons[str(keep_why or 'email_policy_not_keep')] += 1
                 try:
@@ -60400,157 +59011,6 @@ def _setup_email_presend_executable_filter(user_id: int, session_name: str, setu
     except Exception:
         pass
     return list(out or []), reasons
-
-def _setup_object_from_audit_row_for_email(row: dict, session_name: str = ''):
-    """Hydrate a generated/executable audit row back into a Setup-like object."""
-    from types import SimpleNamespace
-    try:
-        r = dict(row or {})
-        sess = str(session_name or r.get('session') or r.get('source_session') or '').upper().strip()
-        sid = str(r.get('setup_id') or _setup_audit_unique_key(r) or '').strip()
-        item = SimpleNamespace(
-            setup_id=sid,
-            id=sid,
-            symbol=str(r.get('symbol') or '').upper().strip(),
-            market_symbol=str(r.get('market_symbol') or r.get('symbol') or '').strip(),
-            side=str(r.get('side') or '').upper().strip(),
-            conf=int(float(r.get('conf') or 0.0)),
-            entry=float(r.get('entry') or 0.0),
-            sl=float(r.get('sl') or 0.0),
-            tp=float(_setup_target_tp(r, 0.0) or 0.0),
-            alt_target_a=float(r.get('alt_target_a') or 0.0),
-            alt_target_b=float(r.get('alt_target_b') or 0.0),
-            fut_vol_usd=float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0),
-            ch24=float(r.get('ch24') or 0.0),
-            ch4=float(r.get('ch4') or 0.0),
-            ch1=float(r.get('ch1') or 0.0),
-            ch15=float(r.get('ch15') or 0.0),
-            quality_score=float(r.get('quality_score') or r.get('conf') or 0.0),
-            atr_pct=float(r.get('atr_pct') or 0.0),
-            engine=str(r.get('engine') or ''),
-            created_ts=float(_setup_audit_row_ts(r) or 0.0),
-            signal_created_ts=float(r.get('signal_created_ts') or _setup_audit_row_ts(r) or 0.0),
-            executable_ts=float(r.get('executable_ts') or _setup_audit_row_ts(r) or 0.0),
-            email_logged_ts=0.0,
-            generated_logged_ts=float(_setup_audit_row_ts(r) or 0.0),
-            source_kind='audit_keep_rescue',
-            source_session=sess,
-            session=sess,
-            family_id=str(r.get('family_id') or ''),
-            setup_strategy=str(r.get('setup_strategy') or ''),
-            strategy=str(r.get('setup_strategy') or ''),
-            strategy_mode=str(r.get('setup_strategy') or ''),
-            strategy_reason=str(r.get('strategy_reason') or 'audit_keep_open_rescue')[:500],
-            original_setup_id=str(r.get('original_setup_id') or ''),
-            original_side=str(r.get('original_side') or ''),
-            delivery_lane_locked=True,
-        )
-        try:
-            item = _research_finalize_setup(item, session_name=sess)
-        except Exception:
-            pass
-        return item
-    except Exception:
-        return None
-
-
-def _select_recent_keep_open_audit_rescue_email_setups(user_id: int, session_name: str, limit: int | None = None) -> tuple[list, Counter]:
-    """Last-chance normal setup email rescue for current KEEP+OPEN audit rows.
-
-    This covers the case where /setup_audit shows a fresh KEEP/OPEN row but the
-    in-memory email pool was empty or missed the row. It still uses KEEP-only,
-    current entry-window, cooldown, presend and AutoTrade-compatible gates.
-    """
-    reasons = Counter()
-    out = []
-    try:
-        uid = int(user_id or 0)
-        sess = str(session_name or '').upper().strip()
-        if sess not in {'ASIA', 'LON', 'NY'}:
-            reasons['audit_rescue_missing_session'] += 1
-            return [], reasons
-        blk, blk_reason = _setup_generation_blackout_now()
-        if blk:
-            reasons[str(blk_reason or 'setup_generation_blackout')] += 1
-            return [], reasons
-        win_sec = float(_setup_email_actionable_queue_window_sec())
-        cutoff = float(time.time()) - win_sec
-        hours = max(1, int(math.ceil((win_sec / 3600.0) + 1.0)))
-        try:
-            max_n = int(limit if limit is not None else max(1, int(EMAIL_SETUPS_N or 1)))
-        except Exception:
-            max_n = 1
-        try:
-            rows = _setup_audit_load_rows(uid, hours=hours, limit=0, dedup=True, apply_final_quality_gate=False, source_mode_override='ALL')
-        except Exception:
-            rows = []
-        seen = set()
-        for r in list(rows or []):
-            try:
-                ts = float(_setup_audit_row_ts(r) or 0.0)
-                if ts <= cutoff:
-                    reasons['audit_rescue_expired'] += 1
-                    continue
-                rsess = str(r.get('session') or r.get('source_session') or '').upper().strip()
-                policy_sess = rsess if rsess in {'ASIA', 'LON', 'NY'} else sess
-                if rsess != sess:
-                    reasons['audit_rescue_cross_session_fresh'] += 1
-                blackout_label = _setup_audit_blackout_label_for_ts(ts)
-                if str(blackout_label or '').upper().strip() != 'OPEN':
-                    reasons['audit_rescue_blackout'] += 1
-                    continue
-                side = str(r.get('side') or '').upper().strip()
-                policy_label = _setup_audit_policy_label(r, uid=uid, session_name=policy_sess, side=side)
-                if str(policy_label or '').upper().strip() != 'KEEP':
-                    reasons['audit_rescue_not_keep'] += 1
-                    continue
-                try:
-                    fast_res = _setup_audit_keep_watch_fast_result_label(r, _setup_audit_result_horizon_hours())
-                    if str(fast_res or '').upper().strip() not in {'OPEN', ''}:
-                        reasons[f'audit_rescue_already_{str(fast_res).lower()}'] += 1
-                        continue
-                except Exception:
-                    pass
-                s = _setup_object_from_audit_row_for_email(r, policy_sess)
-                if s is None:
-                    reasons['audit_rescue_hydrate_failed'] += 1
-                    continue
-                sid = str(getattr(s, 'setup_id', '') or '').strip()
-                sym = str(getattr(s, 'symbol', '') or '').upper().strip()
-                side = str(getattr(s, 'side', '') or '').upper().strip()
-                key = sid or f'{sym}:{side}:{float(getattr(s, "entry", 0.0) or 0.0):.8f}'
-                if key in seen:
-                    continue
-                seen.add(key)
-                if _email_setup_identity_recently_sent(uid, s) or _email_symbol_recently_sent(uid, sym, side, policy_sess, setup_id=sid):
-                    reasons['audit_rescue_email_cooldown'] += 1
-                    continue
-                if symbol_flip_guard_active(uid, sym, side, policy_sess):
-                    reasons['audit_rescue_flip_guard'] += 1
-                    continue
-                ok_exec, why_exec = is_executable_setup_eligible(s, session_name=policy_sess)
-                if not ok_exec:
-                    reasons[f'audit_rescue_exec_{why_exec}'] += 1
-                    continue
-                ok_vis, why_vis, _meta_vis = _setup_user_visible_keep_policy_allows(s, session_name=policy_sess, user_id=uid, lane='email')
-                if not ok_vis:
-                    reasons[f'audit_rescue_visible_{why_vis}'] += 1
-                    continue
-                try:
-                    setattr(s, 'audit_keep_open_rescue', True)
-                except Exception:
-                    pass
-                out.append(s)
-                reasons['audit_rescue_selected'] += 1
-                if len(out) >= max_n:
-                    break
-            except Exception as exc:
-                reasons[f'audit_rescue_exception:{type(exc).__name__}'] += 1
-                continue
-    except Exception as exc:
-        reasons[f'audit_rescue_outer_exception:{type(exc).__name__}'] += 1
-    return out, reasons
-
 
 def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
     """
@@ -60995,9 +59455,7 @@ def downgrade_user_with_ledger_by_email(email: str, ref: str = "stripe_cancel"):
 EMAIL_FETCH_TIMEOUT_SEC = int(os.environ.get("EMAIL_FETCH_TIMEOUT_SEC", "15"))
 EMAIL_BUILD_POOL_TIMEOUT_SEC = int(os.environ.get("EMAIL_BUILD_POOL_TIMEOUT_SEC", "45"))
 EMAIL_SEND_TIMEOUT_SEC = max(30, int(os.environ.get("EMAIL_SEND_TIMEOUT_SEC", "45") or 55))
-ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "55"))
-if bool(globals().get("PULSEFUTURES_FORCE_NO_LAG_MODE", True)):
-    ALERT_JOB_MAX_RUNTIME_SEC = min(int(ALERT_JOB_MAX_RUNTIME_SEC or 55), 55)
+ALERT_JOB_MAX_RUNTIME_SEC = int(os.environ.get("ALERT_JOB_MAX_RUNTIME_SEC", "90"))
 # Ver21: the setup/email/autotrade pipeline must not depend on a user pressing /screen.
 # Older builds defaulted ALERT_JOB_MIN_INTERVAL_SEC to 300s, so manual /screen could appear
 # to be the trigger. Keep the autonomous setup pipeline hot by default.
@@ -61029,12 +59487,6 @@ _SMTP_LOCK = threading.RLock()
 _SMTP_CONN = None          # cached SMTP connection
 _SMTP_CONN_IS_SSL = None   # bool
 _SMTP_CONN_TS = 0.0        # last-used timestamp
-
-# Ver95: BigMove work must not block/starve the normal setup/email scan lane.
-_BIGMOVE_PAYLOAD_TASKS: dict[int, float] = {}
-_BIGMOVE_F8_TASKS: dict[str, float] = {}
-BIGMOVE_ASYNC_INFLIGHT_TTL_SEC = int(os.environ.get('BIGMOVE_ASYNC_INFLIGHT_TTL_SEC', '90') or 90)
-
 
 
 async def _to_thread_with_timeout(fn, timeout_sec: int, *args, **kwargs):
@@ -61145,12 +59597,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 return False
 
-        # Ver92: the command firewall owns Telegram responsiveness. User commands
-        # must not switch the autonomous setup/email/AutoTrade scanner to a
-        # light-only pass by default, because that starves setup generation when
-        # the owner is actively testing commands.
-        no_lag_light_only = False
-
         def _bigmove_session_reserve_hit() -> bool:
             try:
                 if not users_notify:
@@ -61179,35 +59625,17 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         if not email_config_ok():
             return
 
-        # Ver71: responsiveness first, but do not starve setup email / AutoTrade.
-        # In no-lag mode, recent owner commands now disable heavy rebuilds for this
-        # tick but still consume existing DB/cache/audit KEEP rows and can trigger
-        # immediate AutoTrade after an email.
-        try:
-            # Ver92: do NOT let manual Telegram command activity pause the core
-            # setup/email/AutoTrade scanner. The command firewall already keeps
-            # handlers instant, so the autonomous pipeline must keep doing real
-            # session builds even while the owner is pressing commands.
-            if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) and bool(globals().get('AUTONOMOUS_SETUP_LIGHT_ON_USER_ACTIVITY', False)) and _recent_user_activity(int(globals().get('HEAVY_USER_ACTIVITY_DEFER_SEC', 360) or 360)):
-                no_lag_light_only = True
-                try:
-                    db_log_setup_pipeline_event(0, stage='autonomous_setup_pipeline_tick', status='light_user_activity', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='email', details={'reason': 'recent_user_activity_no_lag_light_core_only', 'ver92_default': 'disabled'})
-                except Exception:
-                    pass
-        except Exception:
-            no_lag_light_only = False
-
         # Trade-signal emails may be notify_on-gated,
         # but Big-Move Alerts should go to anyone who has an email saved.
 
         try:
-            users_notify = await to_thread_fast(list_users_notify_on, timeout=6)
+            users_notify = await to_thread_fast(list_users_notify_on, timeout=10)
         except Exception as e:
             logger.exception("list_users_notify_on failed: %s", e)
             users_notify = []
 
         try:
-            users_bigmove = await to_thread_fast(list_users_with_email, timeout=6)
+            users_bigmove = await to_thread_fast(list_users_with_email, timeout=10)
         except Exception as e:
             logger.exception("list_users_with_email failed: %s", e)
             users_bigmove = []
@@ -61263,9 +59691,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         def _build_bigmove_payload_for_user(uid: int, tz):
             try:
                 uu = get_user(int(uid)) or {}
-                on = int(uu.get("bigmove_alert_on", 1) or 0)
-                if not on:
-                    return {"status": "SKIP", "reasons": ["bigmove_alert_off"]}
+                alert_on = int(uu.get("bigmove_alert_on", 1) or 0)
+                setup_email_on = 1 if _user_bigmove_setup_email_on(uu) else 0
+                if not alert_on and not setup_email_on:
+                    return {"status": "SKIP", "reasons": ["bigmove_alert_and_f8_setup_email_off"]}
 
                 try:
                     p15, p1, p4 = _user_bigmove_thresholds(uu)
@@ -61434,6 +59863,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     "top_dir": str(top_dir or ""),
                     "top_tf": str(top_tf or ""),
                     "top_move": float(top_move or 0.0),
+                    "alert_email_on": bool(alert_on),
+                    "setup_email_on": bool(setup_email_on),
                     "reasons": [
                         f"candidates={len(filtered)}",
                         f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%",
@@ -61468,13 +59899,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 setups = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(filtered or []), best_fut_snapshot or {}, sess_u, timeout=8)
             except Exception as exc:
                 try:
-                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_build', status='fallback_fast_builder', session=sess_u, mode='bigmove', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_build', status='error', session=sess_u, mode='bigmove', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
                 except Exception:
                     pass
-                try:
-                    setups = _bigmove_candidates_to_autotrade_setups_fast(list(filtered or []), best_fut_snapshot or {}, sess_u)
-                except Exception:
-                    setups = []
+                setups = []
             if not setups:
                 try:
                     db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_build', status='empty', session=sess_u, mode='bigmove', details={'candidates': len(filtered or []), 'tag': str(tag or '')})
@@ -61570,27 +59998,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as exc:
                 try:
-                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', status='fallback_fast_builder', session=sess_u, mode='bigmove_setup_email', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', status='error', session=sess_u, mode='bigmove_setup_email', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
                 except Exception:
                     pass
-                try:
-                    setups = _bigmove_candidates_to_autotrade_setups_fast(list(filtered or []), best_fut_snapshot or {}, sess_u)
-                except Exception:
-                    setups = []
-                try:
-                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f'f8_setup_build_fallback_after:{type(exc).__name__}')
-                except Exception:
-                    pass
-                if not setups:
-                    return [], False
+                return [], False
 
             if not setups:
                 try:
                     db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_build', status='empty', session=sess_u, mode='bigmove_setup_email', details={'candidates': len(filtered or []), 'tag': str(tag or '')})
-                except Exception:
-                    pass
-                try:
-                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_build_empty')
                 except Exception:
                     pass
                 return [], False
@@ -61618,22 +60033,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 setups, _bm_gate_reasons = [], Counter({'bigmove_presend_gate_exception': 1})
             if not setups:
                 try:
-                    top_reasons = _pipeline_top_reasons(_bm_gate_reasons, 8)
-                except Exception:
-                    top_reasons = []
-                try:
-                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', status='empty', session=sess_u, mode='bigmove_setup_email', details={'tag': str(tag or ''), 'top_reasons': top_reasons})
-                except Exception:
-                    pass
-                try:
-                    reason_txt = ', '.join([str(x) for x in list(top_reasons or [])[:4]]) or 'presend_gate_empty'
-                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f'f8_setup_blocked:{reason_txt}')
-                    _LAST_EMAIL_DECISION[int(uid)] = {
-                        'status': 'SKIP',
-                        'picked': '',
-                        'when': datetime.now(_zoneinfo_or_default((get_user(int(uid)) or {}).get('tz'))[0]).isoformat(timespec='seconds'),
-                        'reasons': ['bigmove_alert_f8_setup_blocked', reason_txt[:240]],
-                    }
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_presend_gate', status='empty', session=sess_u, mode='bigmove_setup_email', details={'tag': str(tag or ''), 'top_reasons': _pipeline_top_reasons(_bm_gate_reasons, 8)})
                 except Exception:
                     pass
                 return [], False
@@ -61724,94 +60124,86 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 top_dir = str(payload.get('top_dir') or '')
                 top_tf = str(payload.get('top_tf') or '')
                 top_move = float(payload.get('top_move') or 0.0)
+                alert_email_on = bool(payload.get('alert_email_on', True))
+                setup_email_on = bool(payload.get('setup_email_on', True))
 
-                try:
-                    ok = await _send_email_async(
-                        int(EMAIL_SEND_TIMEOUT_SEC),
-                        subject,
-                        body,
-                        user_id_for_debug=int(uid),
-                        bypass_user_email_master=True,
-                        enforce_trade_window=False,
-                    )
-                except Exception as e:
-                    ok = False
+                raw_alert_ok = True
+                raw_alert_sent = False
+                if alert_email_on:
                     try:
-                        _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
+                        raw_alert_ok = await _send_email_async(
+                            int(EMAIL_SEND_TIMEOUT_SEC),
+                            subject,
+                            body,
+                            user_id_for_debug=int(uid),
+                            bypass_user_email_master=True,
+                            enforce_trade_window=False,
+                        )
+                        raw_alert_sent = bool(raw_alert_ok)
+                    except Exception as e:
+                        raw_alert_ok = False
+                        try:
+                            _LAST_SMTP_ERROR[int(uid)] = f"{type(e).__name__}: {e}"
+                        except Exception:
+                            pass
+
+                _LAST_BIGMOVE_DECISION[int(uid)] = {
+                    "status": ("SENT" if raw_alert_sent else ("SETUP_ONLY" if (not alert_email_on and setup_email_on) else ("SKIP" if not setup_email_on else "ERROR"))),
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                    "subject": subject if alert_email_on else "",
+                    "reasons": (
+                        [f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", f"sent_raw_alert_{tag}"]
+                        if raw_alert_sent else
+                        ([f"raw_bigmove_alert_email_off", f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%"] if (not alert_email_on and setup_email_on) else [f"send_email_failed_or_timeout_{tag}", _LAST_SMTP_ERROR.get(int(uid), "send_email_failed")])
+                    ),
+                }
+
+                bm_sess = _bigmove_autotrade_session_name()
+                setup_email_setups = []
+                setup_email_sent = False
+                if setup_email_on and raw_alert_ok:
+                    try:
+                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
+                    except Exception:
+                        setup_email_setups, setup_email_sent = [], False
+                    try:
+                        if setup_email_sent:
+                            _LAST_BIGMOVE_DECISION[int(uid)]["status"] = "SETUP_SENT" if not raw_alert_sent else "SENT"
+                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
+                        else:
+                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
+                    except Exception:
+                        pass
+                elif not setup_email_on:
+                    try:
+                        _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_off')
                     except Exception:
                         pass
 
-                _LAST_BIGMOVE_DECISION[int(uid)] = {
-                    "status": "SENT" if ok else "ERROR",
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "subject": subject,
-                    "reasons": (
-                        [f"candidates={len(filtered)}", f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%", f"sent_{tag}"]
-                        if ok else
-                        [f"send_email_failed_or_timeout_{tag}", _LAST_SMTP_ERROR.get(int(uid), "send_email_failed")]
-                    ),
-                }
-                if ok:
+                if raw_alert_sent or setup_email_sent:
                     for c in filtered[:8]:
                         try:
                             mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
                         except Exception:
                             pass
-                    bm_sess = _bigmove_autotrade_session_name()
-                    # Ver95: F8 setup-email conversion/sending must not block the
-                    # BigMove payload task either. Queue it and let /email_decision
-                    # show the eventual result from _send_bigmove_setup_email_after_alert.
-                    try:
-                        f8_key = f"{int(uid)}:{str(bm_sess or '')}:{','.join([str((c or {}).get('symbol') or '') for c in list(filtered or [])[:8]])}"
-                        now_f8 = float(time.time())
-                        last_f8 = float((_BIGMOVE_F8_TASKS or {}).get(f8_key, 0.0) or 0.0)
-                        if last_f8 > 0 and (now_f8 - last_f8) < float(BIGMOVE_ASYNC_INFLIGHT_TTL_SEC):
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_already_inflight')
-                        else:
-                            _BIGMOVE_F8_TASKS[f8_key] = now_f8
 
-                            async def _bm_f8_runner(_key=f8_key, _uid=int(uid), _sess=str(bm_sess or ''), _filtered=list(filtered or []), _best=dict(best_fut or {}), _tag=str(tag or 'pre_session')):
-                                try:
-                                    _setup_email_setups, _setup_email_sent = await _send_bigmove_setup_email_after_alert(int(_uid), str(_sess or ''), list(_filtered or []), _best or {}, tag=str(_tag or 'pre_session'))
-                                    try:
-                                        if _setup_email_sent:
-                                            _LAST_BIGMOVE_DECISION[int(_uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(_setup_email_setups or [])}")
-                                        else:
-                                            _existing_f8_reasons = [str(x) for x in (_LAST_BIGMOVE_DECISION[int(_uid)].get('reasons') or [])]
-                                            if not any(x.startswith('f8_setup_') for x in _existing_f8_reasons):
-                                                _LAST_BIGMOVE_DECISION[int(_uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
-                                    except Exception:
-                                        pass
-                                    try:
-                                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                                                "status": "QUEUED",
-                                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if _setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
-                                                "session": str(_sess or ""),
-                                                "mode": str(_autotrade_runtime_mode()).lower(),
-                                                "trigger": "bigmove_setup_email_immediate",
-                                            }
-                                            _safe_create_task(
-                                                _trigger_autotrade_after_bigmove_email_async(int(_uid), str(_sess or ""), list(_filtered or []), _best or {}, tag=str(_tag or "pre_session")),
-                                                "autotrade_after_bigmove_setup_email",
-                                            )
-                                    except Exception:
-                                        pass
-                                finally:
-                                    try:
-                                        _BIGMOVE_F8_TASKS.pop(str(_key), None)
-                                    except Exception:
-                                        pass
-
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_queued_async')
-                            _safe_create_task(_bm_f8_runner(), 'bigmove_f8_setup_email_async')
-                    except Exception as _f8q_exc:
-                        try:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f'f8_setup_queue_error:{type(_f8q_exc).__name__}: {_f8q_exc}')
-                        except Exception:
-                            pass
+                try:
+                    owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+                    if setup_email_sent and owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            "status": "QUEUED",
+                            "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade",
+                            "session": str(bm_sess or ""),
+                            "mode": str(_autotrade_runtime_mode()).lower(),
+                            "trigger": "bigmove_setup_email_immediate",
+                        }
+                        _safe_create_task(
+                            _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
+                            "autotrade_after_bigmove_setup_email",
+                        )
+                except Exception:
+                    pass
             except Exception as e:
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[int(uid)] = {
@@ -61838,7 +60230,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             pass
         users_bigmove = list(users_bigmove or [])
         try:
-            users_bigmove = [u for u in users_bigmove if int((u or {}).get('bigmove_alert_on', 1) or 0) == 1]
+            # ver36: raw Big-Move alert emails and BigMove/F8 setup emails are separate.
+            # Keep users in this lane if either raw alerts are ON or F8 setup emails are ON.
+            users_bigmove = [u for u in users_bigmove if (int((u or {}).get('bigmove_alert_on', 1) or 0) == 1 or _user_bigmove_setup_email_on(u))]
         except Exception:
             users_bigmove = list(users_bigmove or [])
         _bigmove_user_limit = _alert_job_limit('ALERT_JOB_BIGMOVE_MAX_USERS', 0)
@@ -61870,46 +60264,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             # deferred it until after heavy scans; if scans timed out or exhausted
             # the runtime budget, no Big-Move email was ever sent even though
             # /email_test worked. Run it now in the dedicated email executor.
-            # Ver95: do not await BigMove work in the main alert job.
-            # BigMove payload confirmation, SMTP, and F8 setup conversion can take
-            # 15-60s; when awaited here they consume the alert-job budget before
-            # the normal session setup pool runs, causing Last scan='-' and no
-            # setup generation for the whole session. Queue it and immediately
-            # continue to the setup/email pool builder.
-            try:
-                now_bm = float(time.time())
-                last_bm = float((_BIGMOVE_PAYLOAD_TASKS or {}).get(int(uid), 0.0) or 0.0)
-                if last_bm > 0 and (now_bm - last_bm) < float(BIGMOVE_ASYNC_INFLIGHT_TTL_SEC):
-                    _LAST_BIGMOVE_DECISION[int(uid)] = {
-                        "status": "QUEUED",
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
-                        "reasons": ["bigmove_payload_already_inflight", f"age_sec={now_bm-last_bm:.0f}"],
-                    }
-                    continue
-                _BIGMOVE_PAYLOAD_TASKS[int(uid)] = now_bm
-
-                async def _bm_payload_runner(_uid=int(uid), _tz=tz, _tag='pre_session'):
-                    try:
-                        await _send_bigmove_payload_for_user(int(_uid), _tz, tag=str(_tag))
-                    finally:
-                        try:
-                            _BIGMOVE_PAYLOAD_TASKS.pop(int(_uid), None)
-                        except Exception:
-                            pass
-
-                _LAST_BIGMOVE_DECISION[int(uid)] = {
-                    "status": "QUEUED",
+            if _job_budget_exhausted():
+                _LAST_BIGMOVE_DECISION[uid] = {
+                    "status": "SKIP",
                     "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": ["bigmove_payload_queued_async", "session_setup_pool_not_blocked"],
-                }
-                _safe_create_task(_bm_payload_runner(), 'bigmove_payload_async')
-            except Exception as _bmq_exc:
-                _LAST_BIGMOVE_DECISION[int(uid)] = {
-                    "status": "ERROR",
-                    "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    "reasons": [f"bigmove_queue_error:{type(_bmq_exc).__name__}: {_bmq_exc}"],
+                    "reasons": ["pre_session_bigmove_budget_exhausted"],
                 }
                 continue
+            await _send_bigmove_payload_for_user(int(uid), tz, tag='pre_session')
 
 
         # -----------------------------------------------------
@@ -61982,25 +60344,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     pass
                 _email_pool_cache_set(sess_name, persisted_setups)
                 return str(sess_name).upper(), list(persisted_setups or [])
-
-            # Ver71 no-lag light pass: while the owner is actively using Telegram,
-            # avoid a full OHLCV pool rebuild, but still allow cache/DB/recent-candidate
-            # fallbacks later in the per-user send loop to deliver fresh KEEP rows.
-            try:
-                if bool(no_lag_light_only):
-                    if cached_setups and cache_age <= float(_setup_email_actionable_queue_window_sec()):
-                        try:
-                            db_log_setup_pipeline_event(0, stage='email_pool_session_cache', status='no_lag_light_cache_hit', session=str(sess_name or ''), mode='email', details={'setups': len(cached_setups or []), 'cache_age_sec': round(cache_age, 1)})
-                        except Exception:
-                            pass
-                        return str(sess_name).upper(), list(cached_setups or [])
-                    try:
-                        db_log_setup_pipeline_event(0, stage='email_pool_session_skip', status='no_lag_light_no_cache', session=str(sess_name or ''), mode='email', details={'reason': 'recent_user_activity_core_light_pass'})
-                    except Exception:
-                        pass
-                    return str(sess_name).upper(), []
-            except Exception:
-                pass
 
             # Cache-first: avoid rebuilding the full email pool every cycle when a recent
             # authoritative session pool already exists. Under runtime pressure, prefer
@@ -62263,9 +60606,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
             eligible: List[Setup] = []
             for s in (setups_all or []):
                 try:
-                    _pol_sess = _fresh_setup_policy_session(s, sess_name)
-                    s_eff = _setup_route_candidate_for_executable_lane(s, _pol_sess, int(uid))
-                    ok, why = is_executable_setup_eligible(s_eff, session_name=_pol_sess)
+                    s_eff = _setup_route_candidate_for_executable_lane(s, sess_name, int(uid))
+                    ok, why = is_executable_setup_eligible(s_eff, session_name=sess_name)
                 except Exception:
                     s_eff = s
                     ok, why = False, 'email_exec_gate_exception'
@@ -62324,9 +60666,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         if _cand is None:
                             continue
                         try:
-                            _pol_sess = _fresh_setup_policy_session(_cand, sess_name)
-                            _cand_eff = _setup_route_candidate_for_executable_lane(_cand, _pol_sess, int(uid))
-                            if is_executable_setup_eligible(_cand_eff, session_name=_pol_sess)[0]:
+                            _cand_eff = _setup_route_candidate_for_executable_lane(_cand, sess_name, int(uid))
+                            if is_executable_setup_eligible(_cand_eff, session_name=sess_name)[0]:
                                 eligible.append(_cand_eff)
                         except Exception:
                             continue
@@ -62343,10 +60684,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     recovery_now = []
                     for _s in list(setups_all or []):
                         try:
-                            _pol_sess = _fresh_setup_policy_session(_s, sess_name)
-                            _s_eff = _setup_route_candidate_for_executable_lane(_s, _pol_sess, int(uid))
+                            _s_eff = _setup_route_candidate_for_executable_lane(_s, sess_name, int(uid))
                             setattr(_s_eff, 'recovery_fallback', True)
-                            ok_now, _why_now = is_executable_setup_eligible(_s_eff, session_name=_pol_sess)
+                            ok_now, _why_now = is_executable_setup_eligible(_s_eff, session_name=sess_name)
                             if ok_now:
                                 recovery_now.append(_s_eff)
                         except Exception:
@@ -62363,37 +60703,8 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         pass
 
             if not eligible:
-                # yver48: final last-chance rescue from /setup_audit.
-                # This catches the exact case where /setup_audit shows a fresh
-                # KEEP + OPEN row, but the live executable/email pool is empty
-                # because the row was written by another scan lane/cycle.
-                audit_rescue_reasons = Counter()
-                try:
-                    audit_rescue_list, audit_rescue_reasons = _select_recent_keep_open_audit_rescue_email_setups(
-                        int(uid), str(sess_name or ''), limit=max(1, int(EMAIL_SETUPS_N or 1))
-                    )
-                except Exception as _audit_rescue_exc:
-                    audit_rescue_list, audit_rescue_reasons = [], Counter({f'audit_rescue_exception:{type(_audit_rescue_exc).__name__}': 1})
-                if audit_rescue_list:
-                    eligible = list(audit_rescue_list or [])
-                    try:
-                        _persist_stats = _persist_executable_candidates(int(uid), str(sess_name or ''), list(eligible or []), source_kind='executable_setups', mode='email_audit_rescue')
-                        persisted_count = max(int(persisted_count or 0), int((_persist_stats or {}).get('persisted') or 0))
-                    except Exception:
-                        pass
-                    try:
-                        db_log_setup_pipeline_event(int(uid), stage='email_audit_keep_open_rescue', status='selected', session=str(sess_name or ''), mode='email', details={'eligible': len(eligible or []), 'persisted': int(persisted_count or 0), 'top_reasons': _pipeline_top_reasons(audit_rescue_reasons, 6)})
-                    except Exception:
-                        pass
-
-            if not eligible:
                 top_reasons = dict(skip_reasons_counter.most_common(3))
-                try:
-                    if 'audit_rescue_reasons' in locals() and audit_rescue_reasons:
-                        top_reasons = dict((audit_rescue_reasons or Counter()).most_common(3))
-                except Exception:
-                    pass
-                db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'persisted': persisted_count, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5), 'audit_rescue': _pipeline_top_reasons((audit_rescue_reasons if 'audit_rescue_reasons' in locals() else Counter()), 5)})
+                db_log_setup_pipeline_event(int(uid), stage='email_executable_pool', status='empty', session=str(sess_name or ''), mode='email', details={'eligible': 0, 'persisted': persisted_count, 'top_reasons': _pipeline_top_reasons(skip_reasons_counter, 5)})
                 _LAST_EMAIL_DECISION[uid] = {
                     "status": "SKIP",
                     "reasons": ([_email_no_setups_reason(sess, fallback_session=sess_name)] if not setups_all else ["no_setups_after_filters"]) + [f"top_reasons={top_reasons}"],
@@ -62453,8 +60764,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 sess_name = str(sess["name"])
 
                 try:
-                    policy_sess = _fresh_setup_policy_session(s, sess_name)
-                    if not _setup_combo_policy_allows_setup(s, policy_sess, user_id=int(uid)):
+                    if not _setup_combo_policy_allows_setup(s, sess_name, user_id=int(uid)):
                         combo_policy_blocked += 1
                         continue
                 except Exception:
@@ -62466,7 +60776,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 # Otherwise the top candidate can be chosen then removed by presend,
                 # causing the whole email batch to fail instead of trying the next valid setup.
                 try:
-                    _vis_ok, _vis_why, _vis_meta = _setup_user_visible_keep_policy_allows(s, session_name=policy_sess, user_id=int(uid), lane='email')
+                    _vis_ok, _vis_why, _vis_meta = _setup_user_visible_keep_policy_allows(s, session_name=sess_name, user_id=int(uid), lane='email')
                     if not _vis_ok:
                         combo_policy_blocked += 1
                         try:
@@ -62478,11 +60788,11 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     combo_policy_blocked += 1
                     continue
 
-                if symbol_flip_guard_active(uid, sym, side, policy_sess):
+                if symbol_flip_guard_active(uid, sym, side, sess_name):
                     flip_blocked += 1
                     continue
 
-                ok_div, why_div = _email_diversification_guard(s, chosen_list, best_fut, policy_sess)
+                ok_div, why_div = _email_diversification_guard(s, chosen_list, best_fut, sess_name)
                 if not ok_div:
                     diversify_blocked[str(why_div)] += 1
                     continue
@@ -62490,7 +60800,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 if _email_setup_identity_recently_sent(uid, s):
                     cooldown_blocked += 1
                     continue
-                if _email_symbol_recently_sent(uid, sym, side, policy_sess, setup_id=str(getattr(s, 'setup_id', '') or '')):
+                if _email_symbol_recently_sent(uid, sym, side, sess_name, setup_id=str(getattr(s, 'setup_id', '') or '')):
                     cooldown_blocked += 1
                     continue
 
@@ -62504,21 +60814,6 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         continue
 
                 chosen_list.append(s)
-
-            if not chosen_list:
-                audit_rescue_reasons = Counter()
-                try:
-                    audit_rescue_list, audit_rescue_reasons = _select_recent_keep_open_audit_rescue_email_setups(
-                        int(uid), str(sess_name or ''), limit=max(1, int(EMAIL_SETUPS_N or 1))
-                    )
-                except Exception as _audit_rescue_exc:
-                    audit_rescue_list, audit_rescue_reasons = [], Counter({f'audit_rescue_exception:{type(_audit_rescue_exc).__name__}': 1})
-                if audit_rescue_list:
-                    try:
-                        db_log_setup_pipeline_event(int(uid), stage='email_audit_keep_open_rescue', status='selected_after_filters', session=str(sess_name or ''), mode='email', details={'eligible': len(audit_rescue_list), 'top_reasons': _pipeline_top_reasons(audit_rescue_reasons, 6)})
-                    except Exception:
-                        pass
-                    chosen_list = list(audit_rescue_list or [])
 
             if not chosen_list:
                 reasons = []
@@ -62633,31 +60928,13 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 _LAST_EMAIL_DECISION[uid] = _tmp_dec
                 _LAST_EMAIL_SENT[uid] = dict(_tmp_dec)
             else:
-                # yver46: send_email_alert_multi can return False because its final
-                # presend executable gate removed all candidates. That is a clean SKIP,
-                # not an SMTP/email failure. Keep real SMTP failures as ERROR.
-                try:
-                    _cur_dec = dict(_LAST_EMAIL_DECISION.get(uid) or {})
-                    _cur_reasons = [str(_r) for _r in list(_cur_dec.get('reasons') or [])]
-                except Exception:
-                    _cur_dec, _cur_reasons = {}, []
-                if str(_cur_dec.get('status') or '').upper() == 'SKIP' and any('presend_executable_gate_empty' in _r for _r in _cur_reasons):
-                    try:
-                        db_log_setup_pipeline_event(int(uid), stage='email_delivery', status='skip', session=str(sess.get("name") or sess_name or ''), mode='email', details={'reason': 'presend_executable_gate_empty', 'reasons': _cur_reasons[:6]})
-                    except Exception:
-                        pass
-                    try:
-                        _LAST_EMAIL_ERROR.pop(uid, None)
-                    except Exception:
-                        pass
-                else:
-                    _tmp_dec = {
-                        "status": "ERROR",
-                        "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
-                        "when": datetime.now(tz).isoformat(timespec="seconds"),
-                    }
-                    _LAST_EMAIL_DECISION[uid] = _tmp_dec
-                    _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
+                _tmp_dec = {
+                    "status": "ERROR",
+                    "reasons": ["send_email_failed_or_timeout", _LAST_SMTP_ERROR.get(uid, "unknown_error")],
+                    "when": datetime.now(tz).isoformat(timespec="seconds"),
+                }
+                _LAST_EMAIL_DECISION[uid] = _tmp_dec
+                _LAST_EMAIL_ERROR[uid] = dict(_tmp_dec)
 
 
         # -----------------------------------------------------
@@ -62742,9 +61019,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         if setup_email_sent:
                             _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
                         else:
-                            _existing_f8_reasons = [str(x) for x in (_LAST_BIGMOVE_DECISION[int(uid)].get('reasons') or [])]
-                            if not any(x.startswith('f8_setup_') for x in _existing_f8_reasons):
-                                _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
+                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
                     except Exception:
                         pass
                     try:
@@ -62823,13 +61098,13 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     scan = _LAST_EMAIL_DECISION.get(uid) or {}
     bigm = _LAST_BIGMOVE_DECISION.get(uid) or {}
 
+    # If nothing recorded
+    if not scan and not bigm:
+        await update.message.reply_text("No email decision recorded yet.")
+        return
+
     lines = []
     lines.append("📧 Email Decisions")
-    # Ver71: after a Render restart the in-memory decision dict can be empty even
-    # while the job heartbeat/pipeline DB has useful state. Do not return early;
-    # show heartbeat + persisted pipeline evidence below.
-    if not scan and not bigm:
-        lines.append("No in-memory email decision recorded yet after this restart/tick.")
     # Heartbeat
     try:
         last_tick = float(_EMAIL_LOOP_HEARTBEAT.get("last_tick_ts", 0.0) or 0.0)
@@ -62877,6 +61152,10 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         bigm_on = 1
     try:
+        bigm_setup_on = 1 if _user_bigmove_setup_email_on(user) else 0
+    except Exception:
+        bigm_setup_on = 1
+    try:
         bigm_p15, bigm_p1, bigm_p4 = _user_bigmove_thresholds(user)
     except Exception:
         bigm_p15, bigm_p1, bigm_p4 = BIGMOVE_DEFAULT_15M_PCT, BIGMOVE_DEFAULT_1H_PCT, BIGMOVE_DEFAULT_4H_PCT
@@ -62891,8 +61170,9 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     bigm_updated_reason = str(user.get("bigmove_alert_update_reason", "") or "").strip()
 
     lines.append("")
-    lines.append("⚡ Big-Move Alert Settings")
-    lines.append(f"Status: {'ON' if bigm_on else 'OFF'}")
+    lines.append("⚡ Big-Move / F8 Setup Settings")
+    lines.append(f"Raw Alert Emails: {'ON' if bigm_on else 'OFF'}")
+    lines.append(f"F8 Setup Emails: {'ON' if bigm_setup_on else 'OFF'}")
     lines.append(f"Thresholds: |15m| ≥ {bigm_p15:g}% AND |1H| ≥ {bigm_p1:g}% AND |4H| ≥ {bigm_p4:g}% (same direction only)")
     lines.append(f"Min Vol (24H): {bigm_min_vol/1e6:.1f}M")
     lines.append(f"Payload timeout: {int(BIGMOVE_PAYLOAD_TIMEOUT_SEC or 60)}s")
@@ -62978,12 +61258,6 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 lines.append("Build pool: " + _pipe_summary(pipe_build))
             if pipe_exec:
                 lines.append("Executable pool: " + _pipe_summary(pipe_exec))
-            try:
-                audit_rescue_ev = _latest_setup_pipeline_event(uid, stage='email_audit_keep_open_rescue', session=pipe_lookup_sess, mode='email') or _latest_setup_pipeline_event(uid, stage='email_audit_keep_open_rescue', mode='email') or {}
-                if audit_rescue_ev:
-                    lines.append("KEEP/OPEN audit rescue last: " + _pipe_summary(audit_rescue_ev))
-            except Exception:
-                pass
     except Exception:
         pass
 
@@ -62996,13 +61270,6 @@ async def email_decision_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"Mode/session: {str(h.get('last_scan_mode') or '-')}/{str(h.get('last_scan_session') or '-')}")
         lines.append(f"TF phase: {str(h.get('last_tf_phase') or '-')} | Symbols processed: {int(h.get('symbols_processed') or 0)}")
         lines.append(f"Rate-limit hits: {int(h.get('rate_limit_hits') or 0)} | Stale uses: {int(h.get('stale_usage') or 0)} | OHLCV limit: {int(h.get('ohlcv_limit') or MAX_OHLCV_LIMIT)}")
-    except Exception:
-        pass
-    try:
-        _sblk, _swhy = _setup_generation_blackout_now()
-        _eblk, _ewhy = _autotrade_entry_blackout_now()
-        lines.append(f"Setup blackout now: {'ACTIVE' if _sblk else 'OPEN'}" + (f" | {_swhy}" if _sblk and _swhy else "") + f" | windows={_setup_generation_blackout_windows()}")
-        lines.append(f"Entry blackout now: {'ACTIVE' if _eblk else 'OPEN'}" + (f" | {_ewhy}" if _eblk and _ewhy else "") + f" | windows={_autotrade_entry_blackout_windows()}")
     except Exception:
         pass
 
@@ -63137,25 +61404,12 @@ def _log_transient_telegram_error(err: Exception | None) -> None:
         if now - float(_TELEGRAM_TRANSIENT_ERROR_LAST_LOG_TS or 0.0) >= window:
             suppressed = int(_TELEGRAM_TRANSIENT_ERROR_SUPPRESSED or 0)
             suffix = f" | suppressed={suppressed}" if suppressed else ""
-            msg = (
-                "Telegram polling transient network error ignored; polling will retry automatically: "
-                f"{type(err).__name__ if err else 'UnknownError'}: {err}{suffix}"
+            logger.warning(
+                "Telegram polling transient network error ignored; polling will retry automatically: %s: %s%s",
+                type(err).__name__ if err else "UnknownError",
+                err,
+                suffix,
             )
-
-            # Ver49: expected Telegram getUpdates edge/network blips (502 Bad Gateway,
-            # httpx.ReadError, timeouts) are not bot failures and PTB retries them
-            # automatically. Render showed them as WARNING and looked unhealthy, so keep
-            # the counter/throttle but make the default log level DEBUG. Operators can
-            # temporarily raise this with TELEGRAM_TRANSIENT_ERROR_LOG_LEVEL=INFO or WARNING.
-            lvl_name = str(os.getenv("TELEGRAM_TRANSIENT_ERROR_LOG_LEVEL", "DEBUG") or "DEBUG").upper()
-            lvl = getattr(logging, lvl_name, logging.DEBUG)
-            if lvl >= logging.WARNING:
-                logger.log(lvl, msg)
-            elif lvl >= logging.INFO:
-                logger.info(msg)
-            else:
-                logger.debug(msg)
-
             _TELEGRAM_TRANSIENT_ERROR_LAST_LOG_TS = now
             _TELEGRAM_TRANSIENT_ERROR_SUPPRESSED = 0
         else:
@@ -64279,22 +62533,12 @@ async def screen_cache_warmup_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         if _ohlcv_boot_grace_active():
             return
-        # Ver92: command activity alone must not stop the background screen/setup
-        # cache from warming. Only real runtime contention should defer it.
-        if bool(globals().get('SCREEN_WARMUP_DEFER_ON_USER_ACTIVITY', False)) and _recent_user_activity(20):
+        if _recent_user_activity(20):
             return
         if _SCREEN_REFRESH_TASK is not None and not _SCREEN_REFRESH_TASK.done():
             return
-        try:
-            if ALERT_LOCK.locked() or SCAN_LOCK.locked() or _SCREEN_LOCK.locked():
-                return
-        except Exception:
-            pass
-        try:
-            if _backtest_runtime_busy() or _goal_profile_is_running():
-                return
-        except Exception:
-            pass
+        if _interactive_runtime_busy(30):
+            return
         sess = str(scan_session_name_utc(datetime.now(timezone.utc)) or '').upper()
         cache_key = f"global::{sess}"
         ce = _SCREEN_CACHE.get(cache_key) or {}
@@ -64963,26 +63207,10 @@ async def alert_job(context: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
-        # yver47: hard guard the wrapper as well as the internal budget.
-        # On Render, a cold scan/email tick can otherwise still be running when
-        # APScheduler fires the next interval, producing noisy
-        # "maximum number of running instances reached" warnings and delaying
-        # the next email/setup loop.
-        timeout_sec = max(45.0, float(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 25.0)
-        await asyncio.wait_for(_alert_job_async_internal(context), timeout=timeout_sec)
+        await _alert_job_async_internal(context)
         _hb_touch('email', ok=True, details='alert_job_ok')
         try:
             _EMAIL_LOOP_HEARTBEAT["last_error"] = ""
-        except Exception:
-            pass
-    except asyncio.TimeoutError as e:
-        try:
-            _EMAIL_LOOP_HEARTBEAT["last_error"] = f"alert_job_timeout>{timeout_sec:.0f}s"
-        except Exception:
-            pass
-        _hb_touch('email', ok=False, error=f"alert_job_timeout>{timeout_sec:.0f}s", details='alert_job_timeout')
-        try:
-            logger.warning("Alert job timed out after %.1fs; next tick will continue", timeout_sec)
         except Exception:
             pass
     except Exception as e:
@@ -65016,246 +63244,6 @@ async def autotrade_sessions_cmd(update: Update, context: ContextTypes.DEFAULT_T
     _autotrade_set_sessions(",".join(parts))
     await update.message.reply_text(f"✅ AutoTrade sessions updated: {','.join(parts)}")
 
-
-
-# =========================================================
-# Ver90 TELEGRAM COMMAND FIREWALL
-# =========================================================
-# Non-negotiable rule for this bot:
-#   Telegram handler path = parse command -> ACK -> enqueue worker -> return.
-# No slash command is allowed to run reports, scans, Bybit calls, OHLCV fetches,
-# heavy SQLite reads, or email decisions before the visible ACK has been sent.
-PULSEFUTURES_COMMAND_FIREWALL_ENABLED = env_bool("PULSEFUTURES_COMMAND_FIREWALL_ENABLED", True)
-COMMAND_FIREWALL_MAX_CONCURRENT = int(os.getenv("COMMAND_FIREWALL_MAX_CONCURRENT", "8") or 8)
-COMMAND_FIREWALL_RESULT_TIMEOUT_SEC = int(os.getenv("COMMAND_FIREWALL_RESULT_TIMEOUT_SEC", "900") or 900)
-COMMAND_FIREWALL_ACK_TEXT = os.getenv(
-    "COMMAND_FIREWALL_ACK_TEXT",
-    "⏳ /{cmd} accepted. The bot is working in the background and will post the output when ready.",
-)
-_COMMAND_FIREWALL_REGISTRY: dict[str, object] = {}
-_COMMAND_FIREWALL_SEMAPHORE = None
-_COMMAND_FIREWALL_SEQ = 0
-_COMMAND_FIREWALL_INSTALLED = False
-
-
-def _command_firewall_parse(update: Update) -> tuple[str, list[str], str]:
-    try:
-        msg = getattr(update, 'message', None)
-        txt = str(getattr(msg, 'text', '') or '').strip()
-        if not txt.startswith('/'):
-            return '', [], txt
-        parts = txt.split()
-        raw_cmd = parts[0][1:].split('@')[0].strip().lower()
-        args = parts[1:] if len(parts) > 1 else []
-        return raw_cmd, list(args), txt
-    except Exception:
-        return '', [], ''
-
-
-def _command_firewall_set_args(context: ContextTypes.DEFAULT_TYPE, args: list[str]) -> None:
-    try:
-        context.args = list(args or [])
-    except Exception:
-        pass
-
-
-def _command_firewall_semaphore():
-    global _COMMAND_FIREWALL_SEMAPHORE
-    try:
-        if _COMMAND_FIREWALL_SEMAPHORE is None:
-            _COMMAND_FIREWALL_SEMAPHORE = asyncio.Semaphore(max(1, int(COMMAND_FIREWALL_MAX_CONCURRENT or 1)))
-        return _COMMAND_FIREWALL_SEMAPHORE
-    except Exception:
-        return asyncio.Semaphore(1)
-
-
-def _command_firewall_refresh_registry(app) -> None:
-    """Build the command -> original callback registry from the Application.
-
-    This prevents missed legacy paths. Instead of manually patching one command
-    at a time, Ver90 discovers every CommandHandler already registered in the bot
-    and routes all of them through the same ACK/background firewall.
-    """
-    global _COMMAND_FIREWALL_REGISTRY
-    reg: dict[str, object] = {}
-    try:
-        handlers_by_group = getattr(app, 'handlers', {}) or {}
-        for _group, handlers in list(handlers_by_group.items()):
-            for h in list(handlers or []):
-                try:
-                    if isinstance(h, CommandHandler):
-                        cb = getattr(h, 'callback', None)
-                        if not cb:
-                            continue
-                        for c in list(getattr(h, 'commands', []) or []):
-                            key = str(c or '').strip().lower().lstrip('/')
-                            if key:
-                                reg[key] = cb
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-    # Backstop aliases from the previous owner-deferred map, in case a command is
-    # registered via a regex MessageHandler or a legacy alias was not discovered.
-    try:
-        for key, handler_name in dict(globals().get('OWNER_DEFERRED_COMMAND_HANDLERS', {}) or {}).items():
-            cb = globals().get(str(handler_name or ''))
-            if cb:
-                reg[str(key or '').strip().lower().lstrip('/')] = cb
-    except Exception:
-        pass
-
-    # Regex-only / slash-in-name aliases.
-    manual = {
-        'autotrade/closed': 'autotrade_closed_cmd',
-    }
-    for key, handler_name in manual.items():
-        cb = globals().get(handler_name)
-        if cb:
-            reg[str(key).lower()] = cb
-
-    # Ver91 hard override: the discovered CommandHandler('screen') is intentionally
-    # replaced by the safe no-lag screen renderer. This prevents /screen from using
-    # old scan/ticker-only code while the global firewall is active.
-    try:
-        cb = globals().get('_owner_instant_screen_cmd')
-        if cb:
-            reg['screen'] = cb
-    except Exception:
-        pass
-
-    _COMMAND_FIREWALL_REGISTRY = reg
-    try:
-        logger.warning("Ver90 command firewall registry loaded: %s commands", len(_COMMAND_FIREWALL_REGISTRY))
-    except Exception:
-        pass
-
-
-async def _command_firewall_ack(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str) -> bool:
-    label = str(cmd or 'command').strip() or 'command'
-    try:
-        if label == 'start':
-            text = "✅ PulseFutures is live. Command accepted; full output will follow in the background."
-        elif label == 'status':
-            # Keep /status useful even before the background detail arrives.
-            try:
-                sess = current_session_utc()
-            except Exception:
-                sess = scan_session_name_utc() or 'UNKNOWN'
-            text = f"✅ PulseFutures status: LIVE\nSession: {sess}\nCommands are using the Ver90 instant firewall."
-        else:
-            try:
-                text = str(COMMAND_FIREWALL_ACK_TEXT or '').format(cmd=label)
-            except Exception:
-                text = f"⏳ /{label} accepted. The bot is working in the background and will post the output when ready."
-        ok = await _instant_reply(update, text, context=context)
-        if ok:
-            return True
-    except Exception:
-        pass
-    # Last-chance fallback. This is still bounded; if Telegram itself is down, no
-    # code can force delivery, but the command worker is still queued.
-    try:
-        await asyncio.wait_for(
-            update.message.reply_text(f"⏳ /{label} accepted. Working in background."),
-            timeout=2.0,
-        )
-        return True
-    except Exception:
-        return False
-
-
-async def _command_firewall_worker(cmd: str, args_snapshot: list[str], update: Update, context: ContextTypes.DEFAULT_TYPE, seq: int) -> None:
-    sem = _command_firewall_semaphore()
-    async with sem:
-        try:
-            _command_firewall_set_args(context, args_snapshot)
-            # Preserve original access / Pro / channel behavior, but only after ACK.
-            try:
-                await _command_guard(update, context)
-            except ApplicationHandlerStop:
-                return
-            except Exception:
-                pass
-
-            # Ver91: /screen must never call the legacy screen handler from the
-            # command registry. The legacy handler can trigger ticker/full-scan paths and
-            # can also hide live AutoTrade positions behind a ticker-only warming screen.
-            # Always route /screen through the safe cache/DB/live-position snapshot body.
-            if str(cmd or '').strip().lower() == 'screen':
-                handler = globals().get('_owner_instant_screen_cmd')
-            else:
-                handler = _COMMAND_FIREWALL_REGISTRY.get(str(cmd or '').strip().lower())
-            if not handler:
-                handler = globals().get('unknown_command')
-            if not handler:
-                try:
-                    await update.message.reply_text(f"Unknown command: /{cmd}")
-                except Exception:
-                    pass
-                return
-
-            _command_firewall_set_args(context, args_snapshot)
-            try:
-                async def _call_handler_once():
-                    res = handler(update, context)
-                    if inspect.isawaitable(res):
-                        return await res
-                    return res
-                await asyncio.wait_for(
-                    _call_handler_once(),
-                    timeout=max(30, int(COMMAND_FIREWALL_RESULT_TIMEOUT_SEC or 900)),
-                )
-            except ApplicationHandlerStop:
-                return
-        except asyncio.TimeoutError:
-            try:
-                await update.message.reply_text(
-                    f"⚠️ /{cmd} is still running after the safe response window. The command lane stayed instant; try again shortly for the latest cached result."
-                )
-            except Exception:
-                pass
-        except Exception as e:
-            try:
-                logger.exception("Ver90 command firewall worker failed for /%s: %s", cmd, e)
-            except Exception:
-                pass
-            try:
-                await update.message.reply_text(f"⚠️ /{cmd} background run failed: {type(e).__name__}: {str(e)[:180]}")
-            except Exception:
-                pass
-
-
-async def _command_firewall_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Absolute first Telegram command handler.
-
-    It stops propagation for every slash command, so old CommandHandlers cannot
-    accidentally do heavy work before an ACK. The original command result is sent
-    by _command_firewall_worker.
-    """
-    if not bool(globals().get('PULSEFUTURES_COMMAND_FIREWALL_ENABLED', True)):
-        return
-    cmd, args_snapshot, _raw = _command_firewall_parse(update)
-    if not cmd:
-        return
-    try:
-        _mark_user_activity()
-    except Exception:
-        pass
-    _command_firewall_set_args(context, args_snapshot)
-    global _COMMAND_FIREWALL_SEQ
-    try:
-        _COMMAND_FIREWALL_SEQ += 1
-        seq = int(_COMMAND_FIREWALL_SEQ)
-    except Exception:
-        seq = 0
-    await _command_firewall_ack(update, context, cmd)
-    _safe_create_task(
-        _command_firewall_worker(str(cmd), list(args_snapshot or []), update, context, seq),
-        label=f"ver90-command-firewall:{cmd}:{seq}",
-    )
-    raise ApplicationHandlerStop
 
 def main():
     # Render note: if deployed as a Web Service, bind to $PORT so Render keeps the service alive.
@@ -65291,15 +63279,15 @@ def main():
         .connection_pool_size(int(os.getenv('TELEGRAM_CONNECTION_POOL_SIZE', '256') or 256))
         .pool_timeout(float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0))
         .connect_timeout(float(os.getenv('TELEGRAM_CONNECT_TIMEOUT_SEC', '3.0') or 3.0))
-        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '8.0') or 8.0))
-        .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '5.0') or 5.0))
+        .read_timeout(float(os.getenv('TELEGRAM_READ_TIMEOUT_SEC', '30.0') or 30.0))
+        .write_timeout(float(os.getenv('TELEGRAM_WRITE_TIMEOUT_SEC', '10.0') or 10.0))
     )
     # PTB >=20.6 deprecates passing getUpdates timeouts to run_polling().
     # Configure them on ApplicationBuilder to remove the warning and keep polling stable.
     for _method, _value in (
-        ('get_updates_connect_timeout', float(os.getenv('TELEGRAM_POLL_CONNECT_TIMEOUT_SEC', '5') or 5)),
+        ('get_updates_connect_timeout', float(os.getenv('TELEGRAM_POLL_CONNECT_TIMEOUT_SEC', '10') or 10)),
         ('get_updates_read_timeout', float(os.getenv('TELEGRAM_POLL_READ_TIMEOUT_SEC', '35') or 35)),
-        ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '8') or 8)),
+        ('get_updates_write_timeout', float(os.getenv('TELEGRAM_POLL_WRITE_TIMEOUT_SEC', '20') or 20)),
         ('get_updates_pool_timeout', float(os.getenv('TELEGRAM_POOL_TIMEOUT_SEC', '1.0') or 1.0)),
     ):
         try:
@@ -65307,15 +63295,6 @@ def main():
         except Exception:
             pass
     app = builder.build()
-
-    # Ver90: absolute first command firewall. Every slash command ACKs first and the
-    # original handler runs later in the background. This prevents any legacy handler
-    # from blocking Telegram responsiveness.
-    if bool(globals().get('PULSEFUTURES_COMMAND_FIREWALL_ENABLED', True)):
-        app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/"), _command_firewall_router), group=-1000)
-
-    # yver60: owner/admin priority lane must run before all guard/heavy handlers.
-    app.add_handler(MessageHandler(filters.COMMAND, _owner_instant_command_router), group=-100)
 
     # Fast-lane for ultra-light commands that must feel instant (/help, /size, etc.)
     app.add_handler(MessageHandler(filters.COMMAND, _fast_path_command_router), group=-2)
@@ -65488,12 +63467,6 @@ def main():
 # Catch-all for unknown /commands (MUST be after all CommandHandlers)
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
-    # Ver90: discover every registered CommandHandler after registration is complete.
-    try:
-        _command_firewall_refresh_registry(app)
-    except Exception as e:
-        logger.warning('Ver90 command firewall registry refresh failed: %s', e)
-
     if app.job_queue:
         # Ver21: autonomous setup/email/autotrade loop.
         # This must run even when nobody presses /screen. APScheduler's max_instances +
@@ -65502,21 +63475,12 @@ def main():
         # the pipeline alive.
         # Ver110: schedule interval must be longer than the allowed runtime to avoid
         # APScheduler max_instances skipped-run warnings on Render.
-        # yver47: keep the email/autotrade loop responsive but ensure the scheduled
-        # interval is safely longer than the wrapper timeout. Default becomes 3m
-        # instead of 2m, which avoids Render/APScheduler max_instances skipped-run
-        # warnings during cold or slow ticks.
-        if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)):
-            # Ver92: no-lag mode stays bounded, but the core setup-email/AutoTrade
-            # heartbeat stays hot and is no longer paused by owner command activity.
-            interval_sec = max(120, int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 55) + 45)
-        else:
-            interval_sec = max(240, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 120)
+        interval_sec = max(90, int(CHECK_INTERVAL_MIN * 60), int(ALERT_JOB_MIN_INTERVAL_SEC or AUTONOMOUS_SETUP_PIPELINE_INTERVAL_SEC or 60), int(ALERT_JOB_MAX_RUNTIME_SEC or 90) + 30)
     
         app.job_queue.run_repeating(
             alert_job,
             interval=interval_sec,
-            first=(25 if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) else max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2))),
+            first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
             name="alert_job",
             job_kwargs={
                 "max_instances": 1,
@@ -65535,18 +63499,17 @@ def main():
             int(AUTONOMOUS_SCREEN_SYNC_INTERVAL_SEC or 300),
             int(AUTONOMOUS_SCREEN_SYNC_MAX_RUNTIME_SEC or 90) + 120,
         )
-        if (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_AUTONOMOUS_SCREEN_SYNC_JOB", False):
-            app.job_queue.run_repeating(
-                autonomous_screen_sync_job,
-                interval=auto_screen_interval_sec,
-                first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
-                name="autonomous_screen_sync_job",
-                job_kwargs={
-                    "max_instances": 1,
-                    "coalesce": True,
-                    "misfire_grace_time": 900,
-                },
-            )
+        app.job_queue.run_repeating(
+            autonomous_screen_sync_job,
+            interval=auto_screen_interval_sec,
+            first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
+            name="autonomous_screen_sync_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 900,
+            },
+        )
 
         if SETUP_COMBO_REVIEW_ENABLED:
             app.job_queue.run_repeating(
@@ -65594,7 +63557,7 @@ def main():
                 except Exception:
                     pass
 
-        if (not PULSEFUTURES_SAFE_CORE_MODE) and SETUP_COMBO_POLICY_CATCHUP_ENABLED and (SETUP_COMBO_REVIEW_ENABLED or SETUP_COMBO_DAILY_SAFETY_ENABLED):
+        if SETUP_COMBO_POLICY_CATCHUP_ENABLED and (SETUP_COMBO_REVIEW_ENABLED or SETUP_COMBO_DAILY_SAFETY_ENABLED):
             app.job_queue.run_once(
                 setup_combo_policy_catchup_job,
                 when=90,
@@ -65655,24 +63618,27 @@ def main():
                 except Exception:
                     pass
 
-        if (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_SCREEN_CACHE_WARMUP_JOB", False):
-            app.job_queue.run_repeating(
-                screen_cache_warmup_job,
-                interval=int(SCREEN_CACHE_WARMUP_INTERVAL_SEC),
-                first=max(20, min(60, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
-                name="screen_cache_warmup_job",
-                job_kwargs={
-                    "max_instances": 1,
-                    "coalesce": True,
-                    "misfire_grace_time": 300,
-                },
-            )
+        app.job_queue.run_repeating(
+            screen_cache_warmup_job,
+            interval=int(SCREEN_CACHE_WARMUP_INTERVAL_SEC),
+            first=max(20, min(60, int(SCREEN_CACHE_WARMUP_INTERVAL_SEC))),
+            name="screen_cache_warmup_job",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                # Ver22: Render can pause the event loop for >60s during deploy/cold-start
+                # pressure. A short grace produced noisy APScheduler missed-run warnings
+                # even though the next cache warmup runs normally. Give this non-critical
+                # cache job a wider grace window and coalesce missed runs.
+                "misfire_grace_time": 300,
+            },
+        )
 
         # AutoTrade live protection guardian (repairs missing SL / TP stacks continuously)
         app.job_queue.run_repeating(
             autotrade_exit_guardian_job,
-            interval=(max(300, int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 180) if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) else max(int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 150), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 45)),
-            first=(240 if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) else 90),
+            interval=max(int(AUTOTRADE_GUARDIAN_INTERVAL_SEC or 150), int(AUTOTRADE_GUARDIAN_TIMEOUT_SEC or 10) + 45),
+            first=90,
             name="autotrade_exit_guardian_job",
             job_kwargs={
                 "max_instances": 1,
@@ -65685,7 +63651,7 @@ def main():
         app.job_queue.run_repeating(
             autotrade_job,
             interval=max(int(AUTOTRADE_JOB_INTERVAL_SEC or 60), int(AUTOTRADE_JOB_MAX_RUNTIME_SEC or 35) + 10),
-            first=(45 if bool(globals().get('PULSEFUTURES_FORCE_NO_LAG_MODE', True)) else 45),
+            first=45,
             name="autotrade_job",
             job_kwargs={
                 "max_instances": 1,
@@ -65695,7 +63661,7 @@ def main():
         )
 
         # Autonomous optimizer loop (zero-touch governance)
-        if AUTONOMOUS_OPT_ENABLED and (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_AUTONOMOUS_OPTIMIZE_JOB", False):
+        if AUTONOMOUS_OPT_ENABLED:
             app.job_queue.run_repeating(
                 autonomous_optimize_job,
                 interval=max(3600, int(AUTONOMOUS_OPT_INTERVAL_HOURS * 3600)),
@@ -65708,7 +63674,7 @@ def main():
                 },
             )
 
-        if EVOLUTION_ENABLED and (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_EVOLUTION_JOBS", False):
+        if EVOLUTION_ENABLED:
             app.job_queue.run_repeating(
                 evolution_hourly_job,
                 interval=max(900, int(EVOLUTION_HOURLY_INTERVAL_MIN * 60)),
@@ -65733,8 +63699,6 @@ def main():
             )
 
         try:
-            if PULSEFUTURES_SAFE_CORE_MODE:
-                raise RuntimeError('safe_core_skip_market_adaptive')
             _market_cfg = load_strategy_config(force=False)
             if _cfg_bool((_market_cfg or {}).get("market_adaptive_enabled", True), True):
                 app.job_queue.run_repeating(
@@ -65752,8 +63716,6 @@ def main():
             pass
 
         try:
-            if PULSEFUTURES_SAFE_CORE_MODE:
-                raise RuntimeError('safe_core_skip_goal_profile')
             _goal_cfg = load_strategy_config(force=False)
             if _cfg_bool((_goal_cfg or {}).get("goal_profile_enabled", True), True):
                 app.job_queue.run_repeating(
@@ -65770,7 +63732,7 @@ def main():
         except Exception:
             pass
 
-        if SCAN_INTELLIGENCE_ENABLED and (not PULSEFUTURES_SAFE_CORE_MODE) and env_bool("ENABLE_SCAN_INTELLIGENCE_JOB", False):
+        if SCAN_INTELLIGENCE_ENABLED:
             app.job_queue.run_repeating(
                 scan_intelligence_job,
                 interval=max(3600, int(SCAN_INTELLIGENCE_INTERVAL_MIN * 60)),
@@ -65784,8 +63746,6 @@ def main():
             )
 
         try:
-            if PULSEFUTURES_SAFE_CORE_MODE:
-                raise RuntimeError('safe_core_skip_nonessential_family_jobs')
             _family_cfg = load_strategy_config(force=False)
             if _cfg_bool((_family_cfg or {}).get("family_regime_refresh_enabled", True), True):
                 app.job_queue.run_repeating(
