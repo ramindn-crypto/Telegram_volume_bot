@@ -1,3 +1,4 @@
+# yver55: ver54 + Render-safe APScheduler deploy-misfire log filter; no strategy/email/autotrade logic changes.
 # yver52: adds F9 Persistent Leaders research family on top of yver51. F9 records leader/loser daily membership, generates WATCH/audit-only persistent-leader continuation BUY setups after a 2-day leader streak, and cannot promote to KEEP until enough decided evidence is collected; existing F1-F8 setup/email/AutoTrade flow is unchanged.
 # yver54: hard responsiveness patch. Adds true group=-100 instant command handlers, no DB/channel guard before ACK, short Telegram send timeouts for fast commands, user-activity deferral for heavy jobs, and keeps all strategy/F1-F9/email/AutoTrade logic unchanged.
 # yver52b: runtime/cache hardening: detailed /setup_audit no longer shows misleading stale cache older than 90s; alert/guardian scheduler overlap warnings removed via effective runtime cap + lock-check instances; transient Telegram send timeouts logged as INFO.
@@ -5484,6 +5485,45 @@ class RedactSecretsFilter(logging.Filter):
         record.args = ()
         return True
 
+class RenderQuietNoiseFilter(logging.Filter):
+    """Suppress expected Render/APScheduler deploy noise without hiding real bot errors.
+
+    APScheduler logs a WARNING when a repeating/background job is missed during
+    Render deploy/cold-start/sleep windows. Those messages do not mean setup
+    generation, setup email, or AutoTrade failed; they only mean a non-critical
+    catch-up/watchdog tick was skipped. Keep the Render log clean while leaving
+    real exceptions visible.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+
+        name = str(getattr(record, "name", "") or "")
+        if name.startswith("apscheduler"):
+            # Typical after deploy/restart: "Run time of job ... was missed by ...".
+            # These are skipped/coalesced background ticks, not trading failures.
+            if "Run time of job" in msg and "was missed by" in msg:
+                return False
+            # If a duplicate scheduled instance reaches APScheduler before our in-job
+            # lock can fast-return, this is also noise for protected background jobs.
+            if "Execution of job" in msg and "maximum number of running instances reached" in msg:
+                protected_jobs = (
+                    "alert_job",
+                    "autonomous_screen_sync_job",
+                    "autotrade_exit_guardian_job",
+                    "screen_cache_warmup_job",
+                    "research_framework_watchdog_job",
+                    "autonomous_optimize_job",
+                    "evolution_hourly_job",
+                    "setup_combo_policy_catchup_job",
+                )
+                if any(j in msg for j in protected_jobs):
+                    return False
+        return True
+
 
 def setup_logging():
     # Let Render control via LOG_LEVEL, default INFO
@@ -5494,12 +5534,31 @@ def setup_logging():
     for noisy in ("httpx", "telegram", "telegram.ext", "apscheduler"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    # Redact secrets from ALL logs
+    # Redact secrets from ALL logs and keep Render clean from expected
+    # APScheduler deploy/cold-start misfire noise. Attach filters to both the
+    # root logger and existing handlers because third-party loggers often
+    # propagate directly to the root handler.
     secrets = [
         os.environ.get("TELEGRAM_TOKEN", ""),
         os.environ.get("EMAIL_PASS", ""),
     ]
-    logging.getLogger().addFilter(RedactSecretsFilter(secrets))
+    _redact_filter = RedactSecretsFilter(secrets)
+    _render_quiet_filter = RenderQuietNoiseFilter()
+    root_logger = logging.getLogger()
+    root_logger.addFilter(_redact_filter)
+    root_logger.addFilter(_render_quiet_filter)
+    for _handler in list(root_logger.handlers or []):
+        try:
+            _handler.addFilter(_redact_filter)
+            _handler.addFilter(_render_quiet_filter)
+        except Exception:
+            pass
+    for _lname in ("apscheduler", "apscheduler.executors.default", "apscheduler.scheduler"):
+        try:
+            _lg = logging.getLogger(_lname)
+            _lg.addFilter(_render_quiet_filter)
+        except Exception:
+            pass
 
 
 # Call once at import time (after TOKEN/envs exist)
