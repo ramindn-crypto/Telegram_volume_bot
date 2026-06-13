@@ -20857,7 +20857,7 @@ def _bigmove_candidates_to_autotrade_setups(candidates: list, best_fut: dict | N
     return out
 
 
-async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: str, candidates: list, best_fut: dict | None = None, tag: str = 'bigmove'):
+async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: str, candidates: list, best_fut: dict | None = None, tag: str = 'bigmove', setup_list_override: list | None = None):
     """Run immediate owner AutoTrade after a confirmed Big-Move email is sent.
 
     This deliberately reuses _autotrade_place_trade, the same execution/risk/SL/TP
@@ -20909,7 +20909,21 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
         # AutoTrade job is holding the lock for a few seconds. Wait briefly instead;
         # the setup is also persisted so the next scheduled run can pick it up.
 
-        fresh_candidates = await to_thread_autotrade(_bigmove_autotrade_claim_candidates, owner_uid, list(candidates or []), timeout=5)
+        claim_candidates = list(candidates or [])
+        if (not claim_candidates) and setup_list_override:
+            for _s0 in list(setup_list_override or []):
+                try:
+                    _sym0 = str(getattr(_s0, 'symbol', '') or '').upper().strip()
+                    _dir0 = str(getattr(_s0, 'bigmove_direction', '') or '').upper().strip()
+                    if not _dir0:
+                        _side0 = str(getattr(_s0, 'side', '') or '').upper().strip()
+                        _dir0 = 'UP' if _side0 == 'BUY' else 'DOWN' if _side0 == 'SELL' else ''
+                    if _sym0 and _dir0 in {'UP', 'DOWN'}:
+                        claim_candidates.append({'symbol': _sym0, 'direction': _dir0})
+                except Exception:
+                    continue
+
+        fresh_candidates = await to_thread_autotrade(_bigmove_autotrade_claim_candidates, owner_uid, list(claim_candidates or []), timeout=5)
         if not fresh_candidates:
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
                 'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
@@ -20918,7 +20932,27 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
             }
             return
 
-        setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(fresh_candidates or []), best_fut or {}, sess, timeout=8)
+        if setup_list_override:
+            claimed_keys = set()
+            for _c0 in list(fresh_candidates or []):
+                try:
+                    claimed_keys.add((str((_c0 or {}).get('symbol') or '').upper().strip(), str((_c0 or {}).get('direction') or '').upper().strip()))
+                except Exception:
+                    continue
+            setup_list = []
+            for _s0 in list(setup_list_override or []):
+                try:
+                    _sym0 = str(getattr(_s0, 'symbol', '') or '').upper().strip()
+                    _dir0 = str(getattr(_s0, 'bigmove_direction', '') or '').upper().strip()
+                    if not _dir0:
+                        _side0 = str(getattr(_s0, 'side', '') or '').upper().strip()
+                        _dir0 = 'UP' if _side0 == 'BUY' else 'DOWN' if _side0 == 'SELL' else ''
+                    if (_sym0, _dir0) in claimed_keys:
+                        setup_list.append(_s0)
+                except Exception:
+                    continue
+        else:
+            setup_list = await to_thread_autotrade(_bigmove_candidates_to_autotrade_setups, list(fresh_candidates or []), best_fut or {}, sess, timeout=8)
         if not setup_list:
             _LAST_AUTOTRADE_DECISION[owner_uid] = {
                 'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'),
@@ -20954,6 +20988,23 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
                     setattr(_s, 'email_logged_ts', now_ts)
                     setattr(_s, 'emailed_ts', now_ts)
                     setattr(_s, 'created_ts', float(getattr(_s, 'created_ts', 0.0) or now_ts))
+                except Exception:
+                    pass
+                # yver38: AutoTrade must consume the exact F8 setup email that was just
+                # sent, not a rebuilt synthetic setup with a different setup_id.  Mirror
+                # the sent setup id to the owner lane before the entry gate runs.
+                try:
+                    _sid = str(getattr(_s, 'setup_id', '') or getattr(_s, 'id', '') or '')
+                    if _sid:
+                        db_mark_emailed_setup(int(owner_uid), _sid, sess, now_ts)
+                except Exception:
+                    pass
+                try:
+                    _cache_recent_emailed_setup(int(owner_uid), _s, session=sess, emailed_ts=now_ts, source_kind='bigmove_setup_email_exact')
+                except Exception:
+                    pass
+                try:
+                    _mark_emailed_setup_identity(int(owner_uid), _s, emailed_ts=now_ts)
                 except Exception:
                     pass
             try:
@@ -60057,6 +60108,131 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 pass
             return list(setups or []), bool(sent_setup_email)
 
+        async def _bigmove_setup_email_then_autotrade_task(uid: int, tz, session_name: str, filtered: list, best_fut_snapshot: dict | None = None, tag: str = 'bigmove') -> None:
+            """Send the F8 setup email after a Big-Move alert, then AutoTrade that exact setup.
+
+            yver38 fix: the market-event Big-Move email must not directly rebuild and
+            AutoTrade another synthetic setup.  The order is now strict and non-blocking:
+            Big-Move alert email -> F8 setup email if executable -> AutoTrade the same
+            setup_id that was emailed.  If the F8 setup email is blocked/empty, AutoTrade
+            is explicitly skipped.
+            """
+            sess_u = str(session_name or _bigmove_autotrade_session_name()).upper().strip()
+            if sess_u not in {'ASIA', 'LON', 'NY'}:
+                sess_u = _bigmove_autotrade_session_name()
+            setup_email_setups = []
+            setup_email_sent = False
+            try:
+                setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(
+                    int(uid),
+                    str(sess_u or ''),
+                    list(filtered or []),
+                    best_fut_snapshot or {},
+                    tag=str(tag or 'bigmove'),
+                )
+            except Exception as exc:
+                setup_email_setups, setup_email_sent = [], False
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_setup_email_then_autotrade', status='setup_email_error', session=sess_u, mode='bigmove', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
+                except Exception:
+                    pass
+
+            try:
+                if setup_email_sent:
+                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
+                else:
+                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_blocked_or_empty')
+            except Exception:
+                pass
+
+            try:
+                owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+            except Exception:
+                owner_uid_for_bm_at = 0
+
+            if not setup_email_sent or not setup_email_setups:
+                try:
+                    if owner_uid_for_bm_at > 0:
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            'status': 'SKIP',
+                            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                            'reason': 'bigmove_f8_setup_email_not_sent_or_not_executable',
+                            'session': str(sess_u or ''),
+                            'mode': str(_autotrade_runtime_mode()).lower(),
+                            'trigger': 'bigmove_setup_email_immediate',
+                        }
+                except Exception:
+                    pass
+                return
+
+            try:
+                if owner_uid_for_bm_at <= 0 or (not BIGMOVE_AUTOTRADE_ENABLED) or (not _autotrade_ready()):
+                    if owner_uid_for_bm_at > 0:
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            'status': 'SKIP',
+                            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                            'reason': 'bigmove_autotrade_not_ready_or_disabled',
+                            'session': str(sess_u or ''),
+                            'mode': str(_autotrade_runtime_mode()).lower(),
+                            'trigger': 'bigmove_setup_email_immediate',
+                        }
+                    return
+                _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                    'status': 'QUEUED',
+                    'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'reason': 'bigmove_f8_setup_email_sent_waiting_for_immediate_autotrade',
+                    'session': str(sess_u or ''),
+                    'mode': str(_autotrade_runtime_mode()).lower(),
+                    'trigger': 'bigmove_setup_email_immediate',
+                }
+                await _trigger_autotrade_after_bigmove_email_async(
+                    int(uid),
+                    str(sess_u or ''),
+                    list(filtered or []),
+                    best_fut_snapshot or {},
+                    tag=str(tag or 'bigmove'),
+                    setup_list_override=list(setup_email_setups or []),
+                )
+            except Exception as exc:
+                try:
+                    if owner_uid_for_bm_at > 0:
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            'status': 'ERROR',
+                            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                            'reason': f'bigmove_setup_email_then_autotrade_{type(exc).__name__}: {exc}',
+                            'session': str(sess_u or ''),
+                            'mode': str(_autotrade_runtime_mode()).lower(),
+                            'trigger': 'bigmove_setup_email_immediate',
+                        }
+                except Exception:
+                    pass
+
+        def _queue_bigmove_setup_email_then_autotrade(uid: int, tz, session_name: str, filtered: list, best_fut_snapshot: dict | None = None, tag: str = 'bigmove') -> None:
+            try:
+                owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+            except Exception:
+                owner_uid_for_bm_at = 0
+            try:
+                _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_queued')
+            except Exception:
+                pass
+            try:
+                if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
+                    _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                        'status': 'QUEUED',
+                        'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                        'reason': 'bigmove_alert_sent_waiting_for_f8_setup_email',
+                        'session': str(session_name or ''),
+                        'mode': str(_autotrade_runtime_mode()).lower(),
+                        'trigger': 'bigmove_setup_email_immediate',
+                    }
+            except Exception:
+                pass
+            _safe_create_task(
+                _bigmove_setup_email_then_autotrade_task(int(uid), tz, str(session_name or ''), list(filtered or []), best_fut_snapshot or {}, tag=str(tag or 'bigmove')),
+                f"bigmove_setup_email_then_autotrade_{tag}",
+            )
+
         async def _send_bigmove_payload_for_user(uid: int, tz, tag: str = 'pre_session') -> None:
             """Build and send one user's Big-Move email without waiting behind setup scans.
 
@@ -60119,36 +60295,10 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             pass
                     bm_sess = _bigmove_autotrade_session_name()
-                    setup_email_setups = []
-                    setup_email_sent = False
-                    try:
-                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
-                    except Exception:
-                        setup_email_setups, setup_email_sent = [], False
-                    try:
-                        if setup_email_sent:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
-                        else:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
-                    except Exception:
-                        pass
-                    try:
-                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                                "status": "QUEUED",
-                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
-                                "session": str(bm_sess or ""),
-                                "mode": str(_autotrade_runtime_mode()).lower(),
-                                "trigger": "bigmove_setup_email_immediate",
-                            }
-                            _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
-                                "autotrade_after_bigmove_setup_email",
-                            )
-                    except Exception:
-                        pass
+                    # yver38: do not block the alert/email loop while F8 setup email
+                    # and AutoTrade run.  The background task keeps the strict order:
+                    # Big-Move alert -> F8 setup email -> AutoTrade exact emailed setup.
+                    _queue_bigmove_setup_email_then_autotrade(int(uid), tz, str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
             except Exception as e:
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[int(uid)] = {
@@ -60952,36 +61102,9 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         except Exception:
                             pass
                     bm_sess = _bigmove_autotrade_session_name()
-                    setup_email_setups = []
-                    setup_email_sent = False
-                    try:
-                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred")
-                    except Exception:
-                        setup_email_setups, setup_email_sent = [], False
-                    try:
-                        if setup_email_sent:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
-                        else:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
-                    except Exception:
-                        pass
-                    try:
-                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                                "status": "QUEUED",
-                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
-                                "session": str(bm_sess or ""),
-                                "mode": str(_autotrade_runtime_mode()).lower(),
-                                "trigger": "bigmove_setup_email_immediate",
-                            }
-                            _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred"),
-                                "autotrade_after_bigmove_setup_email_deferred",
-                            )
-                    except Exception:
-                        pass
+                    # yver38: deferred Big-Move follows the same non-blocking ordered
+                    # chain as the immediate path.
+                    _queue_bigmove_setup_email_then_autotrade(int(uid), tz, str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred")
             except Exception as e:
                 logger.exception("Deferred big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[uid] = {
