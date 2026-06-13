@@ -1,4 +1,4 @@
-# yver40 emergency: yver35 baseline + 10M volume floor; BigMove market emails stay ON but F8 setup-email/AutoTrade follow-up is disabled to prevent Telegram freeze while logs are collected.
+# yver41: responsive-safe fix from yver40: fail-open admin command guard, remove sync fallbacks from /autotrade_debug, keep heavy refresh/sync away from interactive path, and force 10M volume floor.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -5258,6 +5258,15 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cmd = txt.split()[0][1:].split("@")[0].strip().lower()
         _mark_user_activity()
 
+        # yver41: admin commands must never wait behind a locked SQLite DB or
+        # stale access-check thread. The owner/admin is allowed through and the
+        # real command handler can answer from cache/fallback.
+        try:
+            if is_admin_user(int(update.effective_user.id)):
+                return
+        except Exception:
+            pass
+
         # --- STATIC (function-local) caches to reduce DB hits / lag ---
         # Cache entries: { uid: {"ts": float, "access_ok": bool, "is_pro": bool} }
         if not hasattr(_command_guard, "_cache"):
@@ -5272,7 +5281,7 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Commands that should force a fresh access check (never use cache)
         # (/screen is the only one you said can be slow; we keep it strict/fresh here)
-        FORCE_FRESH = {"screen"}
+        FORCE_FRESH = set()  # yver41: never force a fresh DB access check for /screen
 
         # 0) Channel subscription gate (optional)
         if ENFORCE_REQUIRED_CHANNEL and REQUIRED_CHANNEL:
@@ -5299,10 +5308,14 @@ async def _command_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 access_ok = bool(ent.get("access_ok", False))
                 is_pro = bool(ent.get("is_pro", False))
             else:
-                access_ok = await to_thread_fast(enforce_access_or_block, update, cmd)
-                # Only compute pro flag if needed later; but cheap enough to cache now
                 try:
-                    is_pro = bool(user_has_pro(uid))
+                    access_ok = await to_thread_fast(enforce_access_or_block, update, cmd, timeout=2)
+                except Exception:
+                    # yver41: fail open instead of letting a DB/network stall block all commands.
+                    access_ok = True
+                # Only compute pro flag if needed later; keep it bounded too.
+                try:
+                    is_pro = bool(await to_thread_fast(user_has_pro, uid, timeout=2))
                 except Exception:
                     is_pro = False
 
@@ -5489,10 +5502,8 @@ MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP", 
 MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as final target
 
 def _setup_min_volume_floor_usd() -> float:
-    try:
-        return max(10_000_000.0, float(SETUP_MIN_24H_VOL_USD or 0.0), float(MIN_FUT_VOL_USD or 0.0))
-    except Exception:
-        return 10_000_000.0
+    # yver41: single source of truth.  Volume floor is exactly 10M, never 15M.
+    return 10_000_000.0
 
 def _setup_volume_ok(setup_or_vol) -> bool:
     try:
@@ -5507,7 +5518,7 @@ def _setup_volume_ok(setup_or_vol) -> bool:
         return False
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
-EMAIL_MIN_FUT_VOL_USD = float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD)))
+EMAIL_MIN_FUT_VOL_USD = 10_000_000.0
 
 # ✅ Production scan breadth + loosened trigger only for screen (NOT email)
 # Hard API-load guard: live setup generation must never fan out across hundreds of symbols.
@@ -7091,8 +7102,9 @@ def apply_strategy_config(cfg: dict) -> None:
 
     # Liquidity + RR
     try:
-        MIN_FUT_VOL_USD = max(_setup_min_volume_floor_usd(), float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD) or 0.0))
-        EMAIL_MIN_FUT_VOL_USD = float(MIN_FUT_VOL_USD)
+        MIN_FUT_VOL_USD = 10_000_000.0
+        cfg["min_fut_vol_usd"] = 10_000_000.0
+        EMAIL_MIN_FUT_VOL_USD = 10_000_000.0
     except Exception:
         pass
     try:
@@ -17993,14 +18005,14 @@ def db_connect() -> sqlite3.Connection:
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
 
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=1.0)
     con.row_factory = sqlite3.Row
 
     # safer sqlite on hosted envs
     try:
         con.execute("PRAGMA journal_mode=WAL;")
         con.execute("PRAGMA synchronous=NORMAL;")
-        con.execute("PRAGMA busy_timeout=5000;")
+        con.execute("PRAGMA busy_timeout=1000;")
         con.execute("PRAGMA foreign_keys=ON;")
     except Exception:
         pass
@@ -19775,8 +19787,8 @@ def _safe_float(x, default: float = 0.0) -> float:
 BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "1.5") or 1.5)
 BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") or 3.0)
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
-BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "10000000") or 10_000_000.0)
-BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
+BIGMOVE_DEFAULT_MIN_VOL_USD = 10_000_000.0
+BIGMOVE_MIN_SUPPORTED_VOL_USD = 10_000_000.0
 BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "7200") or 7200)  # Ver15: same-symbol/same-direction F8 cooldown (opposite direction still allowed)
 # Guard against stale Render env BIGMOVE_COOLDOWN_SEC=0 from older no-cooldown builds.
 # Opposite direction remains a different key, so F8 can still close/reverse immediately.
@@ -20277,8 +20289,7 @@ def _user_bigmove_thresholds(user: dict | None) -> tuple[float, float, float]:
 def _user_bigmove_min_vol_usd(user: dict | None, default: float = BIGMOVE_DEFAULT_MIN_VOL_USD) -> float:
     """Resolve big-move min volume with backward-compatible fallback.
 
-    Commercial floor: keep big-move alerts at or above 15M 24h volume unless a
-    future code change intentionally introduces a lower supported floor.
+    Commercial floor: keep big-move alerts at or above the current 10M 24h volume floor.
     """
     floor = float(BIGMOVE_MIN_SUPPORTED_VOL_USD)
     try:
@@ -26596,9 +26607,12 @@ def _report_closed_activity_profit_factor(rows: List[dict]) -> Optional[float]:
 
 async def report_overall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = get_user(uid)
+    try:
+        user = await to_thread_fast(get_user, uid, timeout=2)
+    except Exception:
+        user = {}
 
-    if not has_active_access(uid, user):
+    if (not is_admin_user(int(uid))) and (not has_active_access(uid, user)):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -41768,6 +41782,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     uid = update.effective_user.id
 
+    # yver41: owner/admin /start is a heartbeat and must never wait on DB migrations.
+    try:
+        if is_admin_user(int(uid)):
+            await update.message.reply_text("✅ PulseFutures is alive. Commands are in responsive-safe mode.")
+            return
+    except Exception:
+        pass
+
     # Ensure DB schema is migrated before touching plan/trial columns
     try:
         ensure_email_column()   # includes ensure_billing_columns()
@@ -55035,7 +55057,17 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     owner = int(AUTOTRADE_OWNER_UID or uid)
-    user = get_user(owner) or {}
+    try:
+        user = await to_thread_fast(get_user, owner, timeout=2)
+    except Exception:
+        user = {}
+    # yver41: immediate acknowledgement so the owner can see Telegram is alive even
+    # if live Bybit/account diagnostics time out later.
+    _ack_msg = None
+    try:
+        _ack_msg = await update.message.reply_text("⏱ AutoTrade debug requested — building bounded snapshot...")
+    except Exception:
+        _ack_msg = None
     now_utc = datetime.now(timezone.utc)
     sess = current_session_utc(now_utc)
     ready = _autotrade_ready()
@@ -55050,19 +55082,22 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
     try:
-        snap = await to_thread_fast(_accounting_snapshot_cached, owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, force_refresh=True, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
+        snap = await to_thread_fast(_accounting_snapshot_cached, owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, force_refresh=False, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
     except Exception:
-        snap = _accounting_snapshot_cached(owner, user, is_admin=True, ttl=FAST_ADMIN_SNAPSHOT_TTL_SEC, force_refresh=True)
+        snap = {}
     equity = float(snap.get('equity') or 0.0)
     try:
-        mday = await to_thread_fast(_autotrade_day_risk_metrics_cached, int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, force_refresh=True, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
+        mday = await to_thread_fast(_autotrade_day_risk_metrics_cached, int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, force_refresh=False, timeout=FAST_ADMIN_COMMAND_TIMEOUT_SEC)
     except Exception:
-        mday = _autotrade_day_risk_metrics_cached(int(owner), float(equity), ttl=FAST_ADMIN_METRICS_TTL_SEC, force_refresh=True)
+        mday = {}
     # Ver12: debug closed/PnL should match /autotrade_report. The quick risk snapshot
     # can miss exchange-derived/provisional closes, so reconcile against the same report rows.
     try:
         _start_utc, _end_utc = _admin_today_window_utc(uid=int(owner), user=user)
-        _closed_report_rows = _autotrade_closed_report_rows(int(owner), float(_start_utc.timestamp()), float(_end_utc.timestamp()), lookback_h=24, limit=0) or []
+        try:
+            _closed_report_rows = await to_thread_fast(_autotrade_closed_report_rows, int(owner), float(_start_utc.timestamp()), float(_end_utc.timestamp()), lookback_h=24, limit=0, timeout=3) or []
+        except Exception:
+            _closed_report_rows = []
         _closed_report_pnl = float(sum(float((r or {}).get('pnl_usdt') if (r or {}).get('pnl_usdt') is not None else (r or {}).get('pnl') or 0.0) for r in _closed_report_rows))
         if len(_closed_report_rows) > int(snap.get('positions_closed_today', 0) or 0) or abs(_closed_report_pnl) > abs(float(snap.get('pnl_today') or 0.0)):
             snap['positions_closed_today'] = int(len(_closed_report_rows))
@@ -55236,7 +55271,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         for r in reasons[:6]:
             lines.append(f"• {r}")
     try:
-        bot_positions, _external_positions, _journal_open = _autotrade_collect_live_position_rows(owner, fallback_unmatched_as_owned=True)
+        bot_positions, _external_positions, _journal_open = await to_thread_fast(_autotrade_collect_live_position_rows, owner, fallback_unmatched_as_owned=True, timeout=3)
     except Exception:
         bot_positions, _external_positions, _journal_open = [], [], []
     lines.extend([SEP, f"Open AutoTrade Positions: {len(bot_positions)}"])
@@ -55281,6 +55316,11 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg = "\n".join(html.escape(str(ln)) for ln in lines)
     if open_pos_table:
         msg += "\n<pre>" + html.escape(open_pos_table) + "</pre>"
+    try:
+        if _ack_msg is not None:
+            await _ack_msg.delete()
+    except Exception:
+        pass
     await send_long_message(update, msg, parse_mode=ParseMode.HTML)
 
 async def open_trades_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -56937,7 +56977,7 @@ async def _refresh_screen_cache_for_user_async(uid: int, session: str | None = N
             # and /autotrade_last still say no_setups. The sync still respects email
             # caps, cooldowns, duplicate guards, and is_executable_setup_eligible().
             try:
-                if MANUAL_SCREEN_SYNC_ENABLED and int(uid or 0) > 0 and _setups:
+                if (not bool(globals().get('RESPONSIVE_DISABLE_SCREEN_SYNC_PIPELINE', True))) and MANUAL_SCREEN_SYNC_ENABLED and int(uid or 0) > 0 and _setups:
                     _u = get_user(int(uid or 0)) or {}
                     _live_sess = str(current_session_utc() or '')
                     await _screen_sync_pipeline_async(int(uid or 0), dict(_u or {}), _live_sess, str(sess or ''), best_fut or {}, list(_setups or []))
@@ -58054,9 +58094,12 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _hb_touch('screen', ok=True, details='screen_cmd_invoked')
 
     uid = update.effective_user.id
-    user = get_user(uid)
+    try:
+        user = await to_thread_fast(get_user, uid, timeout=2)
+    except Exception:
+        user = {}
 
-    if not has_active_access(uid, user):
+    if (not is_admin_user(int(uid))) and (not has_active_access(uid, user)):
         await update.message.reply_text(
             "⛔️ Trial finished.\n\n"
             "Your 7-day trial is over — you need to pay to keep using PulseFutures.\n\n"
@@ -58083,8 +58126,9 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         cache_entry, age = _screen_choose_best_cache(cache_keys)
-        _schedule_screen_cache_refresh(int(uid), scan_session)
-        can_show_email_source = _screen_user_can_see_email_source(int(uid), user)
+        if not bool(globals().get('RESPONSIVE_DISABLE_SCREEN_CACHE_REFRESH_ON_COMMAND', True)):
+            _schedule_screen_cache_refresh(int(uid), scan_session)
+        can_show_email_source = False if bool(globals().get('RESPONSIVE_SAFE_MODE', True)) else _screen_user_can_see_email_source(int(uid), user)
         try:
             screen_fallback_min = int(_screen_actionable_fallback_max_age_min())
         except Exception:
@@ -58175,7 +58219,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # already exist in the DB and should be visible on /screen.
         try:
             quick_best = get_cached_futures_tickers() or {}
-            if quick_best:
+            if (not bool(globals().get('RESPONSIVE_SAFE_MODE', True))) and quick_best:
                 body, kb, shown_setups = _screen_recent_db_body_and_kb(
                     int(uid),
                     str(scan_session or '').upper(),
@@ -62425,7 +62469,9 @@ async def screen_cache_warmup_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         if _ohlcv_boot_grace_active():
             return
-        if _recent_user_activity(20):
+        if bool(globals().get('RESPONSIVE_SAFE_MODE', True)) and _recent_user_activity(int(globals().get('RESPONSIVE_RECENT_ACTIVITY_QUIET_SEC', 300) or 300)):
+            return
+        if (not bool(globals().get('RESPONSIVE_SAFE_MODE', True))) and _recent_user_activity(20):
             return
         if _SCREEN_REFRESH_TASK is not None and not _SCREEN_REFRESH_TASK.done():
             return
