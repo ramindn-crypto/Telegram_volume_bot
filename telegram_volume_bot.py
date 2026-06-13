@@ -1,3 +1,4 @@
+# yver39: isolates BigMove post-alert F8 setup-email/AutoTrade chain in a dedicated bounded background worker so BigMove alerts cannot freeze Telegram command responsiveness; keeps yver35 baseline with 10M volume floors.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -2990,6 +2991,8 @@ _SCREEN_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("SCREEN_EXECUTOR
 _EMAIL_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("EMAIL_EXECUTOR_WORKERS", "2")))
 # Dedicated autotrade lane: live entry/risk checks must never queue behind optimizers or scans.
 _AUTOTRADE_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("AUTOTRADE_EXECUTOR_WORKERS", "1")))
+# Dedicated BigMove post-alert lane: isolates F8 setup-email/AutoTrade follow-up from Telegram, email, screen and normal AutoTrade workers.
+_BIGMOVE_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("BIGMOVE_EXECUTOR_WORKERS", "2")))
 # Ver22: autonomous screen-equivalent setup sync. This is the production lane that
 # continuously does what /screen used to do manually: build the executable screen pool,
 # send setup emails, and trigger autotrade. It prevents /screen from being the trigger.
@@ -3112,7 +3115,7 @@ SETUP_COMBO_WATCH_SCOUT_ENABLED = env_bool("SETUP_COMBO_WATCH_SCOUT_ENABLED", Tr
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_CONF", "83") or 84)
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_RR", "1.30") or 1.40)
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "10000000") or 10000000)
 SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
 # Ver32 WR-first final gate: the executable lane itself is now quality-gated,
 # not only the downstream email/autotrade consumer.  This keeps /setup_audit,
@@ -3126,7 +3129,7 @@ SETUP_FINAL_SCOUT_ENABLED = env_bool("SETUP_FINAL_SCOUT_ENABLED", True)
 SETUP_FINAL_SCOUT_MIN_CONF = int(os.environ.get("SETUP_FINAL_SCOUT_MIN_CONF", "83") or 84)
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
 SETUP_FINAL_SCOUT_MIN_RR = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_RR", "1.30") or 1.40)
-SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "10000000") or 10000000)
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = True  # Ver44: hard safety; unknown/new strategy combos enter WATCH probation, never hard-block as UNKNOWN
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
@@ -3140,7 +3143,7 @@ SETUP_KEEP_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_KEEP_MIN_DYNAMIC_SCOR
 SETUP_REVERSE_PROBATION_MIN_CONF = int(os.environ.get("SETUP_REVERSE_PROBATION_MIN_CONF", "85") or 85)
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE", "60") or 60)
 SETUP_BASELINE_DISCOVERY_MIN_RR = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_RR", "1.25") or 1.25)
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_VOL_USD", "10000000") or 10000000)
 # Ver35: /setup_audit is an analytical report and must not disappear just because
 # the live execution gate is strict. Execution/email/autotrade still use the final
 # quality gate; audit keeps visibility of stored setup outcomes for learning.
@@ -3735,7 +3738,7 @@ SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple(x.strip() for x in str(os.environ.get
     "10:00,11:00,13:00,19:00"
 ) or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = int(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_CONF", "83") or 83)
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "10000000") or 10000000)
 # Ver48: global BUY/SELL edge can be noisy and stale after introducing NORMAL/REVERSE strategy routing.
 # Keep combo/symbol/hour blocks strict, but make broad global-side blocking advisory by default.
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = env_bool("SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED", False)
@@ -3760,14 +3763,14 @@ SETUP_COMBO_WATCH_SCOUT_ENABLED = True
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 82
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 55.0
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.25
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 10000000.0
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 84
 SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
 SETUP_FINAL_SCOUT_ENABLED = True
 SETUP_FINAL_SCOUT_MIN_CONF = 82
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 55.0
 SETUP_FINAL_SCOUT_MIN_RR = 1.25
-SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 10000000.0
 SETUP_FINAL_ADAPTIVE_MIN_CONF = 84
 SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
 SETUP_KEEP_MIN_CONF = 80
@@ -3775,9 +3778,9 @@ SETUP_KEEP_MIN_DYNAMIC_SCORE = 45.0
 SETUP_REVERSE_PROBATION_MIN_CONF = 80
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 45.0
 SETUP_BASELINE_DISCOVERY_MIN_RR = 1.25
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 10000000.0
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = 78
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 15000000.0
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 10000000.0
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = False
 
 # Ver57: clean-start legacy ignore + fresh safety ON.
@@ -3842,7 +3845,7 @@ SETUP_FINAL_SCOUT_ENABLED = True
 SETUP_FINAL_SCOUT_MIN_CONF = 78
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 35.0
 SETUP_FINAL_SCOUT_MIN_RR = 1.20
-SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 10000000.0
 SETUP_COMBO_WATCH_MIN_CONF = 84
 SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = 50.0
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 82
@@ -3851,17 +3854,17 @@ SETUP_COMBO_WATCH_SCOUT_ENABLED = True
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 78
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 35.0
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.20
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 10000000.0
 SETUP_KEEP_MIN_CONF = 78
 SETUP_KEEP_MIN_DYNAMIC_SCORE = 35.0
 SETUP_REVERSE_PROBATION_MIN_CONF = 78
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 35.0
 SETUP_BASELINE_DISCOVERY_MIN_RR = 1.20
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 10000000.0
 FINAL_PIPELINE_LOCKED_ENABLED = env_bool("FINAL_PIPELINE_LOCKED_ENABLED", True)
 FINAL_PIPELINE_LOCKED_MIN_CONF = int(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_CONF", "78") or 78)
 FINAL_PIPELINE_LOCKED_MIN_RR = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_RR", "1.20") or 1.20)
-FINAL_PIPELINE_LOCKED_MIN_VOL_USD = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_VOL_USD", "15000000") or 15000000)
+FINAL_PIPELINE_LOCKED_MIN_VOL_USD = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_VOL_USD", "10000000") or 10000000)
 FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE", "35") or 35)
 
 # Ver52 EXECUTABLE_QUEUE_UNBLOCK: hard runtime override.
@@ -3873,7 +3876,7 @@ FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_L
 VER52_EXECUTABLE_QUEUE_UNBLOCK = True
 VER52_MIN_CONF = 72
 VER52_MIN_RR = 1.05
-VER52_MIN_VOL_USD = 15000000.0
+VER52_MIN_VOL_USD = 10000000.0
 VER52_MIN_DYNAMIC_SCORE = 0.0
 SETUP_FINAL_MIN_CONF = 82
 SETUP_FINAL_MIN_DYNAMIC_SCORE = 35.0
@@ -3972,6 +3975,10 @@ async def to_thread_autotrade(fn, *args, timeout: int | None = None, **kwargs):
 
 async def to_thread_bg(fn, *args, timeout: int | None = None, **kwargs):
     return await _run_in_executor(_BACKGROUND_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
+
+
+async def to_thread_bigmove(fn, *args, timeout: int | None = None, **kwargs):
+    return await _run_in_executor(_BIGMOVE_EXECUTOR, fn, *args, timeout=timeout, **kwargs)
 
 
 def _safe_task_done(task: asyncio.Task, label: str = "background") -> None:
@@ -7047,7 +7054,7 @@ def _strategy_config_apply_ver08_quality_patch() -> None:
         cfg['family_allocator_enforce_live'] = False
 
         # Quality floors: reduce raw noise, but avoid the too-tight Ver08 1-3/day profile.
-        cfg['min_fut_vol_usd'] = max(15_000_000.0, float(cfg.get('min_fut_vol_usd', 0) or 0.0))
+        cfg['min_fut_vol_usd'] = 10_000_000.0
         cfg['quality_score_min_screen'] = max(63.0, float(cfg.get('quality_score_min_screen', 0) or 0.0))
         cfg['quality_score_min_email'] = 70.0
         cfg['min_rr_tp'] = 1.35
@@ -18549,7 +18556,7 @@ def db_init():
     if "spike_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_alert_on INTEGER NOT NULL DEFAULT 1")
 
-    # default volume gate: 15M
+    # default volume gate: 10M
     if "spike_min_vol_usd" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
 
@@ -19774,7 +19781,7 @@ def _safe_float(x, default: float = 0.0) -> float:
 BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "1.5") or 1.5)
 BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") or 3.0)
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
-BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0)
+BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "10000000") or 10_000_000.0)
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "7200") or 7200)  # Ver15: same-symbol/same-direction F8 cooldown (opposite direction still allowed)
 # Guard against stale Render env BIGMOVE_COOLDOWN_SEC=0 from older no-cooldown builds.
@@ -20276,7 +20283,7 @@ def _user_bigmove_thresholds(user: dict | None) -> tuple[float, float, float]:
 def _user_bigmove_min_vol_usd(user: dict | None, default: float = BIGMOVE_DEFAULT_MIN_VOL_USD) -> float:
     """Resolve big-move min volume with backward-compatible fallback.
 
-    Commercial floor: keep big-move alerts at or above 15M 24h volume unless a
+    Commercial floor: keep big-move alerts at or above 10M 24h volume unless a
     future code change intentionally introduces a lower supported floor.
     """
     floor = float(BIGMOVE_MIN_SUPPORTED_VOL_USD)
@@ -21045,7 +21052,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
 
 def _spike_reversal_candidates(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 15_000_000.0,
+    min_vol_usd: float = 10_000_000.0,
     wick_ratio_min: float = 0.55,
     atr_mult_min: float = 1.20,
     max_items: int = 10,
@@ -21193,7 +21200,7 @@ def _spike_reversal_candidates(
 
 def _spike_reversal_warnings(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 15_000_000.0,
+    min_vol_usd: float = 10_000_000.0,
     atr_mult_min: float = 1.05,
     body_ratio_min: float = 0.50,
     lookback_1h: int = 8,
@@ -48391,7 +48398,7 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         scout_enabled = bool(globals().get('SETUP_COMBO_WATCH_SCOUT_ENABLED', True))
         scout_min_conf = int(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_CONF', 84) or 84)
         scout_min_rr = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_RR', 1.40) or 1.40)
-        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
+        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 10000000) or 10000000)
         # Ver47: do not kill 84-86 confidence candidates before dynamic risk is
         # calculated. They may pass only via the stronger near/scout dynamic-score
         # lane; sub-scout confidence is still blocked immediately.
@@ -48554,7 +48561,7 @@ def _setup_execution_quality_baseline_allows(setup_or_row, session_name: str = '
         # Ver50 controlled discovery floor: after relaxing baseline Conf/Dyn, keep
         # geometry/liquidity quality strict enough for real forward testing.
         min_base_rr = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_RR', 1.25) or 1.25)
-        min_base_vol = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_VOL_USD', 15000000.0) or 15000000.0)
+        min_base_vol = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_VOL_USD', 10000000.0) or 10000000.0)
         meta['baseline_discovery_min_rr'] = float(min_base_rr)
         meta['baseline_discovery_min_vol_usd'] = float(min_base_vol)
         if rr < min_base_rr:
@@ -48657,7 +48664,7 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
         if side == 'SELL' and not (tp < entry < sl):
             return False, f'{reason_prefix}_invalid_sell_geometry', meta
 
-        min_vol = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_VOL_USD', 15000000.0) or 15000000.0)
+        min_vol = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_VOL_USD', 10000000.0) or 10000000.0)
         min_rr = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_RR', 1.20) or 1.20)
         min_conf = int(globals().get('FINAL_PIPELINE_LOCKED_MIN_CONF', 78) or 78)
         min_dyn = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE', 35.0) or 35.0)
@@ -48951,7 +48958,7 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         scout_min_conf = int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)
         scout_dyn = float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 84) or 84)
         scout_rr = float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.40) or 1.40)
-        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
+        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 10000000) or 10000000)
         fut_vol = float(meta.get('fut_vol_usd') or _autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or 0.0)
         rr = float(meta.get('rr') or 0.0)
         if conf < final_adaptive_min_conf:
@@ -49345,7 +49352,7 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         except Exception:
             pass
         try:
-            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 15000000) or 15000000)
+            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 10000000) or 10000000)
             if min_vol > 0 and vol_v > 0 and vol_v < min_vol and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
                 return False, f'strict_min_volume_block vol=${vol_v/1_000_000:.1f}M<{min_vol/1_000_000:.0f}M'
         except Exception:
@@ -59435,6 +59442,10 @@ ALERT_JOB_SKIP_BIGMOVE_AFTER_BUDGET_PCT = float(os.environ.get("ALERT_JOB_SKIP_B
 ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT = float(os.environ.get("ALERT_JOB_RESERVE_FOR_SESSION_POOLS_PCT", "0.45") or 0.45)
 ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT = float(os.environ.get("ALERT_JOB_BIGMOVE_MAX_RUNTIME_SHARE_WITH_NOTIFY_PCT", "0.55") or 0.55)
 BIGMOVE_PAYLOAD_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_PAYLOAD_TIMEOUT_SEC", "60") or 60)
+BIGMOVE_POST_ALERT_TIMEOUT_SEC = int(os.environ.get("BIGMOVE_POST_ALERT_TIMEOUT_SEC", "90") or 90)
+BIGMOVE_POST_ALERT_QUEUE_DEDUPE_SEC = int(os.environ.get("BIGMOVE_POST_ALERT_QUEUE_DEDUPE_SEC", "120") or 120)
+_BIGMOVE_POST_ALERT_QUEUED: dict[str, float] = {}
+
 # Ver22: autonomous setup discovery must stay hot. A 10-minute rebuild floor made /screen
 # look like the trigger because manual /screen used the dedicated screen lane while the
 # email lane waited on stale/empty pools. Keep it short by default.
@@ -60057,6 +60068,398 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 pass
             return list(setups or []), bool(sent_setup_email)
 
+        def _bigmove_prepare_exact_emailed_setups_sync(owner_uid: int, sess_u: str, setups: list, tag: str = 'bigmove') -> list:
+            """Persist/stamp the exact setup objects that were just sent by setup email.
+
+            This keeps AutoTrade bound to the same setup_id/body that the owner
+            received, instead of rebuilding a new synthetic BigMove setup after SMTP.
+            """
+            out = list(setups or [])
+            now_ts = float(time.time())
+            try:
+                _persist_executable_candidates(int(owner_uid), str(sess_u or ''), out, 'emailed_setups', 'bigmove_setup_email_exact_autotrade')
+            except Exception:
+                pass
+            for stp in out:
+                try:
+                    setattr(stp, 'source_kind', 'emailed_setups')
+                    setattr(stp, 'source_session', str(sess_u or ''))
+                    setattr(stp, 'delivery_lane_locked', True)
+                    setattr(stp, 'email_logged_ts', float(getattr(stp, 'email_logged_ts', 0.0) or now_ts))
+                    setattr(stp, 'emailed_ts', float(getattr(stp, 'emailed_ts', 0.0) or now_ts))
+                    setattr(stp, 'created_ts', float(getattr(stp, 'created_ts', 0.0) or now_ts))
+                    sid = str(getattr(stp, 'setup_id', '') or getattr(stp, 'id', '') or '')
+                    if sid:
+                        try:
+                            db_mark_emailed_setup(int(owner_uid), sid, str(sess_u or ''), now_ts)
+                        except Exception:
+                            pass
+                        try:
+                            db_mark_executable_setup(int(owner_uid), sid, str(sess_u or ''), now_ts, s=stp, source_kind='emailed_setups', state='executable_pending')
+                        except Exception:
+                            pass
+                    try:
+                        _cache_recent_emailed_setup(int(owner_uid), stp, session=str(sess_u or ''), emailed_ts=now_ts, source_kind='recent_email_cache')
+                    except Exception:
+                        pass
+                    try:
+                        _mark_emailed_setup_identity(int(owner_uid), stp, emailed_ts=now_ts)
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+            try:
+                cache_delete(f"autotrade_db_setups_v129:{int(owner_uid)}:{str(sess_u or '')}:24:30")
+                cache_delete(f"autotrade_db_setups:{int(owner_uid)}:{str(sess_u or '')}:12:5")
+            except Exception:
+                pass
+            try:
+                db_log_setup_pipeline_event(int(owner_uid), stage='bigmove_exact_emailed_setup_persist', status='ok', session=str(sess_u or ''), mode='autotrade', details={'setups': len(out), 'tag': str(tag or '')})
+            except Exception:
+                pass
+            return out
+
+        async def _trigger_autotrade_after_bigmove_emailed_setups_async(uid: int, session_name: str, emailed_setups: list, tag: str = 'bigmove') -> None:
+            """AutoTrade the exact F8 setup objects that were just setup-emailed.
+
+            Runs from the dedicated BigMove worker loop. It does not touch the
+            main-loop asyncio AUTOTRADE_EXEC_LOCK, because that lock is tied to
+            Telegram's loop. Serialisation is still preserved by the single-worker
+            _AUTOTRADE_EXECUTOR plus the existing duplicate/setup guards inside
+            _autotrade_place_trade.
+            """
+            owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+            caller_uid = int(uid or 0)
+            sess = str(session_name or _bigmove_autotrade_session_name()).upper().strip()
+            if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
+                return
+            now_utc = datetime.now(timezone.utc)
+            if not bool(BIGMOVE_AUTOTRADE_ENABLED):
+                _LAST_AUTOTRADE_DECISION[owner_uid] = {'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'), 'reason': 'bigmove_autotrade_disabled', 'session': sess, 'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_setup_email_worker'}
+                return
+            if not _autotrade_ready():
+                _LAST_AUTOTRADE_DECISION[owner_uid] = {'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'), 'reason': 'autotrade_not_ready_or_disabled', 'session': sess, 'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_setup_email_worker'}
+                return
+            if not _autotrade_allowed_session(sess):
+                _LAST_AUTOTRADE_DECISION[owner_uid] = {'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'), 'reason': f'session_not_allowed ({sess})', 'session': sess, 'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_setup_email_worker'}
+                return
+            try:
+                user_owner = get_user(owner_uid) or {}
+                if not trade_window_allows_now(user_owner):
+                    _LAST_AUTOTRADE_DECISION[owner_uid] = {'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'), 'reason': 'trade_window_block', 'session': sess, 'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_setup_email_worker'}
+                    return
+            except Exception:
+                pass
+
+            exact_setups = list(emailed_setups or [])
+            if not exact_setups:
+                _LAST_AUTOTRADE_DECISION[owner_uid] = {'status': 'SKIP', 'when': now_utc.isoformat(timespec='seconds'), 'reason': 'no_exact_emailed_bigmove_setups', 'session': sess, 'mode': str(_autotrade_runtime_mode()).lower(), 'trigger': 'bigmove_setup_email_worker'}
+                return
+
+            try:
+                exact_setups = await to_thread_autotrade(_bigmove_prepare_exact_emailed_setups_sync, owner_uid, sess, list(exact_setups or []), str(tag or 'bigmove'), timeout=8)
+            except Exception:
+                exact_setups = list(emailed_setups or [])
+
+            attempted = 0
+            placed = 0
+            attempts_meta = []
+            last_reason = 'no_bigmove_emailed_candidates_attempted'
+            for cand in list(exact_setups or [])[:max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 1))]:
+                attempted += 1
+                meta = {
+                    'setup_id': str(getattr(cand, 'setup_id', '') or getattr(cand, 'id', '') or ''),
+                    'symbol': str(getattr(cand, 'symbol', '') or ''),
+                    'side': str(getattr(cand, 'side', '') or ''),
+                    'source_kind': str(getattr(cand, 'source_kind', '') or ''),
+                    'trigger': 'bigmove_exact_emailed_setup',
+                }
+                try:
+                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(int(AUTOTRADE_JOB_TIMEOUT_SEC or 55), max(10, int(AUTOTRADE_JOB_TIMEOUT_SEC or 55))))
+                except asyncio.TimeoutError:
+                    _timeout_reason = 'autotrade_place_trade_timeout_after_bigmove_setup_email'
+                    try:
+                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, owner_uid, sess, cand, _timeout_reason, timeout=8)
+                    except Exception:
+                        ok, reason = False, _timeout_reason
+                except Exception as e:
+                    ok, reason = False, f'{type(e).__name__}: {e}'
+                last_reason = '' if ok else str(reason or '')
+                if ok:
+                    placed += 1
+                try:
+                    detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
+                    meta.update({
+                        'status': 'PLACED' if ok else 'SKIP',
+                        'reason': '' if ok else str(reason or ''),
+                        'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
+                        'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
+                        'tp': detail_snapshot.get('live_exit_tp') or getattr(cand, 'tp', ''),
+                        'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+                        'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
+                        'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
+                    })
+                    _autotrade_record_attempt(owner_uid, meta, detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else str(reason or ''))
+                except Exception:
+                    pass
+                attempts_meta.append(meta)
+                if not ok and not _autotrade_should_try_next_after_skip(reason):
+                    break
+
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'PLACED' if placed > 0 else 'SKIP',
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': '' if placed > 0 else str(last_reason or 'no_tradable_bigmove_emailed_setup'),
+                'attempted': int(attempted),
+                'placed': int(placed),
+                'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(),
+                'attempted_candidates': attempts_meta,
+                'latest_candidate': attempts_meta[0] if attempts_meta else {},
+                'trigger': 'bigmove_setup_email_worker',
+            }
+            try:
+                db_log_setup_pipeline_event(owner_uid, stage='bigmove_autotrade_after_setup_email', status='placed' if placed > 0 else 'skip', session=sess, mode='autotrade', details={'reason': last_reason, 'attempted': attempted, 'placed': placed, 'tag': str(tag or ''), 'candidates': attempts_meta[:8]})
+            except Exception:
+                pass
+
+        async def _bigmove_setup_email_then_autotrade_task(uid: int, tz, session_name: str, filtered: list, best_fut_snapshot: dict | None = None, tag: str = 'bigmove') -> None:
+            """Bounded BigMove follow-up chain.
+
+            Critical safety: this coroutine is executed from the dedicated BigMove
+            worker thread/event-loop by _queue_bigmove_setup_email_then_autotrade(),
+            not directly on the main Telegram polling loop.  The sequence stays:
+            BigMove alert email -> F8 setup email if executable -> AutoTrade exact
+            emailed setup_id.  If setup email is blocked/empty/timed out, AutoTrade
+            is skipped and the bot remains responsive.
+            """
+            sess_u = str(session_name or _bigmove_autotrade_session_name()).upper().strip()
+            if sess_u not in {'ASIA', 'LON', 'NY'}:
+                sess_u = _bigmove_autotrade_session_name()
+            setup_email_setups = []
+            setup_email_sent = False
+            stage_t0 = time.time()
+            try:
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_post_alert_followup', status='start', session=sess_u, mode='bigmove_worker', details={'tag': str(tag or ''), 'candidates': len(filtered or [])})
+                except Exception:
+                    pass
+                setup_email_setups, setup_email_sent = await asyncio.wait_for(
+                    _send_bigmove_setup_email_after_alert(
+                        int(uid),
+                        str(sess_u or ''),
+                        list(filtered or []),
+                        best_fut_snapshot or {},
+                        tag=str(tag or 'bigmove'),
+                    ),
+                    timeout=max(20, int(BIGMOVE_POST_ALERT_TIMEOUT_SEC or 90)),
+                )
+            except asyncio.TimeoutError:
+                setup_email_setups, setup_email_sent = [], False
+                try:
+                    _LAST_SMTP_ERROR[int(uid)] = f'bigmove_f8_setup_email_timeout_after_{int(BIGMOVE_POST_ALERT_TIMEOUT_SEC or 90)}s'
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_post_alert_followup', status='setup_email_timeout', session=sess_u, mode='bigmove_worker', details={'timeout_sec': int(BIGMOVE_POST_ALERT_TIMEOUT_SEC or 90), 'tag': str(tag or '')})
+                except Exception:
+                    pass
+            except Exception as exc:
+                setup_email_setups, setup_email_sent = [], False
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_post_alert_followup', status='setup_email_error', session=sess_u, mode='bigmove_worker', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
+                except Exception:
+                    pass
+
+            try:
+                if setup_email_sent:
+                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
+                else:
+                    _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_blocked_empty_or_timeout')
+            except Exception:
+                pass
+
+            try:
+                owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+            except Exception:
+                owner_uid_for_bm_at = 0
+
+            if not setup_email_sent or not setup_email_setups:
+                try:
+                    if owner_uid_for_bm_at > 0:
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            'status': 'SKIP',
+                            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                            'reason': 'bigmove_f8_setup_email_not_sent_or_not_executable',
+                            'session': str(sess_u or ''),
+                            'mode': str(_autotrade_runtime_mode()).lower(),
+                            'trigger': 'bigmove_setup_email_worker',
+                        }
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_post_alert_followup', status='skip_autotrade_no_setup_email', session=sess_u, mode='bigmove_worker', details={'elapsed_sec': round(time.time() - stage_t0, 2), 'tag': str(tag or '')})
+                except Exception:
+                    pass
+                return
+
+            try:
+                if owner_uid_for_bm_at <= 0 or (not BIGMOVE_AUTOTRADE_ENABLED) or (not _autotrade_ready()):
+                    if owner_uid_for_bm_at > 0:
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            'status': 'SKIP',
+                            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                            'reason': 'bigmove_autotrade_not_ready_or_disabled',
+                            'session': str(sess_u or ''),
+                            'mode': str(_autotrade_runtime_mode()).lower(),
+                            'trigger': 'bigmove_setup_email_worker',
+                        }
+                    return
+                _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                    'status': 'QUEUED',
+                    'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'reason': 'bigmove_f8_setup_email_sent_waiting_for_worker_autotrade',
+                    'session': str(sess_u or ''),
+                    'mode': str(_autotrade_runtime_mode()).lower(),
+                    'trigger': 'bigmove_setup_email_worker',
+                }
+                await asyncio.wait_for(
+                    _trigger_autotrade_after_bigmove_emailed_setups_async(
+                        int(uid),
+                        str(sess_u or ''),
+                        list(setup_email_setups or []),
+                        tag=str(tag or 'bigmove'),
+                    ),
+                    timeout=max(20, int(AUTOTRADE_JOB_TIMEOUT_SEC or 55) + 20),
+                )
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_post_alert_followup', status='done', session=sess_u, mode='bigmove_worker', details={'elapsed_sec': round(time.time() - stage_t0, 2), 'setups': len(setup_email_setups or []), 'tag': str(tag or '')})
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                try:
+                    if owner_uid_for_bm_at > 0:
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            'status': 'SKIP',
+                            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                            'reason': 'bigmove_autotrade_worker_timeout',
+                            'session': str(sess_u or ''),
+                            'mode': str(_autotrade_runtime_mode()).lower(),
+                            'trigger': 'bigmove_setup_email_worker',
+                        }
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_post_alert_followup', status='autotrade_timeout', session=sess_u, mode='bigmove_worker', details={'elapsed_sec': round(time.time() - stage_t0, 2), 'tag': str(tag or '')})
+                except Exception:
+                    pass
+            except Exception as exc:
+                try:
+                    if owner_uid_for_bm_at > 0:
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            'status': 'ERROR',
+                            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                            'reason': f'bigmove_worker_{type(exc).__name__}: {exc}',
+                            'session': str(sess_u or ''),
+                            'mode': str(_autotrade_runtime_mode()).lower(),
+                            'trigger': 'bigmove_setup_email_worker',
+                        }
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_post_alert_followup', status='error', session=sess_u, mode='bigmove_worker', details={'error': f'{type(exc).__name__}: {exc}', 'elapsed_sec': round(time.time() - stage_t0, 2), 'tag': str(tag or '')})
+                except Exception:
+                    pass
+
+        def _bigmove_post_alert_key(uid: int, filtered: list, tag: str = 'bigmove') -> str:
+            try:
+                parts = []
+                for c in list(filtered or [])[:8]:
+                    parts.append(f"{str((c or {}).get('symbol') or '').upper()}:{str((c or {}).get('direction') or '').upper()}")
+                return f"{int(uid)}:{str(tag or '')}:" + '|'.join(parts)
+            except Exception:
+                return f"{int(uid or 0)}:{str(tag or '')}:unknown"
+
+        def _mark_bigmove_emailed_batch(uid: int, filtered: list) -> None:
+            for c in list(filtered or [])[:8]:
+                try:
+                    mark_bigmove_emailed(int(uid), c['symbol'], c['direction'])
+                except Exception:
+                    pass
+
+        async def _bigmove_followup_worker_launcher(uid: int, tz, session_name: str, filtered: list, best_fut_snapshot: dict | None = None, tag: str = 'bigmove') -> None:
+            """Main-loop wrapper: quickly hands the whole F8 setup/AutoTrade chain to BIGMOVE_EXECUTOR."""
+            try:
+                await asyncio.wait_for(
+                    to_thread_bigmove(
+                        _run_async_in_new_loop,
+                        _bigmove_setup_email_then_autotrade_task,
+                        int(uid),
+                        tz,
+                        str(session_name or ''),
+                        list(filtered or []),
+                        best_fut_snapshot or {},
+                        str(tag or 'bigmove'),
+                        timeout=max(30, int(BIGMOVE_POST_ALERT_TIMEOUT_SEC or 90) + int(AUTOTRADE_JOB_TIMEOUT_SEC or 55) + 30),
+                    ),
+                    timeout=max(35, int(BIGMOVE_POST_ALERT_TIMEOUT_SEC or 90) + int(AUTOTRADE_JOB_TIMEOUT_SEC or 55) + 35),
+                )
+            except asyncio.TimeoutError:
+                try:
+                    owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+                    if owner_uid_for_bm_at > 0:
+                        _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                            'status': 'SKIP',
+                            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                            'reason': 'bigmove_post_alert_worker_launcher_timeout',
+                            'session': str(session_name or ''),
+                            'mode': str(_autotrade_runtime_mode()).lower(),
+                            'trigger': 'bigmove_setup_email_worker',
+                        }
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_post_alert_worker', status='timeout', session=str(session_name or ''), mode='bigmove_worker', details={'tag': str(tag or ''), 'candidates': len(filtered or [])})
+                except Exception:
+                    pass
+            except Exception as exc:
+                try:
+                    db_log_setup_pipeline_event(int(uid), stage='bigmove_post_alert_worker', status='error', session=str(session_name or ''), mode='bigmove_worker', details={'error': f'{type(exc).__name__}: {exc}', 'tag': str(tag or '')})
+                except Exception:
+                    pass
+
+        def _queue_bigmove_setup_email_then_autotrade(uid: int, tz, session_name: str, filtered: list, best_fut_snapshot: dict | None = None, tag: str = 'bigmove') -> None:
+            try:
+                key = _bigmove_post_alert_key(int(uid), list(filtered or []), str(tag or 'bigmove'))
+                now_q = float(time.time())
+                # Drop duplicate queued follow-ups for the same user/symbol/direction/tag.
+                # This prevents repeated confirmed alerts from stacking worker tasks and
+                # starving the bot if SMTP/Bybit is slow.
+                old_q = float(_BIGMOVE_POST_ALERT_QUEUED.get(key, 0.0) or 0.0)
+                if old_q > 0 and (now_q - old_q) < max(10, int(BIGMOVE_POST_ALERT_QUEUE_DEDUPE_SEC or 120)):
+                    try:
+                        _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_followup_duplicate_queue_suppressed')
+                    except Exception:
+                        pass
+                    return
+                _BIGMOVE_POST_ALERT_QUEUED[key] = now_q
+                # Opportunistic pruning.
+                try:
+                    cutoff_q = now_q - max(60, int(BIGMOVE_POST_ALERT_QUEUE_DEDUPE_SEC or 120) * 3)
+                    for _k, _ts in list(_BIGMOVE_POST_ALERT_QUEUED.items()):
+                        if float(_ts or 0.0) < cutoff_q:
+                            _BIGMOVE_POST_ALERT_QUEUED.pop(_k, None)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_worker_queued')
+            except Exception:
+                pass
+            try:
+                owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
+                if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED:
+                    _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
+                        'status': 'QUEUED',
+                        'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                        'reason': 'bigmove_alert_sent_waiting_for_background_f8_setup_email',
+                        'session': str(session_name or ''),
+                        'mode': str(_autotrade_runtime_mode()).lower(),
+                        'trigger': 'bigmove_setup_email_worker',
+                    }
+            except Exception:
+                pass
+            _safe_create_task(
+                _bigmove_followup_worker_launcher(int(uid), tz, str(session_name or ''), list(filtered or []), best_fut_snapshot or {}, tag=str(tag or 'bigmove')),
+                f"bigmove_post_alert_worker_{tag}",
+            )
+
         async def _send_bigmove_payload_for_user(uid: int, tz, tag: str = 'pre_session') -> None:
             """Build and send one user's Big-Move email without waiting behind setup scans.
 
@@ -60113,42 +60516,16 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     ),
                 }
                 if ok:
-                    for c in filtered[:8]:
-                        try:
-                            mark_bigmove_emailed(int(uid), c["symbol"], c["direction"])
-                        except Exception:
-                            pass
                     bm_sess = _bigmove_autotrade_session_name()
-                    setup_email_setups = []
-                    setup_email_sent = False
                     try:
-                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
-                    except Exception:
-                        setup_email_setups, setup_email_sent = [], False
-                    try:
-                        if setup_email_sent:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
-                        else:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
+                        await to_thread_bigmove(_mark_bigmove_emailed_batch, int(uid), list(filtered or []), timeout=3)
                     except Exception:
                         pass
-                    try:
-                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                                "status": "QUEUED",
-                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
-                                "session": str(bm_sess or ""),
-                                "mode": str(_autotrade_runtime_mode()).lower(),
-                                "trigger": "bigmove_setup_email_immediate",
-                            }
-                            _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session")),
-                                "autotrade_after_bigmove_setup_email",
-                            )
-                    except Exception:
-                        pass
+                    # yver39: the BigMove market alert returns immediately after the
+                    # alert email.  The F8 setup email + AutoTrade exact-setup chain is
+                    # isolated in BIGMOVE_EXECUTOR so Telegram command handlers cannot
+                    # be blocked by SMTP, SQLite, ccxt/Bybit, or AutoTrade placement.
+                    _queue_bigmove_setup_email_then_autotrade(int(uid), tz, str(bm_sess or ""), list(filtered or []), best_fut or {}, tag=str(tag or "pre_session"))
             except Exception as e:
                 logger.exception("Big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[int(uid)] = {
@@ -60161,7 +60538,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Big-Move Alert Emails (independent of full trade setups)
         # Trigger: |15m| >= user.bigmove_alert_15m AND |1H| >= user.bigmove_alert_1h
         #          AND |4H| >= user.bigmove_alert_4h, all in the same direction.
-        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 15M)
+        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
         # Defaults: 15m=1.5%, 1H=3%, 4H=5%
         # -----------------------------------------------------
         try:
@@ -60946,42 +61323,14 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                 }
 
                 if ok:
-                    for c in filtered[:8]:
-                        try:
-                            mark_bigmove_emailed(uid, c["symbol"], c["direction"])
-                        except Exception:
-                            pass
                     bm_sess = _bigmove_autotrade_session_name()
-                    setup_email_setups = []
-                    setup_email_sent = False
                     try:
-                        setup_email_setups, setup_email_sent = await _send_bigmove_setup_email_after_alert(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred")
-                    except Exception:
-                        setup_email_setups, setup_email_sent = [], False
-                    try:
-                        if setup_email_sent:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append(f"f8_setup_email_sent:{len(setup_email_setups or [])}")
-                        else:
-                            _LAST_BIGMOVE_DECISION[int(uid)].setdefault('reasons', []).append('f8_setup_email_failed_or_empty')
+                        await to_thread_bigmove(_mark_bigmove_emailed_batch, int(uid), list(filtered or []), timeout=3)
                     except Exception:
                         pass
-                    try:
-                        owner_uid_for_bm_at = int(AUTOTRADE_OWNER_UID or 0)
-                        if owner_uid_for_bm_at > 0 and BIGMOVE_AUTOTRADE_ENABLED and _autotrade_ready():
-                            _LAST_AUTOTRADE_DECISION[owner_uid_for_bm_at] = {
-                                "status": "QUEUED",
-                                "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                                "reason": "bigmove_setup_email_sent_waiting_for_immediate_autotrade" if setup_email_sent else "bigmove_alert_sent_waiting_for_immediate_autotrade",
-                                "session": str(bm_sess or ""),
-                                "mode": str(_autotrade_runtime_mode()).lower(),
-                                "trigger": "bigmove_setup_email_immediate",
-                            }
-                            _safe_create_task(
-                                _trigger_autotrade_after_bigmove_email_async(int(uid), str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred"),
-                                "autotrade_after_bigmove_setup_email_deferred",
-                            )
-                    except Exception:
-                        pass
+                    # yver39: deferred BigMove follows the same isolated background
+                    # F8 setup email + AutoTrade chain as the immediate path.
+                    _queue_bigmove_setup_email_then_autotrade(int(uid), tz, str(bm_sess or ""), list(filtered or []), best_fut or {}, tag="deferred")
             except Exception as e:
                 logger.exception("Deferred big-move alert failed for uid=%s: %s", uid, e)
                 _LAST_BIGMOVE_DECISION[uid] = {
