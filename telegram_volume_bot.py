@@ -1,4 +1,3 @@
-# yver36: changes setup/executable minimum 24h volume and Big-Move alert minimum volume defaults from 15M to 10M only; no risk, policy, blackout, TP/SL, timing, or AutoTrade logic changes.
 # yver32: adds shadow scan logging during blackout windows. Blackout blocks email/AutoTrade, but would-have-been executable setups are stored as shadow_blackout for future WR analysis.
 # yver31: /setup_audit Blackout column now shows the matched blackout window/category (or OPEN) instead of YES/NO, so blackout WR can be analysed by category.
 # yver30: adds /setup_audit Blackout column based on the setup generation timestamp and current configured blackout windows. Built on yver29 day-aware multi-window BLACKOUT_WINDOWS support.
@@ -3107,7 +3106,7 @@ SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMB
 # Ver49: anti-starvation correction.  Ver48 still allowed stale Render/env values and
 # the final WATCH gate to starve the executable pool for hours.  Keep WR-first
 # controls, but make the scout lane practical: Conf>=83, Dyn>=70, RR>=1.30,
-# Vol>=10M. Broad global BUY/SELL side history is advisory only; combo/symbol/hour
+# Vol>=15M. Broad global BUY/SELL side history is advisory only; combo/symbol/hour
 # evidence and disabled policy rows remain enforceable.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = env_bool("SETUP_COMBO_WATCH_SCOUT_ENABLED", True)
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_CONF", "83") or 84)
@@ -3755,8 +3754,8 @@ SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE = float(os.environ.get("SETUP_EDGE_GUA
 # scout lane could help.  The system needs controlled forward-testing now, not a
 # frozen bot.  Keep real blockers (disabled combos, bad SL/TP/RR, weak symbol/combo/
 # hour, cooldown, risk caps), but lower the discovery lane just enough to persist
-# measurable setups for /setup_audit and AutoTrade learning.  Minimum liquidity is now
-# 10M.
+# measurable setups for /setup_audit and AutoTrade learning.  Minimum liquidity stays
+# 15M, not 10M.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = True
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 82
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 55.0
@@ -3832,7 +3831,7 @@ def _setup_policy_row_is_clean_start_legacy(pol: dict | None) -> bool:
         return False
 
 # Ver51 FINAL_PIPELINE_LOCKED: forward-test starvation guard.
-# Keep liquidity at 10M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
+# Keep liquidity at 15M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
 # floors freeze the executable queue at zero during live sessions.  The daily/weekly
 # policy will still learn and tighten from results.
 SETUP_FINAL_MIN_CONF = 84
@@ -5490,11 +5489,7 @@ MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as fin
 
 def _setup_min_volume_floor_usd() -> float:
     try:
-        v = max(10_000_000.0, float(SETUP_MIN_24H_VOL_USD or 0.0), float(MIN_FUT_VOL_USD or 0.0))
-        # yver36: if an old persisted/env default is exactly 15M, treat it as the new 10M floor.
-        if abs(float(v) - 15_000_000.0) < 1e-6:
-            return 10_000_000.0
-        return float(v)
+        return max(10_000_000.0, float(SETUP_MIN_24H_VOL_USD or 0.0), float(MIN_FUT_VOL_USD or 0.0))
     except Exception:
         return 10_000_000.0
 
@@ -18554,7 +18549,7 @@ def db_init():
     if "spike_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_alert_on INTEGER NOT NULL DEFAULT 1")
 
-    # default volume gate: 10M
+    # default volume gate: 15M
     if "spike_min_vol_usd" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
 
@@ -19780,9 +19775,6 @@ BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "1.5")
 BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") or 3.0)
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
 BIGMOVE_DEFAULT_MIN_VOL_USD = float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "10000000") or 10_000_000.0)
-# yver36: do not let an old Render env/default value of 15M keep Big-Move on the previous floor.
-if abs(float(BIGMOVE_DEFAULT_MIN_VOL_USD) - 15_000_000.0) < 1e-6:
-    BIGMOVE_DEFAULT_MIN_VOL_USD = 10_000_000.0
 BIGMOVE_MIN_SUPPORTED_VOL_USD = BIGMOVE_DEFAULT_MIN_VOL_USD
 BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "7200") or 7200)  # Ver15: same-symbol/same-direction F8 cooldown (opposite direction still allowed)
 # Guard against stale Render env BIGMOVE_COOLDOWN_SEC=0 from older no-cooldown builds.
@@ -20284,7 +20276,7 @@ def _user_bigmove_thresholds(user: dict | None) -> tuple[float, float, float]:
 def _user_bigmove_min_vol_usd(user: dict | None, default: float = BIGMOVE_DEFAULT_MIN_VOL_USD) -> float:
     """Resolve big-move min volume with backward-compatible fallback.
 
-    Commercial floor: keep big-move alerts at or above 10M 24h volume unless a
+    Commercial floor: keep big-move alerts at or above 15M 24h volume unless a
     future code change intentionally introduces a lower supported floor.
     """
     floor = float(BIGMOVE_MIN_SUPPORTED_VOL_USD)
@@ -48627,7 +48619,7 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
 
     This is not a quality bypass. It is the final fallback when older WATCH/dynamic/
     micro-edge gates would otherwise leave the executable queue at zero.  It requires:
-    valid symbol/side/session, valid single TP/SL geometry, minimum 10M volume,
+    valid symbol/side/session, valid single TP/SL geometry, minimum 15M volume,
     RR>=1.20, confidence>=78, projected risk/TP dollars, and no true disabled-normal
     policy state.  NORMAL setups in disabled combos still must be routed to REVERSE first.
     """
@@ -60169,7 +60161,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Big-Move Alert Emails (independent of full trade setups)
         # Trigger: |15m| >= user.bigmove_alert_15m AND |1H| >= user.bigmove_alert_1h
         #          AND |4H| >= user.bigmove_alert_4h, all in the same direction.
-        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
+        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 15M)
         # Defaults: 15m=1.5%, 1H=3%, 4H=5%
         # -----------------------------------------------------
         try:
