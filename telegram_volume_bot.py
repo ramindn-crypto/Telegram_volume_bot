@@ -1,4 +1,4 @@
-# yver29: restores the 15M setup/BigMove minimum-volume floor and hard-locks setup email, /screen and AutoTrade to KEEP policies only (WATCH never delivered/executed).
+# yver30: restores the 10M setup/BigMove minimum-volume floor and keeps setup email, /screen and AutoTrade locked to KEEP policies only (WATCH never delivered/executed).
 # yver28: syncs /setup_audit_keep and /setup_audit_keep_watch to the exact /setup_matrix policy source-of-truth lane sets; bumps cache keys to avoid stale policy summaries.
 # yver27: fixes stale stored KEEP demotion when current WR<=49 even if latest score row is only present in policy last_* fields; /setup_matrix policy and runtime gates now treat current WR as authoritative.
 # yver26: fixes current-WR policy sync: stored KEEP rows are demoted when latest WR is <=49%, keeps fast /setup_matrix policy, removes Dec, and uses WR=TP/(TP+SL) with OPEN excluded.
@@ -133,7 +133,7 @@ from typing import Any  # yver130 early import required before early helper anno
 
 # --- ASIA tightening (hard-coded, no env vars) ---
 ASIA_MIN_CONF_BOOST = 10
-ASIA_MIN_FUT_VOL_USD = 15_000_000
+ASIA_MIN_FUT_VOL_USD = 10_000_000
 ASIA_EXCLUDED_PREFIXES = ("1000",)
 ASIA_SYMBOL_COOLDOWN_HOURS = 3
 
@@ -2974,13 +2974,13 @@ SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMB
 # Ver49: anti-starvation correction.  Ver48 still allowed stale Render/env values and
 # the final WATCH gate to starve the executable pool for hours.  Keep WR-first
 # controls, but make the scout lane practical: Conf>=83, Dyn>=70, RR>=1.30,
-# Vol>=15M. Broad global BUY/SELL side history is advisory only; combo/symbol/hour
+# Vol>=10M. Broad global BUY/SELL side history is advisory only; combo/symbol/hour
 # evidence and disabled policy rows remain enforceable.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = env_bool("SETUP_COMBO_WATCH_SCOUT_ENABLED", True)
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = int(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_CONF", "83") or 84)
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_RR", "1.30") or 1.40)
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 10_000_000.0
 SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS = env_bool("SETUP_COMBO_WATCH_REQUIRE_RISK_METRICS", True)
 # Ver32 WR-first final gate: the executable lane itself is now quality-gated,
 # not only the downstream email/autotrade consumer.  This keeps /setup_audit,
@@ -2994,7 +2994,7 @@ SETUP_FINAL_SCOUT_ENABLED = env_bool("SETUP_FINAL_SCOUT_ENABLED", True)
 SETUP_FINAL_SCOUT_MIN_CONF = int(os.environ.get("SETUP_FINAL_SCOUT_MIN_CONF", "83") or 84)
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE", "70") or 84)
 SETUP_FINAL_SCOUT_MIN_RR = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_RR", "1.30") or 1.40)
-SETUP_FINAL_SCOUT_MIN_VOL_USD = float(os.environ.get("SETUP_FINAL_SCOUT_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 10_000_000.0
 SETUP_FINAL_REQUIRE_POLICY_STATE = env_bool("SETUP_FINAL_REQUIRE_POLICY_STATE", True)
 SETUP_FINAL_UNKNOWN_AS_WATCH = True  # Ver44: hard safety; unknown/new strategy combos enter WATCH probation, never hard-block as UNKNOWN
 SETUP_FINAL_WEAK_COMBO_MIN_DECIDED = int(os.environ.get("SETUP_FINAL_WEAK_COMBO_MIN_DECIDED", "3") or 3)
@@ -3008,7 +3008,7 @@ SETUP_KEEP_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_KEEP_MIN_DYNAMIC_SCOR
 SETUP_REVERSE_PROBATION_MIN_CONF = int(os.environ.get("SETUP_REVERSE_PROBATION_MIN_CONF", "85") or 85)
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = float(os.environ.get("SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE", "60") or 60)
 SETUP_BASELINE_DISCOVERY_MIN_RR = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_RR", "1.25") or 1.25)
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = float(os.environ.get("SETUP_BASELINE_DISCOVERY_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 10_000_000.0
 # Ver35: /setup_audit is an analytical report and must not disappear just because
 # the live execution gate is strict. Execution/email/autotrade still use the final
 # quality gate; audit keeps visibility of stored setup outcomes for learning.
@@ -3570,7 +3570,7 @@ SETUP_EDGE_GUARD_INTERIM_HOUR_LIST = tuple(x.strip() for x in str(os.environ.get
     "10:00,11:00,13:00,19:00"
 ) or "").split(",") if x.strip())
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = int(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_CONF", "83") or 83)
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = float(os.environ.get("SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD", "15000000") or 15000000)
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 10_000_000.0
 # Ver48: global BUY/SELL edge can be noisy and stale after introducing NORMAL/REVERSE strategy routing.
 # Keep combo/symbol/hour blocks strict, but make broad global-side blocking advisory by default.
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = env_bool("SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED", False)
@@ -3590,19 +3590,19 @@ SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE = float(os.environ.get("SETUP_EDGE_GUA
 # frozen bot.  Keep real blockers (disabled combos, bad SL/TP/RR, weak symbol/combo/
 # hour, cooldown, risk caps), but lower the discovery lane just enough to persist
 # measurable setups for /setup_audit and AutoTrade learning.  Minimum liquidity stays
-# 15M, not 10M.
+# 10M.
 SETUP_COMBO_WATCH_SCOUT_ENABLED = True
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 82
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 55.0
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.25
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 10_000_000.0
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 84
 SETUP_COMBO_WATCH_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
 SETUP_FINAL_SCOUT_ENABLED = True
 SETUP_FINAL_SCOUT_MIN_CONF = 82
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 55.0
 SETUP_FINAL_SCOUT_MIN_RR = 1.25
-SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 10_000_000.0
 SETUP_FINAL_ADAPTIVE_MIN_CONF = 84
 SETUP_FINAL_NEAR_CONF_MIN_DYNAMIC_SCORE = 65.0
 SETUP_KEEP_MIN_CONF = 80
@@ -3610,9 +3610,9 @@ SETUP_KEEP_MIN_DYNAMIC_SCORE = 45.0
 SETUP_REVERSE_PROBATION_MIN_CONF = 80
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 45.0
 SETUP_BASELINE_DISCOVERY_MIN_RR = 1.25
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 10_000_000.0
 SETUP_EDGE_GUARD_STRICT_MIN_CONF = 78
-SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 15000000.0
+SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD = 10_000_000.0
 SETUP_EDGE_GUARD_GLOBAL_SIDE_HARD_BLOCK_ENABLED = False
 
 # Ver57: clean-start legacy ignore + fresh safety ON.
@@ -3666,7 +3666,7 @@ def _setup_policy_row_is_clean_start_legacy(pol: dict | None) -> bool:
         return False
 
 # Ver51 FINAL_PIPELINE_LOCKED: forward-test starvation guard.
-# Keep liquidity at 15M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
+# Keep liquidity at 10M and valid RR/SL/TP, but do not let old WATCH/dynamic/micro-edge
 # floors freeze the executable queue at zero during live sessions.  The daily/weekly
 # policy will still learn and tighten from results.
 SETUP_FINAL_MIN_CONF = 84
@@ -3677,7 +3677,7 @@ SETUP_FINAL_SCOUT_ENABLED = True
 SETUP_FINAL_SCOUT_MIN_CONF = 78
 SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE = 35.0
 SETUP_FINAL_SCOUT_MIN_RR = 1.20
-SETUP_FINAL_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_FINAL_SCOUT_MIN_VOL_USD = 10_000_000.0
 SETUP_COMBO_WATCH_MIN_CONF = 84
 SETUP_COMBO_WATCH_MIN_DYNAMIC_SCORE = 50.0
 SETUP_COMBO_WATCH_ADAPTIVE_MIN_CONF = 82
@@ -3686,17 +3686,17 @@ SETUP_COMBO_WATCH_SCOUT_ENABLED = True
 SETUP_COMBO_WATCH_SCOUT_MIN_CONF = 78
 SETUP_COMBO_WATCH_SCOUT_MIN_DYNAMIC_SCORE = 35.0
 SETUP_COMBO_WATCH_SCOUT_MIN_RR = 1.20
-SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 15000000.0
+SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD = 10_000_000.0
 SETUP_KEEP_MIN_CONF = 78
 SETUP_KEEP_MIN_DYNAMIC_SCORE = 35.0
 SETUP_REVERSE_PROBATION_MIN_CONF = 78
 SETUP_REVERSE_PROBATION_MIN_DYNAMIC_SCORE = 35.0
 SETUP_BASELINE_DISCOVERY_MIN_RR = 1.20
-SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 15000000.0
+SETUP_BASELINE_DISCOVERY_MIN_VOL_USD = 10_000_000.0
 FINAL_PIPELINE_LOCKED_ENABLED = env_bool("FINAL_PIPELINE_LOCKED_ENABLED", True)
 FINAL_PIPELINE_LOCKED_MIN_CONF = int(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_CONF", "78") or 78)
 FINAL_PIPELINE_LOCKED_MIN_RR = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_RR", "1.20") or 1.20)
-FINAL_PIPELINE_LOCKED_MIN_VOL_USD = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_VOL_USD", "15000000") or 15000000)
+FINAL_PIPELINE_LOCKED_MIN_VOL_USD = 10_000_000.0
 FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE", "35") or 35)
 
 # Ver52 EXECUTABLE_QUEUE_UNBLOCK: hard runtime override.
@@ -3708,7 +3708,7 @@ FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE = float(os.environ.get("FINAL_PIPELINE_L
 VER52_EXECUTABLE_QUEUE_UNBLOCK = True
 VER52_MIN_CONF = 72
 VER52_MIN_RR = 1.05
-VER52_MIN_VOL_USD = 15000000.0
+VER52_MIN_VOL_USD = 10_000_000.0
 VER52_MIN_DYNAMIC_SCORE = 0.0
 SETUP_FINAL_MIN_CONF = 82
 SETUP_FINAL_MIN_DYNAMIC_SCORE = 35.0
@@ -5315,18 +5315,18 @@ EMAIL_SETUPS_N = max(1, min(int(EMAIL_SETUPS_N or 1), int(os.environ.get("EMAIL_
 MIN_SETUP_CONF = int(os.environ.get("MIN_SETUP_CONF", "72"))
 
 # ✅ Shared liquidity + RR floors for BOTH /screen Top Setups and email (single source of truth)
-MIN_FUT_VOL_USD = float(os.environ.get("MIN_FUT_VOL_USD", "15000000"))
+# yver30: hard-lock active setup liquidity floor to 10M so stale Render env cannot keep it at 15M.
+MIN_FUT_VOL_USD = 10_000_000.0
 # Production quality floor: no setup display/email/autotrade below this 24h futures volume.
-SETUP_MIN_24H_VOL_USD = float(os.environ.get("SETUP_MIN_24H_VOL_USD", "15000000") or 15000000)
-MIN_FUT_VOL_USD = max(float(MIN_FUT_VOL_USD or 0.0), float(SETUP_MIN_24H_VOL_USD or 0.0), 15_000_000.0)
+SETUP_MIN_24H_VOL_USD = 10_000_000.0
 MIN_RR_FINAL = float(os.environ.get("MIN_RR_FINAL", os.environ.get("MIN_RR_TP", os.environ.get("MIN_RR_TP", "1.45"))))
 MIN_RR_TP = MIN_RR_FINAL  # legacy compatibility only; live model uses TP as final target
 
 def _setup_min_volume_floor_usd() -> float:
     try:
-        return max(15_000_000.0, float(SETUP_MIN_24H_VOL_USD or 0.0), float(MIN_FUT_VOL_USD or 0.0))
+        return max(10_000_000.0, float(SETUP_MIN_24H_VOL_USD or 0.0), float(MIN_FUT_VOL_USD or 0.0))
     except Exception:
-        return 15_000_000.0
+        return 10_000_000.0
 
 def _setup_volume_ok(setup_or_vol) -> bool:
     try:
@@ -5341,7 +5341,7 @@ def _setup_volume_ok(setup_or_vol) -> bool:
         return False
 
 # Back-compat: some older logic used EMAIL_MIN_FUT_VOL_USD. Keep it aligned.
-EMAIL_MIN_FUT_VOL_USD = max(15_000_000.0, float(os.environ.get("EMAIL_MIN_FUT_VOL_USD", str(MIN_FUT_VOL_USD))))
+EMAIL_MIN_FUT_VOL_USD = 10_000_000.0
 
 # ✅ Production scan breadth + loosened trigger only for screen (NOT email)
 # Hard API-load guard: live setup generation must never fan out across hundreds of symbols.
@@ -6832,7 +6832,7 @@ def _strategy_config_apply_ver08_quality_patch() -> None:
         cfg['family_allocator_enforce_live'] = False
 
         # Quality floors: reduce raw noise, but avoid the too-tight Ver08 1-3/day profile.
-        cfg['min_fut_vol_usd'] = max(15_000_000.0, float(cfg.get('min_fut_vol_usd', 0) or 0.0))
+        cfg['min_fut_vol_usd'] = 10_000_000.0
         cfg['quality_score_min_screen'] = max(63.0, float(cfg.get('quality_score_min_screen', 0) or 0.0))
         cfg['quality_score_min_email'] = 70.0
         cfg['min_rr_tp'] = 1.35
@@ -6875,8 +6875,13 @@ def apply_strategy_config(cfg: dict) -> None:
 
     # Liquidity + RR
     try:
-        MIN_FUT_VOL_USD = max(_setup_min_volume_floor_usd(), float(cfg.get("min_fut_vol_usd", MIN_FUT_VOL_USD) or 0.0))
-        EMAIL_MIN_FUT_VOL_USD = float(MIN_FUT_VOL_USD)
+        # yver30: keep live setup/email/audit floor at 10M even if old StrategyConfig stored 15M.
+        MIN_FUT_VOL_USD = 10_000_000.0
+        EMAIL_MIN_FUT_VOL_USD = 10_000_000.0
+        try:
+            cfg["min_fut_vol_usd"] = 10_000_000.0
+        except Exception:
+            pass
     except Exception:
         pass
     try:
@@ -7080,7 +7085,7 @@ ENGINE_C_MIN_BASE_BARS = 3
 ENGINE_C_MAX_BASE_WIDTH_PCT = 7.2
 ENGINE_C_HOLD_PORTION = 0.52
 ENGINE_C_BREAKOUT_BUFFER_PCT = 0.35
-ENGINE_C_MIN_FUT_VOL_USD = 15_000_000.0
+ENGINE_C_MIN_FUT_VOL_USD = 10_000_000.0
 ENGINE_C_RR_BONUS = 0.20
 ENGINE_C_TP_CAP_BONUS_PCT = 2.0
 
@@ -18282,7 +18287,7 @@ def db_init():
     if "spike_alert_on" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_alert_on INTEGER NOT NULL DEFAULT 1")
 
-    # default volume gate: 15M
+    # default volume gate: 10M
     if "spike_min_vol_usd" not in cols:
         cur.execute("ALTER TABLE users ADD COLUMN spike_min_vol_usd REAL NOT NULL DEFAULT 10000000")
 
@@ -19505,8 +19510,9 @@ def _safe_float(x, default: float = 0.0) -> float:
 BIGMOVE_DEFAULT_15M_PCT = float(os.environ.get("BIGMOVE_DEFAULT_15M_PCT", "1.5") or 1.5)
 BIGMOVE_DEFAULT_1H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_1H_PCT", "3.0") or 3.0)
 BIGMOVE_DEFAULT_4H_PCT = float(os.environ.get("BIGMOVE_DEFAULT_4H_PCT", "5.0") or 5.0)
-BIGMOVE_DEFAULT_MIN_VOL_USD = max(15_000_000.0, float(os.environ.get("BIGMOVE_DEFAULT_MIN_VOL_USD", "15000000") or 15_000_000.0))
-BIGMOVE_MIN_SUPPORTED_VOL_USD = max(15_000_000.0, BIGMOVE_DEFAULT_MIN_VOL_USD)
+# yver30: hard-lock BigMove min volume to 10M so stale Render env / migrated defaults cannot keep it at 15M.
+BIGMOVE_DEFAULT_MIN_VOL_USD = 10_000_000.0
+BIGMOVE_MIN_SUPPORTED_VOL_USD = 10_000_000.0
 BIGMOVE_MIN_FUT_VOL_USD = BIGMOVE_MIN_SUPPORTED_VOL_USD
 BIGMOVE_COOLDOWN_SEC = int(os.environ.get("BIGMOVE_COOLDOWN_SEC", "7200") or 7200)  # Ver15: same-symbol/same-direction F8 cooldown (opposite direction still allowed)
 # Guard against stale Render env BIGMOVE_COOLDOWN_SEC=0 from older no-cooldown builds.
@@ -20008,7 +20014,7 @@ def _user_bigmove_thresholds(user: dict | None) -> tuple[float, float, float]:
 def _user_bigmove_min_vol_usd(user: dict | None, default: float = BIGMOVE_DEFAULT_MIN_VOL_USD) -> float:
     """Resolve big-move min volume with backward-compatible fallback.
 
-    Commercial floor: keep big-move alerts at or above 15M 24h volume unless a
+    Commercial floor: keep big-move alerts at or above 10M 24h volume unless a
     future code change intentionally introduces a lower supported floor.
     """
     floor = float(BIGMOVE_MIN_SUPPORTED_VOL_USD)
@@ -20023,6 +20029,8 @@ def _user_bigmove_min_vol_usd(user: dict | None, default: float = BIGMOVE_DEFAUL
                 continue
             val = float(raw or 0.0)
             if val > 0:
+                if abs(val - 15_000_000.0) < 1e-6 or abs(val - 18_000_000.0) < 1e-6:
+                    return float(floor)
                 return float(max(floor, val))
         except Exception:
             continue
@@ -20764,7 +20772,7 @@ async def _trigger_autotrade_after_bigmove_email_async(uid: int, session_name: s
 
 def _spike_reversal_candidates(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 15_000_000.0,
+    min_vol_usd: float = 10_000_000.0,
     wick_ratio_min: float = 0.55,
     atr_mult_min: float = 1.20,
     max_items: int = 10,
@@ -20912,7 +20920,7 @@ def _spike_reversal_candidates(
 
 def _spike_reversal_warnings(
     best_fut: Dict[str, Any],
-    min_vol_usd: float = 15_000_000.0,
+    min_vol_usd: float = 10_000_000.0,
     atr_mult_min: float = 1.05,
     body_ratio_min: float = 0.50,
     lookback_1h: int = 8,
@@ -27620,12 +27628,12 @@ def _screen_context_volume_floor_usd() -> float:
     """Minimum 24h futures volume for /screen Market Context leaders/losers.
 
     Keep this aligned with the setup liquidity floor so /screen does not advertise
-    thin symbols in Leaders/Losers while setups are filtered at >= 15M.
+    thin symbols in Leaders/Losers while setups are filtered at >= 10M.
     """
     try:
-        return max(15_000_000.0, float(_setup_min_volume_floor_usd() or 0.0))
+        return max(10_000_000.0, float(_setup_min_volume_floor_usd() or 0.0))
     except Exception:
-        return 15_000_000.0
+        return 10_000_000.0
 
 
 def _screen_market_context_table(best_fut: dict, leaders=None, losers=None, tone: str | None = None) -> str:
@@ -48023,7 +48031,7 @@ def _setup_watch_policy_strict_quality_allows(setup_or_row, session_name: str = 
         scout_enabled = bool(globals().get('SETUP_COMBO_WATCH_SCOUT_ENABLED', True))
         scout_min_conf = int(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_CONF', 84) or 84)
         scout_min_rr = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_RR', 1.40) or 1.40)
-        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
+        scout_min_vol = float(globals().get('SETUP_COMBO_WATCH_SCOUT_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0)
         # Ver47: do not kill 84-86 confidence candidates before dynamic risk is
         # calculated. They may pass only via the stronger near/scout dynamic-score
         # lane; sub-scout confidence is still blocked immediately.
@@ -48186,7 +48194,7 @@ def _setup_execution_quality_baseline_allows(setup_or_row, session_name: str = '
         # Ver50 controlled discovery floor: after relaxing baseline Conf/Dyn, keep
         # geometry/liquidity quality strict enough for real forward testing.
         min_base_rr = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_RR', 1.25) or 1.25)
-        min_base_vol = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_VOL_USD', 15000000.0) or 15000000.0)
+        min_base_vol = float(globals().get('SETUP_BASELINE_DISCOVERY_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0)
         meta['baseline_discovery_min_rr'] = float(min_base_rr)
         meta['baseline_discovery_min_vol_usd'] = float(min_base_vol)
         if rr < min_base_rr:
@@ -48251,7 +48259,7 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
 
     This is not a quality bypass. It is the final fallback when older WATCH/dynamic/
     micro-edge gates would otherwise leave the executable queue at zero.  It requires:
-    valid symbol/side/session, valid single TP/SL geometry, minimum 15M volume,
+    valid symbol/side/session, valid single TP/SL geometry, minimum 10M volume,
     RR>=1.20, confidence>=78, projected risk/TP dollars, and no true disabled-normal
     policy state.  NORMAL setups in disabled combos still must be routed to REVERSE first.
     """
@@ -48289,7 +48297,7 @@ def _final_pipeline_locked_scout_allows(setup_or_row, session_name: str = '', us
         if side == 'SELL' and not (tp < entry < sl):
             return False, f'{reason_prefix}_invalid_sell_geometry', meta
 
-        min_vol = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_VOL_USD', 15000000.0) or 15000000.0)
+        min_vol = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0)
         min_rr = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_RR', 1.20) or 1.20)
         min_conf = int(globals().get('FINAL_PIPELINE_LOCKED_MIN_CONF', 78) or 78)
         min_dyn = float(globals().get('FINAL_PIPELINE_LOCKED_MIN_DYNAMIC_SCORE', 35.0) or 35.0)
@@ -48577,7 +48585,7 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         scout_min_conf = int(globals().get('SETUP_FINAL_SCOUT_MIN_CONF', 84) or 84)
         scout_dyn = float(globals().get('SETUP_FINAL_SCOUT_MIN_DYNAMIC_SCORE', 84) or 84)
         scout_rr = float(globals().get('SETUP_FINAL_SCOUT_MIN_RR', 1.40) or 1.40)
-        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 15000000) or 15000000)
+        scout_vol = float(globals().get('SETUP_FINAL_SCOUT_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0)
         fut_vol = float(meta.get('fut_vol_usd') or _autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or 0.0)
         rr = float(meta.get('rr') or 0.0)
         if conf < final_adaptive_min_conf:
@@ -48971,7 +48979,7 @@ def _setup_edge_quality_guard_allows_setup(setup_or_row, session_name: str = '',
         except Exception:
             pass
         try:
-            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 15000000) or 15000000)
+            min_vol = float(globals().get('SETUP_EDGE_GUARD_STRICT_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0)
             if min_vol > 0 and vol_v > 0 and vol_v < min_vol and q_v < float(globals().get('SETUP_EDGE_GUARD_WEAK_SIDE_QUALITY_ESCAPE', 92) or 92):
                 return False, f'strict_min_volume_block vol=${vol_v/1_000_000:.1f}M<{min_vol/1_000_000:.0f}M'
         except Exception:
@@ -56232,14 +56240,14 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         except Exception:
             ordered = []
 # -----------------------------------------------------
-    # NEW: Spike Reversal candidates (15M+ Vol) — for /screen only
+    # NEW: Spike Reversal candidates (10M+ Vol) — for /screen only
     # -----------------------------------------------------
     spike_candidates = []
     if mode == "screen":
         try:
             spike_candidates = await to_thread_heavy(_spike_reversal_candidates,
                 universe_best,
-                15_000_000.0,  # min_vol_usd
+                10_000_000.0,  # min_vol_usd
                 0.55,          # wick_ratio_min
                 1.20,          # atr_mult_min
                 6,             # max_items
@@ -56255,7 +56263,7 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
         try:
             spike_warnings = await to_thread_heavy(_spike_reversal_warnings,
                 universe_best,
-                15_000_000.0,  # min_vol_usd
+                10_000_000.0,  # min_vol_usd
                 1.15,          # atr_mult_min
                 0.60,          # body_ratio_min
                 8,             # lookback_1h
@@ -59787,7 +59795,7 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
         # Big-Move Alert Emails (independent of full trade setups)
         # Trigger: |15m| >= user.bigmove_alert_15m AND |1H| >= user.bigmove_alert_1h
         #          AND |4H| >= user.bigmove_alert_4h, all in the same direction.
-        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 15M)
+        # Volume gate: vol24 >= user.bigmove_min_vol_usd (default 10M)
         # Defaults: 15m=1.5%, 1H=3%, 4H=5%
         # -----------------------------------------------------
         try:
