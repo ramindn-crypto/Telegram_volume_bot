@@ -1,3 +1,4 @@
+# yver38: adds F9 Multi-Day Leader/Loser Continuation as WATCH-only-by-default; repeated leaders can create BUY setups and repeated losers can create SELL setups once price gives a controlled entry, with policy promotion handled by /setup_matrix.
 # yver37: explains SENT_OLD in /setup_audit and lets AutoTrade consume fresh KEEP executable setups directly when email-matched entry is OFF; default direct KEEP queue mode is ON with dynamic TP/RR restored.
 # yver36: /autotrade_config FULL now includes the full command-example list, and the clean config view hides the daily realised-loss stop line.
 # yver31: adds editable multi-window/day-aware Melbourne blackouts (default 10:00-12:00 + SUN 22:00-MON 10:00) and restores hard setup-geometry validation before policy KEEP overrides.
@@ -3840,7 +3841,7 @@ def _setup_matrix_policy_current_lane_sets(user_id: int = 0) -> dict:
                 families.add(ff)
     except Exception:
         pass
-    for f in [f'F{i}' for i in range(1, 9)]:
+    for f in [f'F{i}' for i in range(1, 10)]:
         families.add(f)
     try:
         for s in _strategy_cfg_execution_sessions_allowed(cfg):
@@ -4742,7 +4743,7 @@ def _setup_combo_full_universe(families=None, sessions=None) -> list[tuple[str, 
         fams = [str(f or '').upper().strip() for f in (families or []) if str(f or '').strip()]
         sesses = [str(s or '').upper().strip() for s in (sessions or []) if str(s or '').strip()]
         if not fams:
-            fams = [f'F{i}' for i in range(1, 9)]
+            fams = [f'F{i}' for i in range(1, 10)]
         if not sesses:
             sesses = ['ASIA', 'LON', 'NY']
         fams = sorted(set(fams), key=lambda x: (int(x[1:]) if re.fullmatch(r'F\d+', x) else 99, x))
@@ -6941,7 +6942,7 @@ def _strategy_cfg_execution_sessions_allowed(cfg: dict | None) -> set[str]:
 
 def _strategy_cfg_execution_engines_allowed(cfg: dict | None) -> set[str]:
     try:
-        default_all = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
+        default_all = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
         raw = (cfg or {}).get('execution_engines_allowed', default_all) or default_all
         out = {str(x).upper().strip().replace('-', '_') for x in raw if str(x).strip()}
         aliases = {
@@ -6953,12 +6954,17 @@ def _strategy_cfg_execution_engines_allowed(cfg: dict | None) -> set[str]:
             'VWAP': 'F6', 'VWAP_RECLAIM': 'F6', 'F6_VWAP_RECLAIM': 'F6',
             'EXHAUSTION': 'F7', 'EXHAUSTION_FAILURE': 'F7', 'F7_EXHAUSTION_FAILURE': 'F7',
             'BIGMOVE': 'F8', 'BIG_MOVE': 'F8', 'BIGMOVE_CONT': 'F8', 'F8_BIGMOVE_CONT': 'F8',
+            'MULTIDAY': 'F9', 'MULTI_DAY': 'F9', 'MULTIDAY_MOVER': 'F9', 'F9_MULTI_DAY_MOVER_CONT': 'F9',
         }
         norm = {aliases.get(x, x) for x in out}
-        cleaned = {x for x in norm if x in {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}}
-        return cleaned or {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}
+        # yver38: keep the new WATCH-first F9 family active even on deployed DBs
+        # whose persisted engine allowlist predates F9. It still must pass policy
+        # and defaults to WATCH, so this only allows evidence collection.
+        norm.add('F9')
+        cleaned = {x for x in norm if x in {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9'}}
+        return cleaned or {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9'}
     except Exception:
-        return {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8'}
+        return {'A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9'}
 
 def _strategy_cfg_preferred_trade_window(cfg: dict | None) -> tuple[str, str]:
     try:
@@ -7256,8 +7262,8 @@ def _strategy_config_apply_ver08_quality_patch() -> None:
         # Ver14: discovery mode. Keep all eight setup families active so we can
         # collect enough real samples before prioritising winners. F1/F2/F3 are
         # represented by engines A/B/C; F4-F7 are research-family overlays; F8 is BigMove.
-        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
-        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8']
+        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
+        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
         cfg['execution_asia_enabled'] = True
         cfg['execution_asia_user_override'] = False
         cfg['execution_engine_b_email_enabled'] = True
@@ -16009,6 +16015,14 @@ def _research_family_registry_defaults() -> list[dict]:
             "thesis": "Parabolic exhaustion followed by failed continuation and reversal.",
         },
         {
+            "family_id": "F9_MULTI_DAY_MOVER_CONT",
+            "family_name": "Multi-Day Leader/Loser Continuation",
+            "status": "active",
+            "eligible_sessions_json": json.dumps(["ASIA", "LON", "NY"]),
+            "eligible_regimes_json": json.dumps(["TREND_UP", "TREND_DOWN", "EXPANSION", "UNSTABLE_HIGH_VOL"]),
+            "thesis": "Symbols that stay in the Directional Leaders/Losers table for 2+ Melbourne days can continue in the same direction after a controlled EMA/ATR entry forms. New lanes start as WATCH and only promote through /setup_matrix evidence.",
+        },
+        {
             "family_id": BIGMOVE_FAMILY_ID,
             "family_name": BIGMOVE_FAMILY_NAME,
             "status": "active",
@@ -16029,6 +16043,8 @@ def _family_id_from_engine(engine: str, setup: Any | None = None) -> str:
         return 'F3_IMPULSE_BASE_CONT'
     if eng in {'F8', 'BIGMOVE', 'BIG_MOVE', 'F8_BIGMOVE_CONT'}:
         return 'F8_BIGMOVE_CONT'
+    if eng in {'F9', 'MULTIDAY', 'MULTI_DAY', 'MULTIDAY_MOVER', 'F9_MULTI_DAY_MOVER_CONT'}:
+        return 'F9_MULTI_DAY_MOVER_CONT'
     try:
         rid = str(getattr(setup, 'family_id', '') or '').strip()
         if rid:
@@ -16049,6 +16065,7 @@ def _family_name_from_id(family_id: str) -> str:
         'F6_VWAP_RECLAIM': 'VWAP Reclaim',
         'F7_EXHAUSTION_FAILURE': 'Exhaustion Failure Reversal',
         'F8_BIGMOVE_CONT': BIGMOVE_FAMILY_NAME,
+        'F9_MULTI_DAY_MOVER_CONT': 'Multi-Day Leader/Loser Continuation',
     }
     return mapping.get(fam, fam or 'Unknown Family')
 
@@ -16381,8 +16398,8 @@ def _ver14_all_family_profile_bootstrap() -> None:
         cfg['ver14_all_family_discovery_applied'] = True
         cfg['ver14_all_family_discovery_ts'] = float(time.time())
         cfg['execution_sessions_allowed'] = ['ASIA', 'LON', 'NY']
-        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8']
-        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8']
+        cfg['execution_engines_allowed'] = ['A', 'B', 'C', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
+        cfg['active_family_codes'] = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9']
         cfg['execution_asia_enabled'] = True
         cfg['execution_engine_b_email_enabled'] = True
         cfg['family_allocator_shadow_mode'] = True
@@ -20012,6 +20029,13 @@ if BIGMOVE_AUTOTRADE_TRIGGER_COOLDOWN_SEC <= 0:
     BIGMOVE_AUTOTRADE_TRIGGER_COOLDOWN_SEC = BIGMOVE_COOLDOWN_SEC
 BIGMOVE_FAMILY_ID = "F8_BIGMOVE_CONT"
 BIGMOVE_FAMILY_NAME = "Big Move Continuation"
+F9_FAMILY_ID = "F9_MULTI_DAY_MOVER_CONT"
+F9_FAMILY_NAME = "Multi-Day Leader/Loser Continuation"
+F9_MIN_DAYS = int(os.environ.get("F9_MIN_DAYS", "2") or 2)
+F9_LOOKBACK_DAYS = int(os.environ.get("F9_LOOKBACK_DAYS", "4") or 4)
+F9_MIN_FUT_VOL_USD = float(os.environ.get("F9_MIN_FUT_VOL_USD", "10000000") or 10000000)
+F9_MAX_ITEMS = int(os.environ.get("F9_MAX_ITEMS", "6") or 6)
+F9_TARGET_RR = float(os.environ.get("F9_TARGET_RR", "1.5") or 1.5)
 BIGMOVE_SIGNAL_FINAL_RR = float(os.environ.get("BIGMOVE_SIGNAL_FINAL_RR", "1.8") or 1.8)
 BIGMOVE_SIGNAL_TP1_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP1_RR", str(BIGMOVE_SIGNAL_FINAL_RR)) or BIGMOVE_SIGNAL_FINAL_RR)
 BIGMOVE_SIGNAL_TP2_RR = float(os.environ.get("BIGMOVE_SIGNAL_TP2_RR", str(BIGMOVE_SIGNAL_FINAL_RR)) or BIGMOVE_SIGNAL_FINAL_RR)
@@ -39999,6 +40023,215 @@ def pick_bigmove_family_setups(best_fut: Dict[str, MarketVol], n: int, session_n
         return out[:int(max(0, n))]
 
 
+
+
+# =========================================================
+# F9 — Multi-Day Leader/Loser Continuation
+# =========================================================
+def _f9_melbourne_day(ts: float | None = None) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc).astimezone(MEL_TZ).date().isoformat()
+    except Exception:
+        try:
+            return datetime.now(MEL_TZ).date().isoformat()
+        except Exception:
+            return datetime.utcnow().date().isoformat()
+
+
+def _f9_repeated_bucket_days(symbol: str, bucket: str, current_ts: float | None = None, lookback_days: int | None = None) -> int:
+    """Distinct Melbourne dates the symbol appeared in a leaders/losers bucket.
+
+    The current scan bucket is counted immediately, so a symbol that was in Leaders
+    yesterday and is again in Leaders today qualifies without waiting for the
+    asynchronous scan-intelligence snapshot writer.
+    """
+    sym = str(symbol or '').upper().strip()
+    buck = str(bucket or '').lower().strip()
+    if not sym or buck not in {'leaders', 'losers'}:
+        return 0
+    days = {_f9_melbourne_day(current_ts)}
+    try:
+        _scan_intel_migrate_tables()
+        cutoff = float(current_ts or time.time()) - 86400.0 * float(lookback_days or F9_LOOKBACK_DAYS or 4)
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT created_ts FROM market_scan_symbols WHERE UPPER(symbol)=? AND LOWER(bucket)=? AND created_ts>=?",
+                (sym, buck, float(cutoff)),
+            ).fetchall() or []
+        for (ts_val,) in rows:
+            try:
+                days.add(_f9_melbourne_day(float(ts_val or 0.0)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return len(days)
+
+
+def _f9_ema_entry_limit_pct(session_name: str = '') -> float:
+    sess = str(session_name or '').upper().strip()
+    if sess == 'ASIA':
+        return 1.10
+    if sess == 'LON':
+        return 1.25
+    return 1.35
+
+
+def make_multiday_mover_family_setup(base: str, mv: Any, side: str, days: int, bucket: str, session_name: str = 'LON') -> Optional[Setup]:
+    """Build a F9 candidate only after a repeated Leaders/Losers symbol gives an entry.
+
+    F9 does not force execution. It enters the normal policy pipeline as a new
+    Family-Session-Strategy-Side lane, which starts as WATCH and can promote to KEEP
+    only through /setup_matrix evidence.
+    """
+    try:
+        b = str(base or '').upper().strip()
+        side = str(side or '').upper().strip()
+        if not b or side not in {'BUY', 'SELL'}:
+            return None
+        fut_vol = float(usd_notional(mv) or 0.0)
+        if fut_vol < float(F9_MIN_FUT_VOL_USD):
+            return None
+        if int(days or 0) < int(F9_MIN_DAYS or 2):
+            return None
+
+        ch1, ch4, ch15, atr_1h, ema_support_15m, ema_period, c15, c1 = metrics_from_candles_1h_15m(mv.symbol)
+        entry = float((c15[-1][4] if c15 else 0.0) or getattr(mv, 'last', 0.0) or 0.0)
+        if entry <= 0 or float(atr_1h or 0.0) <= 0:
+            return None
+
+        ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0)
+        if side == 'BUY' and ch24 <= 0:
+            return None
+        if side == 'SELL' and ch24 >= 0:
+            return None
+
+        # Entry point: repeated-mover trend is allowed only when price is still
+        # controlled near the adaptive 15m EMA and short-term movement is not sharply
+        # against the continuation direction.
+        ema_val = float(ema_support_15m or 0.0)
+        ema_dist_pct = abs(entry - ema_val) / entry * 100.0 if ema_val > 0 else 999.0
+        if ema_dist_pct > float(_f9_ema_entry_limit_pct(session_name)):
+            try:
+                _rej('f9_waiting_for_entry_ema', b, mv, f'days={days} dist={ema_dist_pct:.2f}%')
+            except Exception:
+                pass
+            return None
+        if side == 'BUY' and (float(ch1 or 0.0) < -0.55 or float(ch15 or 0.0) < -0.35 or float(ch4 or 0.0) < -0.45):
+            return None
+        if side == 'SELL' and (float(ch1 or 0.0) > 0.55 or float(ch15 or 0.0) > 0.35 or float(ch4 or 0.0) > 0.45):
+            return None
+
+        recent = list(c15[-10:] if c15 else [])
+        lows = [float(x[3] or 0.0) for x in recent if len(x) >= 5 and float(x[3] or 0.0) > 0]
+        highs = [float(x[2] or 0.0) for x in recent if len(x) >= 5 and float(x[2] or 0.0) > 0]
+        atr = float(atr_1h or 0.0)
+        if side == 'BUY':
+            swing = min(lows) if lows else entry
+            sl = min(entry - max(1.15 * atr, entry * 0.0055), swing - max(0.15 * atr, entry * 0.0012))
+            if sl <= 0 or sl >= entry:
+                return None
+            r = abs(entry - sl)
+            tp = entry + float(F9_TARGET_RR or 1.5) * r
+            trend = 'BULLISH'
+        else:
+            swing = max(highs) if highs else entry
+            sl = max(entry + max(1.15 * atr, entry * 0.0055), swing + max(0.15 * atr, entry * 0.0012))
+            if sl <= entry:
+                return None
+            r = abs(sl - entry)
+            tp = max(entry - float(F9_TARGET_RR or 1.5) * r, entry * 0.001)
+            trend = 'BEARISH'
+        if r <= 0 or tp <= 0:
+            return None
+
+        conf = int(clamp(75 + min(8.0, abs(ch24) * 0.35) + min(4.0, max(0, int(days or 0) - 2) * 1.5) + (2.0 if fut_vol >= 50_000_000 else 0.0), 75, 94))
+        s = Setup(
+            setup_id=make_setup_id(b, side),
+            symbol=b,
+            market_symbol=str(getattr(mv, 'symbol', '') or b).upper(),
+            side=side,
+            conf=int(conf),
+            entry=float(entry),
+            sl=float(sl),
+            tp=float(tp),
+            alt_target_a=0.0,
+            alt_target_b=0.0,
+            fut_vol_usd=float(fut_vol),
+            ch24=float(ch24),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
+            ema_support_period=int(ema_period or 0),
+            ema_support_dist_pct=float(ema_dist_pct),
+            pullback_ema_period=int(ema_period or 0),
+            pullback_ema_dist_pct=float(ema_dist_pct),
+            pullback_ready=bool(ema_dist_pct <= 0.85),
+            pullback_bypass_hot=bool(fut_vol >= 35_000_000.0),
+            leader_base_override=True,
+            engine='F9',
+            is_trailing_alt_target_b=False,
+            created_ts=time.time(),
+            family_id=F9_FAMILY_ID,
+            family_name=F9_FAMILY_NAME,
+        )
+        setattr(s, 'atr_pct', float((atr / entry * 100.0) if entry > 0 else 0.0))
+        setattr(s, 'regime', 'TRENDING')
+        setattr(s, 'trend', trend)
+        setattr(s, 'structure', f'{trend} MULTI_DAY_CONTINUATION')
+        setattr(s, 'f9_multiday_mover', True)
+        setattr(s, 'f9_days', int(days or 0))
+        setattr(s, 'f9_bucket', str(bucket or ''))
+        setattr(s, 'entry_reason', f'F9 repeated {bucket} {int(days or 0)}d controlled EMA entry')
+        try:
+            score, comps = compute_setup_quality_score(s, session_name=session_name)
+            score = float(clamp(float(score or 0.0) + 2.0 + min(3.0, max(0, int(days or 0) - 2) * 0.8), 0.0, 100.0))
+            setattr(s, 'quality_score', float(score))
+            setattr(s, 'quality_components', comps or {})
+        except Exception:
+            pass
+        return _research_finalize_setup(s, session_name=session_name)
+    except Exception:
+        return None
+
+
+def pick_multiday_mover_family_setups(best_fut: Dict[str, MarketVol], leaders: list[str], losers: list[str], n: int, session_name: str, scan_profile: str = DEFAULT_SCAN_PROFILE) -> List[Setup]:
+    out: List[Setup] = []
+    try:
+        pairs = []
+        for b in list(leaders or [])[:10]:
+            pairs.append((str(b).upper(), 'leaders', 'BUY'))
+        for b in list(losers or [])[:10]:
+            pairs.append((str(b).upper(), 'losers', 'SELL'))
+        seen = set()
+        for b, bucket, side in pairs:
+            if not b or (b, side) in seen:
+                continue
+            seen.add((b, side))
+            mv = (best_fut or {}).get(b)
+            if not mv:
+                continue
+            days = _f9_repeated_bucket_days(b, bucket, current_ts=time.time(), lookback_days=int(F9_LOOKBACK_DAYS or 4))
+            if int(days or 0) < int(F9_MIN_DAYS or 2):
+                continue
+            s = make_multiday_mover_family_setup(b, mv, side, int(days), bucket, session_name=session_name)
+            if s:
+                out.append(s)
+                try:
+                    _rej('ok_f9_multiday_mover', b, mv, f'{bucket} {days}d')
+                except Exception:
+                    pass
+        out.sort(key=lambda s: (
+            int(getattr(s, 'conf', 0) or 0),
+            float(getattr(s, 'quality_score', 0.0) or 0.0),
+            int(getattr(s, 'f9_days', 0) or 0),
+            float(getattr(s, 'fut_vol_usd', 0.0) or 0.0),
+        ), reverse=True)
+        return out[:int(max(0, n))]
+    except Exception:
+        return out[:int(max(0, n))]
+
+
 def _email_market_regime(best_fut: dict) -> str:
     try:
         best = dict(best_fut or {})
@@ -45140,7 +45373,7 @@ def _fallback_setups_from_universe(best_fut: dict, leaders: list, losers: list, 
     return setups
 
 def _setup_family_id_to_code(family_id: str) -> str:
-    """Compact family label for Telegram tables: F1, F2, ... F8."""
+    """Compact family label for Telegram tables: F1, F2, ... F9."""
     try:
         fam = str(family_id or '').strip().upper().replace('-', '_')
         if not fam:
@@ -45181,6 +45414,8 @@ def _setup_engine_to_family_id(engine: str, row: dict | None = None) -> str:
             return 'F7_EXHAUSTION_FAILURE'
         if eng in {'F8', 'ENGINE_F8', 'BIGMOVE', 'BIG_MOVE', 'BIGMOVE_CONT', 'F8_BIGMOVE_CONT'} or 'BIGMOVE' in eng or 'BIG_MOVE' in eng:
             return 'F8_BIGMOVE_CONT'
+        if eng in {'F9', 'ENGINE_F9', 'MULTIDAY', 'MULTI_DAY', 'MULTIDAY_MOVER', 'F9_MULTI_DAY_MOVER_CONT'} or 'MULTIDAY' in eng or 'MULTI_DAY' in eng:
+            return 'F9_MULTI_DAY_MOVER_CONT'
         try:
             return _family_id_from_engine(eng, None)
         except Exception:
@@ -45216,6 +45451,8 @@ def _setup_audit_family_from_row(row: dict) -> str:
                     return 'F7_EXHAUSTION_FAILURE'
                 if fam == 'F8':
                     return 'F8_BIGMOVE_CONT'
+                if fam == 'F9':
+                    return 'F9_MULTI_DAY_MOVER_CONT'
                 return fam
 
         # 2) details_json from executable/admin lifecycle. This is where modern setups
@@ -45246,7 +45483,7 @@ def _setup_audit_family_from_row(row: dict) -> str:
 
         # 4) Setup-id/name fallback for rare family-coded rows.
         text = ' '.join(str(rr.get(k) or '') for k in ('setup_id', 'note', 'open_reason', 'close_reason')).upper()
-        m = re.search(r'\b(F[1-8])\b', text)
+        m = re.search(r'\b(F[1-9])\b', text)
         if m:
             code = m.group(1)
             return {
@@ -45258,6 +45495,7 @@ def _setup_audit_family_from_row(row: dict) -> str:
                 'F6': 'F6_VWAP_RECLAIM',
                 'F7': 'F7_EXHAUSTION_FAILURE',
                 'F8': 'F8_BIGMOVE_CONT',
+                'F9': 'F9_MULTI_DAY_MOVER_CONT',
             }.get(code, code)
         return 'F0_UNKNOWN'
     except Exception:
@@ -45529,7 +45767,7 @@ def _setup_audit_result_horizon_hours() -> int:
 
 
 def _setup_audit_family_code(row_or_family) -> str:
-    """Compact family label: F1, F2, ... F8."""
+    """Compact family label: F1, F2, ... F9."""
     try:
         if isinstance(row_or_family, dict):
             return _setup_audit_family_display(row_or_family, compact=True)
@@ -45634,7 +45872,7 @@ def _setup_audit_help_text() -> str:
         "• Symbol — coin.\n"
         "• Type — BUY/SELL.\n"
         "• Conf — setup confidence.\n"
-        "• Family — compact family code, e.g. F1/F2/F3/F8.\n"
+        "• Family — compact family code, e.g. F1/F2/F3/F8/F9.\n"
         "• Result — TP, SL, NOHIT, or OPEN.\n"
         "  OPEN means still inside the result horizon. NOHIT means the horizon expired without TP or SL.\n\n"
         "<b>Important</b>: the hour argument filters setup generation time only. "
@@ -50748,7 +50986,7 @@ def _setup_combo_policy_text(uid: int) -> str:
                     families.add(ff)
         except Exception:
             pass
-        for f in [f'F{i}' for i in range(1, 9)]:
+        for f in [f'F{i}' for i in range(1, 10)]:
             families.add(f)
         try:
             for s in _strategy_cfg_execution_sessions_allowed(cfg):
@@ -56699,6 +56937,24 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
     if bm_setups:
         priority_setups.extend(bm_setups)
 
+    # ------------------------------------------------
+    # F9: Multi-Day Leader/Loser Continuation (WATCH-first)
+    # ------------------------------------------------
+    try:
+        f9_take = max(2, min(int(F9_MAX_ITEMS or 6), int(max(4, n_target))))
+        f9_setups = pick_multiday_mover_family_setups(
+            best_fut,
+            leaders,
+            losers,
+            f9_take,
+            session_name,
+            scan_profile=prof,
+        )
+    except Exception:
+        f9_setups = []
+    if f9_setups:
+        priority_setups.extend(f9_setups)
+
 
     # -----------------------------------------------------
     # BALANCE MODE: If strict_15m produces too few candidates,
@@ -56798,6 +57054,9 @@ async def build_priority_pool(best_fut: dict, session_name: str, mode: str, scan
                 if fam == BIGMOVE_FAMILY_ID:
                     bm_floor = 1.12 if str(session_name or '').upper().strip() in {'LON', 'NY'} else 0.98
                     adaptive_allowed = max(float(adaptive_allowed), float(bm_floor))
+                if fam == globals().get('F9_FAMILY_ID', 'F9_MULTI_DAY_MOVER_CONT'):
+                    f9_floor = float(_f9_ema_entry_limit_pct(session_name))
+                    adaptive_allowed = max(float(adaptive_allowed), float(f9_floor))
             except Exception:
                 pass
             try:
