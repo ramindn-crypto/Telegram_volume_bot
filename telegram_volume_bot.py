@@ -1,3 +1,4 @@
+# yver45: hard-enforces Directional Leaders/Losers before policy KEEP overrides, blocks leader SELL/loser BUY in /screen/email/executable/AutoTrade, and forces direct KEEP queue entry so fresh KEEP rows are not NO_EMAIL-blocked.
 # yver44: fixes /setup_audit PnL by matching AT_CLOSED rows to canonical /autotrade_closed rows, persists /autotrade_last attempts to SQLite so longer history survives/truncates less, and keeps /autotrade_last in clean table format.
 # yver43: cleans /autotrade_last into a /setup_audit-style preformatted table, removes Entry/SL/TP from /setup_audit, adds realised AutoTrade PnL for AT_CLOSED rows, and re-forces direct KEEP queue entry so fresh KEEP rows are not blocked by missing setup-email logs.
 # yver42: adds /setup_audit AutoTrade skip-reason column, converts /autotrade_last to a compact table, and re-applies direct KEEP queue entry so fresh KEEP rows are not blocked by missing setup-email logs.
@@ -3140,6 +3141,27 @@ def _autotrade_apply_yver44_direct_keep_queue_fix() -> None:
         pass
 
 
+
+
+def _autotrade_apply_yver45_directional_guard_and_direct_queue_fix() -> None:
+    """yver45: hard directional coherence + direct KEEP queue.
+
+    A Directional Leader must never create/send/execute SELL, and a Directional
+    Loser must never create/send/execute BUY.  This version also forces direct
+    KEEP-queue entry so fresh KEEP rows are not blocked by missing setup-email
+    logs.  Risk, RR, leverage, caps and live policy thresholds are not changed.
+    """
+    try:
+        target_version = 'yver45_2026_06_15_directional_guard_direct_keep'
+        if (not env_bool('AUTOTRADE_YVER45_REAPPLY_FIXES', False)) and str(_autotrade_config_get('yver45_directional_guard_direct_keep_version', '') or '').strip().lower() == target_version:
+            return
+        # For the owner's current workflow, setup email is a notification only.
+        # AutoTrade must consume fresh KEEP rows directly from the executable queue.
+        _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 0)
+        _autotrade_config_set('yver45_directional_guard_direct_keep_version', target_version)
+    except Exception:
+        pass
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -6076,6 +6098,20 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
         meta.update({'policy_uid': int(policy_uid or 0), 'policy_status_effective': status, 'policy_combo': combo})
         l = str(lane or 'screen').lower().strip() or 'screen'
         allowed_statuses = _user_visible_allowed_policy_statuses(l)
+
+        # yver45: run hard Directional Leaders/Losers coherence before the
+        # matrix KEEP shortcut so /screen and setup emails cannot expose
+        # Leader->SELL or Loser->BUY rows.
+        try:
+            dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0))
+            if isinstance(dir_meta, dict):
+                for _k, _v in dir_meta.items():
+                    meta.setdefault(_k, _v)
+            if not dir_ok:
+                return False, f'{l}_{dir_why or "directional_context_blocked"}', meta
+        except Exception as _dir_exc:
+            meta['directional_context_guard_error'] = f'{type(_dir_exc).__name__}: {_dir_exc}'
+
         # yver24: use /setup_matrix policy as source of truth for subscriber
         # visibility and setup-email selection.  A matrix KEEP lane must be shown
         # and eligible for delivery; non-KEEP lanes remain blocked unless WATCH is
@@ -7812,6 +7848,7 @@ try:
     _autotrade_apply_yver42_direct_keep_queue_fix()
     _autotrade_apply_yver43_direct_keep_queue_fix()
     _autotrade_apply_yver44_direct_keep_queue_fix()
+    _autotrade_apply_yver45_directional_guard_and_direct_queue_fix()
 except Exception:
     pass
 
@@ -13302,6 +13339,16 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         # AutoTrade is trying to consume before their entry window expires.
         if not _setup_volume_ok(s):
             return (False, f"below_min_volume_{_setup_min_volume_floor_usd()/1e6:.0f}M")
+        # yver45: AutoTrade structural validation must enforce Directional
+        # Leaders/Losers before the matrix KEEP fast-path.  KEEP is not allowed
+        # to override Leader->SELL or Loser->BUY.
+        try:
+            dir_ok, dir_why, _dir_meta = _setup_directional_context_guard_allows_setup(s, session_name=sess, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+            if not dir_ok:
+                return (False, str(dir_why or 'directional_context_blocked'))
+        except Exception:
+            pass
+
         # yver24: if /setup_matrix policy says KEEP, this setup is executable
         # for the user-facing path.  Keep only the basic structural price-order
         # validation here; risk sizing, cooldowns, duplicate guards, email gate
@@ -47131,6 +47178,11 @@ def _setup_audit_short_autotrade_reason(reason: str) -> str:
     if not r:
         return '-'
     mapping = [
+        ('directional_context_blocks_sell_leader', 'DIRECTION'),
+        ('directional_context_blocks_buy_loser', 'DIRECTION'),
+        ('directional_context', 'DIRECTION'),
+        ('leader_sell', 'DIRECTION'),
+        ('loser_buy', 'DIRECTION'),
         ('entry_drift_too_wide', 'DRIFT'),
         ('max_open_trades', 'MAX_OPEN'),
         ('max_trades', 'MAX_DAY'),
@@ -47228,6 +47280,15 @@ def _setup_audit_autotrade_skip_reason(row: dict, uid: int = 0, policy_label: st
             return '-'
         if pol and pol != 'KEEP':
             return pol
+        # yver45: surface hard leader/loser direction blocks in ATWhy instead
+        # of showing PENDING/NO_EMAIL for a row that should never trade.
+        try:
+            sess_u = str(session_name or rr.get('session') or rr.get('source_session') or '').upper().strip()
+            dir_ok, dir_why, _dir_meta = _setup_directional_context_guard_allows_setup(rr, session_name=sess_u, user_id=int(uid or 0))
+            if not dir_ok:
+                return 'DIRECTION'
+        except Exception:
+            pass
         reason = _setup_audit_recent_attempt_reason(rr, uid=int(uid or 0))
         if reason:
             return _setup_audit_short_autotrade_reason(reason)
@@ -49891,6 +49952,17 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
         if not geom_ok:
             return False, str(geom_why or 'basic_geometry_blocked'), meta
 
+        # yver45: directional coherence is a HARD guard and must run before
+        # any /setup_matrix KEEP source-of-truth shortcut. KEEP can bypass soft
+        # quality starvation, but it must never allow Leader->SELL or Loser->BUY.
+        try:
+            dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
+            meta.update(dict(dir_meta or {}))
+            if not dir_ok:
+                return False, str(dir_why or 'directional_context_blocked'), meta
+        except Exception as _dir_exc:
+            meta['directional_context_guard_error'] = f'{type(_dir_exc).__name__}: {_dir_exc}'
+
         # yver24: /setup_matrix policy is the source of truth.  If the
         # exact lane's Policy column is KEEP, the shared final gate must not
         # downgrade it to OFF because of separate context/quality policy layers.
@@ -49902,14 +49974,6 @@ def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '',
                 return True, 'setup_matrix_policy_keep_source_of_truth', meta
         except Exception as _matrix_exc:
             meta['setup_matrix_policy_error'] = f'{type(_matrix_exc).__name__}: {_matrix_exc}'
-
-        try:
-            dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
-            meta.update(dict(dir_meta or {}))
-            if not dir_ok:
-                return False, str(dir_why or 'directional_context_blocked'), meta
-        except Exception as _dir_exc:
-            meta['directional_context_guard_error'] = f'{type(_dir_exc).__name__}: {_dir_exc}'
 
         info = _setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=int(user_id or 0))
         found = bool(info.get('found'))
@@ -56135,7 +56199,7 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(HDR)
         lines.append("Tip: <code>/autotrade_last 30</code> shows up to 30 recent attempts.")
     else:
-        lines.append("No attempt rows found in memory for this process.")
+        lines.append("No attempt rows found yet for this process/DB window.")
 
     await send_long_message(update, "\n".join(lines), parse_mode='HTML')
 
