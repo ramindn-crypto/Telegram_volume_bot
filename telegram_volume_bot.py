@@ -1,3 +1,4 @@
+# yver42: adds /setup_audit AutoTrade skip-reason column, converts /autotrade_last to a compact table, and re-applies direct KEEP queue entry so fresh KEEP rows are not blocked by missing setup-email logs.
 # yver41: cleans /setup_matrix policy output by removing the long schedule/evidence/safety description above the table, keeps the 1 Jun 2026 evidence baseline, and keeps F9 zero-evidence lanes WATCH-only; no live AutoTrade settings changed.
 # yver40: fixes /setup_matrix policy and /setup_audit background reports not posting by disabling heavy policy refresh-on-view by default, expanding admin background workers, adding stale running-lock cleanup, and bumping admin report cache keys.
 # yver39: moves setup evidence/policy baseline from 15 May 2026 to 1 Jun 2026 so /setup_matrix policy, setup deep/safety and overall setup evidence ignore older rule versions; policy view now refreshes scores from the new baseline by default and cache keys are bumped.
@@ -3074,6 +3075,26 @@ def _autotrade_apply_yver37_direct_keep_entry_defaults() -> None:
     except Exception:
         pass
 
+
+
+
+def _autotrade_apply_yver42_direct_keep_queue_fix() -> None:
+    """yver42: keep fresh KEEP rows openable even when email logging misses a row.
+
+    The clean config already recommends AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY=false
+    for direct KEEP queue mode. This re-applies that one setting on upgrade so
+    KEEP rows are not blocked with ATWhy=NO_EMAIL merely because the setup email
+    did not log/send. It does not change risk, caps, RR, leverage, or policy gates.
+    """
+    try:
+        target_version = 'yver42_2026_06_15_direct_keep_queue_fix'
+        if (not env_bool('AUTOTRADE_YVER42_REAPPLY_DIRECT_KEEP', False)) and str(_autotrade_config_get('yver42_direct_keep_queue_fix_version', '') or '').strip().lower() == target_version:
+            return
+        if 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY' not in os.environ:
+            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 0)
+        _autotrade_config_set('yver42_direct_keep_queue_fix_version', target_version)
+    except Exception:
+        pass
 
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
@@ -7744,6 +7765,7 @@ try:
     _autotrade_apply_yver34_config_refinements()
     _autotrade_apply_yver35_cap_rr_refinements()
     _autotrade_apply_yver37_direct_keep_entry_defaults()
+    _autotrade_apply_yver42_direct_keep_queue_fix()
 except Exception:
     pass
 
@@ -46914,6 +46936,141 @@ def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: st
     except Exception:
         return '-'
 
+
+def _setup_audit_short_autotrade_reason(reason: str) -> str:
+    """Compact reason label for the /setup_audit ATWhy column."""
+    r = str(reason or '').strip().lower()
+    if not r:
+        return '-'
+    mapping = [
+        ('entry_drift_too_wide', 'DRIFT'),
+        ('max_open_trades', 'MAX_OPEN'),
+        ('max_trades', 'MAX_DAY'),
+        ('daily_risk', 'DAILY_CAP'),
+        ('open_risk', 'OPEN_CAP'),
+        ('missing_recent_setup_email', 'NO_EMAIL'),
+        ('setup_email', 'NO_EMAIL'),
+        ('email_gate', 'EMAIL_GATE'),
+        ('setup_expired', 'EXPIRED'),
+        ('expired', 'EXPIRED'),
+        ('trade_window_block', 'BLACKOUT'),
+        ('blackout', 'BLACKOUT'),
+        ('session_not_allowed', 'SESSION'),
+        ('duplicate', 'DUPLICATE'),
+        ('already_open', 'DUPLICATE'),
+        ('liq_guard', 'LIQ_GUARD'),
+        ('liquidation', 'LIQ_GUARD'),
+        ('bad_prices', 'BAD_GEOM'),
+        ('bad_geometry', 'BAD_GEOM'),
+        ('missing_tp', 'BAD_GEOM'),
+        ('leverage', 'LEVERAGE'),
+        ('autotrade_off', 'AT_OFF'),
+        ('entry_disabled', 'AT_OFF'),
+        ('mode_not_live', 'MODE'),
+        ('capital', 'CAPITAL'),
+    ]
+    for token, label in mapping:
+        if token in r:
+            return label
+    return re.sub(r'[^A-Z0-9_]+', '_', str(reason or '').upper()).strip('_')[:16] or '-'
+
+
+def _setup_audit_recent_attempt_reason(row: dict, uid: int = 0) -> str:
+    """Best-effort match against the recent in-memory AutoTrade attempt list."""
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        hist = list((_LAST_AUTOTRADE_ATTEMPTS.get(owner_uid) or []))
+        if not hist:
+            dec = _LAST_AUTOTRADE_DECISION.get(owner_uid) or {}
+            hist = list((dec or {}).get('attempted_candidates') or []) if isinstance(dec, dict) else []
+        if not hist:
+            return ''
+        rr = dict(row or {})
+        sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
+        sym = _symbol_base(str(rr.get('symbol') or rr.get('market_symbol') or ''))
+        side = str(rr.get('side') or '').upper().strip()
+        setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
+        best = None
+        best_dt = 10**18
+        for a in hist:
+            try:
+                aa = dict(a or {})
+                asid = str(aa.get('setup_id') or aa.get('id') or '').strip()
+                asym = _symbol_base(str(aa.get('symbol') or aa.get('symbol_sent') or aa.get('symbol_raw') or ''))
+                aside = str(aa.get('side') or '').upper().strip()
+                if sid and asid and sid == asid:
+                    best = aa
+                    break
+                if sym and asym == sym and side and aside == side:
+                    when_raw = str(aa.get('when') or '')
+                    try:
+                        dt_ts = datetime.fromisoformat(when_raw.replace('Z', '+00:00')).timestamp() if when_raw else 0.0
+                    except Exception:
+                        dt_ts = 0.0
+                    if setup_ts > 0 and dt_ts > 0:
+                        delta = abs(float(dt_ts) - setup_ts)
+                        if delta < best_dt and delta <= max(7200.0, float(_autotrade_entry_window_min()) * 60.0 + 1800.0):
+                            best = aa
+                            best_dt = delta
+                    elif best is None:
+                        best = aa
+            except Exception:
+                continue
+        if isinstance(best, dict):
+            return str(best.get('reason') or best.get('reject_reason') or best.get('status') or '').strip()
+    except Exception:
+        pass
+    return ''
+
+
+def _setup_audit_autotrade_skip_reason(row: dict, uid: int = 0, policy_label: str = '', at_state: str = '', session_name: str = '') -> str:
+    """Explain why a /setup_audit row has not become an AutoTrade position.
+
+    The column is diagnostic, not a second policy engine. It prioritises actual
+    recent AutoTrade reject reasons, then falls back to the main live gates.
+    """
+    try:
+        rr = dict(row or {})
+        pol = str(policy_label or '').upper().strip()
+        at = str(at_state or '').upper().strip()
+        if at.startswith('AT_') or at == 'AT':
+            return '-'
+        if pol and pol != 'KEEP':
+            return pol
+        reason = _setup_audit_recent_attempt_reason(rr, uid=int(uid or 0))
+        if reason:
+            return _setup_audit_short_autotrade_reason(reason)
+        if not bool(_autotrade_entry_enabled()):
+            return 'AT_OFF'
+        if str(_autotrade_runtime_mode()).lower() != 'live':
+            return 'MODE'
+        try:
+            blk, _why = _autotrade_entry_blackout_now()
+            if blk:
+                return 'BLACKOUT_NOW'
+        except Exception:
+            pass
+        setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
+        entry_win_sec = float(max(60, int(_autotrade_entry_window_min()) * 60))
+        age_sec = float(time.time()) - setup_ts if setup_ts > 0 else 0.0
+        if setup_ts > 0 and age_sec > entry_win_sec:
+            return 'EXPIRED'
+        if bool(_autotrade_require_setup_email_for_entry()):
+            if at == 'SENT_OLD':
+                return 'SENT_OLD'
+            if at not in {'SENT'}:
+                return 'NO_EMAIL'
+        try:
+            side_u = str(rr.get('side') or '').upper().strip()
+            sym = str(rr.get('symbol') or rr.get('market_symbol') or '')
+            if side_u in {'BUY','SELL'} and sym and _setup_audit_live_position_present(sym, side_u):
+                return 'DUPLICATE'
+        except Exception:
+            pass
+        return 'PENDING'
+    except Exception:
+        return '-'
+
 def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
     """Policy label for one /setup_audit row.
 
@@ -46990,7 +47147,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
         policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
         at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
-        table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
+        at_why = _setup_audit_autotrade_skip_reason(r, uid=int(uid), policy_label=policy_label, at_state=at_state, session_name=sess_row)
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, at_why, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -47007,16 +47165,16 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'ATWhy', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
         HDR,
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        "AT legend: <b>SENT_OLD</b> = setup email was sent but the entry window has expired; fresh KEEP rows can auto-enter directly when email-matched entry is OFF.",
+        "AT legend: <b>SENT_OLD</b> = setup email was sent but the entry window has expired; <b>ATWhy</b> explains the current non-entry reason (NO_EMAIL/DRIFT/EXPIRED/CAP/etc.).",
     ]
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -55477,7 +55635,7 @@ def _autotrade_reconcile_attempt_rows_for_display(uid: int, hist: list) -> list:
     return rows
 
 async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show recent autotrade attempts details (admin only)."""
+    """Show recent autotrade attempts as a compact table (admin only)."""
     uid = update.effective_user.id
     if not is_admin_user(uid):
         await update.message.reply_text("⛔️ Admin only.")
@@ -55487,10 +55645,8 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
     hist = list(_LAST_AUTOTRADE_ATTEMPTS.get(owner) or [])
     dec_attempts = list(dec.get('attempted_candidates') or []) if isinstance(dec, dict) else []
-    # If the process has no in-memory history yet, still show the latest decision attempts.
     if not hist and dec_attempts:
         hist = dec_attempts
-    # yver116: repair timeout rows that later resulted in real open positions.
     try:
         hist = _autotrade_reconcile_attempt_rows_for_display(owner, hist)
         if isinstance(dec, dict) and dec.get('attempted_candidates'):
@@ -55520,64 +55676,77 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
         lines.append(HDR)
 
-    max_rows = 8
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        max_rows = int(float(args[0])) if args and re.fullmatch(r'\d+(\.\d+)?', args[0]) else 15
+    except Exception:
+        max_rows = 15
+    max_rows = max(1, min(30, int(max_rows or 15)))
+
+    table_rows = []
     for i, a in enumerate(hist[:max_rows], start=1):
         try:
             when_raw = str(a.get('when') or '')
             when_txt = _fmt_iso_to_local(when_raw) if when_raw else '—'
+            # Keep only the month-day/time part when possible to keep the table narrow.
+            try:
+                m = re.search(r'(\d{2}-\d{2}\s+\d{2}:\d{2}:?\d{0,2})', when_txt)
+                if m:
+                    when_txt = m.group(1)
+            except Exception:
+                pass
             sid = str(a.get('setup_id') or a.get('id') or '—')
             sym = str(a.get('symbol') or a.get('symbol_sent') or a.get('symbol_raw') or '—')
-            side = str(a.get('side') or '—')
+            if sym.upper().endswith('USDT'):
+                sym = sym[:-4]
+            side = str(a.get('side') or '—').upper()
             status = str(a.get('status') or '').upper() or '—'
             reason = str(a.get('reason') or '').strip()
             entry = _autotrade_price_str(a.get('entry'))
             sl = _autotrade_price_str(a.get('sl'))
-            drift = a.get('entry_drift_pct', '')
-            drift_dir = str(a.get('entry_drift_direction') or '').strip().lower()
-            adverse = a.get('entry_drift_adverse_pct', '')
-            drift_txt = ''
+            tp = _autotrade_price_str(a.get('tp')) if a.get('tp') not in ('', None) else '-'
+            drift_txt = '-'
             try:
+                drift = a.get('entry_drift_pct', '')
+                drift_dir = str(a.get('entry_drift_direction') or '').strip().lower()
+                adverse = a.get('entry_drift_adverse_pct', '')
                 if drift not in ('', None):
                     if drift_dir in {'favourable', 'favorable'}:
-                        drift_txt = f" | Drift: {float(drift):.2f}% favourable"
+                        drift_txt = f"{float(drift):.2f}% fav"
                     elif drift_dir == 'adverse':
                         try:
-                            drift_txt = f" | Drift: {float(drift):.2f}% adverse ({float(adverse):.2f}% adverse)"
+                            drift_txt = f"{float(adverse):.2f}% adv"
                         except Exception:
-                            drift_txt = f" | Drift: {float(drift):.2f}% adverse"
+                            drift_txt = f"{float(drift):.2f}% adv"
                     else:
-                        drift_txt = f" | Drift: {float(drift):.2f}%"
+                        drift_txt = f"{float(drift):.2f}%"
             except Exception:
                 pass
-            lines.append(f"{i}) {sym} {side} | {status}" + (f" | {reason}" if reason else ''))
-            lines.append(f"   Setup ID: {sid}")
-            lines.append(f"   Time: {when_txt}")
-            lines.append(f"   Entry: {entry} | SL: {sl}{drift_txt}")
+            dyn_txt = '-'
             try:
-                drs = a.get('dynamic_risk_score', '')
-                rmult = a.get('risk_multiplier', '')
-                arisk = a.get('allowed_risk_pct', a.get('risk_actual_pct', ''))
-                if drs not in ('', None) or rmult not in ('', None):
-                    score_txt = f"{float(drs):.1f}" if drs not in ('', None) else '-'
-                    mult_txt = f"{float(rmult):.2f}x" if rmult not in ('', None) else '-'
-                    risk_txt = f" | Risk≈{float(arisk):.2f}%" if arisk not in ('', None) else ''
-                    lines.append(f"   DynRisk: score {score_txt} | mult {mult_txt}{risk_txt}")
+                if a.get('allowed_risk_pct') not in ('', None):
+                    dyn_txt = f"{float(a.get('allowed_risk_pct')):.2f}%"
+                elif a.get('risk_actual_pct') not in ('', None):
+                    dyn_txt = f"{float(a.get('risk_actual_pct')):.2f}%"
             except Exception:
-                pass
-            try:
-                cfg_lev = a.get('configured_leverage', '')
-                safe_lev = a.get('safe_leverage', '')
-                lev_pol = str(a.get('leverage_policy') or '').strip()
-                lev_applied = bool(a.get('leverage_downgrade_applied'))
-                if cfg_lev not in ('', None) and safe_lev not in ('', None):
-                    suffix = ' | controlled downgrade applied' if lev_applied else (f' | {lev_pol}' if lev_pol else '')
-                    lines.append(f"   Leverage: configured {int(float(cfg_lev))}x | safe {int(float(safe_lev))}x{suffix}")
-            except Exception:
-                pass
+                dyn_txt = '-'
+            reason_short = _setup_audit_short_autotrade_reason(reason) if reason else '-'
+            table_rows.append([i, when_txt, sym, side, status, reason_short, entry, sl, tp, drift_txt, dyn_txt, sid[:18]])
         except Exception:
             continue
-        if i != min(len(hist), max_rows):
-            lines.append("────────────────────")
+
+    if table_rows:
+        table = tabulate(
+            table_rows,
+            headers=['#', 'Time', 'Sym', 'Side', 'Status', 'Reason', 'Entry', 'SL', 'TP', 'Drift', 'Risk', 'Setup'],
+            tablefmt='plain',
+            colalign=('right', 'left', 'left', 'center', 'center', 'left', 'right', 'right', 'right', 'right', 'right', 'left'),
+        )
+        lines.append(table)
+        lines.append(HDR)
+        lines.append("Tip: /autotrade_last 30 shows up to 30 recent attempts.")
+    else:
+        lines.append("No attempt rows found in memory for this process.")
 
     await send_long_message(update, "\n".join(lines), parse_mode=None)
 
