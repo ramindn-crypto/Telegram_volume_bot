@@ -1,4 +1,5 @@
 # yver31: adds editable multi-window/day-aware Melbourne blackouts (default 10:00-12:00 + SUN 22:00-MON 10:00) and restores hard setup-geometry validation before policy KEEP overrides.
+# yver33: restores the requested dynamic live profile: base risk 1.5% with 1.0x-1.5x dynamic scaling, dynamic TP/RR ON with 1.5R-2.0R clamp, 2% entry drift, and keeps the cleaned /autotrade_config display.
 # yver32: cleans /autotrade_config, restores conservative live defaults (fixed 1% risk, fixed 1.5R TP, drift 1%, entry window 60m, open cap 5%, daily cap 15%, KEEP-only/email-matched), and keeps advanced tuning keys editable but hidden from the default screen.
 # yver30: restores the 10M setup/BigMove minimum-volume floor and keeps setup email, /screen and AutoTrade locked to KEEP policies only (WATCH never delivered/executed).
 # yver28: syncs /setup_audit_keep and /setup_audit_keep_watch to the exact /setup_matrix policy source-of-truth lane sets; bumps cache keys to avoid stale policy summaries.
@@ -2895,6 +2896,70 @@ def _autotrade_apply_yver32_config_cleanup_defaults() -> None:
         _autotrade_config_set('yver32_config_cleanup_version', target_version)
     except Exception:
         pass
+
+
+def _autotrade_apply_yver33_dynamic_risk_tp_defaults() -> None:
+    """yver33: owner-requested dynamic risk + dynamic TP/RR live profile.
+
+    This intentionally runs after the yver32 cleanup migration so the newer desired
+    profile wins on deploy.  It writes Telegram-editable runtime config rows once;
+    set AUTOTRADE_YVER33_REAPPLY_DEFAULTS=true only if you want to force the same
+    profile again after manual edits.
+    """
+    try:
+        target_version = 'yver33_2026_06_15_dynamic_risk_dynamic_tp_rr'
+        if (not env_bool('AUTOTRADE_YVER33_REAPPLY_DEFAULTS', False)) and str(_autotrade_config_get('yver33_dynamic_profile_version', '') or '').strip().lower() == target_version:
+            return
+
+        desired = {
+            # Requested sizing: base 1.50%, dynamic multiplier up to 1.50x.
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 1.5,
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.5,
+            AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: 40.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: 65.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: 90.0,
+
+            # Dynamic RR: keep weaker/normal setups near 1.5R, allow stronger ones
+            # to reach 1.8R-2.0R. Avoid a fixed 2R default because it can reduce WR.
+            AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MIN_LIVE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MAX_LIVE_RR_KEY: 2.0,
+
+            # Requested live entry tolerance.
+            AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: 2.0,
+            AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY: 60,
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1,
+
+            # Keep yver32's clean, controlled live profile for everything else.
+            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 0,
+            AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY: 1,
+            AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY: 1,
+            AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY: 0,
+            AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY: 0,
+            AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: 20,
+            AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: 50,
+        }
+        for k, v in desired.items():
+            try:
+                _autotrade_config_set(k, v)
+            except Exception:
+                pass
+
+        _autotrade_config_set('yver33_dynamic_profile_version', target_version)
+    except Exception:
+        pass
+
 
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
@@ -7440,7 +7505,7 @@ except Exception:
     AUTOTRADE_OWNER_UID = 0
 
 # Risk controls
-AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "1") or 1)
+AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "1.5") or 1.5)
 AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "3") or 3)
 AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "15") or 15)
 # Open-trade count cap for commercial/live safety.
@@ -7497,6 +7562,7 @@ try:
     _autotrade_apply_ver118_audit_match_config_defaults()
     _autotrade_apply_ver119_audit_match_config_defaults()
     _autotrade_apply_yver32_config_cleanup_defaults()
+    _autotrade_apply_yver33_dynamic_risk_tp_defaults()
 except Exception:
     pass
 
@@ -7522,7 +7588,7 @@ AUTOTRADE_BE_AFTER_TP_ALLOWED_ENGINES = set(str(os.environ.get("AUTOTRADE_BE_AFT
 # Live market-order entries must still stay close to the setup entry. Otherwise the bot can
 # execute a stale emailed setup at a materially worse price just because it is still inside
 # the time window. This guard keeps the email/setup engine and live execution aligned.
-AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
+AUTOTRADE_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_MAX_ENTRY_DRIFT_PCT", "2.00") or 2.00)
 # Estimated liquidation must sit this many percent-of-entry beyond the SL.
 # This protects isolated futures positions where a wide SL with high leverage would
 # otherwise liquidate before the stop can execute.
@@ -42337,10 +42403,15 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Router: {'ON' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'OFF'} | Reverse disabled lanes: {'ON' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'OFF'} | Reverse RR: {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.50)):.2f}",
             "",
             "Common commands",
-            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.0",
+            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.5",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED true",
+            "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
+            "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 2.0",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
-            "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0",
+            "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0",
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50",
@@ -42348,7 +42419,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00",
             "• /autotrade_on  /  /autotrade_off",
             "",
-            "Advanced keys are still accepted but hidden from this clean view: dynamic risk, dynamic TP/RR, report fallback, strict edge thresholds, max-hold, daily flat, leverage and router settings.",
+            "Advanced keys are still accepted but hidden from this clean view: report fallback, strict edge thresholds, max-hold, daily flat, leverage and router settings.",
             "Note: AutoTrade risk caps are controlled here only; /dailycap is manual-only.",
         ]
         await send_long_message(update, "\n".join(lines), parse_mode=None)
