@@ -1,4 +1,6 @@
+# yver47: adds hard blackout/email delivery enforcement, broad core-market direction guard, dynamic TP/RR/live risk hardening, daily-loss safety, and dust-risk skip to improve live AutoTrade profitability.
 # yver45: hard-enforces Directional Leaders/Losers before policy KEEP overrides, blocks leader SELL/loser BUY in /screen/email/executable/AutoTrade, and forces direct KEEP queue entry so fresh KEEP rows are not NO_EMAIL-blocked.
+# yver46: hardens /autotrade_last diagnostics: prevents stale global AutoTrade detail from overwriting the candidate symbol/entry/SL, improves risk% fallback, and collapses near-duplicate attempt rows in display. No trading/risk/policy changes.
 # yver44: fixes /setup_audit PnL by matching AT_CLOSED rows to canonical /autotrade_closed rows, persists /autotrade_last attempts to SQLite so longer history survives/truncates less, and keeps /autotrade_last in clean table format.
 # yver43: cleans /autotrade_last into a /setup_audit-style preformatted table, removes Entry/SL/TP from /setup_audit, adds realised AutoTrade PnL for AT_CLOSED rows, and re-forces direct KEEP queue entry so fresh KEEP rows are not blocked by missing setup-email logs.
 # yver42: adds /setup_audit AutoTrade skip-reason column, converts /autotrade_last to a compact table, and re-applies direct KEEP queue entry so fresh KEEP rows are not blocked by missing setup-email logs.
@@ -14379,7 +14381,19 @@ def _autotrade_persist_attempt_row(uid: int, row: dict) -> None:
                 return float(v)
             except Exception:
                 return None
-        risk_val = rr.get('allowed_risk_pct') if rr.get('allowed_risk_pct') not in (None, '') else rr.get('risk_actual_pct')
+        # yver46: do not persist 0.00% as the displayed risk when a richer
+        # placement/skip detail contains the actual filled/configured risk.  Some
+        # timeout/reconcile paths populate allowed_risk_pct=0 while risk_actual_pct
+        # or filled_risk_pct has the useful value.
+        risk_val = None
+        for _rk in ('allowed_risk_pct', 'risk_actual_pct', 'filled_risk_pct', 'risk_effective_pct', 'configured_risk_pct'):
+            try:
+                _rv = rr.get(_rk)
+                if _rv not in (None, '') and float(_rv) > 0:
+                    risk_val = float(_rv)
+                    break
+            except Exception:
+                continue
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
             c.execute(
@@ -14459,8 +14473,15 @@ def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict |
         if isinstance(meta, dict):
             row.update(meta)
         if isinstance(detail, dict):
+            # yver46: detail_snapshot is a global last-detail cache.  During a
+            # multi-candidate tick it can briefly hold the previous candidate, so
+            # never let it overwrite the candidate identity/entry/SL already passed
+            # in meta/attempt_summaries.  It may still fill missing diagnostics.
+            _identity_keys = {'setup_id', 'symbol_sent', 'symbol_raw', 'side', 'entry', 'sl', 'setup_entry'}
             for k in ('when','setup_id','symbol_sent','symbol_raw','side','entry','sl','setup_entry','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct','signal_created_time','email_logged_time','generated_logged_time','trade_id','filled_risk_usd','filled_risk_pct','dynamic_risk_score','risk_multiplier','configured_risk_pct','allowed_risk_pct','risk_actual_pct','risk_actual_usd','configured_leverage','safe_leverage','leverage_downgrade_applied','leverage_policy','leverage_downgrade_blocked'):
                 if k in detail and detail.get(k) not in (None, ''):
+                    if k in _identity_keys and row.get(k) not in (None, ''):
+                        continue
                     row[k] = detail.get(k)
         row['when'] = str(row.get('when') or datetime.now(timezone.utc).isoformat(timespec='seconds'))
         row['status'] = str(status or row.get('status') or '').upper() or ('PLACED' if not reason else 'SKIP')
@@ -56107,6 +56128,37 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             dec['attempted_candidates'] = _autotrade_reconcile_attempt_rows_for_display(owner, list(dec.get('attempted_candidates') or []))
     except Exception:
         pass
+    # yver46: collapse near-identical diagnostics in the display so a single
+    # setup retried by email/immediate/scheduled jobs does not flood the table.
+    # This is display-only; persisted raw diagnostics remain available in SQLite.
+    try:
+        compact_hist = []
+        seen_compact = set()
+        for _r in list(hist or []):
+            try:
+                _ts = int(_autotrade_attempt_ts(_r) // 60)  # same local minute bucket
+                _sym = str(_r.get('symbol') or _r.get('symbol_sent') or _r.get('symbol_raw') or '').upper()
+                if _sym.endswith('USDT'):
+                    _sym = _sym[:-4]
+                _key = (
+                    _ts,
+                    str(_r.get('setup_id') or _r.get('id') or ''),
+                    _sym,
+                    str(_r.get('side') or '').upper(),
+                    str(_r.get('status') or '').upper(),
+                    _setup_audit_short_autotrade_reason(str(_r.get('reason') or '')),
+                    str(_r.get('entry') or ''),
+                    str(_r.get('sl') or ''),
+                )
+                if _key in seen_compact:
+                    continue
+                seen_compact.add(_key)
+                compact_hist.append(_r)
+            except Exception:
+                compact_hist.append(_r)
+        hist = compact_hist
+    except Exception:
+        pass
 
     lines = ["🤖 <b>AutoTrade — Last Attempts</b>", HDR]
     if not hist and not dec:
@@ -65571,6 +65623,268 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 # ==========================================================
 # END SIGNAL QUALITY GATE ENGINE
 # ==========================================================
+
+
+# =========================================================
+# yver47: live profitability/sync hardening
+# =========================================================
+# This patch intentionally sits after all original definitions and before main().
+# It wraps shared gates instead of changing the old evidence tables.
+
+YVER47_VERSION = 'yver47_2026_06_16_profitability_blackout_coretrend_risk_tp_hardening'
+YVER47_BLACKOUT_WINDOWS = '05:00-12:00,SUN 22:00-MON 10:00'
+YVER47_CORE_MARKET_SYMBOLS = {'BTC', 'ETH', 'SOL'}
+YVER47_MIN_NEW_TRADE_RISK_PCT = 0.25
+YVER47_MIN_NEW_TRADE_RISK_USD = 5.0
+
+
+def _yver47_apply_runtime_safety_profile() -> None:
+    """One-time runtime config alignment for ver47.
+
+    The 24h live report showed profitable setup-audit WR but negative realised AutoTrade
+    PnL because the bot was over-exposed, still sending/attempting setups during the
+    Melbourne blackout period, and allowing very tiny residual-risk entries after the
+    daily cap was exhausted.  These settings are still Telegram-editable after deploy.
+    """
+    try:
+        if (not env_bool('AUTOTRADE_YVER47_REAPPLY_DEFAULTS', False)) and str(_autotrade_config_get('yver47_runtime_safety_version', '') or '').strip().lower() == YVER47_VERSION:
+            return
+
+        # Keep the user's requested dynamic-risk profile, but make live execution safer.
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 1)
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, 1.0)
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.5)
+        except Exception:
+            pass
+
+        # Dynamic TP/RR must be ON.  Setup emails still show the audit/base RR, while
+        # live AutoTrade can stretch stronger setups toward 2R.
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY, 1)
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY, 1)
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY, 1.5)
+            _autotrade_config_set(AUTOTRADE_CFG_MIN_LIVE_RR_KEY, 1.5)
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, 2.0)
+        except Exception:
+            pass
+
+        # Re-apply the practical Tuesday/Monday blackout that the evidence points to.
+        # This stops fresh setup delivery and live AutoTrade entries during the noisy
+        # handover/pre-ASIA window.
+        try:
+            bw = _normalise_melbourne_blackout_windows(YVER47_BLACKOUT_WINDOWS, default=YVER47_BLACKOUT_WINDOWS)
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, bw)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, bw)
+        except Exception:
+            pass
+
+        # Profitability guardrails.  These reduce churn and stop the bot after a bad
+        # day, without disabling dynamic risk entirely.
+        try:
+            _autotrade_set_daily_cap_settings('PCT', float(os.environ.get('AUTOTRADE_YVER47_DAILY_RISK_CAP_PCT', '12') or 12))
+            _autotrade_config_set(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, float(os.environ.get('AUTOTRADE_YVER47_OPEN_RISK_CAP_PCT', '12') or 12))
+            _autotrade_config_set(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY, 1)
+            _autotrade_config_set(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY, float(os.environ.get('AUTOTRADE_YVER47_DAILY_LOSS_STOP_PCT', '8') or 8))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, int(os.environ.get('AUTOTRADE_YVER47_MAX_OPEN_TRADES', '8') or 8))
+            _autotrade_config_set(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, int(os.environ.get('AUTOTRADE_YVER47_MAX_TRADES_PER_DAY', '50') or 50))
+        except Exception:
+            pass
+
+        # Direct KEEP queue remains the intended execution mode.
+        try:
+            if 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY' not in os.environ:
+                _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 0)
+        except Exception:
+            pass
+
+        _autotrade_config_set('yver47_runtime_safety_version', YVER47_VERSION)
+    except Exception:
+        pass
+
+
+def _yver47_setup_market_context_guard_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    """Block counter-trend core-market setups that the old Leaders table misses.
+
+    The Leaders/Losers table often excludes BTC/ETH/SOL from the visible mover list, so
+    the old rule did not stop a SOL/ETH short when the broader core market was bullish.
+    This guard treats BTC/ETH/SOL 24h strength/weakness as a hard direction context.
+    """
+    meta = {}
+    try:
+        side = str(_autotrade_setup_attr(setup_or_row, 'side', '') or '').upper().strip()
+        sym = _symbol_base(str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or _autotrade_setup_attr(setup_or_row, 'market_symbol', '') or ''))
+        if side not in {'BUY', 'SELL'} or not sym:
+            return True, 'yver47_core_context_missing_side_symbol', meta
+        ch24 = float(_autotrade_setup_attr(setup_or_row, 'ch24', 0.0) or 0.0)
+        ch4 = float(_autotrade_setup_attr(setup_or_row, 'ch4', 0.0) or 0.0)
+        ch1 = float(_autotrade_setup_attr(setup_or_row, 'ch1', 0.0) or 0.0)
+        ch15 = float(_autotrade_setup_attr(setup_or_row, 'ch15', 0.0) or 0.0)
+        meta.update({'yver47_core_symbol': sym, 'yver47_core_side': side, 'yver47_ch24': ch24, 'yver47_ch4': ch4, 'yver47_ch1': ch1, 'yver47_ch15': ch15})
+        if sym in YVER47_CORE_MARKET_SYMBOLS:
+            # Broad bullish core: do not short a major unless the short-term damage is
+            # genuinely strong.  This is the SOL/ETH issue from 2026-06-15/16.
+            if side == 'SELL' and ch24 >= 2.5 and ch4 >= -2.5 and ch1 >= -2.0:
+                return False, f'broad_market_blocks_sell_core_bull:{sym}:24h{ch24:+.1f}:4h{ch4:+.1f}:1h{ch1:+.1f}', meta
+            # Broad bearish core: same logic in reverse.
+            if side == 'BUY' and ch24 <= -2.5 and ch4 <= 2.5 and ch1 <= 2.0:
+                return False, f'broad_market_blocks_buy_core_bear:{sym}:24h{ch24:+.1f}:4h{ch4:+.1f}:1h{ch1:+.1f}', meta
+        return True, 'yver47_core_context_ok', meta
+    except Exception as exc:
+        meta['yver47_core_context_error'] = f'{type(exc).__name__}: {exc}'
+        return True, 'yver47_core_context_error_allowed', meta
+
+
+try:
+    _YVER47_ORIG_DIRECTIONAL_GUARD = _setup_directional_context_guard_allows_setup
+except Exception:
+    _YVER47_ORIG_DIRECTIONAL_GUARD = None
+
+
+def _setup_directional_context_guard_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    meta = {}
+    try:
+        if _YVER47_ORIG_DIRECTIONAL_GUARD is not None:
+            ok, why, old_meta = _YVER47_ORIG_DIRECTIONAL_GUARD(setup_or_row, session_name=session_name, user_id=user_id)
+            meta.update(dict(old_meta or {}))
+            if not ok:
+                return False, str(why or 'directional_context_blocked'), meta
+    except Exception as exc:
+        meta['yver47_orig_directional_guard_error'] = f'{type(exc).__name__}: {exc}'
+    ok2, why2, meta2 = _yver47_setup_market_context_guard_allows(setup_or_row, session_name=session_name, user_id=user_id)
+    meta.update(dict(meta2 or {}))
+    if not ok2:
+        return False, str(why2 or 'broad_market_context_block'), meta
+    return True, 'directional_context_ok', meta
+
+
+try:
+    _YVER47_ORIG_USER_VISIBLE_GATE = _setup_user_visible_keep_policy_allows
+except Exception:
+    _YVER47_ORIG_USER_VISIBLE_GATE = None
+
+
+def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '', user_id: int = 0, lane: str = 'screen') -> tuple[bool, str, dict]:
+    meta = {}
+    try:
+        l = str(lane or '').lower().strip()
+        # During setup blackout: do not send fresh setup emails / autonomous sync
+        # and do not pass the final AutoTrade email-lane gate.  /screen may still
+        # be used for diagnostics/cached context.
+        if l in {'email', 'setup_email', 'bigmove', 'f8', 'screen_sync', 'autotrade'}:
+            try:
+                blk, why = _setup_generation_blackout_now()
+                if blk:
+                    return False, str(why or 'setup_generation_blackout'), {'blackout': True, 'lane': l}
+            except Exception:
+                pass
+        dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=session_name, user_id=user_id)
+        meta.update(dict(dir_meta or {}))
+        if not dir_ok:
+            return False, str(dir_why or 'directional_context_blocked'), meta
+        if _YVER47_ORIG_USER_VISIBLE_GATE is None:
+            return True, 'user_visible_gate_missing_allowed', meta
+        ok, why, old_meta = _YVER47_ORIG_USER_VISIBLE_GATE(setup_or_row, session_name=session_name, user_id=user_id, lane=lane)
+        meta.update(dict(old_meta or {}))
+        return bool(ok), str(why or ''), meta
+    except Exception as exc:
+        return False, f'yver47_user_visible_gate_exception:{type(exc).__name__}', {'error': str(exc)}
+
+
+try:
+    _YVER47_ORIG_FINAL_GATE = _setup_final_quality_gate_allows_setup
+except Exception:
+    _YVER47_ORIG_FINAL_GATE = None
+
+
+def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    meta = {}
+    try:
+        dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=session_name, user_id=user_id)
+        meta.update(dict(dir_meta or {}))
+        if not dir_ok:
+            return False, str(dir_why or 'directional_context_blocked'), meta
+    except Exception as exc:
+        meta['yver47_direction_precheck_error'] = f'{type(exc).__name__}: {exc}'
+    if _YVER47_ORIG_FINAL_GATE is None:
+        return True, 'final_gate_missing_allowed', meta
+    ok, why, old_meta = _YVER47_ORIG_FINAL_GATE(setup_or_row, session_name=session_name, user_id=user_id)
+    meta.update(dict(old_meta or {}))
+    return bool(ok), str(why or ''), meta
+
+
+try:
+    _YVER47_ORIG_EFFECTIVE_RISK_USD = _autotrade_effective_risk_usd
+except Exception:
+    _YVER47_ORIG_EFFECTIVE_RISK_USD = None
+
+
+def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd: float, remaining_risk_usd: float, open_risk_usd: float, daily_cap_usd: float, session_name: str = '') -> tuple[float, float, str]:
+    try:
+        if _YVER47_ORIG_EFFECTIVE_RISK_USD is None:
+            risk, mult, regime = float(base_risk_usd or 0.0), 1.0, 'UNKNOWN'
+        else:
+            risk, mult, regime = _YVER47_ORIG_EFFECTIVE_RISK_USD(uid, setup, equity, base_risk_usd, remaining_risk_usd, open_risk_usd, daily_cap_usd, session_name=session_name)
+        eq = max(0.0, float(equity or 0.0))
+        base_pct = max(0.0, float(_autotrade_risk_per_trade_pct() or 0.0))
+        dyn_mult = float(_autotrade_dynamic_risk_max_mult() if _autotrade_dynamic_risk_enabled() else 1.0)
+        hard_cap_usd = float(_risk_amount_from_pct(eq, base_pct * max(1.0, dyn_mult)) or 0.0)
+        if hard_cap_usd > 0:
+            risk = min(float(risk), hard_cap_usd)
+        # Do not open dust trades after the daily cap is almost exhausted.  These
+        # rows made /autotrade_last noisy and do not materially improve PnL.
+        min_usd = max(float(YVER47_MIN_NEW_TRADE_RISK_USD), float(_risk_amount_from_pct(eq, float(YVER47_MIN_NEW_TRADE_RISK_PCT)) or 0.0))
+        if float(risk or 0.0) < min_usd:
+            try:
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+                _LAST_AUTOTRADE_DETAIL[int(uid)].update({'reject_reason': 'daily_remaining_too_small', 'min_new_trade_risk_usd': float(min_usd), 'risk_effective_usd_before_min': float(risk or 0.0)})
+            except Exception:
+                pass
+            return 0.0, float(mult or 1.0), str(regime or 'UNKNOWN')
+        return max(0.0, float(risk or 0.0)), float(mult or 1.0), str(regime or 'UNKNOWN')
+    except Exception:
+        return (max(0.0, float(base_risk_usd or 0.0)), 1.0, 'UNKNOWN')
+
+
+try:
+    _YVER47_ORIG_SHORT_AT_REASON = _setup_audit_short_autotrade_reason
+except Exception:
+    _YVER47_ORIG_SHORT_AT_REASON = None
+
+
+def _setup_audit_short_autotrade_reason(reason: str) -> str:
+    r = str(reason or '').strip().lower()
+    if 'daily_remaining' in r or 'daily_cap' in r:
+        return 'DAILY_CAP'
+    if 'broad_market' in r or 'core_bull' in r or 'core_bear' in r:
+        return 'DIRECTION'
+    if 'daily_remaining_too_small' in r:
+        return 'DAILY_CAP'
+    if _YVER47_ORIG_SHORT_AT_REASON is not None:
+        return _YVER47_ORIG_SHORT_AT_REASON(reason)
+    return re.sub(r'[^A-Z0-9_]+', '_', str(reason or '').upper()).strip('_')[:16] or '-'
+
+
+try:
+    _YVER47_ORIG_MAIN = main
+except Exception:
+    _YVER47_ORIG_MAIN = None
+
+
+def main():
+    try:
+        _yver47_apply_runtime_safety_profile()
+    except Exception:
+        pass
+    if _YVER47_ORIG_MAIN is not None:
+        return _YVER47_ORIG_MAIN()
+    return None
+
+# =========================================================
+# end yver47 hardening
+# =========================================================
 
 if __name__ == "__main__":
     main()
