@@ -1,4 +1,5 @@
 # yver31: adds editable multi-window/day-aware Melbourne blackouts (default 10:00-12:00 + SUN 22:00-MON 10:00) and restores hard setup-geometry validation before policy KEEP overrides.
+# yver34: adds /autotrade_config full view, aligns runtime policy sync guard to WR>49 matrix rule, uses 1.5R reverse setup geometry, and removes permanent symbol blocks with a 24h TTL for any future static block.
 # yver33: restores the requested dynamic live profile: base risk 1.5% with 1.0x-1.5x dynamic scaling, dynamic TP/RR ON with 1.5R-2.0R clamp, 2% entry drift, and keeps the cleaned /autotrade_config display.
 # yver32: cleans /autotrade_config, restores conservative live defaults (fixed 1% risk, fixed 1.5R TP, drift 1%, entry window 60m, open cap 5%, daily cap 15%, KEEP-only/email-matched), and keeps advanced tuning keys editable but hidden from the default screen.
 # yver30: restores the 10M setup/BigMove minimum-volume floor and keeps setup email, /screen and AutoTrade locked to KEEP policies only (WATCH never delivered/executed).
@@ -875,9 +876,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True) else 0,
         AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1 if env_bool('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True) else 0,
         AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1 if env_bool('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True) else 0,
-        AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5') or 5),
-        AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0') or 60.0),
-        AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25') or 0.25),
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: int(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '1') or 1),
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '49.0') or 49.0),
+        AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: float(os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.05') or 0.05),
         AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('AUTOTRADE_ALLOW_WATCH_POLICY', False) else 0,
         USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('USER_VISIBLE_ALLOW_WATCH_POLICY', False) else 0,
         AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_TP_RR_CAP_ENABLED', True) else 0,
@@ -1197,25 +1198,25 @@ def _autotrade_strict_keep_edge_enabled() -> bool:
 
 def _autotrade_strict_keep_edge_min_decided() -> int:
     try:
-        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY, os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '5')) or 5))
+        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY, os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', '1')) or 1))
     except Exception:
-        val = 5
+        val = 1
     return max(1, min(200, int(val)))
 
 
 def _autotrade_strict_keep_edge_min_wr() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY, os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '60.0')) or 60.0)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY, os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', '49.0')) or 49.0)
     except Exception:
-        val = 60.0
+        val = 49.0
     return max(0.0, min(100.0, float(val)))
 
 
 def _autotrade_strict_keep_edge_min_avgr() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY, os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.25')) or 0.25)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY, os.environ.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', '0.05')) or 0.05)
     except Exception:
-        val = 0.25
+        val = 0.05
     return max(-5.0, min(10.0, float(val)))
 
 
@@ -1878,7 +1879,7 @@ def _autotrade_runtime_summary_dict() -> dict:
         'AUTOTRADE_ISOLATED': bool(_autotrade_runtime_isolated()),
         'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': bool(globals().get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)),
         'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': bool(globals().get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)),
-        'SETUP_REVERSE_TARGET_RR': float(globals().get('SETUP_REVERSE_TARGET_RR', 1.20) or 1.20),
+        'SETUP_REVERSE_TARGET_RR': float(globals().get('SETUP_REVERSE_TARGET_RR', 1.50) or 1.50),
         'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY': _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True),
     }
 
@@ -2961,6 +2962,52 @@ def _autotrade_apply_yver33_dynamic_risk_tp_defaults() -> None:
         pass
 
 
+
+def _autotrade_apply_yver34_config_refinements() -> None:
+    """yver34: config hygiene requested after the cleaned yver33 view.
+
+    - Keep setup_matrix policy as the source of truth; runtime strict edge only
+      acts as a light sync/sanity guard aligned with the WR>49 rule.
+    - Keep reverse setup geometry at the same 1.5R base as dynamic TP/RR.  Final
+      live TP can still expand dynamically after the candidate passes execution.
+    - Remove permanent/static CL blocks.  Future static symbol blocks, if set,
+      expire after 24h and are editable/clearable from /autotrade_config.
+    """
+    try:
+        target_version = 'yver34_2026_06_15_config_full_policy_reverse_static_block_ttl'
+        if (not env_bool('AUTOTRADE_YVER34_REAPPLY_DEFAULTS', False)) and str(_autotrade_config_get('yver34_config_refinements_version', '') or '').strip().lower() == target_version:
+            return
+
+        desired = {
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: 49.0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: 0.05,
+            'SETUP_REVERSE_TARGET_RR': 1.5,
+        }
+        for k, v in desired.items():
+            try:
+                _autotrade_config_set(k, v)
+            except Exception:
+                pass
+        try:
+            globals()['SETUP_REVERSE_TARGET_RR'] = 1.5
+        except Exception:
+            pass
+
+        # Clear any old permanent/static symbol block such as CL.  Evidence-based
+        # symbol blocks still exist elsewhere and already use a rolling 24h window.
+        try:
+            _autotrade_config_set('autotrade_blocked_symbols', '')
+            _autotrade_config_set('autotrade_static_symbol_block_list_hash', '')
+            _autotrade_config_set('autotrade_static_symbol_block_expires_ts', 0)
+        except Exception:
+            pass
+
+        _autotrade_config_set('yver34_config_refinements_version', target_version)
+    except Exception:
+        pass
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -3324,7 +3371,7 @@ SETUP_ADAPTIVE_REVERSE_SUFFIX = str(os.environ.get("SETUP_ADAPTIVE_REVERSE_SUFFI
 # yver70: old swap geometry made REVERSE RR = 1 / original RR, so almost every
 # REV candidate failed the shared executable RR gate.  Reverse tests now target
 # the old NORMAL stop and calculate a closer protective stop to keep RR valid.
-SETUP_REVERSE_TARGET_RR = float(os.environ.get("SETUP_REVERSE_TARGET_RR", "1.20") or 1.20)
+SETUP_REVERSE_TARGET_RR = float(os.environ.get("SETUP_REVERSE_TARGET_RR", "1.50") or 1.50)
 SETUP_ADAPTIVE_WEAK_MIN_DECIDED = int(os.environ.get("SETUP_ADAPTIVE_WEAK_MIN_DECIDED", "2") or 2)
 SETUP_ADAPTIVE_STRONG_MIN_DECIDED = int(os.environ.get("SETUP_ADAPTIVE_STRONG_MIN_DECIDED", "2") or 2)
 SETUP_ADAPTIVE_STRONG_WR = float(os.environ.get("SETUP_ADAPTIVE_STRONG_WR", "55") or 55)
@@ -4885,7 +4932,7 @@ def _setup_strategy_reverse_setup(setup, session_name: str = '', user_id: int = 
             return setup
 
         new_side = 'SELL' if side == 'BUY' else 'BUY'
-        target_rr = float(globals().get('SETUP_REVERSE_TARGET_RR', 1.20) or 1.20)
+        target_rr = float(globals().get('SETUP_REVERSE_TARGET_RR', 1.50) or 1.50)
         target_rr = float(clamp(target_rr, 1.05, 2.50))
         # The old normal SL is the first proof point that the normal idea failed;
         # use it as the reverse TP and calculate a closer stop from target RR.
@@ -5732,19 +5779,73 @@ DIRECTIONAL_CONTEXT_GUARD_MIN_ABS_4H = float(os.environ.get("DIRECTIONAL_CONTEXT
 AUTOTRADE_REQUIRE_KEEP_POLICY = env_bool("AUTOTRADE_REQUIRE_KEEP_POLICY", True)
 AUTOTRADE_ALLOW_WATCH_POLICY = env_bool("AUTOTRADE_ALLOW_WATCH_POLICY", False)
 
-# yver147: hard live-block for symbols/contracts that are not suitable for the
-# current Bybit futures account or repeatedly fail exchange terms (e.g. CL crude oil).
-# This is only for setup delivery/autotrade; audit can still retain historical rows.
+# yver34: no permanent symbol hard-blocks.  Static blocks are optional,
+# Telegram-clearable, and expire after 24h.  Evidence-based symbol blocks are
+# handled separately by the setup edge guard and already use a rolling 24h window.
+AUTOTRADE_STATIC_SYMBOL_BLOCK_TTL_HOURS = float(os.environ.get("AUTOTRADE_STATIC_SYMBOL_BLOCK_TTL_HOURS", "24") or 24)
 AUTOTRADE_BLOCKED_SYMBOLS = tuple(
-    x.strip().upper() for x in str(os.environ.get("AUTOTRADE_BLOCKED_SYMBOLS", "CL") or "").split(",") if x.strip()
+    x.strip().upper()
+    for x in str(os.environ.get("AUTOTRADE_BLOCKED_SYMBOLS", "") or "").split(",")
+    if x.strip() and x.strip().upper() != "CL"
 )
+
+def _autotrade_static_block_symbol_candidates() -> tuple[str, ...]:
+    try:
+        raw_cfg = _autotrade_config_get('autotrade_blocked_symbols', None)
+    except Exception:
+        raw_cfg = None
+    raw = raw_cfg if raw_cfg is not None else ','.join(AUTOTRADE_BLOCKED_SYMBOLS)
+    out = []
+    try:
+        for item in str(raw or '').replace(';', ',').split(','):
+            b = _symbol_base(str(item or '')).upper().strip()
+            if b and b != 'CL' and b not in out:
+                out.append(b)
+    except Exception:
+        pass
+    return tuple(out)
+
+def _autotrade_static_symbol_blocks_active() -> tuple[set[str], float]:
+    try:
+        symbols = tuple(sorted(_autotrade_static_block_symbol_candidates()))
+        if not symbols:
+            return set(), 0.0
+        now_ts = float(time.time())
+        digest = hashlib.sha1(','.join(symbols).encode('utf-8')).hexdigest()
+        key_hash = 'autotrade_static_symbol_block_list_hash'
+        key_exp = 'autotrade_static_symbol_block_expires_ts'
+        old_hash = str(_autotrade_config_get(key_hash, '') or '')
+        exp = float(_autotrade_config_get(key_exp, 0) or 0.0)
+        if old_hash != digest or exp <= 0:
+            ttl_h = max(1.0, min(24.0, float(globals().get('AUTOTRADE_STATIC_SYMBOL_BLOCK_TTL_HOURS', 24) or 24)))
+            exp = now_ts + ttl_h * 3600.0
+            _autotrade_config_set(key_hash, digest)
+            _autotrade_config_set(key_exp, exp)
+        if exp <= now_ts:
+            return set(), float(exp or 0.0)
+        return set(symbols), float(exp or 0.0)
+    except Exception:
+        return set(), 0.0
+
+def _autotrade_format_static_symbol_blocks() -> str:
+    try:
+        active, exp = _autotrade_static_symbol_blocks_active()
+        if not active:
+            return '- (static blocks disabled/expired; evidence symbol blocks are rolling 24h)'
+        try:
+            until_txt = _setup_combo_format_policy_ts(exp)
+        except Exception:
+            until_txt = time.strftime('%Y-%m-%d %H:%M', time.localtime(float(exp or 0.0)))
+        return f"{','.join(sorted(active))} (expires {until_txt}; max 24h)"
+    except Exception:
+        return '-'
 
 def _autotrade_symbol_blocked(sym: str) -> tuple[bool, str]:
     try:
         base = _symbol_base(str(sym or '')).upper().strip()
-        blocked = {str(x or '').upper().strip() for x in AUTOTRADE_BLOCKED_SYMBOLS if str(x or '').strip()}
-        if base and base in blocked:
-            return True, f'autotrade_symbol_hard_block:{base}'
+        active, exp = _autotrade_static_symbol_blocks_active()
+        if base and base in active:
+            return True, f'autotrade_symbol_static_24h_block:{base}:expires_ts={int(exp or 0)}'
     except Exception:
         pass
     return False, ''
@@ -7563,6 +7664,7 @@ try:
     _autotrade_apply_ver119_audit_match_config_defaults()
     _autotrade_apply_yver32_config_cleanup_defaults()
     _autotrade_apply_yver33_dynamic_risk_tp_defaults()
+    _autotrade_apply_yver34_config_refinements()
 except Exception:
     pass
 
@@ -42349,6 +42451,61 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     summary = _autotrade_runtime_summary_dict()
+
+    def _cfg_val(k, default='-'):
+        try:
+            v = summary.get(k, default)
+            if isinstance(v, bool):
+                return 'true' if v else 'false'
+            if isinstance(v, float):
+                return f'{v:.4g}'
+            return str(v)
+        except Exception:
+            return str(default)
+
+    async def _send_full_autotrade_config_view():
+        full_keys = [
+            'AUTOTRADE_MODE', 'AUTOTRADE_ENTRY_ENABLED', 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY',
+            'AUTOTRADE_RISK_PER_TRADE_PCT', 'AUTOTRADE_DYNAMIC_RISK_ENABLED', 'AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 'AUTOTRADE_DYNAMIC_RISK_MAX_MULT',
+            'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE',
+            'AUTOTRADE_OPEN_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_PCT', 'AUTOTRADE_DAILY_RISK_CAP_MODE',
+            'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', 'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT',
+            'AUTOTRADE_MAX_OPEN_TRADES', 'AUTOTRADE_MAX_TRADES_PER_DAY', 'AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 'AUTOTRADE_ENTRY_WINDOW_MIN',
+            'AUTOTRADE_TP_RR_CAP_ENABLED', 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED', 'AUTOTRADE_DYNAMIC_TP_BASE_RR', 'AUTOTRADE_MIN_LIVE_RR', 'AUTOTRADE_MAX_LIVE_RR',
+            'AUTOTRADE_LEVERAGE', 'AUTOTRADE_ISOLATED', 'AUTOTRADE_LIQ_BUFFER_PCT', 'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE', 'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 'AUTOTRADE_EMERGENCY_RISK_MAX_MULT',
+            'AUTOTRADE_STRICT_TPSL_ONLY', 'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL',
+            'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
+            'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP',
+            'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS',
+            'BLACKOUT_ENABLED', 'BLACKOUT_WINDOWS', 'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', 'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS',
+            'AUTOTRADE_ALLOW_WATCH_POLICY', 'USER_VISIBLE_ALLOW_WATCH_POLICY', 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', 'AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 'AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 'AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR',
+            'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED',
+            'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR',
+        ]
+        lines = [
+            '🤖 AutoTrade Runtime Config — Full Keys',
+            HDR,
+            'Use /autotrade_config for the clean view.',
+            'Use /autotrade_config FULL for this full view.',
+            '',
+        ]
+        for k in full_keys:
+            lines.append(f'{k} = {_cfg_val(k)}')
+        lines.extend([
+            f"AUTOTRADE_BLOCKED_SYMBOLS = {_autotrade_format_static_symbol_blocks()}",
+            '',
+            'Append/clear helpers:',
+            '• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00',
+            '• /autotrade_config BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00',
+            '• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS BTC,ETH   (static block; expires within 24h)',
+            '• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS none      (clear static symbol blocks)',
+        ])
+        await send_long_message(update, '\n'.join(lines), parse_mode=None)
+
+    if context.args and str(context.args[0] or '').strip().upper() in {'FULL', 'FULL_KEYS', 'SHOW_FULL_KEYS', 'ADVANCED', 'ALL'}:
+        await _send_full_autotrade_config_view()
+        return
+
     if not context.args:
         risk_pct = float(summary['AUTOTRADE_RISK_PER_TRADE_PCT'])
         dyn_risk_on = bool(summary.get('AUTOTRADE_DYNAMIC_RISK_ENABLED'))
@@ -42397,10 +42554,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Leverage: {int(summary['AUTOTRADE_LEVERAGE'])}x | Isolated: {'ON' if bool(summary['AUTOTRADE_ISOLATED']) else 'OFF'} | Safe downgrade: {'ON' if bool(summary.get('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE')) else 'OFF'} min {int(summary.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 4))}x",
             f"Max-hold exit: {'ON' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False)) else 'OFF'} {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 18.0)):.1f}h | Daily flat: {'ON' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)) else 'OFF'} {int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9)):02d}:{int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 55)):02d}",
             "",
-            "Policy gates",
-            f"Strict KEEP edge: {'ON' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)) else 'OFF'} | decided≥{int(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 5))}, WR≥{float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 60.0)):.1f}%, AvgR≥{float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', 0.25)):+.2f}",
-            f"Blocked symbols: {','.join(AUTOTRADE_BLOCKED_SYMBOLS) if AUTOTRADE_BLOCKED_SYMBOLS else '-'}",
-            f"Router: {'ON' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'OFF'} | Reverse disabled lanes: {'ON' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'OFF'} | Reverse RR: {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.50)):.2f}",
+            "Policy sync",
+            f"Setup matrix policy is source-of-truth. Runtime sync guard: {'ON' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)) else 'OFF'} | decided≥{int(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 1))}, WR≥{float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 49.0)):.1f}%, AvgR≥{float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', 0.05)):+.2f}",
+            f"Static blocked symbols: {_autotrade_format_static_symbol_blocks()}",
+            f"Router: {'ON' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'OFF'} | Reverse disabled lanes: {'ON' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'OFF'} | Reverse setup RR/base: {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.50)):.2f}R",
             "",
             "Common commands",
             "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.5",
@@ -42415,11 +42572,13 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50",
+            "• /autotrade_config FULL",
+            "• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS none",
             "• /autotrade_config BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00",
             "• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00",
             "• /autotrade_on  /  /autotrade_off",
             "",
-            "Advanced keys are still accepted but hidden from this clean view: report fallback, strict edge thresholds, max-hold, daily flat, leverage and router settings.",
+            "For all keys: /autotrade_config FULL",
             "Note: AutoTrade risk caps are controlled here only; /dailycap is manual-only.",
         ]
         await send_long_message(update, "\n".join(lines), parse_mode=None)
@@ -42449,7 +42608,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED',
         'AUTOTRADE_ALLOW_WATCH_POLICY', 'USER_VISIBLE_ALLOW_WATCH_POLICY',
         'AUTOTRADE_TP_RR_CAP_ENABLED', 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED', 'AUTOTRADE_DYNAMIC_TP_BASE_RR', 'AUTOTRADE_MAX_LIVE_RR', 'AUTOTRADE_MIN_LIVE_RR',
-        'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR'
+        'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR',
+        'AUTOTRADE_BLOCKED_SYMBOLS'
     }:
         await update.message.reply_text("Unknown key. Use /autotrade_config to see supported keys.")
         return
@@ -42670,6 +42830,22 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         elif key == 'AUTOTRADE_MIN_LIVE_RR':
             val = max(0.50, min(5.0, float(value_raw)))
             _autotrade_config_set(AUTOTRADE_CFG_MIN_LIVE_RR_KEY, val)
+        elif key == 'AUTOTRADE_BLOCKED_SYMBOLS':
+            raw = str(value_raw or '').strip()
+            if raw.lower() in {'', '-', 'none', 'clear', 'off', 'false', '0'}:
+                cleaned = ''
+                exp = 0.0
+            else:
+                items = []
+                for item in raw.replace(';', ',').split(','):
+                    b = _symbol_base(str(item or '')).upper().strip()
+                    if b and b != 'CL' and b not in items:
+                        items.append(b)
+                cleaned = ','.join(items)
+                exp = float(time.time()) + max(1.0, min(24.0, float(globals().get('AUTOTRADE_STATIC_SYMBOL_BLOCK_TTL_HOURS', 24) or 24))) * 3600.0 if cleaned else 0.0
+            _autotrade_config_set('autotrade_blocked_symbols', cleaned)
+            _autotrade_config_set('autotrade_static_symbol_block_list_hash', '')
+            _autotrade_config_set('autotrade_static_symbol_block_expires_ts', exp)
         elif key == 'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED':
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             globals()['SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED'] = bool(val)
@@ -42696,6 +42872,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         display_key = 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS'
     elif key in {'SETUP_GENERATION_BLACKOUT_ADD_WINDOW'}:
         display_key = 'SETUP_GENERATION_BLACKOUT_WINDOWS'
+    elif key == 'AUTOTRADE_BLOCKED_SYMBOLS':
+        await update.message.reply_text(f"✅ Updated {key}. Current value: {_autotrade_format_static_symbol_blocks()}")
+        return
     await update.message.reply_text(f"✅ Updated {key}. Current value: {summary.get(display_key)}")
 
 
