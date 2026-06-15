@@ -1,3 +1,4 @@
+# yver44: fixes /setup_audit PnL by matching AT_CLOSED rows to canonical /autotrade_closed rows, persists /autotrade_last attempts to SQLite so longer history survives/truncates less, and keeps /autotrade_last in clean table format.
 # yver43: cleans /autotrade_last into a /setup_audit-style preformatted table, removes Entry/SL/TP from /setup_audit, adds realised AutoTrade PnL for AT_CLOSED rows, and re-forces direct KEEP queue entry so fresh KEEP rows are not blocked by missing setup-email logs.
 # yver42: adds /setup_audit AutoTrade skip-reason column, converts /autotrade_last to a compact table, and re-applies direct KEEP queue entry so fresh KEEP rows are not blocked by missing setup-email logs.
 # yver41: cleans /setup_matrix policy output by removing the long schedule/evidence/safety description above the table, keeps the 1 Jun 2026 evidence baseline, and keeps F9 zero-evidence lanes WATCH-only; no live AutoTrade settings changed.
@@ -1702,9 +1703,9 @@ def _setup_generation_blackout_windows() -> str:
 
 def _autotrade_require_setup_email_for_entry() -> bool:
     try:
-        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False)
     except Exception:
-        return bool(globals().get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True))
+        return bool(globals().get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', False))
 
 
 
@@ -3116,6 +3117,28 @@ def _autotrade_apply_yver43_direct_keep_queue_fix() -> None:
         _autotrade_config_set('yver43_direct_keep_queue_fix_version', target_version)
     except Exception:
         pass
+
+
+
+def _autotrade_apply_yver44_direct_keep_queue_fix() -> None:
+    """yver44: remove NO_EMAIL as a blocker for fresh KEEP rows.
+
+    The owner wants AutoTrade to open fresh KEEP setups directly from the executable
+    KEEP queue. Setup emails are notifications, not a required execution receipt.
+    This intentionally overwrites older persisted true values unless the server env
+    explicitly sets AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY=true.
+    """
+    try:
+        target_version = 'yver44_2026_06_15_direct_keep_queue_fix'
+        if (not env_bool('AUTOTRADE_YVER44_REAPPLY_DIRECT_KEEP', False)) and str(_autotrade_config_get('yver44_direct_keep_queue_fix_version', '') or '').strip().lower() == target_version:
+            return
+        env_raw = os.environ.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', '')
+        if str(env_raw).strip().lower() not in {'1', 'true', 'yes', 'on'}:
+            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 0)
+        _autotrade_config_set('yver44_direct_keep_queue_fix_version', target_version)
+    except Exception:
+        pass
+
 
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
@@ -7788,6 +7811,7 @@ try:
     _autotrade_apply_yver37_direct_keep_entry_defaults()
     _autotrade_apply_yver42_direct_keep_queue_fix()
     _autotrade_apply_yver43_direct_keep_queue_fix()
+    _autotrade_apply_yver44_direct_keep_queue_fix()
 except Exception:
     pass
 
@@ -14242,6 +14266,144 @@ def _autotrade_clone_setup_for_execution(setup, **overrides):
         return setup
 
 
+def _autotrade_attempts_migrate() -> None:
+    """Persist AutoTrade attempt diagnostics for /autotrade_last.
+
+    Older versions only kept attempts in process memory, so /autotrade_last lost
+    rows after restart and could show only a handful of recent rejects.  This table
+    is diagnostic-only and does not affect execution/risk logic.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid INTEGER NOT NULL DEFAULT 0,
+                when_ts REAL NOT NULL DEFAULT 0,
+                when_iso TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                entry REAL,
+                sl REAL,
+                drift_pct REAL,
+                drift_direction TEXT NOT NULL DEFAULT '',
+                risk_pct REAL,
+                payload_json TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_attempts_uid_ts ON autotrade_attempts(uid, when_ts DESC)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _autotrade_attempt_ts(row: dict) -> float:
+    try:
+        w = str((row or {}).get('when') or (row or {}).get('when_iso') or '').strip()
+        if w:
+            return float(datetime.fromisoformat(w.replace('Z', '+00:00')).timestamp())
+    except Exception:
+        pass
+    try:
+        return float((row or {}).get('when_ts') or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _autotrade_persist_attempt_row(uid: int, row: dict) -> None:
+    try:
+        _autotrade_attempts_migrate()
+        rr = dict(row or {})
+        when_iso = str(rr.get('when') or rr.get('when_iso') or datetime.now(timezone.utc).isoformat(timespec='seconds'))
+        when_ts = _autotrade_attempt_ts({'when': when_iso}) or time.time()
+        sym = str(rr.get('symbol') or rr.get('symbol_sent') or rr.get('symbol_raw') or '').upper().strip()
+        if sym.endswith('USDT'):
+            sym = sym[:-4]
+        side = str(rr.get('side') or '').upper().strip()
+        status = str(rr.get('status') or '').upper().strip()
+        reason = str(rr.get('reason') or rr.get('reject_reason') or '').strip()
+        setup_id = str(rr.get('setup_id') or rr.get('id') or '').strip()
+        def _f(v):
+            try:
+                if v in (None, ''):
+                    return None
+                return float(v)
+            except Exception:
+                return None
+        risk_val = rr.get('allowed_risk_pct') if rr.get('allowed_risk_pct') not in (None, '') else rr.get('risk_actual_pct')
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """INSERT INTO autotrade_attempts
+                   (uid, when_ts, when_iso, setup_id, symbol, side, status, reason, entry, sl, drift_pct, drift_direction, risk_pct, payload_json)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    int(uid), float(when_ts), when_iso, setup_id, sym, side, status, reason,
+                    _f(rr.get('entry')), _f(rr.get('sl')),
+                    _f(rr.get('entry_drift_adverse_pct') if str(rr.get('entry_drift_direction') or '').lower() == 'adverse' else rr.get('entry_drift_pct')),
+                    str(rr.get('entry_drift_direction') or '').strip(), _f(risk_val), json.dumps(rr, default=str)[:12000],
+                ),
+            )
+            # Keep the table bounded; this is diagnostics, not a trading ledger.
+            c.execute("""DELETE FROM autotrade_attempts
+                         WHERE uid=? AND id NOT IN (
+                           SELECT id FROM autotrade_attempts WHERE uid=? ORDER BY when_ts DESC, id DESC LIMIT 500
+                         )""", (int(uid), int(uid)))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _autotrade_load_attempt_rows(uid: int, limit: int = 30) -> list[dict]:
+    try:
+        _autotrade_attempts_migrate()
+        lim = max(1, min(100, int(limit or 30)))
+        out = []
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = cur.execute(
+                """SELECT * FROM autotrade_attempts
+                   WHERE uid=? ORDER BY when_ts DESC, id DESC LIMIT ?""",
+                (int(uid), int(max(lim * 2, lim + 10))),
+            ).fetchall() or []
+        for r in rows:
+            try:
+                payload = {}
+                try:
+                    payload = json.loads(str(r['payload_json'] or '{}')) if r['payload_json'] else {}
+                except Exception:
+                    payload = {}
+                d = dict(payload or {})
+                d.setdefault('when', str(r['when_iso'] or ''))
+                d.setdefault('when_ts', float(r['when_ts'] or 0.0))
+                d.setdefault('setup_id', str(r['setup_id'] or ''))
+                d.setdefault('symbol', str(r['symbol'] or ''))
+                d.setdefault('side', str(r['side'] or ''))
+                d.setdefault('status', str(r['status'] or ''))
+                d.setdefault('reason', str(r['reason'] or ''))
+                if r['entry'] is not None:
+                    d.setdefault('entry', float(r['entry']))
+                if r['sl'] is not None:
+                    d.setdefault('sl', float(r['sl']))
+                if r['drift_pct'] is not None:
+                    d.setdefault('entry_drift_pct', float(r['drift_pct']))
+                    if str(r['drift_direction'] or '').lower() == 'adverse':
+                        d.setdefault('entry_drift_adverse_pct', float(r['drift_pct']))
+                if str(r['drift_direction'] or '').strip():
+                    d.setdefault('entry_drift_direction', str(r['drift_direction'] or ''))
+                if r['risk_pct'] is not None:
+                    d.setdefault('allowed_risk_pct', float(r['risk_pct']))
+                out.append(d)
+            except Exception:
+                continue
+        return out[:lim]
+    except Exception:
+        return []
+
+
 def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict | None = None, status: str = '', reason: str = '') -> None:
     """Keep a short in-memory list of recent AutoTrade attempts for /autotrade_last."""
     try:
@@ -14262,7 +14424,11 @@ def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict |
             row['setup_id'] = str(row.get('id') or '')
         hist = list(_LAST_AUTOTRADE_ATTEMPTS.get(u) or [])
         hist.insert(0, row)
-        _LAST_AUTOTRADE_ATTEMPTS[u] = hist[:20]
+        _LAST_AUTOTRADE_ATTEMPTS[u] = hist[:100]
+        try:
+            _autotrade_persist_attempt_row(u, row)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -47119,7 +47285,105 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
     except Exception:
         return 'DISABLE'
 
-def _setup_audit_closed_pnl_for_row(row: dict, uid: int = 0, at_state: str = '') -> str:
+
+def _setup_audit_closed_pnl_index(rows: list[dict], uid: int = 0, hours: int = 24) -> dict:
+    """Build a display-only PnL lookup for /setup_audit from canonical closed rows.
+
+    /autotrade_closed uses the canonical closed-row pipeline, including Bybit Closed
+    P&L enrichment.  yver43 only queried autotrade_trades by setup_id, so rows that
+    /autotrade_closed could show still rendered '-' in /setup_audit.  This index
+    keeps the two reports aligned without changing setup-audit TP/SL scoring.
+    """
+    idx = {'by_setup': {}, 'candidates': []}
+    try:
+        owner = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        ts_vals = [float(_setup_audit_row_ts(r) or 0.0) for r in (rows or []) if float(_setup_audit_row_ts(r) or 0.0) > 0]
+        now_ts = float(time.time())
+        if ts_vals:
+            start_ts = max(0.0, min(ts_vals) - 6 * 3600.0)
+            end_ts = max(now_ts + 3600.0, max(ts_vals) + float(_setup_audit_result_horizon_hours() + 6) * 3600.0)
+        else:
+            start_ts = now_ts - max(1, int(hours or 24)) * 3600.0
+            end_ts = now_ts + 3600.0
+        lookback_h = max(int(hours or 24) + 12, int((end_ts - start_ts) / 3600.0) + 2)
+        closed_rows = _autotrade_closed_report_rows(owner, float(start_ts), float(end_ts), lookback_h=lookback_h, limit=0) or []
+        for cr0 in closed_rows:
+            try:
+                cr = dict(cr0 or {})
+                pnl = cr.get('pnl_usdt') if cr.get('pnl_usdt') is not None else cr.get('pnl')
+                pnl_f = float(pnl or 0.0)
+                sid = str(cr.get('setup_id') or cr.get('id') or '').strip()
+                if sid:
+                    idx['by_setup'][sid] = float(idx['by_setup'].get(sid, 0.0) or 0.0) + pnl_f
+                sym = str(_bybit_linear_symbol(cr.get('symbol') or cr.get('market_symbol') or '')).upper().strip()
+                side = str(cr.get('side') or '').upper().strip()
+                if not sym or side not in {'BUY', 'SELL'}:
+                    continue
+                idx['candidates'].append({
+                    'setup_id': sid,
+                    'symbol': sym,
+                    'base': _symbol_base(sym),
+                    'side': side,
+                    'opened_ts': float(cr.get('opened_ts') or 0.0),
+                    'closed_ts': float(cr.get('closed_ts') or cr.get('close_ts') or 0.0),
+                    'pnl': pnl_f,
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return idx
+
+
+def _setup_audit_match_closed_pnl_from_index(row: dict, idx: dict | None = None) -> float | None:
+    try:
+        rr = dict(row or {})
+        idx = dict(idx or {})
+        sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
+        if sid and sid in (idx.get('by_setup') or {}):
+            return float((idx.get('by_setup') or {}).get(sid) or 0.0)
+        setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
+        sym_base = _symbol_base(str(rr.get('symbol') or rr.get('market_symbol') or ''))
+        side_u = str(rr.get('side') or '').upper().strip()
+        if setup_ts <= 0 or not sym_base or side_u not in {'BUY', 'SELL'}:
+            return None
+        # Prefer a closed row whose open time is close to the setup time.  If open
+        # time is unavailable, use the close time as a weaker fallback inside the
+        # audit horizon.  This mirrors /autotrade_closed enrichment but avoids
+        # showing random same-symbol PnL from much older trades.
+        entry_win = float(max(60, int(_autotrade_entry_window_min()) * 60))
+        best = None
+        best_score = 10**18
+        for cand in list((idx or {}).get('candidates') or []):
+            try:
+                if str(cand.get('base') or '') != sym_base:
+                    continue
+                if str(cand.get('side') or '').upper().strip() != side_u:
+                    continue
+                opened = float(cand.get('opened_ts') or 0.0)
+                closed = float(cand.get('closed_ts') or 0.0)
+                if opened > 0:
+                    if opened < setup_ts - 30 * 60.0 or opened > setup_ts + entry_win + 45 * 60.0:
+                        continue
+                    score = abs(opened - setup_ts)
+                elif closed > 0:
+                    if closed < setup_ts - 10 * 60.0 or closed > setup_ts + float(_setup_audit_result_horizon_hours() + 2) * 3600.0:
+                        continue
+                    score = 3600.0 + abs(closed - setup_ts)
+                else:
+                    continue
+                if score < best_score:
+                    best = cand
+                    best_score = score
+            except Exception:
+                continue
+        if best is not None:
+            return float(best.get('pnl') or 0.0)
+    except Exception:
+        pass
+    return None
+
+def _setup_audit_closed_pnl_for_row(row: dict, uid: int = 0, at_state: str = '', pnl_index: dict | None = None) -> str:
     """Return realised AutoTrade PnL for a /setup_audit row when it is closed.
 
     This is display-only.  It does not change setup-audit TP/SL scoring.  It first
@@ -47132,6 +47396,15 @@ def _setup_audit_closed_pnl_for_row(row: dict, uid: int = 0, at_state: str = '')
         if at not in {'AT_CLOSED', 'AT_TP', 'AT_SL'}:
             return '-'
         rr = dict(row or {})
+        # First use the canonical /autotrade_closed index.  This catches Bybit
+        # Closed-PnL rows that were reconciled/enriched for /autotrade_closed but
+        # not stored cleanly in autotrade_trades with the exact setup_id.
+        try:
+            ix_val = _setup_audit_match_closed_pnl_from_index(rr, pnl_index or {})
+            if ix_val is not None:
+                return f"{float(ix_val):+.2f}"
+        except Exception:
+            pass
         uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
         sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
         setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
@@ -47207,6 +47480,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
     candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
     actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+    closed_pnl_index = _setup_audit_closed_pnl_index(rows, uid=int(uid), hours=int(hours))
 
     table_rows = []
     tp_n = sl_n = nohit_n = open_n = 0
@@ -47242,7 +47516,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
         at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
         at_why = _setup_audit_autotrade_skip_reason(r, uid=int(uid), policy_label=policy_label, at_state=at_state, session_name=sess_row)
-        pnl_txt = _setup_audit_closed_pnl_for_row(r, uid=int(uid), at_state=at_state)
+        pnl_txt = _setup_audit_closed_pnl_for_row(r, uid=int(uid), at_state=at_state, pnl_index=closed_pnl_index)
         table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, at_why, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", pnl_txt, result])
 
     decided = tp_n + sl_n
@@ -55718,7 +55992,7 @@ def _autotrade_reconcile_attempt_rows_for_display(uid: int, hist: list) -> list:
 
     if changed:
         try:
-            _LAST_AUTOTRADE_ATTEMPTS[uid_i] = rows[:20]
+            _LAST_AUTOTRADE_ATTEMPTS[uid_i] = rows[:100]
             dec = dict(_LAST_AUTOTRADE_DECISION.get(uid_i) or {})
             if dec and str(dec.get('status') or '').upper() == 'SKIP':
                 dec['status'] = 'PLACED'
@@ -55740,8 +56014,29 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     dec = _LAST_AUTOTRADE_DECISION.get(owner) or {}
     hist = list(_LAST_AUTOTRADE_ATTEMPTS.get(owner) or [])
     dec_attempts = list(dec.get('attempted_candidates') or []) if isinstance(dec, dict) else []
-    if not hist and dec_attempts:
-        hist = dec_attempts
+    if dec_attempts:
+        hist = list(hist or []) + list(dec_attempts or [])
+    # yver44: include persisted attempt rows so /autotrade_last 30 is not limited
+    # to the tiny in-memory slice since the last handler cycle/restart.
+    try:
+        persisted = _autotrade_load_attempt_rows(owner, limit=60)
+    except Exception:
+        persisted = []
+    if persisted:
+        merged = []
+        seen = set()
+        for rr in list(hist or []) + list(persisted or []):
+            try:
+                d = dict(rr or {})
+                key = (str(d.get('when') or d.get('when_iso') or d.get('when_ts') or ''), str(d.get('setup_id') or ''), str(d.get('symbol') or d.get('symbol_sent') or d.get('symbol_raw') or ''), str(d.get('side') or ''), str(d.get('reason') or ''))
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(d)
+            except Exception:
+                continue
+        merged.sort(key=lambda x: _autotrade_attempt_ts(x), reverse=True)
+        hist = merged
     try:
         hist = _autotrade_reconcile_attempt_rows_for_display(owner, hist)
         if isinstance(dec, dict) and dec.get('attempted_candidates'):
