@@ -1,3 +1,4 @@
+# yver39: moves setup evidence/policy baseline from 15 May 2026 to 1 Jun 2026 so /setup_matrix policy, setup deep/safety and overall setup evidence ignore older rule versions; policy view now refreshes scores from the new baseline by default and cache keys are bumped.
 # yver38: adds F9 Multi-Day Leader/Loser Continuation as WATCH-only-by-default; repeated leaders can create BUY setups and repeated losers can create SELL setups once price gives a controlled entry, with policy promotion handled by /setup_matrix.
 # yver37: explains SENT_OLD in /setup_audit and lets AutoTrade consume fresh KEEP executable setups directly when email-matched entry is OFF; default direct KEEP queue mode is ON with dynamic TP/RR restored.
 # yver36: /autotrade_config FULL now includes the full command-example list, and the clean config view hides the daily realised-loss stop line.
@@ -56,11 +57,11 @@ from typing import Any  # yver130 early import required before early helper anno
 # yver101: User-facing setup quality lock: /screen and setup emails now expose KEEP-policy lanes only, while background generation/audit/matrix/daily-weekly safety and continuous learning still collect all executable evidence.
 # yver100: Fixes AutoTrade zero-attempt/zero-entry diagnostics and execution selection from ver99: deeper KEEP-lane queue scan, candidate-level skip continuation, fallback from disabled emailed setups to best KEEP executable queue, and /autotrade_last visibility for selector rejects.
 # yver91: Adds AutoTrade capital-protection guards: daily realised loss stop, setup-policy KEEP + realised AutoTrade combo edge, and setup audit side/session/symbol/hour context gating for execution.
-# yver90: AutoTrade now consumes KEEP policy lanes only by default, fixes misleading /autoytrade_report_overall rolling-window alias, and keeps /autotrade_report_overall fixed from 2026-05-15.
+# yver90: AutoTrade now consumes KEEP policy lanes only by default, fixes misleading /autoytrade_report_overall rolling-window alias, and keeps /autotrade_report_overall fixed from 2026-06-01.
 # yver89: adds directional leader/loser coherence guard so leader symbols cannot emit SELL setups and loser symbols cannot emit BUY setups across setup email, executable queue, F8/BigMove, and AutoTrade lanes.
 # yver85: setup-audit compare now reconciles merged practical AutoTrade positions, not raw Bybit closed-PnL fragments; non-TP/SL historical exits are INFO instead of corrupting setup-audit DIFF counts.
 # yver79: fixes /autotrade/closed handler registration for PTB compatibility; no Application.add_handler(block=...) keyword.
-# yver77: /setup_matrix policy timeout hardening: policy display now uses the same 15 May baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
+# yver77: /setup_matrix policy timeout hardening: policy display now uses the same 1 Jun baseline refresh with a 240s guarded timeout and catches failures instead of crashing the Telegram handler; scheduled/catchup daily safety also uses the same baseline.
 # yver84: strict audit/report reconciliation: setup compare loads full pre-close setup history, fixes Bybit closed-PnL original-side inference, ignores exchange-only rows for audit scoring, and disables automatic time exits under strict TP/SL-only mode.
 # yver86: setup audit now prefers fresh candle price-path over stale cached outcomes, and compare rejects future/unrelated setup matches.
 # yver88: hardens setup_audit_compare: mismatch rows are rechecked with 1m candles before DIFF, and inferred/legacy loss-reason closes are NON_TPSL instead of false natural TP/SL mismatches.
@@ -41696,7 +41697,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "autotrade_report": "Compact recent AutoTrade journal (open and closed PnL rows), sorted by Open time",
     "autotrade_closed": "Last closed Bybit P&L rows: /autotrade_closed 24 or /autotrade/closed 24 shows exact Melbourne Close, Combo, Symbol, Side, SL Risk$, PnL",
     "autotrade_report_overall": "AutoTrade overall performance summary",
-    "autoytrade_report_overall": "Typo alias for fixed /autotrade_report_overall from 15 May",
+    "autoytrade_report_overall": "Typo alias for fixed /autotrade_report_overall from 1 Jun",
     "autotrade_report_matrix": "Rolling AutoTrade matrix: /autotrade_report_matrix 24 or 168",
     "performance_report": "Recent + overall autotrade performance with equity/PnL chart",
     "trade_lifecycle": "Exchange-backed per-trade lifecycle analytics with TP/SL path classification",
@@ -50909,14 +50910,14 @@ def _setup_combo_policy_text(uid: int) -> str:
             owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
 
         # yver26: keep /setup_matrix policy fast and non-blocking again.
-        # yver25 tried to run the full 15-May score rebuild on every policy view;
+        # yver25 tried to run the full 1-Jun score rebuild on every policy view;
         # that can take too long because it preloads OHLCV and resolves the full
         # price-path history.  The report must return the latest stored policy/scores
         # immediately.  Scheduled daily/intraday safety plus explicit setup-matrix
         # builds remain responsible for refreshing setup_combo_scores.  If an admin
         # really wants a heavy on-view refresh, it can still be enabled by env.
         baseline_res = {'ok': True, 'reason': 'view_fast_db_policy_no_refresh'}
-        if env_bool('SETUP_MATRIX_POLICY_REFRESH_ON_VIEW', False):
+        if env_bool('SETUP_MATRIX_POLICY_REFRESH_ON_VIEW', True):
             try:
                 baseline_res = _setup_combo_matrix_build(
                     int(owner_uid),
@@ -51148,7 +51149,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v28:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v39:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -51167,7 +51168,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             f"/setup_matrix deep {int(hours_deep)}",
-            f"admin:bg:v24:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
+            f"admin:bg:v39:setup_matrix_deep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(_overall_report_effective_hours(hours_deep))}",
             _setup_edge_deep_text,
             args=(int(AUTOTRADE_OWNER_UID or uid), int(_overall_report_effective_hours(hours_deep)), _overall_report_start_ts()),
             parse_mode=ParseMode.HTML,
@@ -51217,7 +51218,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix safety",
-            f"admin:bg:v24:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v39:setup_matrix_safety:{int(AUTOTRADE_OWNER_UID or uid)}",
             _daily_safety_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
@@ -51642,7 +51643,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v21:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v39:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -51654,13 +51655,13 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # yver76: one reporting/policy evidence baseline for the Setup Audit / Reports section.
-# Reports and setup-policy evidence use the fixed 15 May baseline so /setup_audit_overall,
+# Reports and setup-policy evidence use the fixed 1 Jun baseline so /setup_audit_overall,
 # /setup_matrix, /setup_matrix policy, /setup_matrix deep, /setup_matrix safety and
 # /setup_deep_analysis all read the same historical setup evidence. Trading/live scans
 # still use their own normal runtime gates unless a scheduled/manual policy refresh writes policy rows.
 OVERALL_REPORT_START_LOCAL_YEAR = 2026
-OVERALL_REPORT_START_LOCAL_MONTH = 5
-OVERALL_REPORT_START_LOCAL_DAY = 15
+OVERALL_REPORT_START_LOCAL_MONTH = 6
+OVERALL_REPORT_START_LOCAL_DAY = 1
 
 
 def _overall_report_start_local_dt() -> datetime:
@@ -51675,7 +51676,7 @@ def _overall_report_start_local_dt() -> datetime:
             tzinfo=MEL_TZ,
         )
     except Exception:
-        return datetime(2026, 5, 15, 0, 0, 0, tzinfo=timezone.utc).astimezone(MEL_TZ)
+        return datetime(2026, 6, 1, 0, 0, 0, tzinfo=timezone.utc).astimezone(MEL_TZ)
 
 
 def _overall_report_start_ts() -> float:
@@ -51689,7 +51690,7 @@ def _overall_report_start_txt() -> str:
     try:
         return _overall_report_start_local_dt().strftime('%Y-%m-%d %H:%M')
     except Exception:
-        return '2026-05-15 00:00'
+        return '2026-06-01 00:00'
 
 
 def _overall_report_hours_since_start(now_ts: float | None = None) -> int:
@@ -51704,10 +51705,10 @@ def _overall_report_hours_since_start(now_ts: float | None = None) -> int:
 
 
 def _overall_report_effective_hours(requested_hours: int | float | None = None, now_ts: float | None = None) -> int:
-    """Return an hour value large enough to cover the fixed 15 May baseline.
+    """Return an hour value large enough to cover the fixed 1 Jun baseline.
 
     Existing matrix/deep/safety code is hours-based. This helper lets those commands
-    keep their old signatures while ensuring the practical data start is 2026-05-15
+    keep their old signatures while ensuring the practical data start is 2026-06-01
     when a command belongs to the Setup Audit / Reports evidence section.
     """
     try:
@@ -51757,14 +51758,14 @@ def _overall_report_source_rows(uid: int, *, start_ts: float | None = None, limi
     return rows, source_label
 
 def _setup_audit_overall_text(uid: int) -> str:
-    """Overall family-level setup audit summary from the fixed 15 May reporting baseline."""
+    """Overall family-level setup audit summary from the fixed 1 Jun reporting baseline."""
     _overall_start_ts = float(_overall_report_start_ts() or 0.0)
     _overall_source_label = str(globals().get('SETUP_AUDIT_SOURCE_MODE', 'EXECUTABLE')).upper()
     # Historical overall must not re-apply today's final quality/policy gate to old executable rows.
     # The executable table already represents what was executable at the time.
     rows = _setup_audit_load_rows(int(uid), hours=None, limit=0, dedup=True, start_ts=_overall_start_ts, apply_final_quality_gate=False)
     # If the current executable table does not contain the older baseline period, use the same
-    # deduped setup-audit path against the historical generated table so the 15 May window is real.
+    # deduped setup-audit path against the historical generated table so the 1 Jun window is real.
     try:
         if rows:
             _row_start = min([_setup_audit_row_ts(r) for r in rows if _setup_audit_row_ts(r) > 0] or [0.0])
@@ -51857,7 +51858,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         f"Families: <b>{len(fam_codes_seen or [])}</b> | Family/session/strategy/side rows: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
         f"Window: <b>from {_overall_report_start_txt()} Melbourne</b>",
         f"Data start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | Data end: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        f"Duration from 15 May: <b>{max(0.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0):.1f} days</b> | Avg generated: <b>{(float(total_setups) / max(1.0/24.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0)):.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        f"Duration from 1 Jun: <b>{max(0.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0):.1f} days</b> | Avg generated: <b>{(float(total_setups) / max(1.0/24.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0)):.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={html.escape(str(_overall_source_label or 'EXECUTABLE'))} lane.",
         f"Quick read: strongest now = <b>{html.escape(keep_txt)}</b> | weakest now = <b>{html.escape(weak_txt)}</b>.",
         f"Current live disabled policy combos: <b>{html.escape(pol_txt)}</b>.",
@@ -52100,7 +52101,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v28:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v39:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -52125,7 +52126,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v28:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v39:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -55963,7 +55964,7 @@ async def autotrade_debug_reset_cmd(update: Update, context: ContextTypes.DEFAUL
 
 
 def _autotrade_closed_report_rows_for_fixed_overall(owner_uid: int, start_ts: float, end_ts: float) -> list[dict]:
-    """Load closed AutoTrade rows for the fixed 15 May overall window.
+    """Load closed AutoTrade rows for the fixed 1 Jun overall window.
 
     The original 24h report works because Bybit/reconstruction calls stay inside a short
     range. A single 8+ day exchange request can return no rows on some Bybit endpoints, so
