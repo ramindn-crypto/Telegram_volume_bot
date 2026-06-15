@@ -1,4 +1,5 @@
 # yver31: adds editable multi-window/day-aware Melbourne blackouts (default 10:00-12:00 + SUN 22:00-MON 10:00) and restores hard setup-geometry validation before policy KEEP overrides.
+# yver32: cleans /autotrade_config, restores conservative live defaults (fixed 1% risk, fixed 1.5R TP, drift 1%, entry window 60m, open cap 5%, daily cap 15%, KEEP-only/email-matched), and keeps advanced tuning keys editable but hidden from the default screen.
 # yver30: restores the 10M setup/BigMove minimum-volume floor and keeps setup email, /screen and AutoTrade locked to KEEP policies only (WATCH never delivered/executed).
 # yver28: syncs /setup_audit_keep and /setup_audit_keep_watch to the exact /setup_matrix policy source-of-truth lane sets; bumps cache keys to avoid stale policy summaries.
 # yver27: fixes stale stored KEEP demotion when current WR<=49 even if latest score row is only present in policy last_* fields; /setup_matrix policy and runtime gates now treat current WR as authoritative.
@@ -842,9 +843,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: float(AUTOTRADE_MAX_ENTRY_DRIFT_PCT),
         AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY: int(os.environ.get('AUTOTRADE_ENTRY_WINDOW_MIN', '60') or 60),
         AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY: float(AUTOTRADE_LIQ_BUFFER_PCT),
-        AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_RISK_ENABLED', True) else 0,
-        AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '0.75') or 0.75),
-        AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.25') or 1.25),
+        AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_RISK_ENABLED', False) else 0,
+        AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '1.0') or 1.0),
+        AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.0') or 1.0),
         AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', '40') or 40),
         AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', '65') or 65),
         AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', '90') or 90),
@@ -879,9 +880,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('AUTOTRADE_ALLOW_WATCH_POLICY', False) else 0,
         USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 1 if env_bool('USER_VISIBLE_ALLOW_WATCH_POLICY', False) else 0,
         AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_TP_RR_CAP_ENABLED', True) else 0,
-        AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_TP_RR_ENABLED', True) else 0,
-        AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', '2.0') or 2.0),
-        AUTOTRADE_CFG_MAX_LIVE_RR_KEY: float(os.environ.get('AUTOTRADE_MAX_LIVE_RR', '4.0') or 4.0),
+        AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 1 if env_bool('AUTOTRADE_DYNAMIC_TP_RR_ENABLED', False) else 0,
+        AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: float(os.environ.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', '1.5') or 1.5),
+        AUTOTRADE_CFG_MAX_LIVE_RR_KEY: float(os.environ.get('AUTOTRADE_MAX_LIVE_RR', '1.5') or 1.5),
         AUTOTRADE_CFG_MIN_LIVE_RR_KEY: float(os.environ.get('AUTOTRADE_MIN_LIVE_RR', '1.5') or 1.5),
     }
     for k, v in defaults.items():
@@ -1059,25 +1060,25 @@ def _autotrade_runtime_isolated() -> bool:
 
 def _autotrade_dynamic_risk_enabled() -> bool:
     try:
-        raw = _autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 1 if env_bool('AUTOTRADE_DYNAMIC_RISK_ENABLED', True) else 0)
+        raw = _autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 1 if env_bool('AUTOTRADE_DYNAMIC_RISK_ENABLED', False) else 0)
         return str(raw).strip().lower() in {'1', 'true', 'yes', 'on'}
     except Exception:
-        return True
+        return False
 
 
 def _autotrade_dynamic_risk_min_mult() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '0.75')) or 0.75)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', '1.0')) or 1.0)
     except Exception:
-        val = 0.50
+        val = 1.0
     return max(0.10, min(1.00, float(val)))
 
 
 def _autotrade_dynamic_risk_max_mult() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.25')) or 1.25)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, os.environ.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', '1.0')) or 1.0)
     except Exception:
-        val = 1.50
+        val = 1.0
     return max(1.00, min(3.00, float(val)))
 
 
@@ -1226,9 +1227,9 @@ def _autotrade_tp_rr_cap_enabled() -> bool:
 
 def _autotrade_max_live_rr() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, os.environ.get('AUTOTRADE_MAX_LIVE_RR', '4.0')) or 4.0)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_MAX_LIVE_RR_KEY, os.environ.get('AUTOTRADE_MAX_LIVE_RR', '1.5')) or 1.5)
     except Exception:
-        val = 4.0
+        val = 1.5
     return max(1.05, min(10.0, float(val)))
 
 
@@ -1243,16 +1244,16 @@ def _autotrade_min_live_rr() -> float:
 
 def _autotrade_dynamic_tp_rr_enabled() -> bool:
     try:
-        return _autotrade_bool_cfg(AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY, 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED', True)
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY, 'AUTOTRADE_DYNAMIC_TP_RR_ENABLED', False)
     except Exception:
-        return True
+        return False
 
 
 def _autotrade_dynamic_tp_base_rr() -> float:
     try:
-        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY, os.environ.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', '2.0')) or 2.0)
+        val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY, os.environ.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', '1.5')) or 1.5)
     except Exception:
-        val = 2.0
+        val = 1.5
     return max(1.0, min(6.0, float(val)))
 
 
@@ -2802,6 +2803,96 @@ def _autotrade_apply_ver119_audit_match_config_defaults() -> None:
         # the owner can increase them if he wants more coverage, but safety defaults
         # should remain under Telegram control.
         _autotrade_config_set('ver119_audit_match_config_version', target_version)
+    except Exception:
+        pass
+
+
+def _autotrade_apply_yver32_config_cleanup_defaults() -> None:
+    """yver32: clean/safe runtime profile for the current live bot.
+
+    The deployed DB can still hold old test values from manual tuning (dynamic risk
+    ON, 30% risk caps, 20% drift, 90m entry window, 1.8R max TP).  This writes a
+    conservative, fixed-RR profile once on deploy, then remains Telegram-editable.
+    It does not touch API keys, users, emails, positions, journals or history.
+    """
+    try:
+        target_version = 'yver32_2026_06_15_config_cleanup_safe_fixed_rr'
+        if (not env_bool('AUTOTRADE_YVER32_REAPPLY_DEFAULTS', False)) and str(_autotrade_config_get('yver32_config_cleanup_version', '') or '').strip().lower() == target_version:
+            return
+
+        desired = {
+            # Fixed sizing: clean PnL analysis and no quality-score risk expansion.
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.0,
+
+            # Fixed 1.5R live target. Dynamic TP/RR remains editable but hidden from
+            # the default config screen because it makes audit/live comparison noisy.
+            AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MIN_LIVE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MAX_LIVE_RR_KEY: 1.5,
+
+            # Entry quality/safety: avoid late or drifted fills.
+            AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: 1.0,
+            AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY: 60,
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1,
+
+            # Throughput limits: no hidden caps, but no unlimited live churn.
+            AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: 20,
+            AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: 50,
+
+            # KEEP-only live mode with the strict edge sync still active.
+            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: 5,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: 60.0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: 0.25,
+            AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 0,
+            AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
+
+            # Keep strict TP/SL lifecycle. No operational market exits by default.
+            AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY: 1,
+            AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY: 1,
+            AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY: 0,
+            AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY: 0,
+            AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 0,
+
+            # Daily realised loss stop should not be looser than the daily cap.
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: 15.0,
+        }
+        for k, v in desired.items():
+            try:
+                _autotrade_config_set(k, v)
+            except Exception:
+                pass
+
+        # Risk caps are intentionally written through the cap helper so the display
+        # and daily-risk calculations agree.
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, 5.0)
+            _autotrade_set_daily_cap_settings('PCT', 15.0)
+        except Exception:
+            pass
+
+        # yver31 introduced the required windows, but old DB rows may still show
+        # 10:00-11:00.  Reset both setup and entry blackouts to the required default.
+        try:
+            default_w = _normalise_melbourne_blackout_windows(_blackout_default_windows(), default='10:00-12:00,SUN 22:00-MON 10:00')
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+            _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, default_w)
+            _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, default_w)
+        except Exception:
+            pass
+
+        _autotrade_config_set('yver32_config_cleanup_version', target_version)
     except Exception:
         pass
 
@@ -7405,6 +7496,7 @@ try:
     _autotrade_apply_ver117_live_test_alignment_defaults()
     _autotrade_apply_ver118_audit_match_config_defaults()
     _autotrade_apply_ver119_audit_match_config_defaults()
+    _autotrade_apply_yver32_config_cleanup_defaults()
 except Exception:
     pass
 
@@ -42192,118 +42284,71 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 
     summary = _autotrade_runtime_summary_dict()
     if not context.args:
+        risk_pct = float(summary['AUTOTRADE_RISK_PER_TRADE_PCT'])
+        dyn_risk_on = bool(summary.get('AUTOTRADE_DYNAMIC_RISK_ENABLED'))
+        dyn_min = float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 1.0))
+        dyn_max = float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.0))
+        min_rr = float(summary.get('AUTOTRADE_MIN_LIVE_RR', 1.5))
+        max_rr = float(summary.get('AUTOTRADE_MAX_LIVE_RR', 1.5))
+        dyn_tp_on = bool(summary.get('AUTOTRADE_DYNAMIC_TP_RR_ENABLED', False))
+        risk_line = (
+            f"Dynamic risk: ON {dyn_min:.2f}x-{dyn_max:.2f}x | effective {risk_pct * dyn_min:.2f}%-{risk_pct * dyn_max:.2f}%"
+            if dyn_risk_on else
+            f"Dynamic risk: OFF | fixed {risk_pct:.2f}% per trade"
+        )
+        rr_line = (
+            f"Dynamic TP/RR: ON | base {float(summary.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', 1.5)):.2f}R | clamp {min_rr:.2f}R-{max_rr:.2f}R"
+            if dyn_tp_on else
+            (f"Dynamic TP/RR: OFF | fixed {min_rr:.2f}R" if abs(min_rr - max_rr) < 1e-9 else f"Dynamic TP/RR: OFF | RR clamp {min_rr:.2f}R-{max_rr:.2f}R")
+        )
+        keep_only = (not bool(summary.get('AUTOTRADE_ALLOW_WATCH_POLICY', False))) and (not bool(summary.get('USER_VISIBLE_ALLOW_WATCH_POLICY', False)))
         lines = [
             "🤖 AutoTrade Runtime Config",
             HDR,
-            f"AUTOTRADE_RISK_PER_TRADE_PCT = {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']):.2f} (base)",
-            f"AUTOTRADE_DYNAMIC_RISK_ENABLED = {'true' if bool(summary.get('AUTOTRADE_DYNAMIC_RISK_ENABLED')) else 'false'}",
-            f"AUTOTRADE_DYNAMIC_RISK_RANGE = {float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.75)):.2f}x–{float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.25)):.2f}x",
-            f"AUTOTRADE_DYNAMIC_RISK_SCORE = low {float(summary.get('AUTOTRADE_DYNAMIC_RISK_LOW_SCORE', 40)):.0f} | base {float(summary.get('AUTOTRADE_DYNAMIC_RISK_BASE_SCORE', 65)):.0f} | high {float(summary.get('AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE', 90)):.0f}",
-            f"Effective risk range now ≈ {float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MIN_MULT', 0.75)):.2f}%–{float(summary['AUTOTRADE_RISK_PER_TRADE_PCT']) * float(summary.get('AUTOTRADE_DYNAMIC_RISK_MAX_MULT', 1.25)):.2f}%",
-            f"AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE = {'true' if bool(summary.get('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE')) else 'false'}",
-            f"AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN = {int(summary.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 4))}x",
-            f"AUTOTRADE_EMERGENCY_RISK_MAX_MULT = {float(summary.get('AUTOTRADE_EMERGENCY_RISK_MAX_MULT', 2.0)):.2f}x",
-            f"AUTOTRADE_STRICT_TPSL_ONLY = {'true' if bool(summary.get('AUTOTRADE_STRICT_TPSL_ONLY', True)) else 'false'}",
-            f"AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY = {'true' if bool(summary.get('AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', True)) else 'false'}",
-            f"AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH = {'true' if bool(summary.get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)) else 'false'}",
-            f"AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL = {'true' if bool(summary.get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)) else 'false'}",
-            f"AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED = {'true' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)) else 'false'}",
-            f"AUTOTRADE_FLAT_BEFORE_ASIA_TIME = {int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9)):02d}:{int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 55)):02d} Melbourne",
-            f"AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP = {'true' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP', True)) else 'false'}",
-            f"AUTOTRADE_ENTRY_BLACKOUT_ENABLED = {'true' if bool(summary.get('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = {str(summary.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '10:00-12:00,SUN 22:00-MON 10:00') or '-')} Melbourne",
-            f"SETUP_GENERATION_BLACKOUT_ENABLED = {'true' if bool(summary.get('SETUP_GENERATION_BLACKOUT_ENABLED', True)) else 'false'}",
-            f"SETUP_GENERATION_BLACKOUT_WINDOWS = {str(summary.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '10:00-12:00,SUN 22:00-MON 10:00') or '-')} Melbourne",
-            f"AUTOTRADE_MAX_POSITION_HOURS_ENABLED = {'true' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False)) else 'false'}",
-            f"AUTOTRADE_MAX_POSITION_HOURS = {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 18.0)):.2f}",
-            f"AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL = {'true' if bool(summary.get('AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', True)) else 'false'}",
-            f"AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK = {'true' if bool(summary.get('AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK', True)) else 'false'}",
-            f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED = {'true' if bool(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT = {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 3.0)):.2f}",
-            f"AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', True)) else 'false'}",
-            f"AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED = {'true' if bool(summary.get('AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_STRICT_KEEP_EDGE_ENABLED = {'true' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED = {int(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 5))}",
-            f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 60.0)):.1f}",
-            f"AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR = {float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', 0.25)):+.2f}",
-            f"AUTOTRADE_BLOCKED_SYMBOLS = {','.join(AUTOTRADE_BLOCKED_SYMBOLS) if AUTOTRADE_BLOCKED_SYMBOLS else '-'}",
-            f"AUTOTRADE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('AUTOTRADE_ALLOW_WATCH_POLICY', True)) else 'false'}",
-            f"USER_VISIBLE_ALLOW_WATCH_POLICY = {'true' if bool(summary.get('USER_VISIBLE_ALLOW_WATCH_POLICY', True)) else 'false'}",
-            f"AUTOTRADE_TP_RR_CAP_ENABLED = {'true' if bool(summary.get('AUTOTRADE_TP_RR_CAP_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_DYNAMIC_TP_RR_ENABLED = {'true' if bool(summary.get('AUTOTRADE_DYNAMIC_TP_RR_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_DYNAMIC_TP_BASE_RR = {float(summary.get('AUTOTRADE_DYNAMIC_TP_BASE_RR', 2.0)):.2f}",
-            f"AUTOTRADE_MAX_LIVE_RR = {float(summary.get('AUTOTRADE_MAX_LIVE_RR', 4.0)):.2f}",
-            f"AUTOTRADE_MIN_LIVE_RR = {float(summary.get('AUTOTRADE_MIN_LIVE_RR', 1.5)):.2f}",
-            f"AUTOTRADE_OPEN_RISK_CAP_PCT = {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}",
-            f"AUTOTRADE_DAILY_RISK_CAP_PCT = {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f} ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
-            f"AUTOTRADE_MODE = {str(summary['AUTOTRADE_MODE']).lower()}",
-            f"AUTOTRADE_ENTRY_ENABLED = {'true' if bool(summary.get('AUTOTRADE_ENTRY_ENABLED', True)) else 'false'}",
-            f"AUTOTRADE_MAX_OPEN_TRADES = {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])}",
-            f"AUTOTRADE_MAX_TRADES_PER_DAY = {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0))} (default 50; env can allow 0=unlimited)",
-            f"AUTOTRADE_MAX_ENTRY_DRIFT_PCT = {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 0.0)):.2f}",
-            f"AUTOTRADE_ENTRY_WINDOW_MIN = {int(summary.get('AUTOTRADE_ENTRY_WINDOW_MIN', 60))} minutes",
-            f"AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = {'true' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)) else 'false'} (email-matched; true recommended)",
-            f"AUTOTRADE_LEVERAGE = {int(summary['AUTOTRADE_LEVERAGE'])}",
-            f"AUTOTRADE_ISOLATED = {'true' if bool(summary['AUTOTRADE_ISOLATED']) else 'false'}",
-            f"SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED = {'true' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'false'}",
-            f"SETUP_ADAPTIVE_REVERSE_FOR_DISABLED = {'true' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'false'}",
-            f"SETUP_REVERSE_TARGET_RR = {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.20)):.2f}",
+            "Profile",
+            f"Mode: {str(summary['AUTOTRADE_MODE']).lower()} | Entries: {'ON' if bool(summary.get('AUTOTRADE_ENTRY_ENABLED', True)) else 'OFF'} | Policy: {'KEEP-only' if keep_only else 'KEEP+WATCH'} | Email-matched entry: {'ON' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)) else 'OFF'}",
             "",
-            "Examples:",
-            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.0   (base risk; audit-match default)",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED false   (audit-match default)",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 1.0",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.0",
-            "• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true",
-            "• /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 4",
-            "• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25",
-            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED false   (audit-match default)",
-            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_HOUR 9",
-            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE 55",
-            "• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP false",
-            "• /autotrade_config BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00   (sets both setup + autotrade blackout)",
-            "• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00",
-            "• /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00",
-            "• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00   (append without replacing existing windows)",
-            "• /autotrade_config SETUP_GENERATION_BLACKOUT_ENABLED true",
-            "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS_ENABLED true",
-            "• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 12",
-            "• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true",
-            "• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK true",
-            "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true",
-            "• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5",
-            "• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false   (audit-match default)",
-            "• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true",
-            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true   (syncs /screen + email + AutoTrade to high-edge KEEP lanes)",
-            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 60",
-            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 5",
-            "• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.25",
-            "• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY false   (KEEP-only live mode)",
-            "• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY false   (/screen + emails KEEP-only)",
-            "• /autotrade_config AUTOTRADE_TP_RR_CAP_ENABLED true",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false   (audit-match default)",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 1.5",
-            "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
-            "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 1.5",
-            "• Strict TP/SL lifecycle is ON. For audit-match testing, scheduled ASIA flat is OFF by default but remains configurable above; max-hold is optional and controlled by AUTOTRADE_MAX_POSITION_HOURS_ENABLED.",
+            "Risk & caps",
+            f"Base risk/trade: {risk_pct:.2f}%",
+            risk_line,
+            f"Open risk cap: {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}%",
+            f"Daily risk cap: {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f}% ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
+            f"Daily realised-loss stop: {'ON' if bool(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True)) else 'OFF'} {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 15.0)):.2f}%",
+            "",
+            "Entry controls",
+            f"Max open trades: {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])} | Max trades/day: {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 50))}",
+            f"Max entry drift: {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 1.0)):.2f}% | Entry window: {int(summary.get('AUTOTRADE_ENTRY_WINDOW_MIN', 60))}m",
+            f"Entry blackout: {'ON' if bool(summary.get('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)) else 'OFF'} | {str(summary.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '-') or '-')} Melbourne",
+            f"Setup blackout: {'ON' if bool(summary.get('SETUP_GENERATION_BLACKOUT_ENABLED', True)) else 'OFF'} | {str(summary.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '-') or '-')} Melbourne",
+            "",
+            "TP/SL & RR",
+            rr_line,
+            f"TP/RR cap: {'ON' if bool(summary.get('AUTOTRADE_TP_RR_CAP_ENABLED', True)) else 'OFF'}",
+            f"Strict TP/SL only: {'ON' if bool(summary.get('AUTOTRADE_STRICT_TPSL_ONLY', True)) else 'OFF'} | Immutable TP/SL after entry: {'ON' if bool(summary.get('AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', True)) else 'OFF'}",
+            f"Market reduce on risk breach: {'ON' if bool(summary.get('AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', False)) else 'OFF'} | Market close on TP/SL attach fail: {'ON' if bool(summary.get('AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL', False)) else 'OFF'}",
+            "",
+            "Execution safety",
+            f"Leverage: {int(summary['AUTOTRADE_LEVERAGE'])}x | Isolated: {'ON' if bool(summary['AUTOTRADE_ISOLATED']) else 'OFF'} | Safe downgrade: {'ON' if bool(summary.get('AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE')) else 'OFF'} min {int(summary.get('AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN', 4))}x",
+            f"Max-hold exit: {'ON' if bool(summary.get('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False)) else 'OFF'} {float(summary.get('AUTOTRADE_MAX_POSITION_HOURS', 18.0)):.1f}h | Daily flat: {'ON' if bool(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', False)) else 'OFF'} {int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 9)):02d}:{int(summary.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 55)):02d}",
+            "",
+            "Policy gates",
+            f"Strict KEEP edge: {'ON' if bool(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', True)) else 'OFF'} | decided≥{int(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 5))}, WR≥{float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 60.0)):.1f}%, AvgR≥{float(summary.get('AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR', 0.25)):+.2f}",
+            f"Blocked symbols: {','.join(AUTOTRADE_BLOCKED_SYMBOLS) if AUTOTRADE_BLOCKED_SYMBOLS else '-'}",
+            f"Router: {'ON' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'OFF'} | Reverse disabled lanes: {'ON' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'OFF'} | Reverse RR: {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.50)):.2f}",
+            "",
+            "Common commands",
+            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.0",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
-            "• /autotrade_config AUTOTRADE_MODE live",
-            "• /autotrade_on   (enable new AutoTrade entries)",
-            "• /autotrade_off  (pause new AutoTrade entries; reports/guardian remain active)",
-            "• /autotrade_config AUTOTRADE_ENTRY_ENABLED true",
+            "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0",
+            "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
-            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50   (default; env can allow 0=unlimited)",
-            "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 1.0   (audit-match default)",
-            "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60   (deadline to open a setup)",
-            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY true   (recommended; AutoTrade only opens recently emailed setups)",
-            "• /autotrade_config AUTOTRADE_LEVERAGE 10",
-            "• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2",
-            "• /autotrade_config AUTOTRADE_ISOLATED true",
-            "• /autotrade_config SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED true",
-            "• /autotrade_config SETUP_ADAPTIVE_REVERSE_FOR_DISABLED true",
-            "• /autotrade_config SETUP_REVERSE_TARGET_RR 1.20",
+            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50",
+            "• /autotrade_config BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00",
+            "• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00",
+            "• /autotrade_on  /  /autotrade_off",
             "",
+            "Advanced keys are still accepted but hidden from this clean view: dynamic risk, dynamic TP/RR, report fallback, strict edge thresholds, max-hold, daily flat, leverage and router settings.",
             "Note: AutoTrade risk caps are controlled here only; /dailycap is manual-only.",
         ]
         await send_long_message(update, "\n".join(lines), parse_mode=None)
