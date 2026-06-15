@@ -1,3 +1,4 @@
+# yver43: cleans /autotrade_last into a /setup_audit-style preformatted table, removes Entry/SL/TP from /setup_audit, adds realised AutoTrade PnL for AT_CLOSED rows, and re-forces direct KEEP queue entry so fresh KEEP rows are not blocked by missing setup-email logs.
 # yver42: adds /setup_audit AutoTrade skip-reason column, converts /autotrade_last to a compact table, and re-applies direct KEEP queue entry so fresh KEEP rows are not blocked by missing setup-email logs.
 # yver41: cleans /setup_matrix policy output by removing the long schedule/evidence/safety description above the table, keeps the 1 Jun 2026 evidence baseline, and keeps F9 zero-evidence lanes WATCH-only; no live AutoTrade settings changed.
 # yver40: fixes /setup_matrix policy and /setup_audit background reports not posting by disabling heavy policy refresh-on-view by default, expanding admin background workers, adding stale running-lock cleanup, and bumping admin report cache keys.
@@ -3093,6 +3094,26 @@ def _autotrade_apply_yver42_direct_keep_queue_fix() -> None:
         if 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY' not in os.environ:
             _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 0)
         _autotrade_config_set('yver42_direct_keep_queue_fix_version', target_version)
+    except Exception:
+        pass
+
+
+
+def _autotrade_apply_yver43_direct_keep_queue_fix() -> None:
+    """yver43: direct KEEP queue is the default execution source.
+
+    A KEEP setup should not need a setup-email database row before AutoTrade can
+    consider it. Email delivery remains useful for notifications, but live entry
+    should read the fresh KEEP executable queue directly and still respect drift,
+    duplicate, risk, cap, blackout, liquidation and exchange-safety gates.
+    """
+    try:
+        target_version = 'yver43_2026_06_15_direct_keep_queue_fix'
+        if (not env_bool('AUTOTRADE_YVER43_REAPPLY_DIRECT_KEEP', False)) and str(_autotrade_config_get('yver43_direct_keep_queue_fix_version', '') or '').strip().lower() == target_version:
+            return
+        if 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY' not in os.environ:
+            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 0)
+        _autotrade_config_set('yver43_direct_keep_queue_fix_version', target_version)
     except Exception:
         pass
 
@@ -7766,6 +7787,7 @@ try:
     _autotrade_apply_yver35_cap_rr_refinements()
     _autotrade_apply_yver37_direct_keep_entry_defaults()
     _autotrade_apply_yver42_direct_keep_queue_fix()
+    _autotrade_apply_yver43_direct_keep_queue_fix()
 except Exception:
     pass
 
@@ -46948,6 +46970,9 @@ def _setup_audit_short_autotrade_reason(reason: str) -> str:
         ('max_trades', 'MAX_DAY'),
         ('daily_risk', 'DAILY_CAP'),
         ('open_risk', 'OPEN_CAP'),
+        ('blocked_manual_same_symbol_position', 'MANUAL_POS'),
+        ('manual_same_symbol', 'MANUAL_POS'),
+        ('manual_position', 'MANUAL_POS'),
         ('missing_recent_setup_email', 'NO_EMAIL'),
         ('setup_email', 'NO_EMAIL'),
         ('email_gate', 'EMAIL_GATE'),
@@ -47094,6 +47119,75 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
     except Exception:
         return 'DISABLE'
 
+def _setup_audit_closed_pnl_for_row(row: dict, uid: int = 0, at_state: str = '') -> str:
+    """Return realised AutoTrade PnL for a /setup_audit row when it is closed.
+
+    This is display-only.  It does not change setup-audit TP/SL scoring.  It first
+    matches by setup_id, then falls back to the same symbol/side/open-time window
+    used by the AutoTrade journal, so the PnL column stays aligned with
+    /autotrade_closed and /autotrade_report closed rows as closely as possible.
+    """
+    try:
+        at = str(at_state or '').upper().strip()
+        if at not in {'AT_CLOSED', 'AT_TP', 'AT_SL'}:
+            return '-'
+        rr = dict(row or {})
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
+        setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
+        sym_base = _symbol_base(str(rr.get('symbol') or rr.get('market_symbol') or ''))
+        side_u = str(rr.get('side') or '').upper().strip()
+        pnl_val = None
+        n = 0
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            if sid:
+                r = cur.execute(
+                    """
+                    SELECT COUNT(*) AS n, COALESCE(SUM(COALESCE(pnl_usdt,0)),0) AS pnl
+                    FROM autotrade_trades
+                    WHERE uid=? AND setup_id=? AND closed_ts IS NOT NULL
+                    """,
+                    (uid_i, sid),
+                ).fetchone()
+                if r and int(r['n'] or 0) > 0:
+                    pnl_val = float(r['pnl'] or 0.0)
+                    n = int(r['n'] or 0)
+            if pnl_val is None and setup_ts > 0 and sym_base and side_u in {'BUY', 'SELL'}:
+                # Allow a small buffer around the setup entry window so journal rows
+                # created a little late still reconcile to the visible setup row.
+                start_ts = float(setup_ts) - 30.0 * 60.0
+                end_ts = float(setup_ts) + float(max(60, int(_autotrade_entry_window_min()) * 60)) + 30.0 * 60.0
+                rows = cur.execute(
+                    """
+                    SELECT symbol, side, opened_ts, closed_ts, COALESCE(pnl_usdt,0) AS pnl
+                    FROM autotrade_trades
+                    WHERE uid=? AND closed_ts IS NOT NULL
+                      AND UPPER(COALESCE(side,''))=?
+                      AND COALESCE(opened_ts,0)>=? AND COALESCE(opened_ts,0)<=?
+                    ORDER BY ABS(COALESCE(opened_ts,0)-?) ASC
+                    LIMIT 20
+                    """,
+                    (uid_i, side_u, float(start_ts), float(end_ts), float(setup_ts)),
+                ).fetchall() or []
+                vals = []
+                for r in rows:
+                    try:
+                        if _symbol_base(str(r['symbol'] or '')) == sym_base:
+                            vals.append(float(r['pnl'] or 0.0))
+                    except Exception:
+                        continue
+                if vals:
+                    pnl_val = float(sum(vals))
+                    n = len(vals)
+        if pnl_val is None or n <= 0:
+            return '-'
+        return f"{float(pnl_val):+.2f}"
+    except Exception:
+        return '-'
+
+
 def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     """Compact setup audit with current Policy lane per setup."""
     limit = max(0, int(limit or 0))
@@ -47148,7 +47242,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
         at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
         at_why = _setup_audit_autotrade_skip_reason(r, uid=int(uid), policy_label=policy_label, at_state=at_state, session_name=sess_row)
-        table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, at_why, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", fmt_price(float(r.get('entry') or 0.0)) if float(r.get('entry') or 0.0) > 0 else '-', fmt_price(float(r.get('sl') or 0.0)) if float(r.get('sl') or 0.0) > 0 else '-', fmt_price(float(_resolve_single_tp(float(r.get('entry') or 0.0), float(r.get('sl') or 0.0), r.get('tp'), r.get('alt_target_a'), r.get('alt_target_b'), side) or 0.0)) if float(r.get('entry') or 0.0) > 0 and float(r.get('sl') or 0.0) > 0 else '-', result])
+        pnl_txt = _setup_audit_closed_pnl_for_row(r, uid=int(uid), at_state=at_state)
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, at_why, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", pnl_txt, result])
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -47165,16 +47260,16 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'ATWhy', 'Conf', 'VolM', 'Entry', 'SL', 'TP', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'ATWhy', 'Conf', 'VolM', 'PnL', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
         HDR,
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        "AT legend: <b>SENT_OLD</b> = setup email was sent but the entry window has expired; <b>ATWhy</b> explains the current non-entry reason (NO_EMAIL/DRIFT/EXPIRED/CAP/etc.).",
+        "AT legend: <b>SENT_OLD</b> = setup email was sent but the entry window has expired; <b>ATWhy</b> explains the current non-entry reason; <b>PnL</b> shows realised AutoTrade PnL for AT_CLOSED rows.",
     ]
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -55635,7 +55730,7 @@ def _autotrade_reconcile_attempt_rows_for_display(uid: int, hist: list) -> list:
     return rows
 
 async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show recent autotrade attempts as a compact table (admin only)."""
+    """Show recent autotrade attempts as a clean /setup_audit-style table (admin only)."""
     uid = update.effective_user.id
     if not is_admin_user(uid):
         await update.message.reply_text("⛔️ Admin only.")
@@ -55654,24 +55749,26 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
 
-    lines = ["AutoTrade — Last Attempts", HDR]
+    lines = ["🤖 <b>AutoTrade — Last Attempts</b>", HDR]
     if not hist and not dec:
         lines.append("No attempts recorded yet.")
-        await send_long_message(update, "\n".join(lines), parse_mode=None)
+        await send_long_message(update, "\n".join(lines), parse_mode='HTML')
         return
 
     if dec:
         when_raw = str(dec.get('when') or '')
-        lines.append(f"Last decision: {str(dec.get('status') or '—')}" + (f" | {str(dec.get('reason') or '')}" if str(dec.get('reason') or '') else ''))
+        last_status = html.escape(str(dec.get('status') or '—').upper())
+        last_reason = html.escape(_setup_audit_short_autotrade_reason(str(dec.get('reason') or '')) if str(dec.get('reason') or '') else '-')
+        lines.append(f"Last decision: <b>{last_status}</b> | {last_reason}")
         if when_raw:
-            lines.append(f"Decision time: {_fmt_iso_to_local(when_raw)}")
+            lines.append(f"Decision time: <b>{html.escape(_fmt_iso_to_local(when_raw))}</b>")
         if dec.get('trigger'):
-            lines.append(f"Trigger: {dec.get('trigger')}")
+            lines.append(f"Trigger: <code>{html.escape(str(dec.get('trigger') or ''))}</code>")
         try:
             sel = dict(dec.get('selector_top_reasons') or {})
             if sel:
                 compact = ', '.join([f"{k}={v}" for k, v in list(sel.items())[:5]])
-                lines.append(f"Selector reasons: {compact}")
+                lines.append(f"Selector reasons: {html.escape(compact)}")
         except Exception:
             pass
         lines.append(HDR)
@@ -55688,14 +55785,12 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             when_raw = str(a.get('when') or '')
             when_txt = _fmt_iso_to_local(when_raw) if when_raw else '—'
-            # Keep only the month-day/time part when possible to keep the table narrow.
             try:
-                m = re.search(r'(\d{2}-\d{2}\s+\d{2}:\d{2}:?\d{0,2})', when_txt)
+                m = re.search(r'(\d{2}-\d{2}\s+\d{2}:\d{2})', when_txt)
                 if m:
                     when_txt = m.group(1)
             except Exception:
                 pass
-            sid = str(a.get('setup_id') or a.get('id') or '—')
             sym = str(a.get('symbol') or a.get('symbol_sent') or a.get('symbol_raw') or '—')
             if sym.upper().endswith('USDT'):
                 sym = sym[:-4]
@@ -55704,7 +55799,6 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reason = str(a.get('reason') or '').strip()
             entry = _autotrade_price_str(a.get('entry'))
             sl = _autotrade_price_str(a.get('sl'))
-            tp = _autotrade_price_str(a.get('tp')) if a.get('tp') not in ('', None) else '-'
             drift_txt = '-'
             try:
                 drift = a.get('entry_drift_pct', '')
@@ -55712,43 +55806,43 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 adverse = a.get('entry_drift_adverse_pct', '')
                 if drift not in ('', None):
                     if drift_dir in {'favourable', 'favorable'}:
-                        drift_txt = f"{float(drift):.2f}% fav"
+                        drift_txt = f"{float(drift):+.2f}% fav"
                     elif drift_dir == 'adverse':
                         try:
                             drift_txt = f"{float(adverse):.2f}% adv"
                         except Exception:
                             drift_txt = f"{float(drift):.2f}% adv"
                     else:
-                        drift_txt = f"{float(drift):.2f}%"
+                        drift_txt = f"{float(drift):+.2f}%"
             except Exception:
                 pass
-            dyn_txt = '-'
+            risk_txt = '-'
             try:
                 if a.get('allowed_risk_pct') not in ('', None):
-                    dyn_txt = f"{float(a.get('allowed_risk_pct')):.2f}%"
+                    risk_txt = f"{float(a.get('allowed_risk_pct')):.2f}%"
                 elif a.get('risk_actual_pct') not in ('', None):
-                    dyn_txt = f"{float(a.get('risk_actual_pct')):.2f}%"
+                    risk_txt = f"{float(a.get('risk_actual_pct')):.2f}%"
             except Exception:
-                dyn_txt = '-'
+                risk_txt = '-'
             reason_short = _setup_audit_short_autotrade_reason(reason) if reason else '-'
-            table_rows.append([i, when_txt, sym, side, status, reason_short, entry, sl, tp, drift_txt, dyn_txt, sid[:18]])
+            table_rows.append([i, when_txt, sym, side, status, reason_short, entry, sl, drift_txt, risk_txt])
         except Exception:
             continue
 
     if table_rows:
         table = tabulate(
             table_rows,
-            headers=['#', 'Time', 'Sym', 'Side', 'Status', 'Reason', 'Entry', 'SL', 'TP', 'Drift', 'Risk', 'Setup'],
+            headers=['#', 'Time', 'Sym', 'Side', 'Status', 'Why', 'Entry', 'SL', 'Drift', 'Risk'],
             tablefmt='plain',
-            colalign=('right', 'left', 'left', 'center', 'center', 'left', 'right', 'right', 'right', 'right', 'right', 'left'),
+            colalign=('right', 'left', 'left', 'center', 'center', 'left', 'right', 'right', 'right', 'right'),
         )
-        lines.append(table)
+        lines.append("<pre>" + html.escape(table) + "</pre>")
         lines.append(HDR)
-        lines.append("Tip: /autotrade_last 30 shows up to 30 recent attempts.")
+        lines.append("Tip: <code>/autotrade_last 30</code> shows up to 30 recent attempts.")
     else:
         lines.append("No attempt rows found in memory for this process.")
 
-    await send_long_message(update, "\n".join(lines), parse_mode=None)
+    await send_long_message(update, "\n".join(lines), parse_mode='HTML')
 
 async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """AutoTrade readiness + last decision diagnostics (admin only)."""
