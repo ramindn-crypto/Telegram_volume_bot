@@ -1,3 +1,4 @@
+# yver37: explains SENT_OLD in /setup_audit and lets AutoTrade consume fresh KEEP executable setups directly when email-matched entry is OFF; default direct KEEP queue mode is ON with dynamic TP/RR restored.
 # yver36: /autotrade_config FULL now includes the full command-example list, and the clean config view hides the daily realised-loss stop line.
 # yver31: adds editable multi-window/day-aware Melbourne blackouts (default 10:00-12:00 + SUN 22:00-MON 10:00) and restores hard setup-geometry validation before policy KEEP overrides.
 # yver35: fixes AutoTrade cap display/control: max-open defaults to 20 even in keep-all mode, max-trades/day uses 0=unlimited cleanly, and Dynamic TP/RR clamp is forced to 1.50R-2.00R.
@@ -3032,6 +3033,43 @@ def _autotrade_apply_yver35_cap_rr_refinements() -> None:
         _autotrade_config_set('yver35_cap_rr_refinements_version', target_version)
     except Exception:
         pass
+
+
+
+def _autotrade_apply_yver37_direct_keep_entry_defaults() -> None:
+    """yver37: direct KEEP queue entry mode.
+
+    SENT_OLD in /setup_audit means the setup was emailed but is now older than
+    AUTOTRADE_ENTRY_WINDOW_MIN.  It should remain visible in the 24h audit, but
+    should not be opened late.  To make fresh KEEP setups open as expected, this
+    version makes email-matched entry optional and defaults it OFF so AutoTrade can
+    consume fresh executable KEEP rows directly.
+    """
+    try:
+        target_version = 'yver37_2026_06_15_direct_keep_queue_entry'
+        if (not env_bool('AUTOTRADE_YVER37_REAPPLY_DEFAULTS', False)) and str(_autotrade_config_get('yver37_direct_keep_entry_version', '') or '').strip().lower() == target_version:
+            return
+
+        desired = {
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 0,
+            AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(globals().get('AUTOTRADE_VER35_MAX_OPEN_TRADES', 20) or 20),
+            AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: int(globals().get('AUTOTRADE_VER35_MAX_TRADES_PER_DAY', 0) or 0),
+            AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MIN_LIVE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MAX_LIVE_RR_KEY: 2.0,
+        }
+        for k, v in desired.items():
+            try:
+                _autotrade_config_set(k, v)
+            except Exception:
+                pass
+
+        _autotrade_config_set('yver37_direct_keep_entry_version', target_version)
+    except Exception:
+        pass
+
 
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
@@ -7696,6 +7734,7 @@ try:
     _autotrade_apply_yver33_dynamic_risk_tp_defaults()
     _autotrade_apply_yver34_config_refinements()
     _autotrade_apply_yver35_cap_rr_refinements()
+    _autotrade_apply_yver37_direct_keep_entry_defaults()
 except Exception:
     pass
 
@@ -13169,13 +13208,16 @@ def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") ->
         sess = str(session_name or "").upper().strip()
         if sess not in {"ASIA", "LON", "NY"}:
             return (False, "session_not_supported")
-        # yver129: AutoTrade must only consume the exact recent setup-email lane.
-        # This keeps AutoTrade, /screen and subscriber emails synchronised.
+        # yver37: email matching is now optional.  When
+        # AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY=false, AutoTrade can consume
+        # fresh executable KEEP rows directly so valid KEEP setups do not depend
+        # on the setup-email loop.  When true, keep the older exact-email lock.
         try:
-            policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
-            email_ok, email_why = _autotrade_recent_email_gate_allows_setup(policy_uid, s, session_label=sess)
-            if not email_ok:
-                return (False, str(email_why or 'missing_recent_setup_email'))
+            if _autotrade_require_setup_email_for_entry():
+                policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+                email_ok, email_why = _autotrade_recent_email_gate_allows_setup(policy_uid, s, session_label=sess)
+                if not email_ok:
+                    return (False, str(email_why or 'missing_recent_setup_email'))
         except Exception:
             return (False, 'setup_email_gate_exception')
         # Ver53: setup-generation blackout only stops creating new setups.
@@ -14421,17 +14463,23 @@ def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[
     except Exception:
         pass
 
-    # yver129: final hard gate before any Bybit placement. Even if an upstream
-    # selector accidentally passes a raw executable object, do not open it unless
-    # the exact setup was emailed/delivered recently.
+    # yver37: final email gate is conditional.  Direct KEEP queue mode opens
+    # fresh executable KEEP rows even if the email pipeline did not log the setup;
+    # email-matched mode still requires an exact recent emailed_setups row.
     try:
-        _email_ok, _email_why = _autotrade_recent_email_gate_allows_setup(int(uid), s, session_label=session_label)
-        if not _email_ok:
+        if _autotrade_require_setup_email_for_entry():
+            _email_ok, _email_why = _autotrade_recent_email_gate_allows_setup(int(uid), s, session_label=session_label)
+            if not _email_ok:
+                try:
+                    _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(_email_why), last_reason=str(_email_why))
+                except Exception:
+                    pass
+                return (False, str(_email_why or 'missing_recent_setup_email'))
+        else:
             try:
-                _admin_setup_lifecycle_merge(int(uid), setup_id, state=_admin_setup_state_from_reason(_email_why), last_reason=str(_email_why))
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {}).update({'email_gate': 'disabled_direct_keep_queue'})
             except Exception:
                 pass
-            return (False, str(_email_why or 'missing_recent_setup_email'))
     except Exception:
         return (False, 'setup_email_gate_exception')
 
@@ -42530,7 +42578,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_on',
             '• /autotrade_off',
             '• /autotrade_config AUTOTRADE_ENTRY_ENABLED true',
-            '• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY true',
+            '• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (direct KEEP queue entry)',
             '',
             'Examples — risk / caps:',
             '• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.5',
@@ -42641,7 +42689,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "🤖 AutoTrade Runtime Config",
             HDR,
             "Profile",
-            f"Mode: {str(summary['AUTOTRADE_MODE']).lower()} | Entries: {'ON' if bool(summary.get('AUTOTRADE_ENTRY_ENABLED', True)) else 'OFF'} | Policy: {'KEEP-only' if keep_only else 'KEEP+WATCH'} | Email-matched entry: {'ON' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)) else 'OFF'}",
+            f"Mode: {str(summary['AUTOTRADE_MODE']).lower()} | Entries: {'ON' if bool(summary.get('AUTOTRADE_ENTRY_ENABLED', True)) else 'OFF'} | Policy: {'KEEP-only' if keep_only else 'KEEP+WATCH'} | Entry source: {'EMAIL-MATCHED' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)) else 'DIRECT KEEP QUEUE'}",
             "",
             "Risk & caps",
             f"Base risk/trade: {risk_pct:.2f}%",
@@ -42681,6 +42729,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0",
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
+            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (open fresh KEEP directly)",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 0   (unlimited)",
             "• /autotrade_config FULL",
@@ -46726,6 +46775,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         HDR,
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        "AT legend: <b>SENT_OLD</b> = setup email was sent but the entry window has expired; fresh KEEP rows can auto-enter directly when email-matched entry is OFF.",
     ]
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
