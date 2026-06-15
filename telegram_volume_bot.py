@@ -1,4 +1,6 @@
+# yver36: /autotrade_config FULL now includes the full command-example list, and the clean config view hides the daily realised-loss stop line.
 # yver31: adds editable multi-window/day-aware Melbourne blackouts (default 10:00-12:00 + SUN 22:00-MON 10:00) and restores hard setup-geometry validation before policy KEEP overrides.
+# yver35: fixes AutoTrade cap display/control: max-open defaults to 20 even in keep-all mode, max-trades/day uses 0=unlimited cleanly, and Dynamic TP/RR clamp is forced to 1.50R-2.00R.
 # yver34: adds /autotrade_config full view, aligns runtime policy sync guard to WR>49 matrix rule, uses 1.5R reverse setup geometry, and removes permanent symbol blocks with a 24h TTL for any future static block.
 # yver33: restores the requested dynamic live profile: base risk 1.5% with 1.0x-1.5x dynamic scaling, dynamic TP/RR ON with 1.5R-2.0R clamp, 2% entry drift, and keeps the cleaned /autotrade_config display.
 # yver32: cleans /autotrade_config, restores conservative live defaults (fixed 1% risk, fixed 1.5R TP, drift 1%, entry window 60m, open cap 5%, daily cap 15%, KEEP-only/email-matched), and keeps advanced tuning keys editable but hidden from the default screen.
@@ -960,60 +962,51 @@ def _autotrade_immutable_tpsl_after_entry() -> bool:
 
 
 def _autotrade_runtime_max_open_trades() -> int:
-    # yver55 forward-test mode: no artificial open-position count cap.
-    # Keep real safety elsewhere: SL/TP, liquidation guard, exchange filters,
-    # equity/risk sizing and duplicate-owner checks. Returning 0 means unlimited.
+    """AutoTrade live open-position cap.
+
+    yver35: max-open is a real live safety cap and must not be disabled by
+    keep-all/forward-test mode. Stored 0 from older builds is treated as the
+    current default (20), because the owner wants max-open capped while allowing
+    max trades/day to be unlimited.
+    """
     try:
-        if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)):
-            return 0
+        raw = _autotrade_config_get(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, None)
+        if raw is None or str(raw).strip() == '':
+            val = int(globals().get('AUTOTRADE_VER35_MAX_OPEN_TRADES', AUTOTRADE_MAX_OPEN_TRADES) or 20)
+        else:
+            val = int(float(raw))
     except Exception:
-        pass
-    try:
-        val = int(float(_autotrade_config_get(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, AUTOTRADE_MAX_OPEN_TRADES) or AUTOTRADE_MAX_OPEN_TRADES))
-    except Exception:
-        # Production safety: a corrupted DB/env value must fall back to the static
-        # default, not recurse into this function and crash the bot.
         try:
-            val = int(AUTOTRADE_MAX_OPEN_TRADES)
+            val = int(globals().get('AUTOTRADE_VER35_MAX_OPEN_TRADES', AUTOTRADE_MAX_OPEN_TRADES) or 20)
         except Exception:
-            val = 1
+            val = 20
+    if int(val) <= 0:
+        try:
+            return max(1, int(globals().get('AUTOTRADE_VER35_MAX_OPEN_TRADES', 20) or 20))
+        except Exception:
+            return 20
     return max(1, int(val))
 
 
 def _autotrade_runtime_max_trades_per_day() -> int:
     """AutoTrade-only daily trade count cap.
 
-    yver55: In keep-all forward-test mode, return 0 to mean no artificial
-    daily count cap. Risk sizing/caps and exchange safety still remain active.
-
-    Ver47: the requested production default is 50/day. Older DB snapshots can
-    still contain 0 from the previous "unlimited" era, which makes
-    /autotrade_debug show 6/∞ and weakens the WR-first learning loop. Treat a
-    stored 0/blank as the configured default unless the operator explicitly sets
-    AUTOTRADE_ALLOW_UNLIMITED_MAX_TRADES_PER_DAY=1 in the environment.
+    yver35: 0 means unlimited and is now the intended default for max trades/day.
+    This remains separate from max-open positions, which is capped at 20 by default.
+    Risk caps, duplicate guards, SL/TP, liquidation guard and email-matched entry
+    still apply even when the daily count cap is unlimited.
     """
-    try:
-        if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)):
-            return 0
-    except Exception:
-        pass
     try:
         raw = _autotrade_config_get(AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY, None)
         if raw is None or str(raw).strip() == '':
-            val = int(AUTOTRADE_MAX_TRADES_PER_DAY)
+            val = int(globals().get('AUTOTRADE_VER35_MAX_TRADES_PER_DAY', 0) or 0)
         else:
             val = int(float(raw))
     except Exception:
-        try:
-            val = int(AUTOTRADE_MAX_TRADES_PER_DAY)
-        except Exception:
-            val = 50
-    if int(val) <= 0 and not env_bool('AUTOTRADE_ALLOW_UNLIMITED_MAX_TRADES_PER_DAY', False):
-        try:
-            return max(1, int(globals().get('AUTOTRADE_VER34_MAX_TRADES_PER_DAY', AUTOTRADE_MAX_TRADES_PER_DAY) or 50))
-        except Exception:
-            return 50
-    return max(0, int(val))
+        val = int(globals().get('AUTOTRADE_VER35_MAX_TRADES_PER_DAY', 0) or 0)
+    if int(val) < 0:
+        val = 0
+    return min(500, int(val))
 
 
 def _autotrade_runtime_max_entry_drift_pct() -> float:
@@ -3008,6 +3001,38 @@ def _autotrade_apply_yver34_config_refinements() -> None:
     except Exception:
         pass
 
+
+def _autotrade_apply_yver35_cap_rr_refinements() -> None:
+    """yver35: final config display/control fixes requested by owner.
+
+    - Max open trades is a real safety cap and defaults to 20.
+    - Max trades/day defaults to 0 = unlimited and should display as unlimited.
+    - Dynamic TP/RR stays enabled with a 1.50R-2.00R clamp.
+    """
+    try:
+        target_version = 'yver35_2026_06_15_maxopen20_dayunlimited_rr15_20'
+        if (not env_bool('AUTOTRADE_YVER35_REAPPLY_DEFAULTS', False)) and str(_autotrade_config_get('yver35_cap_rr_refinements_version', '') or '').strip().lower() == target_version:
+            return
+
+        desired = {
+            AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: int(globals().get('AUTOTRADE_VER35_MAX_OPEN_TRADES', 20) or 20),
+            AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: int(globals().get('AUTOTRADE_VER35_MAX_TRADES_PER_DAY', 0) or 0),
+            AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MIN_LIVE_RR_KEY: float(globals().get('AUTOTRADE_VER35_MIN_LIVE_RR', 1.5) or 1.5),
+            AUTOTRADE_CFG_MAX_LIVE_RR_KEY: float(globals().get('AUTOTRADE_VER35_MAX_LIVE_RR', 2.0) or 2.0),
+        }
+        for k, v in desired.items():
+            try:
+                _autotrade_config_set(k, v)
+            except Exception:
+                pass
+
+        _autotrade_config_set('yver35_cap_rr_refinements_version', target_version)
+    except Exception:
+        pass
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -3347,6 +3372,11 @@ AUTOTRADE_VER34_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER34_MAX_OPEN_T
 AUTOTRADE_VER34_MAX_POSITION_HOURS = float(os.environ.get("AUTOTRADE_VER34_MAX_POSITION_HOURS", "12") or 12)
 AUTOTRADE_VER34_MAX_ENTRY_DRIFT_PCT = float(os.environ.get("AUTOTRADE_VER34_MAX_ENTRY_DRIFT_PCT", "1.00") or 1.00)
 AUTOTRADE_VER34_DAILY_CAP_PCT = float(os.environ.get("AUTOTRADE_VER34_DAILY_CAP_PCT", "15.0") or 15.0)
+# yver35: max open is capped; daily trade count can be unlimited (0).
+AUTOTRADE_VER35_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_VER35_MAX_OPEN_TRADES", "20") or 20)
+AUTOTRADE_VER35_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_VER35_MAX_TRADES_PER_DAY", "0") or 0)
+AUTOTRADE_VER35_MIN_LIVE_RR = float(os.environ.get("AUTOTRADE_VER35_MIN_LIVE_RR", "1.5") or 1.5)
+AUTOTRADE_VER35_MAX_LIVE_RR = float(os.environ.get("AUTOTRADE_VER35_MAX_LIVE_RR", "2.0") or 2.0)
 # Ver36: re-sync user-requested AutoTrade runtime defaults after stale persisted DB values.
 # These are applied once on deploy and remain editable via /autotrade_config.
 AUTOTRADE_VER36_FORCE_DEFAULTS_ON_DEPLOY = env_bool("AUTOTRADE_VER36_FORCE_DEFAULTS_ON_DEPLOY", True)
@@ -7613,7 +7643,7 @@ AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PC
 AUTOTRADE_MAX_OPEN_TRADES = int(os.environ.get("AUTOTRADE_MAX_OPEN_TRADES", "20") or 20)
 # AutoTrade-only daily trade count cap. 0 = unlimited.
 # This is deliberately independent from /limits maxtrades, which remains manual-only.
-AUTOTRADE_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_MAX_TRADES_PER_DAY", "50") or 50)
+AUTOTRADE_MAX_TRADES_PER_DAY = int(os.environ.get("AUTOTRADE_MAX_TRADES_PER_DAY", "0") or 0)
 EXECUTION_ENGINE_B_EMAIL_ENABLED = str(os.environ.get("EXECUTION_ENGINE_B_EMAIL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
 EMAIL_BUILD_SESSIONS = [s.strip().upper() for s in str(os.environ.get("EMAIL_BUILD_SESSIONS", "ASIA,LON,NY") or "ASIA,LON,NY").split(",") if s.strip()]
 EXECUTION_ASIA_ENABLED = env_bool("EXECUTION_ASIA_ENABLED", True)
@@ -7665,6 +7695,7 @@ try:
     _autotrade_apply_yver32_config_cleanup_defaults()
     _autotrade_apply_yver33_dynamic_risk_tp_defaults()
     _autotrade_apply_yver34_config_refinements()
+    _autotrade_apply_yver35_cap_rr_refinements()
 except Exception:
     pass
 
@@ -42494,11 +42525,90 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.extend([
             f"AUTOTRADE_BLOCKED_SYMBOLS = {_autotrade_format_static_symbol_blocks()}",
             '',
-            'Append/clear helpers:',
-            '• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00',
+            'Examples — profile / mode:',
+            '• /autotrade_config AUTOTRADE_MODE live',
+            '• /autotrade_on',
+            '• /autotrade_off',
+            '• /autotrade_config AUTOTRADE_ENTRY_ENABLED true',
+            '• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY true',
+            '',
+            'Examples — risk / caps:',
+            '• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.5',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 1.0',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90',
+            '• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 20',
+            '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 20',
+            '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true',
+            '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 25',
+            '',
+            'Examples — entry controls:',
+            '• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20',
+            '• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 0   (unlimited)',
+            '• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0',
+            '• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60',
+            '',
+            'Examples — TP/SL and RR:',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED true',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 1.5',
+            '• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5',
+            '• /autotrade_config AUTOTRADE_MAX_LIVE_RR 2.0',
+            '• /autotrade_config AUTOTRADE_TP_RR_CAP_ENABLED true',
+            '• /autotrade_config AUTOTRADE_STRICT_TPSL_ONLY true',
+            '• /autotrade_config AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY true',
+            '• /autotrade_config AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH false',
+            '• /autotrade_config AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL false',
+            '',
+            'Examples — leverage / exchange safety:',
+            '• /autotrade_config AUTOTRADE_LEVERAGE 10',
+            '• /autotrade_config AUTOTRADE_ISOLATED true',
+            '• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2',
+            '• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true',
+            '• /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 4',
+            '• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25',
+            '',
+            'Examples — reports / exits:',
+            '• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true',
+            '• /autotrade_config AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK true',
+            '• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS_ENABLED false',
+            '• /autotrade_config AUTOTRADE_MAX_POSITION_HOURS 48',
+            '• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED false',
+            '• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_HOUR 9',
+            '• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE 55',
+            '• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP false',
+            '',
+            'Examples — blackout windows:',
             '• /autotrade_config BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00',
-            '• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS BTC,ETH   (static block; expires within 24h)',
+            '• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00',
+            '• /autotrade_config BLACKOUT_ENABLED true',
+            '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00',
+            '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_ADD_WINDOW 13:00-14:00',
+            '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_ENABLED true',
+            '• /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00',
+            '• /autotrade_config SETUP_GENERATION_BLACKOUT_ADD_WINDOW 13:00-14:00',
+            '• /autotrade_config SETUP_GENERATION_BLACKOUT_ENABLED true',
+            '',
+            'Examples — policy / router:',
+            '• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY false',
+            '• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY false',
+            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true',
+            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 1',
+            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 49',
+            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.05',
+            '• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false',
+            '• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true',
+            '• /autotrade_config SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED true',
+            '• /autotrade_config SETUP_ADAPTIVE_REVERSE_FOR_DISABLED true',
+            '• /autotrade_config SETUP_REVERSE_TARGET_RR 1.5',
+            '',
+            'Examples — temporary static blocks:',
+            '• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS BTC,ETH   (static blocks expire within 24h)',
             '• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS none      (clear static symbol blocks)',
+            '',
+            'Note: AutoTrade risk caps are controlled here only; /dailycap is manual-only.',
         ])
         await send_long_message(update, '\n'.join(lines), parse_mode=None)
 
@@ -42525,6 +42635,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             (f"Dynamic TP/RR: OFF | fixed {min_rr:.2f}R" if abs(min_rr - max_rr) < 1e-9 else f"Dynamic TP/RR: OFF | RR clamp {min_rr:.2f}R-{max_rr:.2f}R")
         )
         keep_only = (not bool(summary.get('AUTOTRADE_ALLOW_WATCH_POLICY', False))) and (not bool(summary.get('USER_VISIBLE_ALLOW_WATCH_POLICY', False)))
+        max_day_i = int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 0) or 0)
+        max_day_txt = 'unlimited' if max_day_i <= 0 else str(max_day_i)
         lines = [
             "🤖 AutoTrade Runtime Config",
             HDR,
@@ -42536,10 +42648,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             risk_line,
             f"Open risk cap: {float(summary['AUTOTRADE_OPEN_RISK_CAP_PCT']):.2f}%",
             f"Daily risk cap: {float(summary['AUTOTRADE_DAILY_RISK_CAP_PCT']):.2f}% ({str(summary['AUTOTRADE_DAILY_RISK_CAP_MODE']).upper()})",
-            f"Daily realised-loss stop: {'ON' if bool(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED', True)) else 'OFF'} {float(summary.get('AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT', 15.0)):.2f}%",
             "",
             "Entry controls",
-            f"Max open trades: {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])} | Max trades/day: {int(summary.get('AUTOTRADE_MAX_TRADES_PER_DAY', 50))}",
+            f"Max open trades: {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])} | Max trades/day: {max_day_txt}",
             f"Max entry drift: {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 1.0)):.2f}% | Entry window: {int(summary.get('AUTOTRADE_ENTRY_WINDOW_MIN', 60))}m",
             f"Entry blackout: {'ON' if bool(summary.get('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)) else 'OFF'} | {str(summary.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '-') or '-')} Melbourne",
             f"Setup blackout: {'ON' if bool(summary.get('SETUP_GENERATION_BLACKOUT_ENABLED', True)) else 'OFF'} | {str(summary.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '-') or '-')} Melbourne",
@@ -42571,7 +42682,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0",
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
-            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 50",
+            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 0   (unlimited)",
             "• /autotrade_config FULL",
             "• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS none",
             "• /autotrade_config BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00",
@@ -42723,13 +42834,15 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(AUTOTRADE_CFG_ENTRY_ENABLED_KEY, 1 if val else 0)
         elif key == 'AUTOTRADE_MAX_OPEN_TRADES':
-            # 0 = unlimited in keep-all forward-test mode; risk caps and exchange safety still apply.
-            val = max(0, int(float(value_raw)))
+            # yver35: max-open is a real safety cap. 0/negative resets to default 20.
+            val = int(float(value_raw))
+            if val <= 0:
+                val = int(globals().get('AUTOTRADE_VER35_MAX_OPEN_TRADES', 20) or 20)
             if val > 500:
-                raise ValueError('max AutoTrade open trades must be 0..500 (0 = unlimited)')
+                raise ValueError('max AutoTrade open trades must be 1..500')
             _autotrade_config_set(AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY, val)
         elif key == 'AUTOTRADE_MAX_TRADES_PER_DAY':
-            # 0 = unlimited. This is AutoTrade-only and intentionally not capped by /limits.
+            # yver35: 0 = unlimited. This is AutoTrade-only and intentionally not capped by /limits.
             val = max(0, int(float(value_raw)))
             if val > 500:
                 raise ValueError('max AutoTrade trades/day must be 0..500 (0 = unlimited)')
@@ -55333,7 +55446,7 @@ async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Trading day: {snap.get('today_window_label')}",
         "Configured sessions: ASIA/LON/NY active by default; current Session line only shows the active session/time block right now.",
         (f"Keep-all test: ON | Daily flat: {'ON' if _autotrade_flat_before_asia_enabled() else 'OFF'} {int(_autotrade_flat_before_asia_hour()):02d}:{int(_autotrade_flat_before_asia_minute()):02d} | Max-hold: {'ON' if _autotrade_max_position_hours_enabled() else 'OFF'} | Entry window: {int(_autotrade_entry_window_min())}m" if _autotrade_keep_all_test_mode() else None),
-        (f"No artificial count caps: ON | Batch/tick cap: ∞ | Entry blackout: {'ON' if _autotrade_entry_blackout_enabled() else 'OFF'} | Setup blackout: {'ON' if _setup_generation_blackout_enabled() else 'OFF'}" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
+        (f"Count caps: max-open {int(_autotrade_runtime_max_open_trades())} | max/day {_max_trades_day_txt} | Batch/tick cap: ∞ | Entry blackout: {'ON' if _autotrade_entry_blackout_enabled() else 'OFF'} | Setup blackout: {'ON' if _setup_generation_blackout_enabled() else 'OFF'}" if bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_UNLIMITED_MODE', False)) and bool(globals().get('AUTOTRADE_KEEP_ALL_TEST_DISABLE_COUNT_CAPS', True)) else None),
         SEP,
         f"EquityAT: ${equity:.2f}",
         f"Daily cap (AT): {str(_autotrade_daily_cap_settings()[0]).upper()} {float(_autotrade_daily_cap_settings()[1] or 0.0):.2f}{'%' if str(_autotrade_daily_cap_settings()[0]).upper() == 'PCT' else ''} (≈ ${float(snap.get('cap') or 0.0):.2f})",
