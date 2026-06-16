@@ -1,3 +1,4 @@
+# yver53: adds /setup_matrix policy WR beside each row in /setup_audit so policy context and row result are visible together.
 # yver49: makes the multi-day Leaders/Losers direction block explicitly rolling/expiring: 2+ appearances inside the last 3 Melbourne days only; current Leader/Loser still blocks only while current.
 # yver52: adds concise /setup_matrix policy metadata above the table: latest refresh time, actual setup database start, and 1 Jun policy baseline; bumps policy cache key.
 # yver51: separates continuous shadow setup generation from delivery/AutoTrade blackout; setup generation/audit learning never stops, while /screen setup display, setup emails, and AutoTrade entries respect blackout windows.
@@ -47384,6 +47385,30 @@ def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', s
         return 'DISABLE'
 
 
+def _setup_audit_policy_wr_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
+    """Display the current /setup_matrix policy WR for the row's exact lane.
+
+    This is the broad lane WR from /setup_matrix policy, not the individual
+    setup result in the Res column.  WR is shown only when the lane has decided
+    TP/SL evidence; otherwise '-' keeps zero-evidence lanes clear.
+    """
+    try:
+        rr = dict(row or {})
+        sess = str(session_name or rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
+        side_u = str(side or rr.get('side') or '').upper().strip()
+        if side_u in {'BUY', 'SELL'}:
+            rr['side'] = side_u
+        policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        state = _setup_matrix_policy_source_state_for_setup(rr, session_name=sess, user_id=policy_uid) or {}
+        dec = int(float(state.get('decided') or 0.0))
+        if dec <= 0:
+            return '-'
+        wr = float(state.get('wr') or 0.0)
+        return f"{wr:.1f}%"
+    except Exception:
+        return '-'
+
+
 def _setup_audit_closed_pnl_index(rows: list[dict], uid: int = 0, hours: int = 24) -> dict:
     """Build a display-only PnL lookup for /setup_audit from canonical closed rows.
 
@@ -47615,7 +47640,8 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
         at_why = _setup_audit_autotrade_skip_reason(r, uid=int(uid), policy_label=policy_label, at_state=at_state, session_name=sess_row)
         pnl_txt = _setup_audit_closed_pnl_for_row(r, uid=int(uid), at_state=at_state, pnl_index=closed_pnl_index)
-        table_rows.append([ttxt, sym, side, combo_key, policy_label, at_state, at_why, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", pnl_txt, result])
+        policy_wr = _setup_audit_policy_wr_label(r, uid=int(uid), session_name=sess_row, side=side)
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, policy_wr, at_state, at_why, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", pnl_txt, result])
 
     decided = tp_n + sl_n
     # yver123: WR excludes NOHIT and OPEN.
@@ -47632,16 +47658,16 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     hidden_rows = 0
     table = tabulate(
         display_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'AT', 'ATWhy', 'Conf', 'VolM', 'PnL', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'WR', 'AT', 'ATWhy', 'Conf', 'VolM', 'PnL', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'center', 'center', 'center', 'right', 'right', 'right', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'right', 'center', 'center', 'right', 'right', 'right', 'center'),
     )
     header_lines = [
         "🧪 <b>Setup Audit</b>",
         HDR,
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        "AT legend: <b>SENT_OLD</b> = setup email was sent but the entry window has expired; <b>ATWhy</b> explains the current non-entry reason; <b>PnL</b> shows realised AutoTrade PnL for AT_CLOSED rows.",
+        "AT legend: <b>SENT_OLD</b> = setup email was sent but the entry window has expired; <b>WR</b> is the current /setup_matrix lane WR; <b>ATWhy</b> explains the current non-entry reason; <b>PnL</b> shows realised AutoTrade PnL for AT_CLOSED rows.",
     ]
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -52701,7 +52727,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v40:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v53:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
