@@ -1,4 +1,6 @@
 # yver49: makes the multi-day Leaders/Losers direction block explicitly rolling/expiring: 2+ appearances inside the last 3 Melbourne days only; current Leader/Loser still blocks only while current.
+# yver51: separates continuous shadow setup generation from delivery/AutoTrade blackout; setup generation/audit learning never stops, while /screen setup display, setup emails, and AutoTrade entries respect blackout windows.
+# yver50: adds /setup_open_times (/setup_blackout_analysis) KEEP-only setup-time analysis from 01 Jun/24h/7d, with proposed blackout windows and detailed Time/Sym/Side/Combo/Policy/Res rows; no live config changes.
 # yver48: hard-locks live AutoTrade to /setup_matrix Policy=KEEP at the exact open gate, generalizes Leaders/Losers direction blocking beyond BTC/ETH/SOL with rolling expiring 2-of-3-day memory, adds Policy-at-open to /setup_audit_compare, and makes the matrix policy refresh every 3h.
 # yver47: adds hard blackout/email delivery enforcement, broad core-market direction guard, dynamic TP/RR/live risk hardening, daily-loss safety, and dust-risk skip to improve live AutoTrade profitability.
 # yver45: hard-enforces Directional Leaders/Losers before policy KEEP overrides, blocks leader SELL/loser BUY in /screen/email/executable/AutoTrade, and forces direct KEEP queue entry so fresh KEEP rows are not NO_EMAIL-blocked.
@@ -25409,19 +25411,19 @@ def _persist_executable_candidates(user_id: int, session_name: str, setups: List
         stats['edge_quality_skips'] = 0
         stats['cooldown_skips'] = 0
         stats['setup_blackout_skips'] = 0
+        # yver51: setup generation/executable persistence is shadow-on forever.
+        # Blackout now controls only delivery (/screen setups + setup emails) and live AutoTrade entries.
         try:
             _blk, _blk_reason = _setup_generation_blackout_now(now_ts)
             if _blk:
-                stats['setup_blackout_skips'] = int(len(list(setups or [])) * max(1, len(target_uids)))
                 db_log_setup_pipeline_event(
                     int(uid),
-                    stage='executable_setup_generation_blackout',
-                    status='skip',
+                    stage='executable_setup_shadow_during_delivery_blackout',
+                    status='shadow',
                     session=sess,
                     mode=str(mode or ''),
-                    details={'reason': str(_blk_reason or 'setup_generation_blackout'), 'windows': _setup_generation_blackout_windows(), 'attempted_setups': len(list(setups or [])), 'target_uids': target_uids},
+                    details={'reason': str(_blk_reason or 'setup_delivery_blackout'), 'windows': _setup_generation_blackout_windows(), 'attempted_setups': len(list(setups or [])), 'target_uids': target_uids},
                 )
-                return stats
         except Exception:
             pass
         for s in (setups or []):
@@ -26070,12 +26072,16 @@ def db_log_generated_setup(user_id: int, source: str, session: str, s) -> None:
     con = None
     ts_now = float(time.time())
     try:
+        # yver51: never suppress generated_setups logging during blackout.
+        # This keeps the shadow/audit database complete so /setup_open_times can
+        # identify better future blackout windows. Delivery and AutoTrade entry
+        # blackouts are enforced downstream, not here.
         try:
             src_l = str(source or '').strip().lower()
             if src_l in {'screen', 'exec', 'email', 'bigmove_email', 'executable', 'setup', 'autotrade'}:
                 _blk, _why = _setup_generation_blackout_now(ts_now)
                 if _blk:
-                    return
+                    pass
         except Exception:
             pass
         try:
@@ -41966,6 +41972,7 @@ ADMIN_HELP_DESCRIPTIONS = {
     "setup_audit_keep": "Multi-window KEEP-only setup summary table: Last 24h, 7d, 14d, Overall; same columns as /setup_audit_keep_watch",
     "setup_keep_watch_summary": "Alias of /setup_audit_keep_watch",
     "setup_audit_compare": "Reconcile bot-created AutoTrade closes against /setup_audit price-path results; exchange-only rows are marked BYBIT_ONLY: /setup_audit_compare 24",
+    "setup_open_times": "KEEP-only setup opening-time analysis for manual blackout selection: /setup_open_times, /setup_open_times 24, /setup_open_times 7d",
     "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix 24, /setup_matrix 168, /setup_matrix policy, /setup_matrix deep 168, /setup_matrix safety",
     "setup_edge_matrix": "Alias of /setup_matrix for the DB-backed family/session edge matrix",
     "setup_deep_analysis": "Deep setup analytics: family/session, symbol, side, Melbourne hour/day, regime buckets. Usage: /setup_deep_analysis 168",
@@ -42022,7 +42029,7 @@ ADMIN_HELP_GROUPS = [
     ("🧰 SUPPORT / OPS", ["support_open", "support_close"]),
     ("⚡ QUICK ADMIN SNAPSHOTS", ["health_sys", "dev_status", "health", "why", "edge_status", "learning_status", "optimizer_status", "autopilot_status", "adaptive_status", "goal_status", "winrate", "ny_winrate", "lessons_learned", "email_decision", "email_pipeline_status", "setups_log", "setup_audit", "setup_audit_overall"]),
     ("⚙️ HEAVY / BACKGROUND RUNS", ["adaptive_run", "goal_run", "goal_set", "goal_abort", "universe_backtest", "optimize", "optimize_report", "self_optimize_report", "autopilot_report"]),
-    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_audit_overall", "setup_audit_keep_watch", "setup_audit_keep", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
+    ("📊 SETUP AUDIT / REPORTS", ["setup_audit", "setup_audit_compare", "setup_open_times", "setup_audit_overall", "setup_audit_keep_watch", "setup_audit_keep", "setup_matrix", "setup_edge_matrix", "setup_deep_analysis"]),
     ("🤖 AUTOTRADE (OWNER / ADMIN)", ["autotrade_on", "autotrade_off", "autotrade_debug", "autotrade_debug_reset", "autotrade_last", "autotrade_fix_exits", "autotrade_flat_now", "autotrade_report", "autotrade_closed", "autotrade_report_overall", "autotrade_report_matrix", "performance_report", "trade_lifecycle", "trade_lifecycle_detail", "autotrade_sessions", "autotrade_config", "open_trades"]),
     ("⏱️ COOLDOWNS", ["cooldown_clear", "cooldown_clear_all"]),
     ("⚙️ DATA / RECOVERY", ["admin_reset_report", "admin_reset_test_data", "admin_reset_signal_reports", "reset", "restore"]),
@@ -43072,7 +43079,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL', 'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK',
             'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP',
             'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS',
-            'BLACKOUT_ENABLED', 'BLACKOUT_WINDOWS', 'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', 'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS',
+            'BLACKOUT_ENABLED', 'BLACKOUT_WINDOWS', 'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', 'SETUP_SHADOW_GENERATION_ENABLED', 'SETUP_DELIVERY_BLACKOUT_ENABLED', 'SETUP_DELIVERY_BLACKOUT_WINDOWS', 'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS',
             'AUTOTRADE_ALLOW_WATCH_POLICY', 'USER_VISIBLE_ALLOW_WATCH_POLICY', 'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED', 'AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED', 'AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR', 'AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR',
             'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE', 'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED',
             'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', 'SETUP_REVERSE_TARGET_RR',
@@ -43145,15 +43152,17 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP false',
             '',
             'Examples — blackout windows:',
+            'Setup generation is always SHADOW ON. These keys control only /screen setup delivery, setup emails, and AutoTrade entries.',
             '• /autotrade_config BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00',
             '• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00',
             '• /autotrade_config BLACKOUT_ENABLED true',
             '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00',
             '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_ADD_WINDOW 13:00-14:00',
             '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_ENABLED true',
-            '• /autotrade_config SETUP_GENERATION_BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00',
-            '• /autotrade_config SETUP_GENERATION_BLACKOUT_ADD_WINDOW 13:00-14:00',
-            '• /autotrade_config SETUP_GENERATION_BLACKOUT_ENABLED true',
+            '• /autotrade_config SETUP_DELIVERY_BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00',
+            '• /autotrade_config SETUP_DELIVERY_BLACKOUT_ADD_WINDOW 13:00-14:00',
+            '• /autotrade_config SETUP_DELIVERY_BLACKOUT_ENABLED true',
+            'Legacy aliases still work: SETUP_GENERATION_BLACKOUT_* now means delivery blackout, not generation stop.',
             '',
             'Examples — policy / router:',
             '• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY false',
@@ -43217,7 +43226,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Max open trades: {int(summary['AUTOTRADE_MAX_OPEN_TRADES'])} | Max trades/day: {max_day_txt}",
             f"Max entry drift: {float(summary.get('AUTOTRADE_MAX_ENTRY_DRIFT_PCT', 1.0)):.2f}% | Entry window: {int(summary.get('AUTOTRADE_ENTRY_WINDOW_MIN', 60))}m",
             f"Entry blackout: {'ON' if bool(summary.get('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)) else 'OFF'} | {str(summary.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', '-') or '-')} Melbourne",
-            f"Setup blackout: {'ON' if bool(summary.get('SETUP_GENERATION_BLACKOUT_ENABLED', True)) else 'OFF'} | {str(summary.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '-') or '-')} Melbourne",
+            "Setup generation: SHADOW ON (audit learning continues during blackout)",
+            f"Setup delivery blackout: {'ON' if bool(summary.get('SETUP_GENERATION_BLACKOUT_ENABLED', True)) else 'OFF'} | {str(summary.get('SETUP_GENERATION_BLACKOUT_WINDOWS', '-') or '-')} Melbourne",
             "",
             "TP/SL & RR",
             rr_line,
@@ -43252,6 +43262,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS none",
             "• /autotrade_config BLACKOUT_WINDOWS 10:00-12:00,SUN 22:00-MON 10:00",
             "• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00",
+            "  (sets AutoTrade entry + setup delivery blackout; setup generation stays SHADOW ON)",
             "• /autotrade_on  /  /autotrade_off",
             "",
             "For all keys: /autotrade_config FULL",
@@ -43275,7 +43286,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED', 'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR', 'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP', 'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED',
         'BLACKOUT_ENABLED', 'BLACKOUT_WINDOWS', 'BLACKOUT_ADD_WINDOW',
         'AUTOTRADE_ENTRY_BLACKOUT_ENABLED', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', 'AUTOTRADE_ENTRY_BLACKOUT_ADD_WINDOW',
-        'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS', 'SETUP_GENERATION_BLACKOUT_ADD_WINDOW',
+        'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_GENERATION_BLACKOUT_WINDOWS', 'SETUP_GENERATION_BLACKOUT_ADD_WINDOW', 'SETUP_DELIVERY_BLACKOUT_ENABLED', 'SETUP_DELIVERY_BLACKOUT_WINDOWS', 'SETUP_DELIVERY_BLACKOUT_ADD_WINDOW',
         'AUTOTRADE_MAX_POSITION_HOURS_ENABLED', 'AUTOTRADE_MAX_POSITION_HOURS',
         'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY',
         'AUTOTRADE_STRICT_TPSL_ONLY', 'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY', 'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH', 'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL',
@@ -43364,14 +43375,14 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             val = _append_melbourne_blackout_window(_autotrade_entry_blackout_windows(), value_raw)
             _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, val)
             _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1 if val else 0)
-        elif key == 'SETUP_GENERATION_BLACKOUT_ENABLED':
+        elif key in {'SETUP_GENERATION_BLACKOUT_ENABLED', 'SETUP_DELIVERY_BLACKOUT_ENABLED'}:
             val = str(value_raw or '').strip().lower() in {'1', 'true', 'yes', 'on'}
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if val else 0)
-        elif key == 'SETUP_GENERATION_BLACKOUT_WINDOWS':
+        elif key in {'SETUP_GENERATION_BLACKOUT_WINDOWS', 'SETUP_DELIVERY_BLACKOUT_WINDOWS'}:
             val = _normalise_melbourne_blackout_windows(value_raw, default=_blackout_default_windows())
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, val)
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if val else 0)
-        elif key == 'SETUP_GENERATION_BLACKOUT_ADD_WINDOW':
+        elif key in {'SETUP_GENERATION_BLACKOUT_ADD_WINDOW', 'SETUP_DELIVERY_BLACKOUT_ADD_WINDOW'}:
             val = _append_melbourne_blackout_window(_setup_generation_blackout_windows(), value_raw)
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, val)
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1 if val else 0)
@@ -43548,8 +43559,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         display_key = 'BLACKOUT_WINDOWS'
     elif key in {'AUTOTRADE_ENTRY_BLACKOUT_ADD_WINDOW'}:
         display_key = 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS'
-    elif key in {'SETUP_GENERATION_BLACKOUT_ADD_WINDOW'}:
-        display_key = 'SETUP_GENERATION_BLACKOUT_WINDOWS'
+    elif key in {'SETUP_GENERATION_BLACKOUT_ADD_WINDOW', 'SETUP_DELIVERY_BLACKOUT_ADD_WINDOW'}:
+        display_key = 'SETUP_DELIVERY_BLACKOUT_WINDOWS'
+    elif key in {'SETUP_DELIVERY_BLACKOUT_ENABLED', 'SETUP_DELIVERY_BLACKOUT_WINDOWS'}:
+        display_key = key
     elif key == 'AUTOTRADE_BLOCKED_SYMBOLS':
         await update.message.reply_text(f"✅ Updated {key}. Current value: {_autotrade_format_static_symbol_blocks()}")
         return
@@ -47632,6 +47645,344 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
 
+
+
+def _setup_open_times_parse_scope(arg: str | None = None) -> tuple[str, float | None, int]:
+    """Return (label, start_ts, hours) for /setup_open_times.
+
+    Default is the fixed setup-policy baseline (01 Jun 2026 Melbourne).  Numeric
+    arguments are hours; 7d/week and 24h are accepted for quick blackout tuning.
+    """
+    try:
+        a = str(arg or '').strip().lower()
+        now_ts = float(time.time())
+        if not a or a in {'all', 'overall', 'start', 'baseline', 'since'}:
+            st = float(_overall_report_start_ts() or 0.0)
+            return (f"from {_overall_report_start_txt()} Melbourne", st, 0)
+        if a in {'24', '24h', '1d', 'day', 'today'}:
+            return ('last 24h', now_ts - 24.0 * 3600.0, 24)
+        if a in {'7d', '7', 'week', 'lastweek', 'last_week'}:
+            return ('last 7d', now_ts - 7.0 * 86400.0, 168)
+        if a in {'14d', '14', 'fortnight'}:
+            return ('last 14d', now_ts - 14.0 * 86400.0, 336)
+        m = re.fullmatch(r'(\d+(?:\.\d+)?)(h|hr|hrs|hour|hours|d|day|days)?', a)
+        if m:
+            val = float(m.group(1))
+            unit = str(m.group(2) or 'h').lower()
+            hours = int(max(1, min(8760, round(val * 24.0 if unit.startswith('d') else val))))
+            if hours >= 24 and hours % 24 == 0:
+                label = f"last {hours//24}d"
+            else:
+                label = f"last {hours}h"
+            return (label, now_ts - float(hours) * 3600.0, hours)
+    except Exception:
+        pass
+    try:
+        st = float(_overall_report_start_ts() or 0.0)
+    except Exception:
+        st = 0.0
+    return (f"from {_overall_report_start_txt()} Melbourne", st, 0)
+
+
+def _setup_open_times_help_text() -> str:
+    return (
+        "⏱️ <b>Setup Opening-Time Analysis</b>\n" + HDR + "\n"
+        "KEEP-only setup-time analysis to choose accurate blackout windows.\n\n"
+        "Usage:\n"
+        "• <code>/setup_open_times</code> — from 01 Jun 2026 baseline\n"
+        "• <code>/setup_open_times 24</code> — last 24h\n"
+        "• <code>/setup_open_times 7d</code> — last 7d\n"
+        "• <code>/setup_open_times 14d</code> — last 14d\n"
+        "• <code>/setup_open_times all 300</code> — baseline analysis, show 300 rows\n\n"
+        "Aliases: <code>/setup_blackout_analysis</code>, <code>/setup_opening_times</code>, <code>/setup_times</code>."
+    )
+
+
+def _setup_open_times_interval_label(hours: list[int]) -> str:
+    try:
+        if not hours:
+            return '-'
+        hs = sorted({int(h) % 24 for h in hours})
+        if not hs:
+            return '-'
+        # Build segments on a duplicated 24h ring, then choose the natural non-wrapping
+        # representation unless the interval crosses midnight.
+        if len(hs) == 24:
+            return '00:00-24:00'
+        segs = []
+        start = prev = hs[0]
+        for h in hs[1:]:
+            if h == prev + 1:
+                prev = h
+            else:
+                segs.append((start, prev))
+                start = prev = h
+        segs.append((start, prev))
+        labels = []
+        for a, b in segs:
+            labels.append(f"{a:02d}:00-{((b + 1) % 24):02d}:00" if (b + 1) < 24 else f"{a:02d}:00-24:00")
+        return ','.join(labels)
+    except Exception:
+        return '-'
+
+
+def _setup_open_times_proposals(hour_stats: dict[int, dict], *, scope_hours: int = 0) -> list[dict]:
+    """Pick concise blackout candidates from hourly KEEP setup evidence.
+
+    A blackout candidate is an hour with decided evidence where TP/SL performance is
+    below target.  Open/NOHIT rows are displayed in the detailed table but excluded
+    from WR, same as the existing setup-audit methodology.
+    """
+    try:
+        min_decided = 1 if int(scope_hours or 0) and int(scope_hours or 0) <= 48 else 3
+    except Exception:
+        min_decided = 3
+    bad_hours = []
+    for h in range(24):
+        st = dict(hour_stats.get(h) or {})
+        dec = int(st.get('tp', 0) or 0) + int(st.get('sl', 0) or 0)
+        if dec < min_decided:
+            continue
+        wr = (float(st.get('tp', 0) or 0) / dec * 100.0) if dec else 0.0
+        avg_r = (float(st.get('r_sum', 0.0) or 0.0) / dec) if dec else 0.0
+        # Target is not just WR>50. With 1.5R+ setups, 45-50% may be acceptable;
+        # however for blackout tuning we want to remove hours with weak edge or net-negative R.
+        if wr < 45.0 or avg_r < 0.05:
+            bad_hours.append(h)
+    if not bad_hours:
+        return []
+
+    # Merge consecutive hours.  Keep it simple and readable for Telegram.
+    bad_hours = sorted(set(bad_hours))
+    segments = []
+    start = prev = bad_hours[0]
+    for h in bad_hours[1:]:
+        if h == prev + 1:
+            prev = h
+        else:
+            segments.append(list(range(start, prev + 1)))
+            start = prev = h
+    segments.append(list(range(start, prev + 1)))
+    # Merge wrap-around segments like 23 and 0 if present.
+    try:
+        if len(segments) > 1 and segments[0][0] == 0 and segments[-1][-1] == 23:
+            merged = segments[-1] + segments[0]
+            segments = [merged] + segments[1:-1]
+    except Exception:
+        pass
+
+    props = []
+    for seg in segments:
+        tp = sl = nh = op = set_n = 0
+        r_sum = 0.0
+        for h in seg:
+            st = dict(hour_stats.get(int(h) % 24) or {})
+            tp += int(st.get('tp', 0) or 0)
+            sl += int(st.get('sl', 0) or 0)
+            nh += int(st.get('nh', 0) or 0)
+            op += int(st.get('open', 0) or 0)
+            set_n += int(st.get('set', 0) or 0)
+            r_sum += float(st.get('r_sum', 0.0) or 0.0)
+        dec = tp + sl
+        wr = (tp / dec * 100.0) if dec else 0.0
+        avg_r = (r_sum / dec) if dec else 0.0
+        props.append({
+            'hours': [int(h) % 24 for h in seg],
+            'label': _setup_open_times_interval_label([int(h) % 24 for h in seg]),
+            'set': set_n,
+            'tp': tp,
+            'sl': sl,
+            'nh': nh,
+            'open': op,
+            'wr': wr,
+            'avg_r': avg_r,
+            'score': (avg_r, wr, -dec),
+        })
+    props = sorted(props, key=lambda x: (float(x.get('avg_r', 0.0)), float(x.get('wr', 0.0)), -int((x.get('tp',0) or 0)+(x.get('sl',0) or 0))))
+    return props[:4]
+
+
+def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> str:
+    """KEEP-only setup opening-time analysis for manual blackout selection."""
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(owner_uid or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+
+    scope_label, start_ts, scope_hours = _setup_open_times_parse_scope(scope)
+    try:
+        row_limit = max(20, min(600, int(rows_limit or 220)))
+    except Exception:
+        row_limit = 220
+
+    try:
+        lane_sets = _setup_matrix_policy_current_lane_sets(uid_i) or {}
+        keep_combos = set(lane_sets.get('keep') or set())
+    except Exception:
+        keep_combos = set()
+
+    try:
+        rows = _setup_audit_load_rows(
+            int(uid_i),
+            hours=None,
+            limit=0,
+            dedup=True,
+            start_ts=float(start_ts or 0.0),
+            apply_final_quality_gate=False,
+            source_mode_override='ALL',
+        )
+        source_label = 'EXECUTABLE+GENERATED'
+    except Exception:
+        rows, source_label = [], 'EXECUTABLE+GENERATED'
+
+    result_horizon = _setup_audit_result_horizon_hours()
+
+    def _row_combo_u(r: dict) -> str:
+        try:
+            fam = _setup_audit_family_code(r)
+            sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+            strat = _setup_strategy_short_label(r)
+            side_row = _setup_side_suffix(value=str(r.get('side') or ''))
+            return str(_setup_combo_strategy_side_key(fam, sess_row, strat, side_row) or '').upper().strip()
+        except Exception:
+            return ''
+
+    matched: list[dict] = []
+    hour_stats: dict[int, dict] = defaultdict(lambda: {'set': 0, 'tp': 0, 'sl': 0, 'nh': 0, 'open': 0, 'r_sum': 0.0})
+    for r in list(rows or []):
+        try:
+            combo_u = _row_combo_u(r)
+            if combo_u not in keep_combos:
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if ts <= 0:
+                continue
+            res = _setup_audit_keep_watch_fast_result_label(r, result_horizon)
+            res = _setup_audit_result_label(res)
+            local_dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+            h = int(local_dt.hour)
+            st = hour_stats[h]
+            st['set'] += 1
+            if res == 'TP':
+                st['tp'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or 0.0)
+            elif res == 'SL':
+                st['sl'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or -1.0)
+            elif res == 'NOHIT':
+                st['nh'] += 1
+            else:
+                st['open'] += 1
+            matched.append({**dict(r or {}), '_combo': combo_u, '_res': res, '_time_txt': local_dt.strftime('%m-%d %H:%M')})
+        except Exception:
+            continue
+
+    matched = sorted(matched, key=lambda x: float(_setup_audit_row_ts(x) or 0.0), reverse=True)
+    proposals = _setup_open_times_proposals(hour_stats, scope_hours=int(scope_hours or 0))
+
+    top_lines = []
+    if proposals:
+        # The top section intentionally contains only the proposed windows, per owner request.
+        for p in proposals[:3]:
+            dec = int(p.get('tp', 0) or 0) + int(p.get('sl', 0) or 0)
+            top_lines.append(
+                f"• <b>{html.escape(str(p.get('label') or '-'))}</b> — WR {float(p.get('wr', 0.0)):.1f}% | AvgR {float(p.get('avg_r', 0.0)):+.2f} | TP/SL {int(p.get('tp',0) or 0)}/{int(p.get('sl',0) or 0)} | Set {int(p.get('set',0) or 0)}"
+            )
+    else:
+        top_lines.append("• <b>No blackout suggested</b> — no KEEP setup-time hour had enough weak decided evidence in this window.")
+
+    detail_rows = []
+    for r in matched[:row_limit]:
+        try:
+            sym = str(r.get('symbol') or '').upper().strip()
+            if sym.endswith('USDT'):
+                sym = sym[:-4]
+            side = str(r.get('side') or '').upper().strip()
+            detail_rows.append([
+                str(r.get('_time_txt') or '-'),
+                sym or '-',
+                side or '-',
+                str(r.get('_combo') or '-'),
+                'KEEP',
+                str(r.get('_res') or '-'),
+            ])
+        except Exception:
+            continue
+    table = tabulate(
+        detail_rows,
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'Res'],
+        tablefmt='plain',
+        colalign=('left', 'left', 'center', 'left', 'center', 'center'),
+    ) if detail_rows else 'No KEEP setup rows matched this window.'
+
+    try:
+        win = _setup_audit_window_summary(matched)
+        start_txt = str(win.get('start_txt') or '-')
+        end_txt = str(win.get('end_txt') or '-')
+    except Exception:
+        start_txt = end_txt = '-'
+
+    decided = sum(int((st or {}).get('tp', 0) or 0) + int((st or {}).get('sl', 0) or 0) for st in hour_stats.values())
+    tp_n = sum(int((st or {}).get('tp', 0) or 0) for st in hour_stats.values())
+    sl_n = sum(int((st or {}).get('sl', 0) or 0) for st in hour_stats.values())
+    wr = (tp_n / decided * 100.0) if decided else 0.0
+    try:
+        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        now_txt = ''
+
+    lines = [
+        "⏱️ <b>KEEP Setup Opening-Time Analysis</b>",
+        HDR,
+        "<b>Suggested blackout windows only:</b>",
+        *top_lines,
+        HDR,
+        f"Window: <b>{html.escape(scope_label)}</b>" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
+        f"Rows: <b>{len(matched)}</b> KEEP setups | Decided: <b>{decided}</b> | TP/SL: <b>{tp_n}/{sl_n}</b> | WR: <b>{wr:.1f}%</b>",
+        f"Data start: <b>{html.escape(start_txt)}</b> | Data end: <b>{html.escape(end_txt)}</b> | Source: <b>{html.escape(source_label)}</b>",
+        "Detailed rows below are KEEP-only setup opening times. Use <code>/setup_open_times 24</code>, <code>/setup_open_times 7d</code>, or <code>/setup_open_times all 400</code>.",
+        "<pre>" + html.escape(table) + "</pre>",
+    ]
+    if len(matched) > row_limit:
+        lines.append(f"Rows shown: <b>{row_limit}</b> / <b>{len(matched)}</b>. Increase the second argument to show more rows, e.g. <code>/setup_open_times all 400</code>.")
+    if not keep_combos:
+        lines.append("No KEEP policy lanes found. Run <code>/setup_matrix policy</code> first.")
+    return "\n".join(lines)
+
+
+async def setup_open_times_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    scope = ''
+    rows_limit = 220
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and args[0].lower() in {'h', 'help', '?', 'guide'}:
+            await send_long_message(update, _setup_open_times_help_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        if args:
+            scope = args[0]
+        if len(args) >= 2 and re.fullmatch(r'\d+', args[1]):
+            rows_limit = int(args[1])
+    except Exception:
+        scope = ''
+        rows_limit = 220
+    scope_label, start_ts, scope_hours = _setup_open_times_parse_scope(scope)
+    cache_scope = str(scope or 'baseline').lower().replace(' ', '_')
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_open_times {html.escape(str(scope or 'all'))}",
+        f"admin:bg:v50:setup_open_times:{int(AUTOTRADE_OWNER_UID or uid)}:{cache_scope}:{int(rows_limit)}:{int(start_ts or 0)}:{int(scope_hours or 0)}",
+        _setup_open_times_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), str(scope or ''), int(rows_limit)),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=90,
+        stale_ttl=12 * 3600,
+        background_timeout=600,
+    )
 
 def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
     """Multi-window summary for current KEEP policy lanes only.
@@ -59346,6 +59697,15 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             latest_delivery_ts = 0.0
         cache_ts = float((cache_entry or {}).get('ts', 0.0) or 0.0)
+        # yver51: /screen setup cards are part of delivery, so blackout hides
+        # cached/recent setup queues while raw generation continues in shadow.
+        screen_delivery_blackout = False
+        try:
+            screen_delivery_blackout, _screen_blk_reason = _setup_delivery_blackout_now()
+            if screen_delivery_blackout:
+                latest_delivery_ts = 0.0
+        except Exception:
+            screen_delivery_blackout = False
 
         # Latest setup email wins over a cached scan only for Pro/trial users and admins,
         # because Standard users do not receive setup emails.
@@ -59394,7 +59754,7 @@ async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        if cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
+        if (not bool(locals().get('screen_delivery_blackout', False))) and cache_entry.get('body') and age <= float(SCREEN_STALE_CACHE_MAX_SEC):
             note = "_Showing latest cached scan. Fresh scan is refreshing in the background._\n"
             if age <= float(SCREEN_CACHE_TTL_SEC):
                 note = "_Showing latest cached scan._\n"
@@ -64576,6 +64936,10 @@ def main():
     app.add_handler(CommandHandler("setup_keep_watch_summary", setup_audit_keep_watch_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_compare", setup_audit_compare_cmd, block=False))
     app.add_handler(CommandHandler("setup_audit_reconcile", setup_audit_compare_cmd, block=False))
+    app.add_handler(CommandHandler("setup_open_times", setup_open_times_cmd, block=False))
+    app.add_handler(CommandHandler("setup_opening_times", setup_open_times_cmd, block=False))
+    app.add_handler(CommandHandler("setup_blackout_analysis", setup_open_times_cmd, block=False))
+    app.add_handler(CommandHandler("setup_times", setup_open_times_cmd, block=False))
     app.add_handler(CommandHandler("setup_matrix", setup_matrix_cmd, block=False))
     app.add_handler(CommandHandler("setup_edge_matrix", setup_matrix_cmd, block=False))
     app.add_handler(CommandHandler("setup_deep_analysis", setup_deep_analysis_cmd, block=False))
@@ -65773,10 +66137,10 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
     meta = {}
     try:
         l = str(lane or '').lower().strip()
-        # During setup blackout: do not send fresh setup emails / autonomous sync
-        # and do not pass the final AutoTrade email-lane gate.  /screen may still
-        # be used for diagnostics/cached context.
-        if l in {'email', 'setup_email', 'bigmove', 'f8', 'screen_sync', 'autotrade'}:
+        # During setup delivery blackout: do not show fresh /screen setup rows,
+        # do not send setup emails/autonomous sync, and do not pass AutoTrade delivery gates.
+        # Raw setup generation still continues as shadow/audit evidence.
+        if l in {'screen', 'email', 'setup_email', 'bigmove', 'f8', 'screen_sync', 'autotrade'}:
             try:
                 blk, why = _setup_generation_blackout_now()
                 if blk:
@@ -66462,6 +66826,107 @@ def main():
 
 # =========================================================
 # end yver48 hardening
+# =========================================================
+
+
+# =========================================================
+# yver51 shadow-generation / delivery-blackout separation
+# =========================================================
+YVER51_VERSION = 'yver51_2026_06_16_shadow_generation_delivery_blackout'
+
+try:
+    _YVER51_ORIG_RUNTIME_SUMMARY_DICT = _autotrade_runtime_summary_dict
+except Exception:
+    _YVER51_ORIG_RUNTIME_SUMMARY_DICT = None
+
+
+def _setup_delivery_blackout_enabled() -> bool:
+    """Setup delivery blackout: blocks /screen setup rows and setup emails only.
+    Raw setup generation remains shadow-on for audit/blackout analysis.
+    Uses the legacy SETUP_GENERATION_BLACKOUT_* storage keys for backward compatibility.
+    """
+    try:
+        return bool(_setup_generation_blackout_enabled())
+    except Exception:
+        return True
+
+
+def _setup_delivery_blackout_windows() -> str:
+    try:
+        return str(_setup_generation_blackout_windows())
+    except Exception:
+        return _blackout_default_windows()
+
+
+def _setup_delivery_blackout_now(now_ts: float | None = None) -> tuple[bool, str]:
+    try:
+        return _setup_generation_blackout_now(now_ts)
+    except Exception:
+        return False, ''
+
+
+def _autotrade_runtime_summary_dict() -> dict:
+    d = {}
+    try:
+        if _YVER51_ORIG_RUNTIME_SUMMARY_DICT is not None:
+            d = dict(_YVER51_ORIG_RUNTIME_SUMMARY_DICT() or {})
+    except Exception:
+        d = {}
+    try:
+        d['SETUP_SHADOW_GENERATION_ENABLED'] = True
+        d['SETUP_DELIVERY_BLACKOUT_ENABLED'] = bool(_setup_delivery_blackout_enabled())
+        d['SETUP_DELIVERY_BLACKOUT_WINDOWS'] = str(_setup_delivery_blackout_windows())
+        # Backward-compatible keys now describe delivery blackout, not generation stop.
+        d['SETUP_GENERATION_BLACKOUT_ENABLED'] = bool(_setup_delivery_blackout_enabled())
+        d['SETUP_GENERATION_BLACKOUT_WINDOWS'] = str(_setup_delivery_blackout_windows())
+        d['BLACKOUT_ENABLED'] = bool(_autotrade_entry_blackout_enabled() and _setup_delivery_blackout_enabled())
+        entry_w = str(_autotrade_entry_blackout_windows())
+        delivery_w = str(_setup_delivery_blackout_windows())
+        d['BLACKOUT_WINDOWS'] = entry_w if entry_w == delivery_w else f"entry={entry_w} | delivery={delivery_w}"
+    except Exception:
+        pass
+    return d
+
+
+def _yver51_apply_runtime_flags() -> None:
+    try:
+        _autotrade_migrate_tables()
+        # Keep AutoTrade entry blackout ON by default.
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+        # Keep setup DELIVERY blackout ON by default, while generation is shadow-on in code.
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+        try:
+            cur_entry = str(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, '') or '').strip()
+            cur_delivery = str(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, '') or '').strip()
+            default_w = _normalise_melbourne_blackout_windows(_blackout_default_windows(), default='10:00-12:00,SUN 22:00-MON 10:00')
+            if not cur_entry:
+                _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, default_w)
+            if not cur_delivery:
+                _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, default_w)
+        except Exception:
+            pass
+        _autotrade_config_set('yver51_shadow_generation_delivery_blackout_version', YVER51_VERSION)
+    except Exception:
+        pass
+
+
+try:
+    _YVER51_ORIG_MAIN = main
+except Exception:
+    _YVER51_ORIG_MAIN = None
+
+
+def main():
+    try:
+        _yver51_apply_runtime_flags()
+    except Exception:
+        pass
+    if _YVER51_ORIG_MAIN is not None:
+        return _YVER51_ORIG_MAIN()
+    return None
+
+# =========================================================
+# end yver51 shadow-generation / delivery-blackout separation
 # =========================================================
 
 if __name__ == "__main__":
