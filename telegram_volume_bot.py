@@ -1,4 +1,5 @@
 # yver49: makes the multi-day Leaders/Losers direction block explicitly rolling/expiring: 2+ appearances inside the last 3 Melbourne days only; current Leader/Loser still blocks only while current.
+# yver52: adds concise /setup_matrix policy metadata above the table: latest refresh time, actual setup database start, and 1 Jun policy baseline; bumps policy cache key.
 # yver51: separates continuous shadow setup generation from delivery/AutoTrade blackout; setup generation/audit learning never stops, while /screen setup display, setup emails, and AutoTrade entries respect blackout windows.
 # yver50: adds /setup_open_times (/setup_blackout_analysis) KEEP-only setup-time analysis from 01 Jun/24h/7d, with proposed blackout windows and detailed Time/Sym/Side/Combo/Policy/Res rows; no live config changes.
 # yver48: hard-locks live AutoTrade to /setup_matrix Policy=KEEP at the exact open gate, generalizes Leaders/Losers direction blocking beyond BTC/ETH/SOL with rolling expiring 2-of-3-day memory, adds Policy-at-open to /setup_audit_compare, and makes the matrix policy refresh every 3h.
@@ -51871,6 +51872,65 @@ def _setup_combo_policy_view_maybe_auto_safety(uid: int) -> dict:
         return {'ok': False, 'reason': f'{type(exc).__name__}: {exc}'}
 
 
+def _setup_matrix_policy_format_mel_ts(ts_val) -> str:
+    """Format a unix timestamp in Melbourne time for compact policy headers."""
+    try:
+        ts_f = float(ts_val or 0)
+        if ts_f <= 0:
+            return '-'
+        return datetime.fromtimestamp(ts_f, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        return '-'
+
+
+def _setup_matrix_policy_database_start_ts(owner_uid: int = 0) -> float:
+    """Earliest known setup timestamp across setup/audit queues.
+
+    This is shown only as a compact diagnostic in /setup_matrix policy.  It is
+    deliberately independent from the policy evidence baseline, because the DB
+    may contain older retained setup rows while policy scoring starts from the
+    configured baseline (currently 2026-06-01).
+    """
+    candidates = []
+    checks = [
+        ('setup_audit_results', 'created_ts'),
+        ('executable_setups', 'signal_created_ts'),
+        ('executable_setups', 'executable_ts'),
+        ('generated_setups', 'created_ts'),
+        ('emailed_setups', 'emailed_ts'),
+    ]
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            for table, col in checks:
+                try:
+                    exists = cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", (table,)).fetchone()
+                    if not exists:
+                        continue
+                    cols = [r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall() or []]
+                    if col not in cols:
+                        continue
+                    where = f"COALESCE({col},0)>0"
+                    params = []
+                    if 'user_id' in cols and int(owner_uid or 0) > 0:
+                        where += " AND user_id IN (?,0)"
+                        params.extend([int(owner_uid or 0)])
+                    row = cur.execute(f"SELECT MIN({col}) FROM {table} WHERE {where}", tuple(params)).fetchone()
+                    if row and row[0]:
+                        ts = float(row[0] or 0)
+                        # Reject obvious malformed millisecond timestamps here; DB uses seconds.
+                        if 946684800 <= ts <= 4102444800:
+                            candidates.append(ts)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    try:
+        return min(candidates) if candidates else 0.0
+    except Exception:
+        return 0.0
+
+
 def _setup_combo_policy_text(uid: int) -> str:
     try:
         owner_uid = int(uid or 0)
@@ -51915,6 +51975,8 @@ def _setup_combo_policy_text(uid: int) -> str:
             rows = [r for r in rows if not _setup_policy_row_is_clean_start_legacy(r)]
 
         latest_scores = {}
+        latest_refresh_ts = 0.0
+        latest_run_id = ''
         try:
             with sqlite3.connect(DB_PATH) as conn3:
                 conn3.row_factory = sqlite3.Row
@@ -51922,10 +51984,15 @@ def _setup_combo_policy_text(uid: int) -> str:
                 ids = [int(owner_uid), 0]
                 qmarks = ','.join(['?'] * len(ids))
                 latest = cur3.execute(
-                    f"SELECT run_id FROM setup_combo_scores WHERE user_id IN ({qmarks}) ORDER BY evaluated_ts DESC LIMIT 1",
+                    f"SELECT run_id, evaluated_ts FROM setup_combo_scores WHERE user_id IN ({qmarks}) ORDER BY evaluated_ts DESC LIMIT 1",
                     tuple(ids)
                 ).fetchone()
                 if latest and latest['run_id']:
+                    latest_run_id = str(latest['run_id'] or '')
+                    try:
+                        latest_refresh_ts = float(latest['evaluated_ts'] or 0.0)
+                    except Exception:
+                        latest_refresh_ts = 0.0
                     for sr in cur3.execute("SELECT * FROM setup_combo_scores WHERE run_id=?", (latest['run_id'],)).fetchall() or []:
                         d = dict(sr)
                         combo = str(d.get('combo') or f"{d.get('family','')}-{d.get('session','')}-{d.get('strategy','NOR')}-{d.get('side','BOTH')}").upper().strip()
@@ -51939,6 +52006,11 @@ def _setup_combo_policy_text(uid: int) -> str:
                             latest_scores.setdefault(base_combo, d)
         except Exception:
             latest_scores = {}
+        try:
+            if float(latest_refresh_ts or 0.0) <= 0.0:
+                latest_refresh_ts = max([float((r or {}).get('updated_ts') or 0.0) for r in (rows or [])] or [0.0])
+        except Exception:
+            latest_refresh_ts = 0.0
 
         policy_by_combo = _setup_combo_enforceable_policy_lookup(int(owner_uid))
         families = set()
@@ -52103,8 +52175,17 @@ def _setup_combo_policy_text(uid: int) -> str:
         table_rows = sorted(table_rows, key=_row_key)
         table = tabulate(table_rows, headers=['Combo','ExecNow','Policy','Set','WR','AvgR','Reco'], tablefmt='plain')
 
+        latest_txt = _setup_matrix_policy_format_mel_ts(latest_refresh_ts)
+        db_start_txt = _setup_matrix_policy_format_mel_ts(_setup_matrix_policy_database_start_ts(owner_uid))
+        try:
+            baseline_txt = _overall_report_start_txt()
+        except Exception:
+            baseline_txt = '2026-06-01 00:00'
+
         return (
             f"📈 <b>Setup Combo Policy</b>\n{HDR}\n"
+            f"Latest refresh: <b>{html.escape(latest_txt)}</b> Melbourne\n"
+            f"Database start: <b>{html.escape(db_start_txt)}</b> Melbourne | Policy baseline: <b>{html.escape(str(baseline_txt))}</b> Melbourne\n"
             f"<pre>{html.escape(table)}</pre>"
         )
     except Exception as e:
@@ -52121,7 +52202,7 @@ async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_cached_or_queue_admin_report(
             update,
             "/setup_matrix policy",
-            f"admin:bg:v41:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+            f"admin:bg:v52:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
             _setup_combo_policy_text,
             args=(int(AUTOTRADE_OWNER_UID or uid),),
             parse_mode=ParseMode.HTML,
