@@ -1,3 +1,5 @@
+# yver49: makes the multi-day Leaders/Losers direction block explicitly rolling/expiring: 2+ appearances inside the last 3 Melbourne days only; current Leader/Loser still blocks only while current.
+# yver48: hard-locks live AutoTrade to /setup_matrix Policy=KEEP at the exact open gate, generalizes Leaders/Losers direction blocking beyond BTC/ETH/SOL with rolling expiring 2-of-3-day memory, adds Policy-at-open to /setup_audit_compare, and makes the matrix policy refresh every 3h.
 # yver47: adds hard blackout/email delivery enforcement, broad core-market direction guard, dynamic TP/RR/live risk hardening, daily-loss safety, and dust-risk skip to improve live AutoTrade profitability.
 # yver45: hard-enforces Directional Leaders/Losers before policy KEEP overrides, blocks leader SELL/loser BUY in /screen/email/executable/AutoTrade, and forces direct KEEP queue entry so fresh KEEP rows are not NO_EMAIL-blocked.
 # yver46: hardens /autotrade_last diagnostics: prevents stale global AutoTrade detail from overwriting the candidate symbol/entry/SL, improves risk% fallback, and collapses near-duplicate attempt rows in display. No trading/risk/policy changes.
@@ -48345,7 +48347,8 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 mismatch += 1
             else:
                 unresolved += 1
-            rows.append([_fmt_ts(close_ts), sym, side, f"{pnl:.2f}", actual, setup_time, audit_res, verdict])
+            policy_open = _setup_audit_compare_policy_at_open(tr, setup)
+            rows.append([_fmt_ts(close_ts), sym, side, policy_open, f"{pnl:.2f}", actual, setup_time, audit_res, verdict])
         except Exception:
             continue
 
@@ -48359,7 +48362,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         f"Window: <b>last {hours}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
         "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
         "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
-        "AT = actual realised AutoTrade close from Bybit/journal. Audit = independent matched setup price-path result.",
+        "AT = actual realised AutoTrade close from Bybit/journal. Audit = independent matched setup price-path result. Policy = stored policy at open when available; otherwise reconstructed from matched setup/current matrix.",
         "yver149 matching: setup_id/open-time must fit the AutoTrade entry deadline. Trades opened before the selected compare window but closed inside it can still match their original setup when journal/open-time evidence is reliable; close-only legacy rows remain guarded.",
         "Precision: mismatched TP/SL rows are rechecked with targeted 1m candles before DIFF is shown.",
         f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
@@ -48370,9 +48373,9 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         return "\n".join(lines)
     table = tabulate(
         rows,
-        headers=['Close', 'Sym', 'Side', 'PnL', 'AT', 'Setup', 'Audit', 'Chk'],
+        headers=['Close', 'Sym', 'Side', 'Policy', 'PnL', 'AT', 'Setup', 'Audit', 'Chk'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'right', 'center', 'left', 'center', 'center'),
+        colalign=('left', 'left', 'center', 'center', 'right', 'center', 'left', 'center', 'center'),
     )
     lines.append("<pre>" + html.escape(table) + "</pre>")
     lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close still disagrees with setup path after targeted 1m recheck, NON_TPSL=historical/manual/time/profit/inferred close with mismatched or unresolved setup path ignored for setup-audit scoring, PENDING=audit still OPEN/NOHIT, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
@@ -65886,5 +65889,585 @@ def main():
 # end yver47 hardening
 # =========================================================
 
+
+# =========================================================
+# yver48 hard KEEP-only execution + generalized Leaders/Losers guard
+# =========================================================
+YVER48_VERSION = 'yver48_2026_06_16_keep_only_multiday_direction_policy_compare'
+
+# General directional context.  The old yver47 core guard protected BTC/ETH/SOL;
+# yver48 expands the same idea to every liquid symbol that is either a current
+# strong 24h leader/loser or has appeared in the Leaders/Losers context on 2+
+# days inside a rolling/expiring Melbourne-day window.  This prevents EVAA-style Leader shorts and Loser longs before
+# matrix KEEP can override the direction guard.
+DIRECTIONAL_CONTEXT_MEMORY_ENABLED = env_bool('DIRECTIONAL_CONTEXT_MEMORY_ENABLED', True)
+DIRECTIONAL_CONTEXT_MEMORY_DAYS_REQUIRED = int(os.environ.get('DIRECTIONAL_CONTEXT_MEMORY_DAYS_REQUIRED', '2') or 2)
+DIRECTIONAL_CONTEXT_MEMORY_LOOKBACK_DAYS = int(os.environ.get('DIRECTIONAL_CONTEXT_MEMORY_LOOKBACK_DAYS', '3') or 3)
+DIRECTIONAL_CONTEXT_CURRENT_MIN_VOL_USD = float(os.environ.get('DIRECTIONAL_CONTEXT_CURRENT_MIN_VOL_USD', str(_setup_min_volume_floor_usd() if '_setup_min_volume_floor_usd' in globals() else 10_000_000.0)) or 10_000_000.0)
+DIRECTIONAL_CONTEXT_CURRENT_LEADER_24H_MIN = float(os.environ.get('DIRECTIONAL_CONTEXT_CURRENT_LEADER_24H_MIN', '10.0') or 10.0)
+DIRECTIONAL_CONTEXT_CURRENT_LOSER_24H_MAX = float(os.environ.get('DIRECTIONAL_CONTEXT_CURRENT_LOSER_24H_MAX', '-10.0') or -10.0)
+
+
+def _yver48_melbourne_date_from_ts(ts: float | None = None) -> str:
+    try:
+        t = float(ts if ts is not None else time.time())
+        return datetime.fromtimestamp(t, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d')
+    except Exception:
+        return datetime.now(MEL_TZ).strftime('%Y-%m-%d')
+
+
+def _yver48_direction_context_migrate() -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS directional_context_days (
+                    symbol TEXT NOT NULL,
+                    bucket TEXT NOT NULL,
+                    local_date TEXT NOT NULL,
+                    first_ts REAL NOT NULL DEFAULT 0,
+                    last_ts REAL NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT '',
+                    ch24 REAL NOT NULL DEFAULT 0,
+                    ch4 REAL NOT NULL DEFAULT 0,
+                    vol_usd REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY(symbol, bucket, local_date)
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_directional_context_days_lookup ON directional_context_days(symbol,bucket,local_date)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _yver48_extract_context_tuple(item) -> tuple[str, float, float, float]:
+    """Return (base, ch24, ch4, vol_usd) from MarketVol or directional tuple."""
+    try:
+        if isinstance(item, (list, tuple)):
+            # Directional rows are usually (base, vol, ch24, ch4, px).  Screen
+            # leaders/losers are usually (base, MarketVol).
+            if len(item) >= 5 and isinstance(item[1], (int, float)):
+                return str(item[0]).upper().strip(), float(item[2] or 0.0), float(item[3] or 0.0), float(item[1] or 0.0)
+            if len(item) >= 2:
+                base = str(item[0]).upper().strip()
+                mv = item[1]
+                ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0)
+                vol = float(usd_notional(mv) or 0.0)
+                return base, ch24, 0.0, vol
+        if isinstance(item, dict):
+            base = str(item.get('symbol') or item.get('base') or item.get('sym') or '').upper().strip()
+            return base, float(item.get('ch24') or item.get('pct24') or item.get('change24h') or 0.0), float(item.get('ch4') or 0.0), float(item.get('vol_usd') or item.get('fut_vol_usd') or item.get('volume') or 0.0)
+    except Exception:
+        pass
+    return '', 0.0, 0.0, 0.0
+
+
+def _yver48_record_direction_context_rows(leaders=None, losers=None, source: str = '') -> None:
+    try:
+        if not bool(globals().get('DIRECTIONAL_CONTEXT_MEMORY_ENABLED', True)):
+            return
+        _yver48_direction_context_migrate()
+        now_ts = float(time.time())
+        d = _yver48_melbourne_date_from_ts(now_ts)
+        rows = []
+        for bucket, seq in (('LEADER', leaders or []), ('LOSER', losers or [])):
+            for it in list(seq or [])[:20]:
+                base, ch24, ch4, vol = _yver48_extract_context_tuple(it)
+                base = _symbol_base(base).upper().strip()
+                if not base:
+                    continue
+                if vol and vol < float(globals().get('DIRECTIONAL_CONTEXT_CURRENT_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0):
+                    continue
+                rows.append((base, bucket, d, now_ts, now_ts, str(source or '')[:80], float(ch24), float(ch4), float(vol)))
+        if not rows:
+            return
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            for r in rows:
+                c.execute("""
+                    INSERT INTO directional_context_days(symbol,bucket,local_date,first_ts,last_ts,source,ch24,ch4,vol_usd)
+                    VALUES(?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(symbol,bucket,local_date) DO UPDATE SET
+                      last_ts=excluded.last_ts,
+                      source=excluded.source,
+                      ch24=excluded.ch24,
+                      ch4=excluded.ch4,
+                      vol_usd=MAX(directional_context_days.vol_usd, excluded.vol_usd)
+                """, r)
+            # prune old context; keep enough history for the 2-day guard plus buffer
+            try:
+                cutoff_ts = now_ts - max(3, int(globals().get('DIRECTIONAL_CONTEXT_MEMORY_LOOKBACK_DAYS', 4) or 4) + 2) * 86400
+                cutoff_date = _yver48_melbourne_date_from_ts(cutoff_ts)
+                c.execute("DELETE FROM directional_context_days WHERE local_date < ?", (cutoff_date,))
+            except Exception:
+                pass
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _yver48_direction_memory_counts(symbol: str) -> tuple[int, int, list[str], list[str]]:
+    """Count Leader/Loser dates only inside the rolling memory window.
+
+    yver49: this is explicitly NOT forever. With the default lookback of 3,
+    the check uses today + the previous 2 Melbourne dates. A symbol must appear
+    in Leaders/Losers on at least DIRECTIONAL_CONTEXT_MEMORY_DAYS_REQUIRED
+    dates inside that window. Once those dates roll out, the block expires.
+    """
+    try:
+        base = _symbol_base(symbol).upper().strip()
+        if not base:
+            return 0, 0, [], []
+        _yver48_direction_context_migrate()
+        now_ts = float(time.time())
+        lookback_n = max(1, int(globals().get('DIRECTIONAL_CONTEXT_MEMORY_LOOKBACK_DAYS', 3) or 3))
+        # Inclusive rolling N Melbourne-date window: N=3 => today, yesterday, day-2.
+        cutoff_date = _yver48_melbourne_date_from_ts(now_ts - max(0, lookback_n - 1) * 86400)
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT bucket, local_date FROM directional_context_days WHERE symbol=? AND local_date>=?",
+                (base, cutoff_date),
+            ).fetchall() or []
+        leader_days = sorted({str(d) for b, d in rows if str(b).upper() == 'LEADER'})
+        loser_days = sorted({str(d) for b, d in rows if str(b).upper() == 'LOSER'})
+        return len(leader_days), len(loser_days), leader_days, loser_days
+    except Exception:
+        return 0, 0, [], []
+
+
+try:
+    _YVER48_ORIG_COMPUTE_DIRECTIONAL_LISTS = compute_directional_lists
+except Exception:
+    _YVER48_ORIG_COMPUTE_DIRECTIONAL_LISTS = None
+
+
+def compute_directional_lists(best_fut: Dict[str, MarketVol]) -> Tuple[List[Tuple], List[Tuple]]:
+    if _YVER48_ORIG_COMPUTE_DIRECTIONAL_LISTS is None:
+        return [], []
+    up, dn = _YVER48_ORIG_COMPUTE_DIRECTIONAL_LISTS(best_fut)
+    try:
+        _yver48_record_direction_context_rows(up, dn, source='compute_directional_lists')
+    except Exception:
+        pass
+    return up, dn
+
+
+try:
+    _YVER48_ORIG_SCREEN_MARKET_CONTEXT_TABLE = _screen_market_context_table
+except Exception:
+    _YVER48_ORIG_SCREEN_MARKET_CONTEXT_TABLE = None
+
+
+def _screen_market_context_table(best_fut: dict, leaders=None, losers=None, tone: str | None = None) -> str:
+    try:
+        _yver48_record_direction_context_rows(leaders or [], losers or [], source='screen_market_context_table')
+    except Exception:
+        pass
+    if _YVER48_ORIG_SCREEN_MARKET_CONTEXT_TABLE is not None:
+        return _YVER48_ORIG_SCREEN_MARKET_CONTEXT_TABLE(best_fut, leaders=leaders, losers=losers, tone=tone)
+    return ''
+
+
+try:
+    _YVER48_ORIG_DIRECTIONAL_GUARD = _setup_directional_context_guard_allows_setup
+except Exception:
+    _YVER48_ORIG_DIRECTIONAL_GUARD = None
+
+
+def _setup_directional_context_guard_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    meta = {}
+    try:
+        # Keep all earlier yver45/yver47 guards, including core market logic.
+        if _YVER48_ORIG_DIRECTIONAL_GUARD is not None:
+            ok0, why0, meta0 = _YVER48_ORIG_DIRECTIONAL_GUARD(setup_or_row, session_name=session_name, user_id=user_id)
+            meta.update(dict(meta0 or {}))
+            if not ok0:
+                return False, str(why0 or 'directional_context_blocked'), meta
+    except Exception as exc:
+        meta['yver48_orig_directional_guard_error'] = f'{type(exc).__name__}: {exc}'
+
+    try:
+        side = str(_autotrade_setup_attr(setup_or_row, 'side', '') or '').upper().strip()
+        sym = _symbol_base(str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or _autotrade_setup_attr(setup_or_row, 'market_symbol', '') or '')).upper().strip()
+        if side not in {'BUY', 'SELL'} or not sym:
+            return True, 'directional_context_ok', meta
+        ch24 = float(_autotrade_setup_attr(setup_or_row, 'ch24', 0.0) or _autotrade_setup_attr(setup_or_row, 'pct24', 0.0) or _autotrade_setup_attr(setup_or_row, 'change24h', 0.0) or 0.0)
+        ch4 = float(_autotrade_setup_attr(setup_or_row, 'ch4', 0.0) or _autotrade_setup_attr(setup_or_row, 'pct4h', 0.0) or _autotrade_setup_attr(setup_or_row, 'change4h', 0.0) or 0.0)
+        vol = float(_autotrade_setup_attr(setup_or_row, 'fut_vol_usd', 0.0) or _autotrade_setup_attr(setup_or_row, 'volume', 0.0) or _autotrade_setup_attr(setup_or_row, 'vol_usd', 0.0) or 0.0)
+        min_vol = float(globals().get('DIRECTIONAL_CONTEXT_CURRENT_MIN_VOL_USD', 10_000_000.0) or 10_000_000.0)
+        leader_min = float(globals().get('DIRECTIONAL_CONTEXT_CURRENT_LEADER_24H_MIN', 10.0) or 10.0)
+        loser_max = float(globals().get('DIRECTIONAL_CONTEXT_CURRENT_LOSER_24H_MAX', -10.0) or -10.0)
+        leader_days, loser_days, leader_day_list, loser_day_list = _yver48_direction_memory_counts(sym)
+        days_required = max(1, int(globals().get('DIRECTIONAL_CONTEXT_MEMORY_DAYS_REQUIRED', 2) or 2))
+        current_leader = bool(vol >= min_vol and ch24 >= leader_min)
+        current_loser = bool(vol >= min_vol and ch24 <= loser_max)
+        memory_leader = bool(leader_days >= days_required)
+        memory_loser = bool(loser_days >= days_required)
+        meta.update({
+            'yver48_direction_symbol': sym,
+            'yver48_direction_side': side,
+            'yver48_ch24': round(ch24, 4),
+            'yver48_ch4': round(ch4, 4),
+            'yver48_vol_m': round(vol / 1_000_000.0, 3),
+            'yver48_current_leader': current_leader,
+            'yver48_current_loser': current_loser,
+            'yver48_leader_days': leader_days,
+            'yver48_loser_days': loser_days,
+            'yver49_memory_required_days': days_required,
+            'yver49_memory_lookback_days': int(globals().get('DIRECTIONAL_CONTEXT_MEMORY_LOOKBACK_DAYS', 3) or 3),
+        })
+        if side == 'SELL' and (current_leader or memory_leader):
+            src = 'current_leader' if current_leader else f'leader_{leader_days}d'
+            return False, f'directional_context_blocks_sell_leader:{sym}:{src}:24h{ch24:+.1f}%', meta
+        if side == 'BUY' and (current_loser or memory_loser):
+            src = 'current_loser' if current_loser else f'loser_{loser_days}d'
+            return False, f'directional_context_blocks_buy_loser:{sym}:{src}:24h{ch24:+.1f}%', meta
+        return True, 'directional_context_ok', meta
+    except Exception as exc:
+        meta['yver48_direction_guard_error'] = f'{type(exc).__name__}: {exc}'
+        return True, 'directional_context_guard_error_allowed', meta
+
+
+def _yver48_matrix_policy_state_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> dict:
+    try:
+        sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        uid_i = int(user_id or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=uid_i) or {}
+        pol = str(state.get('policy') or '').upper().strip()
+        if pol == 'OFF':
+            pol = 'DISABLE'
+        if not pol:
+            pol = 'WATCH'
+        state['policy'] = pol
+        state.setdefault('session', sess)
+        return state
+    except Exception as exc:
+        return {'policy': 'DISABLE', 'reason': f'{type(exc).__name__}: {exc}'}
+
+
+def _yver48_autotrade_keep_only_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    state = _yver48_matrix_policy_state_for_setup(setup_or_row, session_name=session_name, user_id=user_id)
+    pol = str(state.get('policy') or '').upper().strip()
+    meta = {'matrix_policy_at_check': pol, 'matrix_combo_at_check': str(state.get('combo') or state.get('setup_matrix_combo') or ''), 'matrix_execnow_at_check': str(state.get('execnow') or '')}
+    if pol != 'KEEP':
+        return False, f'autotrade_matrix_policy_not_keep:{pol or "UNKNOWN"}', meta
+    try:
+        dir_ok, dir_why, dir_meta = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=session_name, user_id=user_id)
+        meta.update(dict(dir_meta or {}))
+        if not dir_ok:
+            return False, str(dir_why or 'directional_context_blocked'), meta
+    except Exception as exc:
+        meta['direction_check_error'] = f'{type(exc).__name__}: {exc}'
+    return True, 'autotrade_matrix_keep_ok', meta
+
+
+try:
+    _YVER48_ORIG_USER_VISIBLE_GATE = _setup_user_visible_keep_policy_allows
+except Exception:
+    _YVER48_ORIG_USER_VISIBLE_GATE = None
+
+
+def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '', user_id: int = 0, lane: str = 'screen') -> tuple[bool, str, dict]:
+    meta = {}
+    try:
+        # For screen/email/autotrade delivery, use /setup_matrix policy as the hard
+        # source-of-truth.  WATCH/DISABLE can be audited, but not delivered/executed.
+        l = str(lane or '').lower().strip()
+        if l in {'screen', '/screen', 'email', 'setup_email', 'bigmove', 'f8', 'screen_sync', 'autotrade'}:
+            ok_keep, why_keep, keep_meta = _yver48_autotrade_keep_only_allows(setup_or_row, session_name=session_name, user_id=int(user_id or globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+            meta.update(dict(keep_meta or {}))
+            if not ok_keep:
+                return False, str(why_keep or 'setup_matrix_policy_not_keep'), meta
+        if _YVER48_ORIG_USER_VISIBLE_GATE is None:
+            return True, 'user_visible_gate_missing_allowed', meta
+        ok, why, old_meta = _YVER48_ORIG_USER_VISIBLE_GATE(setup_or_row, session_name=session_name, user_id=user_id, lane=lane)
+        meta.update(dict(old_meta or {}))
+        return bool(ok), str(why or ''), meta
+    except Exception as exc:
+        return False, f'yver48_user_visible_gate_exception:{type(exc).__name__}', {'error': str(exc)}
+
+
+try:
+    _YVER48_ORIG_AUTOTRADE_DB_STRUCT_VALID = _autotrade_db_signal_structurally_valid
+except Exception:
+    _YVER48_ORIG_AUTOTRADE_DB_STRUCT_VALID = None
+
+
+def _autotrade_db_signal_structurally_valid(s: Any, session_name: str = "NY") -> tuple[bool, str]:
+    try:
+        ok_keep, why_keep, meta = _yver48_autotrade_keep_only_allows(s, session_name=session_name, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+        if not ok_keep:
+            return False, str(why_keep or 'autotrade_matrix_policy_not_keep')
+    except Exception:
+        return False, 'autotrade_matrix_policy_check_exception'
+    if _YVER48_ORIG_AUTOTRADE_DB_STRUCT_VALID is None:
+        return True, 'autotrade_matrix_keep_ok'
+    return _YVER48_ORIG_AUTOTRADE_DB_STRUCT_VALID(s, session_name=session_name)
+
+
+try:
+    _YVER48_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = is_executable_setup_eligible
+except Exception:
+    _YVER48_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = None
+
+
+def is_executable_setup_eligible(s: "Setup", session_name: str = "NY", min_quality: float = 68.0, min_conf: int = 74, min_rr_final: float = 0.0) -> tuple[bool, str]:
+    # Direction guard must run before any matrix KEEP shortcut in the original function.
+    try:
+        dir_ok, dir_why, _dir_meta = _setup_directional_context_guard_allows_setup(s, session_name=session_name, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+        if not dir_ok:
+            return False, str(dir_why or 'directional_context_blocked')
+    except Exception:
+        pass
+    if _YVER48_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE is None:
+        return True, 'ok'
+    return _YVER48_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE(s, session_name=session_name, min_quality=min_quality, min_conf=min_conf, min_rr_final=min_rr_final)
+
+
+try:
+    _YVER48_ORIG_AUTOTRADE_PLACE_TRADE = _autotrade_place_trade
+except Exception:
+    _YVER48_ORIG_AUTOTRADE_PLACE_TRADE = None
+
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    try:
+        kept = []
+        last_reason = 'no_keep_setup'
+        for s in list(setups or []):
+            ok_keep, why_keep, keep_meta = _yver48_autotrade_keep_only_allows(s, session_name=session_label, user_id=int(uid or 0))
+            if ok_keep:
+                # Store policy snapshot for the journal wrapper below.
+                try:
+                    setattr(s, 'policy_at_open', 'KEEP')
+                    setattr(s, 'policy_combo_at_open', str(keep_meta.get('matrix_combo_at_check') or ''))
+                    setattr(s, 'policy_execnow_at_open', str(keep_meta.get('matrix_execnow_at_check') or ''))
+                except Exception:
+                    pass
+                kept.append(s)
+                break
+            last_reason = str(why_keep or 'autotrade_matrix_policy_not_keep')
+            try:
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {}).update({'reject_reason': last_reason, 'matrix_policy_at_check': keep_meta.get('matrix_policy_at_check'), 'matrix_combo_at_check': keep_meta.get('matrix_combo_at_check')})
+                _admin_setup_lifecycle_merge(int(uid), str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''), state=_admin_setup_state_from_reason(last_reason), last_reason=last_reason)
+            except Exception:
+                pass
+        if not kept:
+            return False, last_reason
+    except Exception as exc:
+        return False, f'autotrade_keep_only_precheck_exception:{type(exc).__name__}'
+    if _YVER48_ORIG_AUTOTRADE_PLACE_TRADE is None:
+        return False, 'autotrade_place_trade_missing'
+    return _YVER48_ORIG_AUTOTRADE_PLACE_TRADE(uid, session_label, kept)
+
+
+try:
+    _YVER48_ORIG_AUTOTRADE_MIGRATE_TABLES = _autotrade_migrate_tables
+except Exception:
+    _YVER48_ORIG_AUTOTRADE_MIGRATE_TABLES = None
+
+
+def _autotrade_migrate_tables():
+    try:
+        if _YVER48_ORIG_AUTOTRADE_MIGRATE_TABLES is not None:
+            _YVER48_ORIG_AUTOTRADE_MIGRATE_TABLES()
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            cols = [r[1] for r in c.execute('PRAGMA table_info(autotrade_trades)').fetchall()]
+            if 'policy_at_open' not in cols:
+                c.execute("ALTER TABLE autotrade_trades ADD COLUMN policy_at_open TEXT NOT NULL DEFAULT ''")
+            if 'policy_combo_at_open' not in cols:
+                c.execute("ALTER TABLE autotrade_trades ADD COLUMN policy_combo_at_open TEXT NOT NULL DEFAULT ''")
+            if 'policy_execnow_at_open' not in cols:
+                c.execute("ALTER TABLE autotrade_trades ADD COLUMN policy_execnow_at_open TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+    except Exception:
+        pass
+
+
+try:
+    _YVER48_ORIG_AUTOTRADE_DB_ADD_TRADE = _autotrade_db_add_trade
+except Exception:
+    _YVER48_ORIG_AUTOTRADE_DB_ADD_TRADE = None
+
+
+def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float, lifecycle_state: str = 'executed_open', lifecycle_reason: str = '', report_meta: dict | None = None) -> str:
+    if _YVER48_ORIG_AUTOTRADE_DB_ADD_TRADE is None:
+        return ''
+    trade_id = _YVER48_ORIG_AUTOTRADE_DB_ADD_TRADE(uid, session_label, s, qty, lifecycle_state=lifecycle_state, lifecycle_reason=lifecycle_reason, report_meta=report_meta)
+    try:
+        _autotrade_migrate_tables()
+        state = _yver48_matrix_policy_state_for_setup(s, session_name=session_label, user_id=int(uid or 0))
+        pol = str(getattr(s, 'policy_at_open', '') or state.get('policy') or '').upper().strip()
+        combo = str(getattr(s, 'policy_combo_at_open', '') or state.get('combo') or state.get('setup_matrix_combo') or '').upper().strip()
+        execnow = str(getattr(s, 'policy_execnow_at_open', '') or state.get('execnow') or '').upper().strip()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE autotrade_trades SET policy_at_open=?, policy_combo_at_open=?, policy_execnow_at_open=? WHERE trade_id=?",
+                (pol, combo, execnow, str(trade_id)),
+            )
+            conn.commit()
+    except Exception:
+        pass
+    return trade_id
+
+
+def _setup_audit_compare_policy_at_open(tr: dict, setup: dict | None = None) -> str:
+    try:
+        for key in ('policy_at_open', 'setup_policy_at_open', 'policy'):
+            v = str((tr or {}).get(key) or '').upper().strip()
+            if v in {'KEEP', 'WATCH', 'TIGHTEN', 'DISABLE', 'OFF'}:
+                return 'DISABLE' if v == 'OFF' else v
+        # Enrich from local autotrade_trades if canonical Bybit row did not carry it.
+        tid = str((tr or {}).get('trade_id') or '').strip()
+        sid = str((tr or {}).get('setup_id') or '').strip()
+        sym = _symbol_base(str((tr or {}).get('symbol') or '')).upper().strip()
+        ots = float((tr or {}).get('opened_ts') or (tr or {}).get('first_ts') or 0.0)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            q = []
+            if tid:
+                q = [dict(r) for r in conn.execute("SELECT policy_at_open, policy_combo_at_open FROM autotrade_trades WHERE trade_id=? LIMIT 1", (tid,)).fetchall() or []]
+            if not q and sid:
+                q = [dict(r) for r in conn.execute("SELECT policy_at_open, policy_combo_at_open FROM autotrade_trades WHERE setup_id=? ORDER BY opened_ts DESC LIMIT 1", (sid,)).fetchall() or []]
+            if not q and sym and ots > 0:
+                q = [dict(r) for r in conn.execute("SELECT policy_at_open, policy_combo_at_open FROM autotrade_trades WHERE UPPER(REPLACE(symbol,'USDT',''))=? AND ABS(COALESCE(opened_ts,0)-?)<=900 ORDER BY ABS(COALESCE(opened_ts,0)-?) ASC LIMIT 1", (sym, ots, ots)).fetchall() or []]
+        if q:
+            v = str(q[0].get('policy_at_open') or '').upper().strip()
+            if v:
+                return v
+        if setup:
+            rr = dict((setup or {}).get('row') or {})
+            if rr:
+                sess = str(rr.get('session') or rr.get('source_session') or '').upper().strip()
+                pol = _setup_audit_policy_label(rr, uid=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), session_name=sess, side=str(rr.get('side') or ''))
+                if pol:
+                    return str(pol).upper().strip() + '*'
+    except Exception:
+        pass
+    return '-'
+
+
+# yver48: every 3h policy update.  The original intraday job called the severe
+# safety pass only.  Redefine the same job so both the 10:00 daily run and the 3h
+# intraday schedule refresh the full /setup_matrix policy using the 1-Jun baseline.
+SETUP_MATRIX_POLICY_REFRESH_3H_ENABLED = env_bool('SETUP_MATRIX_POLICY_REFRESH_3H_ENABLED', True)
+SETUP_MATRIX_POLICY_REFRESH_3H_INTERVAL_HOURS = float(os.environ.get('SETUP_MATRIX_POLICY_REFRESH_3H_INTERVAL_HOURS', '3') or 3)
+
+async def setup_combo_daily_safety_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not bool(globals().get('SETUP_MATRIX_POLICY_REFRESH_3H_ENABLED', True)):
+            return
+        uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        if uid <= 0:
+            try:
+                ids = sorted(list(_admin_ids_all()))
+                uid = int(ids[0]) if ids else 0
+            except Exception:
+                uid = 0
+        if uid <= 0:
+            return
+        job_name = ''
+        try:
+            job_name = str(getattr(getattr(context, 'job', None), 'name', '') or '')
+        except Exception:
+            job_name = ''
+        kind = 'intraday_3h' if 'intraday' in job_name.lower() else 'daily_10_refresh'
+        res = await to_thread_heavy(
+            _setup_combo_matrix_build,
+            int(uid),
+            _overall_report_effective_hours(max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS))),
+            True,
+            True,
+            kind,
+            _overall_report_start_ts(),
+            timeout=240,
+        )
+        try:
+            globals().setdefault('_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE', {'ts': 0.0, 'user_id': 0, 'run_id': '', 'rows': {}})['ts'] = 0.0
+            globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0, 'user_id': 0, 'data': {}})['ts'] = 0.0
+        except Exception:
+            pass
+        try:
+            db_log_setup_pipeline_event(uid, stage='setup_matrix_policy_3h_refresh', status='ok' if (res or {}).get('ok', True) else 'skip', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={
+                'policy_kind': kind,
+                'baseline_start': _overall_report_start_txt(),
+                'window_hours': int((res or {}).get('window_hours') or _overall_report_effective_hours(max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS)))),
+                'rows': len(list((res or {}).get('rows') or [])),
+                'policy_updated': bool((res or {}).get('policy_updated', True)),
+            })
+        except Exception:
+            pass
+    except Exception as e:
+        try:
+            db_log_setup_pipeline_event(int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), stage='setup_matrix_policy_3h_refresh', status='error', session=str(scan_session_name_utc(datetime.now(timezone.utc)) or ''), mode='optimizer', details={'error': f'{type(e).__name__}: {e}'})
+        except Exception:
+            pass
+
+
+# Ensure the 3h interval global is exactly 3h for the existing intraday scheduler.
+try:
+    SETUP_COMBO_INTRADAY_SAFETY_ENABLED = True
+    SETUP_COMBO_INTRADAY_SAFETY_INTERVAL_HOURS = float(globals().get('SETUP_MATRIX_POLICY_REFRESH_3H_INTERVAL_HOURS', 3) or 3)
+except Exception:
+    pass
+
+
+def _yver48_apply_runtime_flags() -> None:
+    try:
+        _autotrade_migrate_tables()
+        _yver48_direction_context_migrate()
+        _autotrade_config_set('yver48_keep_only_direction_policy_version', YVER48_VERSION)
+        # Keep direct KEEP queue mode; email is notification, not execution authority.
+        if 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY' not in os.environ:
+            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 0)
+    except Exception:
+        pass
+
+
+try:
+    _YVER48_ORIG_SHORT_AT_REASON = _setup_audit_short_autotrade_reason
+except Exception:
+    _YVER48_ORIG_SHORT_AT_REASON = None
+
+
+def _setup_audit_short_autotrade_reason(reason: str) -> str:
+    r = str(reason or '').lower().strip()
+    if 'matrix_policy_not_keep' in r or 'autotrade_policy_not_allowed' in r or 'autotrade_policy_not_keep' in r:
+        return 'NOT_KEEP'
+    if 'directional_context' in r or 'blocks_sell_leader' in r or 'blocks_buy_loser' in r or 'broad_market' in r:
+        return 'DIRECTION'
+    if _YVER48_ORIG_SHORT_AT_REASON is not None:
+        return _YVER48_ORIG_SHORT_AT_REASON(reason)
+    return re.sub(r'[^A-Z0-9_]+', '_', str(reason or '').upper()).strip('_')[:16] or '-'
+
+
+try:
+    _YVER48_ORIG_MAIN = main
+except Exception:
+    _YVER48_ORIG_MAIN = None
+
+
+def main():
+    try:
+        _yver48_apply_runtime_flags()
+    except Exception:
+        pass
+    if _YVER48_ORIG_MAIN is not None:
+        return _YVER48_ORIG_MAIN()
+    return None
+
+# =========================================================
+# end yver48 hardening
+# =========================================================
+
 if __name__ == "__main__":
     main()
+
+
+# =========================================================
+# end yver49 rolling/expiring Leaders-Losers memory window
+# =========================================================
