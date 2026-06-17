@@ -1,3 +1,4 @@
+# yver71: improves AutoTrade diagnostics only: /autotrade_last and /setup_audit ATWhy now preserve exact LIVE_OPEN_FAILED / cooldown reason details (e.g. Bybit 110007), while leaving order/risk/TP/SL/leverage/KEEP logic unchanged.
 # yver70: adds a safe cooldown for repeated Bybit LIVE_OPEN_FAILED retries and sanitizes /autotrade_last rows so stale global detail cannot show another symbol's Entry/SL. No risk/TP/SL/leverage/KEEP-policy logic changed.
 # yver69: cleanup /autotrade_config help so Auto Blackout commands are visible in the clean view and old static blackout examples are no longer misleading; no live trading logic changed.
 # yver68: syncs /setup_open_times suggested blackout windows with the exact 7d-only AUTO_BLACKOUT rule (WR<45%, AvgR<0, decided>=5) so manual report and auto status do not disagree; no live order/risk/TP/SL logic changed.
@@ -69585,6 +69586,162 @@ except Exception:
 
 # =========================================================
 # end yver70 LIVE_OPEN_FAILED retry cooldown + attempt hygiene
+# =========================================================
+
+
+
+# =========================================================
+# yver71 exact LIVE_OPEN_FAILED diagnostics
+# =========================================================
+# Display/diagnostic-only patch.  It does not change selection, risk, sizing,
+# leverage, TP/SL, liquidation guards, cooldown length, or live order logic.
+
+try:
+    _YVER71_ORIG_LIVE_OPEN_FAIL_BLOCK_REASON = _yver70_live_open_fail_block_reason
+except Exception:
+    _YVER71_ORIG_LIVE_OPEN_FAIL_BLOCK_REASON = None
+try:
+    _YVER71_ORIG_SHORT_AT_REASON = _setup_audit_short_autotrade_reason
+except Exception:
+    _YVER71_ORIG_SHORT_AT_REASON = None
+try:
+    _YVER71_ORIG_RECORD_ATTEMPT = _autotrade_record_attempt
+except Exception:
+    _YVER71_ORIG_RECORD_ATTEMPT = None
+
+
+def _yver71_clean_live_fail_reason(reason: str, max_len: int = 44) -> str:
+    """Return a compact but useful exact live-open failure detail for tables."""
+    try:
+        r = str(reason or '').strip()
+        if not r:
+            return ''
+        # Unwrap common forms:
+        #   live_open_failed (110007 ab not enough for new order)
+        #   blocked_by_cooldown_live_open_failed:XRP:12m:live_open_failed (...)
+        if 'blocked_by_cooldown_live_open_failed' in r.lower():
+            parts = r.split(':', 3)
+            if len(parts) >= 4:
+                r = str(parts[3] or '').strip()
+        m = re.search(r'live_open_failed\s*\((.*?)\)\s*$', r, flags=re.I)
+        if m:
+            r = str(m.group(1) or '').strip()
+        m = re.search(r'live_entry_fill_not_confirmed\s*\((.*?)\)\s*$', r, flags=re.I)
+        if m:
+            r = 'fill_not_confirmed ' + str(m.group(1) or '').strip()
+        r = re.sub(r'\s+', ' ', r).strip()
+        # Keep Bybit error code text visible but remove punctuation that makes the
+        # preformatted Telegram table unreadable.
+        r = re.sub(r'[^A-Za-z0-9_ .:+\-/]+', ' ', r).strip()
+        r = r.replace('available balance', 'avail_bal')
+        r = r.replace('not enough for new order', 'not_enough_new_order')
+        r = r.replace('not enough', 'not_enough')
+        r = r.replace('new order', 'new_order')
+        r = r.replace(' ', '_')
+        r = re.sub(r'_+', '_', r).strip('_')
+        if not r:
+            return ''
+        return r[:max(12, int(max_len or 44))]
+    except Exception:
+        return ''
+
+
+def _yver71_live_failure_display_label(reason: str) -> str:
+    """Compact reason label that keeps the actual Bybit/live error when available."""
+    try:
+        raw = str(reason or '').strip()
+        r = raw.lower()
+        detail = _yver71_clean_live_fail_reason(raw, 42)
+        if 'blocked_by_cooldown_live_open_failed' in r or 'live_open_failed_cooldown' in r:
+            return ('LIVE_FAIL_CD:' + detail)[:58] if detail else 'LIVE_FAIL_CD'
+        if 'live_open_failed' in r:
+            return ('LIVE_OPEN_FAIL:' + detail)[:58] if detail else 'LIVE_OPEN_FAIL'
+        if 'live_entry_fill_not_confirmed' in r:
+            return ('LIVE_FILL_FAIL:' + detail)[:58] if detail else 'LIVE_FILL_FAIL'
+    except Exception:
+        pass
+    return ''
+
+
+def _yver70_live_open_fail_block_reason(uid: int, setup_id: str, symbol: str, side: str) -> str:
+    """v71 wrapper: cooldown reason retains original live-open failure detail."""
+    try:
+        _yver70_live_open_fail_migrate()
+        key = _yver70_live_open_fail_key(uid, setup_id, symbol, side)
+        cooldown = float(_yver70_live_open_fail_cooldown_sec())
+        now = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            r = cur.execute("SELECT * FROM autotrade_live_open_failures WHERE fail_key=?", (key,)).fetchone()
+            if not r:
+                return ''
+            age = max(0.0, now - float(r['last_ts'] or 0.0))
+            if age >= cooldown:
+                return ''
+            remain_min = max(1, int(math.ceil((cooldown - age) / 60.0)))
+            sym = str(r['symbol'] or symbol or '').upper().replace('USDT', '')
+            prior_reason = str(r['reason'] or '').strip()
+            # Keep machine-parseable prefix for the cooldown guard, then append the
+            # original reason so reports can explain the real Bybit/live error.
+            if prior_reason:
+                return f"blocked_by_cooldown_live_open_failed:{sym}:{remain_min}m:{prior_reason}"
+            return f"blocked_by_cooldown_live_open_failed:{sym}:{remain_min}m"
+    except Exception:
+        try:
+            if _YVER71_ORIG_LIVE_OPEN_FAIL_BLOCK_REASON is not None:
+                return _YVER71_ORIG_LIVE_OPEN_FAIL_BLOCK_REASON(uid, setup_id, symbol, side)
+        except Exception:
+            pass
+        return ''
+
+
+def _setup_audit_short_autotrade_reason(reason: str) -> str:
+    """v71: preserve exact live-open failure detail in /setup_audit ATWhy and /autotrade_last."""
+    try:
+        lbl = _yver71_live_failure_display_label(reason)
+        if lbl:
+            return lbl
+    except Exception:
+        pass
+    if _YVER71_ORIG_SHORT_AT_REASON is not None:
+        return _YVER71_ORIG_SHORT_AT_REASON(reason)
+    return re.sub(r'[^A-Z0-9_]+', '_', str(reason or '').upper()).strip('_')[:16] or '-'
+
+
+def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict | None = None, status: str = '', reason: str = '') -> None:
+    """v71 wrapper: copy exact live failure/cooldown detail into persisted attempt payload."""
+    if _YVER71_ORIG_RECORD_ATTEMPT is None:
+        return
+    try:
+        m = dict(meta or {}) if isinstance(meta, dict) else {}
+        d = dict(detail or {}) if isinstance(detail, dict) else {}
+        reason_s = str(reason or m.get('reason') or d.get('reason') or d.get('reject_reason') or '').strip()
+        exact = _yver71_clean_live_fail_reason(reason_s, 160)
+        if exact and ('live_open_failed' in reason_s.lower() or 'blocked_by_cooldown_live_open_failed' in reason_s.lower() or 'live_entry_fill_not_confirmed' in reason_s.lower()):
+            m['live_open_fail_exact'] = exact
+            if not d.get('live_open_fail_exact'):
+                d['live_open_fail_exact'] = exact
+            # Do not replace the full reason; keep raw reason for debugging and let
+            # the short-label function render it compactly.
+        return _YVER71_ORIG_RECORD_ATTEMPT(uid, m if m else meta, d if d else detail, status, reason)
+    except Exception:
+        try:
+            return _YVER71_ORIG_RECORD_ATTEMPT(uid, meta, detail, status, reason)
+        except Exception:
+            return
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v71'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v71'
+except Exception:
+    pass
+
+# =========================================================
+# end yver71 exact LIVE_OPEN_FAILED diagnostics
 # =========================================================
 
 if __name__ == "__main__":
