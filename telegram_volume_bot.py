@@ -1,3 +1,4 @@
+# yver62: cleans /setup_audit display consistency after v61: ATWhy TP/SL_ALREADY_HIT now always matches final Res, and old sent OPEN rows show ENTRY_OLD instead of current BLACKOUT. No live risk/TP/SL/order logic changes.
 # yver61: fixes patch activation order by moving __main__ to the end, then hard-filters already-traded/resolved setup cards and AutoTrade candidates; cleans EXPIRED/MANUAL_POS labels at display. No live risk/TP/SL/order logic changes.
 # yver60: hardens v59 cleanup: /screen also checks cached setup-audit price path before showing recent emailed setups, removes resolved TP/SL cards from final screen formatting, and renames setup-audit EXPIRED/PENDING noise to ENTRY_OLD/SL_ALREADY_HIT. No live TP/SL/risk/order logic changes.
 # yver59: keeps /screen/email/actionable setup queues clean by hiding setups that have already touched TP/SL, renames entry-window EXPIRED/MANUAL_POS display noise, and labels KEEP journal closes without a safe audit setup as JOURNAL_ONLY instead of scary NO_SETUP. No live TP/SL/risk/order logic changes.
@@ -68190,6 +68191,83 @@ except Exception:
 
 # =========================================================
 # end yver61 hygiene
+# =========================================================
+
+
+# =========================================================
+# yver62 audit display consistency cleanup
+# =========================================================
+YVER62_VERSION = 'yver62_2026_06_17_setup_audit_reason_result_consistency'
+
+try:
+    _YVER62_ORIG_SETUP_AUDIT_TEXT = _setup_audit_text
+except Exception:
+    _YVER62_ORIG_SETUP_AUDIT_TEXT = None
+
+
+def _yver62_fix_setup_audit_row_labels(txt: str) -> str:
+    """Make /setup_audit display labels internally consistent.
+
+    v61 correctly stopped stale setup cards and kept setups non-expiring, but one
+    display-only edge remained: a row could show ATWhy=TP_ALREADY_HIT while the
+    final audit Res column was SL (or the reverse). The final Res is the source
+    of truth for the audit row, so the already-hit explanation must match it.
+
+    Also, when a setup email is already SENT_OLD and the setup is still OPEN,
+    current blackout status is not the correct explanation; the entry opportunity
+    is simply old. This does not expire the setup itself; it only explains why
+    AutoTrade is no longer entering that old email/setup.
+    """
+    try:
+        out = []
+        for line in str(txt or '').splitlines():
+            new_line = line
+            try:
+                # Only touch visible setup-audit table rows.
+                if re.match(r'^\d{2}-\d{2}\s+\d{2}:\d{2}\s+', new_line):
+                    parts = new_line.split()
+                    res = parts[-1].upper() if parts else ''
+                    if res == 'SL' and 'TP_ALREADY_HIT' in new_line:
+                        new_line = new_line.replace('TP_ALREADY_HIT', 'SL_ALREADY_HIT')
+                    elif res == 'TP' and 'SL_ALREADY_HIT' in new_line:
+                        new_line = new_line.replace('SL_ALREADY_HIT', 'TP_ALREADY_HIT')
+                    # A SENT_OLD row that is still OPEN should not explain the
+                    # non-entry with current BLACKOUT; its entry window is old.
+                    parts2 = new_line.split()
+                    res2 = parts2[-1].upper() if parts2 else ''
+                    if res2 == 'OPEN' and 'SENT_OLD' in parts2:
+                        new_line = re.sub(r'(?<![A-Z0-9_])BLACKOUT_NOW(?![A-Z0-9_])', 'ENTRY_OLD', new_line)
+                        new_line = re.sub(r'(?<![A-Z0-9_])BLACKOUT(?![A-Z0-9_])', 'ENTRY_OLD', new_line)
+            except Exception:
+                pass
+            out.append(new_line)
+        return '\n'.join(out)
+    except Exception:
+        return str(txt or '')
+
+
+def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
+    try:
+        txt = _YVER62_ORIG_SETUP_AUDIT_TEXT(uid, limit=limit, hours=hours) if _YVER62_ORIG_SETUP_AUDIT_TEXT is not None else ''
+    except Exception:
+        txt = ''
+    try:
+        return _yver62_fix_setup_audit_row_labels(str(txt or ''))
+    except Exception:
+        return str(txt or '')
+
+# Bump cache namespaces so v61 text with contradictory labels cannot linger.
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v62'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v62'
+except Exception:
+    pass
+
+# =========================================================
+# end yver62 audit display consistency cleanup
 # =========================================================
 
 if __name__ == "__main__":
