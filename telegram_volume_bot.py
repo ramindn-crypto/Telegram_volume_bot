@@ -1,3 +1,4 @@
+# yver72: profit-protection profile after 18 Jun drawdown review: hardens AutoTrade live gate, re-enables email-matched execution, lowers risk/caps, disables dynamic risk/TP, and stops matrix KEEP from bypassing strict live edge. No TP/SL geometry, leverage calculation, setup generation, or order placement mechanics changed.
 # yver71: improves AutoTrade diagnostics only: /autotrade_last and /setup_audit ATWhy now preserve exact LIVE_OPEN_FAILED / cooldown reason details (e.g. Bybit 110007), while leaving order/risk/TP/SL/leverage/KEEP logic unchanged.
 # yver70: adds a safe cooldown for repeated Bybit LIVE_OPEN_FAILED retries and sanitizes /autotrade_last rows so stale global detail cannot show another symbol's Entry/SL. No risk/TP/SL/leverage/KEEP-policy logic changed.
 # yver69: cleanup /autotrade_config help so Auto Blackout commands are visible in the clean view and old static blackout examples are no longer misleading; no live trading logic changed.
@@ -3186,6 +3187,125 @@ def _autotrade_apply_yver45_directional_guard_and_direct_queue_fix() -> None:
     except Exception:
         pass
 
+
+def _autotrade_apply_yver72_profit_protection_defaults() -> None:
+    """yver72: post-drawdown profit-protection live profile.
+
+    18-Jun review showed the Bybit account losing money while raw KEEP setup WR was
+    only around breakeven.  This migration does not change setup generation, TP/SL
+    geometry, Bybit order mechanics or leverage calculation.  It only tightens the
+    live AutoTrade consumer so money is deployed more slowly and only on stronger,
+    email-visible KEEP setups.
+
+    Applied once by default.  Set AUTOTRADE_YVER72_REAPPLY_PROFIT_PROFILE=true to
+    force the profile again, or edit any value later with /autotrade_config.
+    """
+    try:
+        target_version = 'yver72_2026_06_18_profit_protection_profile'
+        if (not env_bool('AUTOTRADE_YVER72_REAPPLY_PROFIT_PROFILE', False)) and str(_autotrade_config_get('yver72_profit_protection_profile_version', '') or '').strip().lower() == target_version:
+            return
+
+        desired = {
+            # Stop compounding drawdowns while edge is only marginal.
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 0.50,
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: 1.0,
+
+            # Throughput/risk brakes.  These are Telegram-editable after deploy.
+            AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: 4,
+            AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: 8,
+            AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: 4.0,
+            AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: 1.0,
+            AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY: 60,
+
+            # Sync AutoTrade back to what the owner can see: setup-email/delivery first.
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1,
+
+            # Fixed TP profile while profitability is being repaired.  Dynamic RR can
+            # be re-enabled later, but fixed 1.5R makes live PnL easier to compare to audit.
+            AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MIN_LIVE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MAX_LIVE_RR_KEY: 1.5,
+
+            # KEEP-only stays, but weak 49%-50% / small-sample lanes no longer receive money.
+            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: 8,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: 55.0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: 0.25,
+
+            # Use real AutoTrade performance as a secondary brake after enough live samples.
+            AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 1,
+            AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
+
+            # Hard daily loss protection.  A 30%-40% daily cap is not account protection.
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: 4.0,
+        }
+        for k, v in desired.items():
+            try:
+                _autotrade_config_set(k, v)
+            except Exception:
+                pass
+        try:
+            _autotrade_set_daily_cap_settings('PCT', 6.0)
+        except Exception:
+            pass
+
+        # Keep setup discovery/learning alive, but raise delivery/execution quality
+        # floors slightly so the live queue is not flooded by marginal entries.
+        try:
+            cfg = load_strategy_config(force=True)
+            changed = False
+            for k, target in {
+                'quality_score_min_email': 78.0,
+                'min_rr_tp': 1.50,
+                'goal_profile_target_setups_per_day_lo': 1.0,
+                'goal_profile_target_setups_per_day_hi': 4.0,
+                'target_setups_per_day_lo': 1.0,
+                'target_setups_per_day_hi': 4.0,
+                'governor_target_lo': 1.0,
+                'governor_target_hi': 4.0,
+            }.items():
+                try:
+                    cur = float(cfg.get(k, 0) or 0.0)
+                except Exception:
+                    cur = 0.0
+                if k in {'quality_score_min_email', 'min_rr_tp'}:
+                    if cur < float(target):
+                        cfg[k] = float(target); changed = True
+                else:
+                    if abs(cur - float(target)) > 1e-9:
+                        cfg[k] = float(target); changed = True
+            cfg['yver72_profit_protection_profile'] = {
+                'risk_pct': 0.50,
+                'dynamic_risk_enabled': False,
+                'max_open_trades': 4,
+                'max_trades_per_day': 8,
+                'open_risk_cap_pct': 4.0,
+                'daily_risk_cap_pct': 6.0,
+                'daily_realized_loss_stop_pct': 4.0,
+                'require_setup_email_for_entry': True,
+                'strict_keep_edge_min_decided': 8,
+                'strict_keep_edge_min_wr': 55.0,
+                'strict_keep_edge_min_avgr': 0.25,
+                'matrix_keep_bypass_strict_edge': False,
+            }
+            if changed:
+                save_strategy_config(cfg)
+                apply_strategy_config(cfg)
+        except Exception:
+            pass
+
+        _autotrade_config_set('yver72_profit_protection_profile_version', target_version)
+    except Exception:
+        pass
+
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
         sym = str(_bybit_linear_symbol(symbol) or '').upper().strip()
@@ -6136,10 +6256,10 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
         except Exception as _dir_exc:
             meta['directional_context_guard_error'] = f'{type(_dir_exc).__name__}: {_dir_exc}'
 
-        # yver24: use /setup_matrix policy as source of truth for subscriber
-        # visibility and setup-email selection.  A matrix KEEP lane must be shown
-        # and eligible for delivery; non-KEEP lanes remain blocked unless WATCH is
-        # explicitly enabled below.
+        # yver72: matrix KEEP is the source lane, but not a direct display/email
+        # bypass.  User-facing setup delivery should stay synced with the same
+        # strict live edge/context guard used by AutoTrade, otherwise the owner gets
+        # setup emails for rows the profit-protection AutoTrade consumer will refuse.
         try:
             matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=int(policy_uid or uid or 0)) or {}
             matrix_policy = str(matrix_state.get('policy') or '').upper().strip()
@@ -6147,8 +6267,10 @@ def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '',
             meta['setup_matrix_execnow'] = str(matrix_state.get('execnow') or '').upper().strip()
             meta['setup_matrix_combo'] = str(matrix_state.get('combo') or combo or '').upper().strip()
             if matrix_policy == 'KEEP':
-                return True, 'setup_matrix_policy_keep_source_of_truth', meta
-            if matrix_policy:
+                status = 'KEEP'
+                raw_status = 'KEEP'
+                combo = str(matrix_state.get('combo') or combo or '').upper().strip()
+            elif matrix_policy:
                 return False, f'{l}_setup_matrix_policy_not_keep:{matrix_policy}', meta
         except Exception as _matrix_exc:
             meta['setup_matrix_policy_error'] = f'{type(_matrix_exc).__name__}: {_matrix_exc}'
@@ -6418,13 +6540,19 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
         sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
         combo = _autotrade_setup_exact_combo_key(setup_or_row, sess)
         pstatus_exec = ''
-        # yver24: /setup_matrix policy is the source of truth.  If the
-        # exact lane is KEEP in that table, do not let secondary realised/context
-        # policy guards re-block it before AutoTrade.
+        # yver72: /setup_matrix KEEP is still required, but it must not bypass
+        # real-money strict edge controls.  The 18-Jun review showed account PnL
+        # falling while matrix KEEP hovered around ~50% WR, so AutoTrade now treats
+        # matrix KEEP as the first gate and continues through strict live edge,
+        # realised-combo and context guards before placing money on the trade.
         try:
             _matrix_state = _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=owner_uid) or {}
             if str(_matrix_state.get('policy') or '').upper().strip() == 'KEEP':
-                return True, 'setup_matrix_policy_keep_source_of_truth'
+                pstatus_exec = 'KEEP'
+                try:
+                    _setup_quality_gate_set_attr(setup_or_row, 'yver72_matrix_keep_seen', True)
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
@@ -6472,7 +6600,8 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
                 _force_keep_policy = bool((_pinfo_exec or {}).get('force_keep')) or bool((_pinfo_exec or {}).get('force_keep_info'))
             except Exception:
                 _force_keep_policy = False
-            if pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled() and not _force_keep_policy:
+            _allow_force_keep_bypass = env_bool('AUTOTRADE_ALLOW_MATRIX_KEEP_STRICT_BYPASS', False)
+            if pstatus_exec == 'KEEP' and _autotrade_strict_keep_edge_enabled() and ((not _force_keep_policy) or (not _allow_force_keep_bypass)):
                 m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo or '').upper().strip()) or {})
                 dec = int(m.get('decided') or 0)
                 wr = float(m.get('wr') or 0.0)
@@ -6482,7 +6611,7 @@ def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str =
                 min_avg = float(_autotrade_strict_keep_edge_min_avgr())
                 if dec < min_dec or wr < min_wr or avg < min_avg:
                     return False, f'autotrade_strict_keep_edge_block:{combo}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
-            elif pstatus_exec == 'KEEP' and _force_keep_policy:
+            elif pstatus_exec == 'KEEP' and _force_keep_policy and _allow_force_keep_bypass:
                 try:
                     _setup_quality_gate_set_attr(setup_or_row, 'yver24_matrix_keep_bypassed_strict_edge', True)
                 except Exception:
@@ -7873,6 +8002,7 @@ try:
     _autotrade_apply_yver43_direct_keep_queue_fix()
     _autotrade_apply_yver44_direct_keep_queue_fix()
     _autotrade_apply_yver45_directional_guard_and_direct_queue_fix()
+    _autotrade_apply_yver72_profit_protection_defaults()
 except Exception:
     pass
 
