@@ -1,3 +1,4 @@
+# yver63: cleans remaining diagnostics only: removes ghost duplicate no-time /autotrade_last rows, formats attempt rows with fallback timestamps, and removes stale yver149 wording from /setup_audit_compare. No live risk/TP/SL/order logic changes.
 # yver62: cleans /setup_audit display consistency after v61: ATWhy TP/SL_ALREADY_HIT now always matches final Res, and old sent OPEN rows show ENTRY_OLD instead of current BLACKOUT. No live risk/TP/SL/order logic changes.
 # yver61: fixes patch activation order by moving __main__ to the end, then hard-filters already-traded/resolved setup cards and AutoTrade candidates; cleans EXPIRED/MANUAL_POS labels at display. No live risk/TP/SL/order logic changes.
 # yver60: hardens v59 cleanup: /screen also checks cached setup-audit price path before showing recent emailed setups, removes resolved TP/SL cards from final screen formatting, and renames setup-audit EXPIRED/PENDING noise to ENTRY_OLD/SL_ALREADY_HIT. No live TP/SL/risk/order logic changes.
@@ -48943,7 +48944,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         "Purpose: compare merged practical AutoTrade closes against the matched setup price-path audit row.",
         "Important: /setup_audit remains AutoTrade-independent; this compare view is the reconciliation layer.",
         "AT = actual realised AutoTrade close from Bybit/journal. Audit = independent matched setup price-path result. Policy = stored policy at open when available; otherwise reconstructed from matched setup/current matrix.",
-        "yver149 matching: setup_id/open-time must fit the AutoTrade entry deadline. Trades opened before the selected compare window but closed inside it can still match their original setup when journal/open-time evidence is reliable; close-only legacy rows remain guarded.",
+        "Matching: setup_id/open-time must fit the AutoTrade entry deadline. Trades opened before the selected compare window but closed inside it can still match their original setup when journal/open-time evidence is reliable; close-only legacy rows remain guarded.",
         "Precision: mismatched TP/SL rows are rechecked with targeted 1m candles before DIFF is shown.",
         f"Rows: <b>{len(rows)}</b> | OK: <b>{match_ok}</b> | DIFF: <b>{mismatch}</b> | Pending/No setup/Info: <b>{unresolved}</b>",
     ]
@@ -56861,6 +56862,49 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception:
         pass
 
+    # yver63: remove ghost duplicate rows that have no timestamp when a real
+    # timestamped attempt for the same setup/symbol/side/reason/entry/SL exists.
+    # This is display-only; the raw persisted diagnostics are left untouched.
+    try:
+        def _yver63_attempt_sig(_r):
+            _sym = str(_r.get('symbol') or _r.get('symbol_sent') or _r.get('symbol_raw') or '').upper()
+            if _sym.endswith('USDT'):
+                _sym = _sym[:-4]
+            return (
+                str(_r.get('setup_id') or _r.get('id') or ''),
+                _sym,
+                str(_r.get('side') or '').upper(),
+                str(_r.get('status') or '').upper(),
+                _setup_audit_short_autotrade_reason(str(_r.get('reason') or '')),
+                _autotrade_price_str(_r.get('entry')),
+                _autotrade_price_str(_r.get('sl')),
+            )
+        _with_time = set()
+        for _r in list(hist or []):
+            try:
+                if str(_r.get('when') or _r.get('when_iso') or _r.get('when_ts') or '').strip():
+                    _with_time.add(_yver63_attempt_sig(_r))
+            except Exception:
+                pass
+        _clean_hist = []
+        _seen_no_time = set()
+        for _r in list(hist or []):
+            try:
+                _has_time = bool(str(_r.get('when') or _r.get('when_iso') or _r.get('when_ts') or '').strip())
+                _sig = _yver63_attempt_sig(_r)
+                if not _has_time and _sig in _with_time:
+                    continue
+                if not _has_time and _sig in _seen_no_time:
+                    continue
+                if not _has_time:
+                    _seen_no_time.add(_sig)
+                _clean_hist.append(_r)
+            except Exception:
+                _clean_hist.append(_r)
+        hist = _clean_hist
+    except Exception:
+        pass
+
     lines = ["🤖 <b>AutoTrade — Last Attempts</b>", HDR]
     if not hist and not dec:
         lines.append("No attempts recorded yet.")
@@ -56895,7 +56939,12 @@ async def autotrade_last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     table_rows = []
     for i, a in enumerate(hist[:max_rows], start=1):
         try:
-            when_raw = str(a.get('when') or '')
+            when_raw = str(a.get('when') or a.get('when_iso') or '')
+            if not when_raw and str(a.get('when_ts') or '').strip():
+                try:
+                    when_raw = datetime.fromtimestamp(float(a.get('when_ts')), tz=timezone.utc).isoformat()
+                except Exception:
+                    when_raw = ''
             when_txt = _fmt_iso_to_local(when_raw) if when_raw else '—'
             try:
                 m = re.search(r'(\d{2}-\d{2}\s+\d{2}:\d{2})', when_txt)
@@ -68268,6 +68317,24 @@ except Exception:
 
 # =========================================================
 # end yver62 audit display consistency cleanup
+# =========================================================
+
+# =========================================================
+# yver63 diagnostics cleanup
+# =========================================================
+YVER63_VERSION = 'yver63_2026_06_17_autotrade_last_dedup_compare_text_cleanup'
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v63'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v63'
+except Exception:
+    pass
+
+# =========================================================
+# end yver63 diagnostics cleanup
 # =========================================================
 
 if __name__ == "__main__":
