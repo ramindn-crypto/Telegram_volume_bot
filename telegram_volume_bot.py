@@ -1,3 +1,4 @@
+# yver64: adds WR column to /setup_open_times detail rows using the /setup_matrix policy WR snapshot available at setup generation time (latest matrix refresh <= setup time); no live trading logic changed.
 # yver63: cleans remaining diagnostics only: removes ghost duplicate no-time /autotrade_last rows, formats attempt rows with fallback timestamps, and removes stale yver149 wording from /setup_audit_compare. No live risk/TP/SL/order logic changes.
 # yver62: cleans /setup_audit display consistency after v61: ATWhy TP/SL_ALREADY_HIT now always matches final Res, and old sent OPEN rows show ENTRY_OLD instead of current BLACKOUT. No live risk/TP/SL/order logic changes.
 # yver61: fixes patch activation order by moving __main__ to the end, then hard-filters already-traded/resolved setup cards and AutoTrade candidates; cleans EXPIRED/MANUAL_POS labels at display. No live risk/TP/SL/order logic changes.
@@ -48030,6 +48031,104 @@ def _setup_open_times_proposals(hour_stats: dict[int, dict], *, scope_hours: int
     return props[:4]
 
 
+
+def _setup_open_times_historical_wr_lookup(uid: int = 0, start_ts: float = 0.0):
+    """Return a lookup(combo, setup_ts) -> WR label for /setup_open_times.
+
+    The value is the /setup_matrix policy WR snapshot that was available when the
+    setup was generated: latest setup_combo_scores row with evaluated_ts <= setup_ts.
+    This is display-only and does not affect current policy, audit scoring, or
+    AutoTrade execution.
+    """
+    data = {}
+    try:
+        _setup_combo_policy_migrate()
+    except Exception:
+        pass
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(uid or owner_uid or 0)
+        ids = list(dict.fromkeys([int(x) for x in [uid_i, 0] if int(x or 0) >= 0])) or [0]
+        qmarks = ','.join(['?'] * len(ids))
+        min_ts = float(start_ts or 0.0)
+        if min_ts > 0:
+            min_ts = max(0.0, min_ts - 14.0 * 86400.0)
+        now_ts = float(time.time()) + 3600.0
+        params = list(ids) + [float(min_ts), float(now_ts)]
+        row_map = {}
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            for sr in cur.execute(
+                f"""SELECT evaluated_ts,user_id,combo,family,session,strategy,side,decided,win_rate
+                    FROM setup_combo_scores
+                    WHERE user_id IN ({qmarks}) AND evaluated_ts>=? AND evaluated_ts<=?
+                    ORDER BY evaluated_ts ASC, user_id ASC""",
+                tuple(params),
+            ).fetchall() or []:
+                d = dict(sr)
+                ts = float(d.get('evaluated_ts') or 0.0)
+                if ts <= 0:
+                    continue
+                fam = str(d.get('family') or '').upper().strip()
+                sess = str(d.get('session') or '').upper().strip()
+                strat = _setup_strategy_suffix(value=str(d.get('strategy') or 'NOR'))
+                side = _setup_side_suffix(value=str(d.get('side') or 'BOTH'))
+                combo = str(d.get('combo') or '').upper().strip()
+                if not combo and fam and sess:
+                    combo = _setup_combo_strategy_side_key(fam, sess, strat, side) if side in {'BUY', 'SELL'} else _setup_combo_strategy_key(fam, sess, strat)
+                if not combo:
+                    continue
+                dec = int(float(d.get('decided') or 0.0))
+                wr = float(d.get('win_rate') or 0.0)
+                # user-specific rows should win over global rows at the same timestamp.
+                row_map[(combo, ts)] = (ts, dec, wr, int(d.get('user_id') or 0))
+        for combo, ts in sorted(row_map.keys(), key=lambda k: (k[0], k[1])):
+            entry = row_map[(combo, ts)]
+            data.setdefault(str(combo).upper().strip(), []).append(entry)
+        for combo in list(data.keys()):
+            data[combo] = sorted(data.get(combo) or [], key=lambda x: float(x[0] or 0.0))
+    except Exception:
+        data = {}
+
+    def _fallback_keys(combo: str) -> list[str]:
+        try:
+            c = str(combo or '').upper().strip()
+            keys = []
+            if c:
+                keys.append(c)
+            parts = [x for x in c.split('-') if x]
+            if len(parts) >= 3:
+                keys.append('-'.join(parts[:3]))
+            if len(parts) >= 2:
+                keys.append('-'.join(parts[:2]))
+            return list(dict.fromkeys(keys))
+        except Exception:
+            return [str(combo or '').upper().strip()]
+
+    def _lookup(combo: str, setup_ts: float) -> str:
+        try:
+            ts = float(setup_ts or 0.0)
+            if ts <= 0:
+                return '-'
+            import bisect as _bisect
+            for key in _fallback_keys(combo):
+                arr = list(data.get(str(key or '').upper().strip()) or [])
+                if not arr:
+                    continue
+                ts_list = [float(x[0] or 0.0) for x in arr]
+                idx = _bisect.bisect_right(ts_list, ts) - 1
+                if idx < 0:
+                    continue
+                _ts, dec, wr, _uid = arr[idx]
+                if int(dec or 0) <= 0:
+                    return '-'
+                return f"{float(wr or 0.0):.1f}%"
+            return '-'
+        except Exception:
+            return '-'
+    return _lookup
+
 def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> str:
     """KEEP-only setup opening-time analysis for manual blackout selection."""
     try:
@@ -48076,6 +48175,11 @@ def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> 
         except Exception:
             return ''
 
+    try:
+        historical_wr = _setup_open_times_historical_wr_lookup(int(uid_i), float(start_ts or 0.0))
+    except Exception:
+        historical_wr = lambda _combo, _ts: '-'
+
     matched: list[dict] = []
     hour_stats: dict[int, dict] = defaultdict(lambda: {'set': 0, 'tp': 0, 'sl': 0, 'nh': 0, 'open': 0, 'r_sum': 0.0})
     for r in list(rows or []):
@@ -48102,7 +48206,8 @@ def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> 
                 st['nh'] += 1
             else:
                 st['open'] += 1
-            matched.append({**dict(r or {}), '_combo': combo_u, '_res': res, '_time_txt': local_dt.strftime('%m-%d %H:%M')})
+            wr_at_gen = historical_wr(combo_u, ts) if callable(historical_wr) else '-'
+            matched.append({**dict(r or {}), '_combo': combo_u, '_wr_at_gen': wr_at_gen, '_res': res, '_time_txt': local_dt.strftime('%m-%d %H:%M')})
         except Exception:
             continue
 
@@ -48133,15 +48238,16 @@ def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> 
                 side or '-',
                 str(r.get('_combo') or '-'),
                 'KEEP',
+                str(r.get('_wr_at_gen') or '-'),
                 str(r.get('_res') or '-'),
             ])
         except Exception:
             continue
     table = tabulate(
         detail_rows,
-        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'Res'],
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'WR', 'Res'],
         tablefmt='plain',
-        colalign=('left', 'left', 'center', 'left', 'center', 'center'),
+        colalign=('left', 'left', 'center', 'left', 'center', 'right', 'center'),
     ) if detail_rows else 'No KEEP setup rows matched this window.'
 
     try:
@@ -48169,6 +48275,7 @@ def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> 
         f"Window: <b>{html.escape(scope_label)}</b>" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
         f"Rows: <b>{len(matched)}</b> KEEP setups | Decided: <b>{decided}</b> | TP/SL: <b>{tp_n}/{sl_n}</b> | WR: <b>{wr:.1f}%</b>",
         f"Data start: <b>{html.escape(start_txt)}</b> | Data end: <b>{html.escape(end_txt)}</b> | Source: <b>{html.escape(source_label)}</b>",
+        "WR column = /setup_matrix policy WR snapshot available when that setup was generated; '-' means no decided matrix snapshot yet.",
         "Detailed rows below are KEEP-only setup opening times. Use <code>/setup_open_times 24</code>, <code>/setup_open_times 7d</code>, or <code>/setup_open_times all 400</code>.",
         "<pre>" + html.escape(table) + "</pre>",
     ]
@@ -48203,7 +48310,7 @@ async def setup_open_times_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_open_times {html.escape(str(scope or 'all'))}",
-        f"admin:bg:v50:setup_open_times:{int(AUTOTRADE_OWNER_UID or uid)}:{cache_scope}:{int(rows_limit)}:{int(start_ts or 0)}:{int(scope_hours or 0)}",
+        f"admin:bg:v64:setup_open_times:{int(AUTOTRADE_OWNER_UID or uid)}:{cache_scope}:{int(rows_limit)}:{int(start_ts or 0)}:{int(scope_hours or 0)}",
         _setup_open_times_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), str(scope or ''), int(rows_limit)),
         parse_mode=ParseMode.HTML,
