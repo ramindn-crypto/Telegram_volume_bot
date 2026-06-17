@@ -1,3 +1,4 @@
+# yver70: adds a safe cooldown for repeated Bybit LIVE_OPEN_FAILED retries and sanitizes /autotrade_last rows so stale global detail cannot show another symbol's Entry/SL. No risk/TP/SL/leverage/KEEP-policy logic changed.
 # yver69: cleanup /autotrade_config help so Auto Blackout commands are visible in the clean view and old static blackout examples are no longer misleading; no live trading logic changed.
 # yver68: syncs /setup_open_times suggested blackout windows with the exact 7d-only AUTO_BLACKOUT rule (WR<45%, AvgR<0, decided>=5) so manual report and auto status do not disagree; no live order/risk/TP/SL logic changed.
 # yver67: lists and documents AUTO_BLACKOUT commands inside /autotrade_config FULL and adds a dedicated auto-blackout command/help block; no live order/risk/TP/SL logic changed.
@@ -69347,6 +69348,243 @@ except Exception:
 
 # =========================================================
 # end yver68 setup_open_times / AUTO_BLACKOUT recommendation sync
+# =========================================================
+
+
+# =========================================================
+# yver70 LIVE_OPEN_FAILED retry cooldown + attempt row hygiene
+# =========================================================
+
+try:
+    _YVER70_ORIG_AUTOTRADE_PLACE_TRADE = _autotrade_place_trade
+except Exception:
+    _YVER70_ORIG_AUTOTRADE_PLACE_TRADE = None
+try:
+    _YVER70_ORIG_AUTOTRADE_RECORD_ATTEMPT = _autotrade_record_attempt
+except Exception:
+    _YVER70_ORIG_AUTOTRADE_RECORD_ATTEMPT = None
+try:
+    _YVER70_ORIG_SHORT_AT_REASON = _setup_audit_short_autotrade_reason
+except Exception:
+    _YVER70_ORIG_SHORT_AT_REASON = None
+
+
+def _yver70_live_open_fail_cooldown_sec() -> float:
+    try:
+        return max(60.0, float(os.environ.get('AUTOTRADE_LIVE_OPEN_FAIL_COOLDOWN_SEC', '900') or 900.0))
+    except Exception:
+        return 900.0
+
+
+def _yver70_live_open_fail_migrate() -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("""CREATE TABLE IF NOT EXISTS autotrade_live_open_failures (
+                fail_key TEXT PRIMARY KEY,
+                uid INTEGER NOT NULL DEFAULT 0,
+                setup_id TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                first_ts REAL NOT NULL DEFAULT 0,
+                last_ts REAL NOT NULL DEFAULT 0,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                reason TEXT NOT NULL DEFAULT ''
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_live_open_failures_uid_ts ON autotrade_live_open_failures(uid,last_ts)")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _yver70_live_open_fail_key(uid: int, setup_id: str, symbol: str, side: str) -> str:
+    try:
+        sym = _bybit_linear_symbol(str(symbol or '').upper())
+    except Exception:
+        sym = str(symbol or '').upper().strip()
+    sid = str(setup_id or '').strip()
+    sd = str(side or '').upper().strip()
+    # Prefer setup_id so a single rejected setup cannot be hammered for the whole
+    # entry window; fall back to symbol/side when older rows have no setup_id.
+    if sid:
+        return f"setup:{int(uid)}:{sid}"
+    return f"symdir:{int(uid)}:{sym}:{sd}"
+
+
+def _yver70_live_open_fail_block_reason(uid: int, setup_id: str, symbol: str, side: str) -> str:
+    try:
+        _yver70_live_open_fail_migrate()
+        key = _yver70_live_open_fail_key(uid, setup_id, symbol, side)
+        cooldown = float(_yver70_live_open_fail_cooldown_sec())
+        now = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            r = cur.execute("SELECT * FROM autotrade_live_open_failures WHERE fail_key=?", (key,)).fetchone()
+            if not r:
+                return ''
+            age = max(0.0, now - float(r['last_ts'] or 0.0))
+            if age >= cooldown:
+                return ''
+            remain_min = max(1, int(math.ceil((cooldown - age) / 60.0)))
+            sym = str(r['symbol'] or symbol or '').upper().replace('USDT', '')
+            return f"blocked_by_cooldown_live_open_failed:{sym}:{remain_min}m"
+    except Exception:
+        return ''
+
+
+def _yver70_note_live_open_fail(uid: int, setup_id: str, symbol: str, side: str, reason: str) -> None:
+    try:
+        _yver70_live_open_fail_migrate()
+        now = float(time.time())
+        key = _yver70_live_open_fail_key(uid, setup_id, symbol, side)
+        sym = _bybit_linear_symbol(str(symbol or '').upper())
+        sd = str(side or '').upper().strip()
+        sid = str(setup_id or '').strip()
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            row = c.execute("SELECT first_ts, fail_count FROM autotrade_live_open_failures WHERE fail_key=?", (key,)).fetchone()
+            if row:
+                first_ts = float(row[0] or now)
+                fail_count = int(row[1] or 0) + 1
+            else:
+                first_ts = now
+                fail_count = 1
+            c.execute("""INSERT OR REPLACE INTO autotrade_live_open_failures
+                         (fail_key, uid, setup_id, symbol, side, first_ts, last_ts, fail_count, reason)
+                         VALUES (?,?,?,?,?,?,?,?,?)""",
+                      (key, int(uid), sid, sym, sd, float(first_ts), float(now), int(fail_count), str(reason or '')[:500]))
+            # bounded diagnostics only
+            c.execute("DELETE FROM autotrade_live_open_failures WHERE last_ts<?", (now - 7 * 86400.0,))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _yver70_detail_matches_meta(meta: dict | None, detail: dict | None) -> bool:
+    try:
+        m = dict(meta or {})
+        d = dict(detail or {})
+        ms = str(m.get('symbol') or m.get('symbol_sent') or m.get('symbol_raw') or '').upper().strip()
+        ds = str(d.get('symbol') or d.get('symbol_sent') or d.get('symbol_raw') or '').upper().strip()
+        if ms.endswith('USDT'):
+            ms = ms[:-4]
+        if ds.endswith('USDT'):
+            ds = ds[:-4]
+        ms_lin = _bybit_linear_symbol(ms) if ms else ''
+        ds_lin = _bybit_linear_symbol(ds) if ds else ''
+        if ms_lin and ds_lin and ms_lin != ds_lin:
+            return False
+        msd = str(m.get('side') or '').upper().strip()
+        dsd = str(d.get('side') or '').upper().strip()
+        if msd in {'BUY','SELL'} and dsd in {'BUY','SELL'} and msd != dsd:
+            return False
+        mid = str(m.get('setup_id') or m.get('id') or '').strip()
+        did = str(d.get('setup_id') or d.get('id') or '').strip()
+        if mid and did and mid != did:
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def _autotrade_record_attempt(uid: int, meta: dict | None = None, detail: dict | None = None, status: str = '', reason: str = '') -> None:
+    """v70 wrapper: prevent stale global detail from contaminating another candidate's /autotrade_last row."""
+    if _YVER70_ORIG_AUTOTRADE_RECORD_ATTEMPT is None:
+        return
+    try:
+        m = dict(meta or {}) if isinstance(meta, dict) else {}
+        d = dict(detail or {}) if isinstance(detail, dict) else {}
+        if d and not _yver70_detail_matches_meta(m, d):
+            # If caller already copied the stale detail into meta, clear those
+            # display-only fields rather than showing another symbol's prices.
+            for k in ('entry','sl','setup_entry','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct'):
+                try:
+                    if k in m and (k in d or str(k).startswith('entry_drift') or k == 'entry_delta_pct'):
+                        m.pop(k, None)
+                except Exception:
+                    pass
+            # Keep useful non-identity/risk diagnostics, but never identity/prices.
+            for k in ('setup_id','symbol','symbol_sent','symbol_raw','side','entry','sl','setup_entry','setup_sl_raw','entry_drift_pct','entry_drift_direction','entry_drift_adverse_pct','entry_delta_pct'):
+                d.pop(k, None)
+            m['detail_identity_mismatch_sanitized'] = True
+        return _YVER70_ORIG_AUTOTRADE_RECORD_ATTEMPT(uid, m if m else meta, d if d else detail, status, reason)
+    except Exception:
+        try:
+            return _YVER70_ORIG_AUTOTRADE_RECORD_ATTEMPT(uid, meta, detail, status, reason)
+        except Exception:
+            return
+
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    """v70 wrapper: throttle repeated exchange open failures for the same setup/symbol."""
+    if _YVER70_ORIG_AUTOTRADE_PLACE_TRADE is None:
+        return (False, 'autotrade_place_trade_unavailable')
+    try:
+        s0 = (list(setups or [None]) or [None])[0]
+    except Exception:
+        s0 = None
+    try:
+        sym = _bybit_linear_symbol(str(getattr(s0, 'symbol', '') or '').upper()) if s0 is not None else ''
+        side = str(getattr(s0, 'side', '') or '').upper().strip() if s0 is not None else ''
+        setup_id = str(getattr(s0, 'setup_id', '') or getattr(s0, 'id', '') or '').strip() if s0 is not None else ''
+        if str(_autotrade_runtime_mode()).lower() == 'live' and sym and side in {'BUY','SELL'}:
+            cd_reason = _yver70_live_open_fail_block_reason(int(uid), setup_id, sym, side)
+            if cd_reason:
+                try:
+                    _LAST_AUTOTRADE_DETAIL[int(uid)] = {
+                        'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                        'session': session_label,
+                        'setup_id': setup_id,
+                        'symbol_raw': str(getattr(s0, 'symbol', '') or ''),
+                        'symbol_sent': sym,
+                        'side': side,
+                        'entry': float(getattr(s0, 'entry', 0.0) or 0.0),
+                        'sl': float(getattr(s0, 'sl', 0.0) or 0.0),
+                        'setup_entry': float(getattr(s0, 'entry', 0.0) or 0.0),
+                        'setup_sl_raw': float(getattr(s0, 'sl', 0.0) or 0.0),
+                        'reject_reason': cd_reason,
+                        'live_open_failed_cooldown': True,
+                    }
+                except Exception:
+                    pass
+                return (False, cd_reason)
+    except Exception:
+        pass
+
+    ok, rr = _YVER70_ORIG_AUTOTRADE_PLACE_TRADE(uid, session_label, setups)
+    try:
+        rlow = str(rr or '').lower()
+        if str(_autotrade_runtime_mode()).lower() == 'live' and not ok and ('live_open_failed' in rlow or 'live_entry_fill_not_confirmed' in rlow):
+            if s0 is not None:
+                sym = _bybit_linear_symbol(str(getattr(s0, 'symbol', '') or '').upper())
+                side = str(getattr(s0, 'side', '') or '').upper().strip()
+                setup_id = str(getattr(s0, 'setup_id', '') or getattr(s0, 'id', '') or '').strip()
+                _yver70_note_live_open_fail(int(uid), setup_id, sym, side, str(rr or ''))
+    except Exception:
+        pass
+    return ok, rr
+
+
+def _setup_audit_short_autotrade_reason(reason: str) -> str:
+    r = str(reason or '').lower().strip()
+    if 'blocked_by_cooldown_live_open_failed' in r or 'live_open_failed_cooldown' in r:
+        return 'LIVE_FAIL_CD'
+    if _YVER70_ORIG_SHORT_AT_REASON is not None:
+        return _YVER70_ORIG_SHORT_AT_REASON(reason)
+    return re.sub(r'[^A-Z0-9_]+', '_', str(reason or '').upper()).strip('_')[:16] or '-'
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v70'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v70'
+except Exception:
+    pass
+
+# =========================================================
+# end yver70 LIVE_OPEN_FAILED retry cooldown + attempt hygiene
 # =========================================================
 
 if __name__ == "__main__":
