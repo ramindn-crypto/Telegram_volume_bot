@@ -1,3 +1,4 @@
+# yver60: hardens v59 cleanup: /screen also checks cached setup-audit price path before showing recent emailed setups, removes resolved TP/SL cards from final screen formatting, and renames setup-audit EXPIRED/PENDING noise to ENTRY_OLD/SL_ALREADY_HIT. No live TP/SL/risk/order logic changes.
 # yver59: keeps /screen/email/actionable setup queues clean by hiding setups that have already touched TP/SL, renames entry-window EXPIRED/MANUAL_POS display noise, and labels KEEP journal closes without a safe audit setup as JOURNAL_ONLY instead of scary NO_SETUP. No live TP/SL/risk/order logic changes.
 # yver56: setup-audit results now have unlimited life: each setup is evaluated from creation until now and remains OPEN until price actually hits TP or SL; no NH/NOHIT expiry, no stale OPEN forced to SL, WR stays TP/(TP+SL) with OPEN excluded, and report/cache labels are bumped. No live AutoTrade entry window/risk/TP/SL logic changed.
 # yver54: 17 Jun 09:20 review — appends evidence-based blackout windows 14:00-15:00 and 17:00-18:00 while keeping 07:00-08:00, 10:00-11:00 and SUN 22:00-MON 10:00; setup generation remains shadow-on, only setup delivery and AutoTrade entries are blocked.
@@ -67583,4 +67584,254 @@ except Exception:
 
 # =========================================================
 # end yver59 cleanup
+# =========================================================
+
+
+# =========================================================
+# yver60 stronger /screen resolved-setup cleanup + audit wording
+# =========================================================
+YVER60_VERSION = 'yver60_2026_06_17_screen_uses_cached_audit_path_and_no_expired_wording'
+
+
+def _yver60_setup_terminal_for_visibility(setup_or_row) -> tuple[bool, str]:
+    """Stronger terminal check for user-facing setup cards.
+
+    v59 only checked signal_outcomes and current cached ticker.  The 12:30 v59
+    output still showed SUI on /screen even though /setup_audit had already
+    resolved that exact emailed setup as SL.  This helper also asks the existing
+    cached setup-audit price-path resolver (no network fetch) so /screen/email
+    visibility uses the same TP/SL evidence as /setup_audit.
+    """
+    try:
+        # Preserve v59 fast checks first.
+        try:
+            terminal, why = _yver59_setup_terminal_for_visibility(setup_or_row)
+            if terminal:
+                return True, why or 'setup_already_resolved'
+        except Exception:
+            pass
+
+        row = _yver59_setup_to_row(setup_or_row)
+        side = str(row.get('side') or '').upper().strip()
+        entry = float(row.get('entry') or 0.0)
+        sl = float(row.get('sl') or 0.0)
+        tp = float(_resolve_single_tp(entry, sl, row.get('tp'), row.get('alt_target_a'), row.get('alt_target_b'), side) or 0.0)
+        if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+            return False, ''
+        if side == 'BUY' and not (sl < entry < tp):
+            return False, ''
+        if side == 'SELL' and not (tp < entry < sl):
+            return False, ''
+        try:
+            row['tp'] = tp
+            res = str(_setup_audit_result_from_cached_price_moves(row, horizon_hours=0) or '').upper().strip()
+            if res in {'WIN', 'TP'}:
+                return True, 'setup_already_hit_tp'
+            if res in {'LOSE', 'LOSS', 'SL'}:
+                return True, 'setup_already_hit_sl'
+        except Exception:
+            pass
+        return False, ''
+    except Exception:
+        return False, ''
+
+
+try:
+    _YVER60_ORIG_RECENT_DELIVERY_LANE_SETUP_OBJECTS = _recent_delivery_lane_setup_objects
+except Exception:
+    _YVER60_ORIG_RECENT_DELIVERY_LANE_SETUP_OBJECTS = None
+
+
+def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int | None = None, limit: int = 3) -> list:
+    rows = []
+    try:
+        if _YVER60_ORIG_RECENT_DELIVERY_LANE_SETUP_OBJECTS is not None:
+            rows = _YVER60_ORIG_RECENT_DELIVERY_LANE_SETUP_OBJECTS(user_id, session_name=session_name, max_age_min=max_age_min, limit=max(int(limit or 3) * 5, int(limit or 3) + 10)) or []
+    except Exception:
+        rows = []
+    out = []
+    seen = set()
+    for item in list(rows or []):
+        try:
+            sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+            ident = _setup_identity_from_obj(item)
+            key = ident or sid
+            if not sid or key in seen:
+                continue
+            terminal, why = _yver60_setup_terminal_for_visibility(item)
+            if terminal:
+                try:
+                    setattr(item, 'screen_hidden_reason', why)
+                except Exception:
+                    pass
+                continue
+            out.append(item)
+            seen.add(key)
+            if len(out) >= int(limit or 3):
+                break
+        except Exception:
+            continue
+    return out[:int(limit or 3)]
+
+
+try:
+    _YVER60_ORIG_FILTER_USER_VISIBLE_KEEP_SETUPS = _filter_user_visible_keep_setups
+except Exception:
+    _YVER60_ORIG_FILTER_USER_VISIBLE_KEEP_SETUPS = None
+
+
+def _filter_user_visible_keep_setups(setups: list, session_name: str = '', user_id: int = 0, lane: str = 'screen') -> list:
+    try:
+        base = _YVER60_ORIG_FILTER_USER_VISIBLE_KEEP_SETUPS(setups, session_name=session_name, user_id=user_id, lane=lane) if _YVER60_ORIG_FILTER_USER_VISIBLE_KEEP_SETUPS is not None else list(setups or [])
+    except Exception:
+        base = list(setups or [])
+    out = []
+    seen = set()
+    for item in list(base or []):
+        try:
+            terminal, why = _yver60_setup_terminal_for_visibility(item)
+            if terminal:
+                try:
+                    setattr(item, 'screen_hidden_reason', why)
+                except Exception:
+                    pass
+                continue
+            ident = _setup_identity_from_obj(item) or str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '')
+            if ident and ident in seen:
+                continue
+            if ident:
+                seen.add(ident)
+            out.append(item)
+        except Exception:
+            continue
+    return out
+
+
+try:
+    _YVER60_ORIG_SCREEN_FORMAT_SETUP_CARDS = _screen_format_setup_cards
+except Exception:
+    _YVER60_ORIG_SCREEN_FORMAT_SETUP_CARDS = None
+
+
+def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
+    visible = []
+    try:
+        for s in list(setups or []):
+            terminal, _why = _yver60_setup_terminal_for_visibility(s)
+            if not terminal:
+                visible.append(s)
+    except Exception:
+        visible = list(setups or [])
+    if _YVER60_ORIG_SCREEN_FORMAT_SETUP_CARDS is not None:
+        return _YVER60_ORIG_SCREEN_FORMAT_SETUP_CARDS(visible, uid, session)
+    return "_No high-quality setups right now._" if not visible else ""
+
+
+try:
+    _YVER60_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = is_executable_setup_eligible
+except Exception:
+    _YVER60_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = None
+
+
+def is_executable_setup_eligible(s: "Setup", session_name: str = "NY", min_quality: float = 68.0, min_conf: int = 74, min_rr_final: float = 0.0) -> tuple[bool, str]:
+    try:
+        terminal, why = _yver60_setup_terminal_for_visibility(s)
+        if terminal:
+            return False, why
+    except Exception:
+        pass
+    if _YVER60_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE is not None:
+        return _YVER60_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE(s, session_name=session_name, min_quality=min_quality, min_conf=min_conf, min_rr_final=min_rr_final)
+    return True, ''
+
+
+try:
+    _YVER60_ORIG_SETUP_FINAL_QUALITY_GATE_ALLOWS_SETUP = _setup_final_quality_gate_allows_setup
+except Exception:
+    _YVER60_ORIG_SETUP_FINAL_QUALITY_GATE_ALLOWS_SETUP = None
+
+
+def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    try:
+        terminal, why = _yver60_setup_terminal_for_visibility(setup_or_row)
+        if terminal:
+            return False, why, {'terminal_by_cached_audit_path': True}
+    except Exception:
+        pass
+    if _YVER60_ORIG_SETUP_FINAL_QUALITY_GATE_ALLOWS_SETUP is not None:
+        return _YVER60_ORIG_SETUP_FINAL_QUALITY_GATE_ALLOWS_SETUP(setup_or_row, session_name=session_name, user_id=user_id)
+    return True, '', {}
+
+
+try:
+    _YVER60_ORIG_SETUP_AUDIT_AUTOTRADE_SKIP_REASON = _setup_audit_autotrade_skip_reason
+except Exception:
+    _YVER60_ORIG_SETUP_AUDIT_AUTOTRADE_SKIP_REASON = None
+
+
+def _yver60_clean_atwhy_label(label: str) -> str:
+    s = str(label or '').upper().strip()
+    if s in {'EXPIRED', 'SETUP_EXPIRED', 'ENTRY_WINDOW_EXPIRED'}:
+        return 'ENTRY_OLD'
+    if s in {'MANUAL_POS', 'MANUAL_POSITION'}:
+        return 'OPEN_POS'
+    if s.startswith('STOP_INVALID') or s in {'INVALID_STOP'}:
+        return 'SL_ALREADY_HIT'
+    return s or '-'
+
+
+def _setup_audit_autotrade_skip_reason(row: dict, uid: int = 0, policy_label: str = '', at_state: str = '', session_name: str = '') -> str:
+    try:
+        at = str(at_state or '').upper().strip()
+        if not (at.startswith('AT_') or at == 'AT'):
+            terminal, why = _yver60_setup_terminal_for_visibility(row)
+            if terminal:
+                if 'tp' in str(why or '').lower():
+                    return 'TP_ALREADY_HIT'
+                if 'sl' in str(why or '').lower():
+                    return 'SL_ALREADY_HIT'
+    except Exception:
+        pass
+    if _YVER60_ORIG_SETUP_AUDIT_AUTOTRADE_SKIP_REASON is not None:
+        try:
+            return _yver60_clean_atwhy_label(_YVER60_ORIG_SETUP_AUDIT_AUTOTRADE_SKIP_REASON(row, uid=uid, policy_label=policy_label, at_state=at_state, session_name=session_name))
+        except TypeError:
+            try:
+                return _yver60_clean_atwhy_label(_YVER60_ORIG_SETUP_AUDIT_AUTOTRADE_SKIP_REASON(row, uid, policy_label, at_state, session_name))
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return '-'
+
+
+try:
+    _YVER60_ORIG_SETUP_AUDIT_TEXT = _setup_audit_text
+except Exception:
+    _YVER60_ORIG_SETUP_AUDIT_TEXT = None
+
+
+def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
+    txt = _YVER60_ORIG_SETUP_AUDIT_TEXT(uid, limit=limit, hours=hours) if _YVER60_ORIG_SETUP_AUDIT_TEXT is not None else ''
+    try:
+        txt = str(txt or '')
+        txt = txt.replace('SENT_OLD</b> = setup email was sent but the entry window has expired;', 'SENT_OLD</b> = setup email was sent but the AutoTrade entry window is old;')
+        txt = txt.replace(' EXPIRED ', ' ENTRY_OLD ')
+        txt = txt.replace('>EXPIRED<', '>ENTRY_OLD<')
+    except Exception:
+        pass
+    return txt
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v60'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v60'
+except Exception:
+    pass
+
+# =========================================================
+# end yver60 cleanup
 # =========================================================
