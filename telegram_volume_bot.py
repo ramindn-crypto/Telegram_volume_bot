@@ -1,3 +1,4 @@
+# yver68: syncs /setup_open_times suggested blackout windows with the exact 7d-only AUTO_BLACKOUT rule (WR<45%, AvgR<0, decided>=5) so manual report and auto status do not disagree; no live order/risk/TP/SL logic changed.
 # yver67: lists and documents AUTO_BLACKOUT commands inside /autotrade_config FULL and adds a dedicated auto-blackout command/help block; no live order/risk/TP/SL logic changed.
 # yver66: simplifies automatic blackout tuning to 7d-only evidence from /setup_open_times (shadow-generated KEEP setups included); 3d/10d/24h no longer control automatic windows; no live order/risk/TP/SL logic changed.
 # yver65: adds automatic daily evidence-based blackout tuning using /setup_open_times logic (7d main, 3d/10d confirmation, 24h early warning only); setup generation stays SHADOW, no order/risk/TP/SL logic changed.
@@ -48220,7 +48221,7 @@ def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> 
     top_lines = []
     if proposals:
         # The top section intentionally contains only the proposed windows, per owner request.
-        for p in proposals[:3]:
+        for p in proposals:
             dec = int(p.get('tp', 0) or 0) + int(p.get('sl', 0) or 0)
             top_lines.append(
                 f"• <b>{html.escape(str(p.get('label') or '-'))}</b> — WR {float(p.get('wr', 0.0)):.1f}% | AvgR {float(p.get('avg_r', 0.0)):+.2f} | TP/SL {int(p.get('tp',0) or 0)}/{int(p.get('sl',0) or 0)} | Set {int(p.get('set',0) or 0)}"
@@ -48313,7 +48314,7 @@ async def setup_open_times_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_open_times {html.escape(str(scope or 'all'))}",
-        f"admin:bg:v64:setup_open_times:{int(AUTOTRADE_OWNER_UID or uid)}:{cache_scope}:{int(rows_limit)}:{int(start_ts or 0)}:{int(scope_hours or 0)}",
+        f"admin:bg:v68:setup_open_times:{int(AUTOTRADE_OWNER_UID or uid)}:{cache_scope}:{int(rows_limit)}:{int(start_ts or 0)}:{int(scope_hours or 0)}",
         _setup_open_times_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), str(scope or ''), int(rows_limit)),
         parse_mode=ParseMode.HTML,
@@ -69201,6 +69202,141 @@ except Exception:
 
 # =========================================================
 # end yver67 auto blackout FULL visibility
+# =========================================================
+
+
+
+# =========================================================
+# yver68 setup_open_times / AUTO_BLACKOUT recommendation sync
+# =========================================================
+YVER68_VERSION = 'yver68_2026_06_17_auto_blackout_setup_open_times_sync'
+YVER68_AUTO_BLACKOUT_RULE_TEXT = 'Auto-rule sync: last 7d only; suggest/add when WR<45%, AvgR<0, and decided TP+SL>=5; OPEN excluded from WR; setup generation remains SHADOW ON.'
+
+
+def _setup_open_times_proposals(hour_stats: dict[int, dict], *, scope_hours: int = 0) -> list[dict]:
+    """v68: use the exact AUTO_BLACKOUT candidate rule for suggestions.
+
+    Before v68, /setup_open_times used an older manual suggestion heuristic
+    (looser min_decided and WR/AvgR OR logic), while AUTO_BLACKOUT used the
+    stricter 7d-only automatic rule.  That made the report's suggested windows
+    look different from AUTO_BLACKOUT_STATUS.  This display/report function now
+    uses the same candidate rule as the automatic blackout tuner:
+      - decided TP+SL >= 5
+      - WR < 45%
+      - AvgR < 0
+    OPEN rows remain visible in the detailed table but are excluded from WR/AvgR.
+    """
+    try:
+        min_decided = int(os.environ.get('PULSE_AUTO_BLACKOUT_MIN_DECIDED', '5') or 5)
+    except Exception:
+        min_decided = 5
+    try:
+        wr_lt = float(os.environ.get('PULSE_AUTO_BLACKOUT_WR_LT', '45') or 45.0)
+    except Exception:
+        wr_lt = 45.0
+    try:
+        avg_r_lt = float(os.environ.get('PULSE_AUTO_BLACKOUT_AVGR_LT', '0') or 0.0)
+    except Exception:
+        avg_r_lt = 0.0
+
+    bad_hours = []
+    for h in range(24):
+        try:
+            st = dict((hour_stats or {}).get(h) or {})
+            tp = int(st.get('tp', 0) or 0)
+            sl = int(st.get('sl', 0) or 0)
+            dec = tp + sl
+            if dec < min_decided:
+                continue
+            wr = (float(tp) / float(dec) * 100.0) if dec else 0.0
+            avg_r = (float(st.get('r_sum', 0.0) or 0.0) / float(dec)) if dec else 0.0
+            if wr < wr_lt and avg_r < avg_r_lt:
+                bad_hours.append(int(h) % 24)
+        except Exception:
+            continue
+    if not bad_hours:
+        return []
+
+    # Merge consecutive hours, including wrap-around such as 23 + 00 => 23:00-01:00.
+    bad_hours = sorted(set(int(h) % 24 for h in bad_hours))
+    segments = []
+    start = prev = bad_hours[0]
+    for h in bad_hours[1:]:
+        if h == prev + 1:
+            prev = h
+        else:
+            segments.append(list(range(start, prev + 1)))
+            start = prev = h
+    segments.append(list(range(start, prev + 1)))
+    try:
+        if len(segments) > 1 and segments[0][0] == 0 and segments[-1][-1] == 23:
+            merged = segments[-1] + segments[0]
+            segments = [merged] + segments[1:-1]
+    except Exception:
+        pass
+
+    props = []
+    for seg in segments:
+        tp = sl = nh = op = set_n = 0
+        r_sum = 0.0
+        for h in seg:
+            st = dict((hour_stats or {}).get(int(h) % 24) or {})
+            tp += int(st.get('tp', 0) or 0)
+            sl += int(st.get('sl', 0) or 0)
+            nh += int(st.get('nh', 0) or 0)
+            op += int(st.get('open', 0) or 0)
+            set_n += int(st.get('set', 0) or 0)
+            r_sum += float(st.get('r_sum', 0.0) or 0.0)
+        dec = tp + sl
+        wr = (float(tp) / float(dec) * 100.0) if dec else 0.0
+        avg_r = (float(r_sum) / float(dec)) if dec else 0.0
+        props.append({
+            'hours': [int(h) % 24 for h in seg],
+            'label': _setup_open_times_interval_label([int(h) % 24 for h in seg]),
+            'set': set_n,
+            'tp': tp,
+            'sl': sl,
+            'nh': nh,
+            'open': op,
+            'wr': wr,
+            'avg_r': avg_r,
+            'score': (avg_r, wr, -dec),
+        })
+    return props
+
+
+try:
+    _YVER68_ORIG_SETUP_OPEN_TIMES_TEXT = _setup_open_times_text
+except Exception:
+    _YVER68_ORIG_SETUP_OPEN_TIMES_TEXT = None
+
+
+def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> str:
+    """v68 wrapper: add explicit auto-rule note to the report."""
+    if _YVER68_ORIG_SETUP_OPEN_TIMES_TEXT is None:
+        return 'setup_open_times unavailable.'
+    txt = _YVER68_ORIG_SETUP_OPEN_TIMES_TEXT(uid, scope, rows_limit)
+    try:
+        note = 'Auto-blackout rule sync: suggestions above use the same 7d-only AUTO_BLACKOUT candidate rule: WR<45%, AvgR<0, decided TP+SL>=5. Applied windows may also retain a previous weak hour for one review for smoothing.'
+        marker = '<b>Suggested blackout windows only:</b>\n'
+        if marker in txt and 'Auto-blackout rule sync:' not in txt:
+            txt = txt.replace(marker, marker + html.escape(note) + '\n', 1)
+    except Exception:
+        pass
+    return txt
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v68'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v68'
+except Exception:
+    pass
+
+# =========================================================
+# end yver68 setup_open_times / AUTO_BLACKOUT recommendation sync
 # =========================================================
 
 if __name__ == "__main__":
