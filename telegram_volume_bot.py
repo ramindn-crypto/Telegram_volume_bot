@@ -1,3 +1,5 @@
+# yver66: simplifies automatic blackout tuning to 7d-only evidence from /setup_open_times (shadow-generated KEEP setups included); 3d/10d/24h no longer control automatic windows; no live order/risk/TP/SL logic changed.
+# yver65: adds automatic daily evidence-based blackout tuning using /setup_open_times logic (7d main, 3d/10d confirmation, 24h early warning only); setup generation stays SHADOW, no order/risk/TP/SL logic changed.
 # yver64: adds WR column to /setup_open_times detail rows using the /setup_matrix policy WR snapshot available at setup generation time (latest matrix refresh <= setup time); no live trading logic changed.
 # yver63: cleans remaining diagnostics only: removes ghost duplicate no-time /autotrade_last rows, formats attempt rows with fallback timestamps, and removes stale yver149 wording from /setup_audit_compare. No live risk/TP/SL/order logic changes.
 # yver62: cleans /setup_audit display consistency after v61: ATWhy TP/SL_ALREADY_HIT now always matches final Res, and old sent OPEN rows show ENTRY_OLD instead of current BLACKOUT. No live risk/TP/SL/order logic changes.
@@ -68442,6 +68444,662 @@ except Exception:
 
 # =========================================================
 # end yver63 diagnostics cleanup
+# =========================================================
+
+
+# =========================================================
+# yver65 automatic evidence-based blackout tuning
+# =========================================================
+YVER65_VERSION = 'yver65_2026_06_17_auto_blackout_daily_from_open_times'
+
+# Persistent config keys used only by the auto-blackout scheduler.  They are kept
+# separate from the live entry/setup-delivery blackout keys so the owner can turn
+# the automation off without losing the last applied blackout windows.
+YVER65_AUTO_BLACKOUT_ENABLED_KEY = 'yver65_auto_blackout_enabled'
+YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY = 'yver65_auto_blackout_last_run_ts'
+YVER65_AUTO_BLACKOUT_LAST_WINDOWS_KEY = 'yver65_auto_blackout_last_windows'
+YVER65_AUTO_BLACKOUT_STATE_KEY = 'yver65_auto_blackout_state_json'
+YVER65_AUTO_BLACKOUT_REVIEW_HOUR_KEY = 'yver65_auto_blackout_review_hour'
+YVER65_AUTO_BLACKOUT_REVIEW_MINUTE_KEY = 'yver65_auto_blackout_review_minute'
+
+# Always preserve the weekend maintenance/safety window while the bot is still
+# changing daily.  Hourly daily windows are learned from recent KEEP setup evidence.
+YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW = 'SUN 22:00-MON 10:00'
+
+
+def _yver65_json_load(text, default=None):
+    try:
+        return json.loads(str(text or '').strip() or '{}')
+    except Exception:
+        return default if default is not None else {}
+
+
+def _yver65_json_dump(obj) -> str:
+    try:
+        return json.dumps(obj or {}, sort_keys=True, separators=(',', ':'))
+    except Exception:
+        return '{}'
+
+
+def _yver65_auto_blackout_enabled() -> bool:
+    try:
+        env = os.environ.get('PULSE_AUTO_BLACKOUT_ENABLED', '')
+        if str(env).strip() != '':
+            return str(env).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        pass
+    try:
+        raw = _autotrade_config_get(YVER65_AUTO_BLACKOUT_ENABLED_KEY, '1')
+        return str(raw).strip().lower() not in {'0', 'false', 'off', 'no'}
+    except Exception:
+        return True
+
+
+def _yver65_auto_blackout_review_time() -> tuple[int, int]:
+    try:
+        h = int(float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_REVIEW_HOUR_KEY, os.environ.get('PULSE_AUTO_BLACKOUT_REVIEW_HOUR', '15')) or 15))
+    except Exception:
+        h = 15
+    try:
+        m = int(float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_REVIEW_MINUTE_KEY, os.environ.get('PULSE_AUTO_BLACKOUT_REVIEW_MINUTE', '5')) or 5))
+    except Exception:
+        m = 5
+    return max(0, min(23, h)), max(0, min(59, m))
+
+
+def _yver65_is_setup_keep_row(row: dict, keep_combos: set[str]) -> tuple[bool, str]:
+    try:
+        fam = _setup_audit_family_code(row)
+        sess_row = str((row or {}).get('session') or (row or {}).get('source_session') or '-').upper().strip() or '-'
+        strat = _setup_strategy_short_label(row)
+        side_row = _setup_side_suffix(value=str((row or {}).get('side') or ''))
+        combo = str(_setup_combo_strategy_side_key(fam, sess_row, strat, side_row) or '').upper().strip()
+        return bool(combo and combo in set(keep_combos or set())), combo
+    except Exception:
+        return False, ''
+
+
+def _yver65_setup_open_hour_stats(uid: int, scope_arg: str) -> dict[int, dict]:
+    """Return the same KEEP-only hourly evidence basis used by /setup_open_times.
+
+    OPEN rows are counted as open but excluded from WR/AvgR decisions, exactly like
+    the manual report.  This function must be best-effort and never block trading.
+    """
+    stats = defaultdict(lambda: {'set': 0, 'tp': 0, 'sl': 0, 'open': 0, 'r_sum': 0.0})
+    try:
+        scope_label, start_ts, scope_hours = _setup_open_times_parse_scope(str(scope_arg or '7d'))
+    except Exception:
+        start_ts = float(time.time()) - 7.0 * 86400.0
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    try:
+        keep_combos = set((_setup_matrix_policy_current_lane_sets(uid_i).get('keep') or set()))
+    except Exception:
+        keep_combos = set()
+    if not keep_combos:
+        return stats
+    try:
+        rows = _setup_audit_load_rows(int(uid_i), hours=None, limit=0, dedup=True, start_ts=float(start_ts or 0.0), apply_final_quality_gate=False, source_mode_override='ALL')
+        if not rows:
+            rows, _src = _overall_report_source_rows(uid_i, start_ts=float(start_ts or 0.0), limit=0, dedup=True)
+    except Exception:
+        rows = []
+    try:
+        result_horizon = _setup_audit_result_horizon_hours()
+    except Exception:
+        result_horizon = 0.0
+    for r0 in list(rows or []):
+        try:
+            r = dict(r0 or {})
+            ok, _combo = _yver65_is_setup_keep_row(r, keep_combos)
+            if not ok:
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if ts <= 0:
+                continue
+            local_dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+            h = int(local_dt.hour) % 24
+            res = _setup_audit_result_label(_setup_audit_keep_watch_fast_result_label(r, result_horizon))
+            st = stats[h]
+            st['set'] += 1
+            if res == 'TP':
+                st['tp'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or 0.0)
+            elif res == 'SL':
+                st['sl'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or -1.0)
+            else:
+                st['open'] += 1
+        except Exception:
+            continue
+    return stats
+
+
+def _yver65_weak_hours_from_stats(stats: dict[int, dict], *, min_decided: int, wr_lt: float = 45.0, avg_r_lt: float = 0.0) -> set[int]:
+    out = set()
+    try:
+        for h in range(24):
+            st = dict((stats or {}).get(h) or {})
+            tp = int(st.get('tp', 0) or 0)
+            sl = int(st.get('sl', 0) or 0)
+            dec = tp + sl
+            if dec < int(min_decided or 1):
+                continue
+            wr = (tp / dec * 100.0) if dec else 0.0
+            avg_r = (float(st.get('r_sum', 0.0) or 0.0) / dec) if dec else 0.0
+            if wr < float(wr_lt) and avg_r < float(avg_r_lt):
+                out.add(int(h) % 24)
+    except Exception:
+        pass
+    return out
+
+
+def _yver65_hour_metric(stats: dict[int, dict], h: int) -> dict:
+    try:
+        st = dict((stats or {}).get(int(h) % 24) or {})
+        tp = int(st.get('tp', 0) or 0)
+        sl = int(st.get('sl', 0) or 0)
+        dec = tp + sl
+        wr = (tp / dec * 100.0) if dec else 0.0
+        avg_r = (float(st.get('r_sum', 0.0) or 0.0) / dec) if dec else 0.0
+        return {'tp': tp, 'sl': sl, 'decided': dec, 'set': int(st.get('set', 0) or 0), 'open': int(st.get('open', 0) or 0), 'wr': wr, 'avg_r': avg_r}
+    except Exception:
+        return {'tp': 0, 'sl': 0, 'decided': 0, 'set': 0, 'open': 0, 'wr': 0.0, 'avg_r': 0.0}
+
+
+def _yver65_daily_hours_from_windows(windows_value: str) -> set[int]:
+    """Extract daily whole-hour blackout windows from existing config.
+
+    Day-aware weekend windows are deliberately ignored here; they are always added
+    separately.  This is used only for the two-review removal smoothing state.
+    """
+    hours = set()
+    try:
+        for w in _split_blackout_windows(windows_value):
+            txt = str(w or '').strip().upper()
+            if re.search(r'\b(MON|TUE|WED|THU|FRI|SAT|SUN)\b', txt):
+                continue
+            if '-' not in txt:
+                continue
+            a, b = [x.strip() for x in txt.split('-', 1)]
+            pa = _parse_blackout_endpoint(a)
+            pb = _parse_blackout_endpoint(b)
+            if not pa or not pb:
+                continue
+            _sd, sm, _sa = pa
+            _ed, em, _eb = pb
+            sh = int(sm // 60) % 24
+            eh = int(em // 60) % 24
+            # Include any hour touched by the interval.  Configs are generated as
+            # whole-hour windows, but this also handles 23:00-23:59.
+            if eh == sh and em != sm:
+                span = 24
+            elif em <= sm:
+                span = (24 - sh) + eh
+            else:
+                span = max(1, eh - sh)
+            for i in range(max(1, min(24, span))):
+                hours.add((sh + i) % 24)
+    except Exception:
+        pass
+    return hours
+
+
+def _yver65_compact_daily_hours_to_windows(hours: set[int]) -> list[str]:
+    hs = sorted({int(h) % 24 for h in set(hours or set())})
+    if not hs:
+        return []
+    if len(hs) >= 24:
+        return ['00:00-00:00']
+    segments = []
+    start = prev = hs[0]
+    for h in hs[1:]:
+        if h == prev + 1:
+            prev = h
+        else:
+            segments.append([start, prev])
+            start = prev = h
+    segments.append([start, prev])
+    # Merge wrap-around consecutive hours, e.g. 23 + 00 -> 23:00-01:00.
+    try:
+        if len(segments) > 1 and segments[0][0] == 0 and segments[-1][1] == 23:
+            first = segments.pop(0)
+            last = segments.pop(-1)
+            segments.insert(0, [last[0], first[1]])
+    except Exception:
+        pass
+    labels = []
+    for a, b in segments:
+        try:
+            a_i = int(a) % 24
+            b_i = int(b) % 24
+            end_h = (b_i + 1) % 24
+            labels.append(f'{a_i:02d}:00-{end_h:02d}:00')
+        except Exception:
+            continue
+    return labels
+
+
+def _yver65_build_auto_blackout_recommendation(uid: int = 0) -> dict:
+    """Build daily blackout windows from the development-safe method.
+
+    Method:
+    - 7d is the main decision window.
+    - 3d is early-warning/support.
+    - 10d is confirmation.
+    - 24h can support a 7d weakness but cannot create a new blackout by itself.
+    - Add/keep weak hours with WR<45%, negative AvgR, enough decisions.
+    - Existing auto hours are removed only after two consecutive daily reviews where
+      they are no longer supported, unless 7d WR rises above 50%.
+    """
+    uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+    stats_7 = _yver65_setup_open_hour_stats(uid_i, '7d')
+    stats_3 = _yver65_setup_open_hour_stats(uid_i, '3d')
+    stats_10 = _yver65_setup_open_hour_stats(uid_i, '10d')
+    stats_24 = _yver65_setup_open_hour_stats(uid_i, '24')
+
+    weak7 = _yver65_weak_hours_from_stats(stats_7, min_decided=5, wr_lt=45.0, avg_r_lt=0.0)
+    weak3 = _yver65_weak_hours_from_stats(stats_3, min_decided=3, wr_lt=45.0, avg_r_lt=0.0)
+    weak10 = _yver65_weak_hours_from_stats(stats_10, min_decided=5, wr_lt=45.0, avg_r_lt=0.0)
+    weak24 = _yver65_weak_hours_from_stats(stats_24, min_decided=2, wr_lt=45.0, avg_r_lt=0.0)
+
+    candidate = set()
+    details = {}
+    for h in sorted(weak7):
+        m7 = _yver65_hour_metric(stats_7, h)
+        severe7 = bool(float(m7.get('wr', 0.0)) <= 35.0 or float(m7.get('avg_r', 0.0)) <= -0.25)
+        supported = bool(h in weak3 or h in weak10 or h in weak24 or severe7)
+        if supported:
+            candidate.add(h)
+            details[str(h)] = {
+                'h': h, 'wr7': round(float(m7.get('wr', 0.0)), 2), 'avg7': round(float(m7.get('avg_r', 0.0)), 3),
+                'dec7': int(m7.get('decided', 0) or 0),
+                'support': [x for x, s in [('3d', weak3), ('10d', weak10), ('24h', weak24), ('severe7d', {h} if severe7 else set())] if h in s],
+            }
+
+    # Smooth removals.  If an hour was auto-applied previously, require two missed
+    # reviews before removing it, unless 7d has clearly recovered above 50% WR.
+    state = _yver65_json_load(_autotrade_config_get(YVER65_AUTO_BLACKOUT_STATE_KEY, '{}'), default={})
+    miss = dict((state or {}).get('miss') or {}) if isinstance(state, dict) else {}
+    previous_hours = set()
+    try:
+        previous_hours = {int(x) % 24 for x in (state or {}).get('hours', [])}
+    except Exception:
+        previous_hours = set()
+    if not previous_hours:
+        previous_hours = _yver65_daily_hours_from_windows(str(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_WINDOWS_KEY, '') or ''))
+
+    final_hours = set(candidate)
+    new_miss = {}
+    for h in sorted(previous_hours):
+        h_i = int(h) % 24
+        if h_i in candidate:
+            new_miss[str(h_i)] = 0
+            final_hours.add(h_i)
+            continue
+        m7 = _yver65_hour_metric(stats_7, h_i)
+        recovered = bool(int(m7.get('decided', 0) or 0) >= 5 and float(m7.get('wr', 0.0)) > 50.0)
+        if recovered:
+            new_miss[str(h_i)] = 2
+            continue
+        n = int(miss.get(str(h_i), 0) or 0) + 1
+        new_miss[str(h_i)] = n
+        if n < 2:
+            final_hours.add(h_i)
+
+    daily_windows = _yver65_compact_daily_hours_to_windows(final_hours)
+    windows_parts = list(daily_windows)
+    if YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW:
+        windows_parts.append(YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW)
+    windows = _normalise_melbourne_blackout_windows(','.join(windows_parts), default='')
+
+    return {
+        'ok': bool(windows),
+        'windows': windows,
+        'daily_hours': sorted(final_hours),
+        'candidate_hours': sorted(candidate),
+        'weak7': sorted(weak7),
+        'weak3': sorted(weak3),
+        'weak10': sorted(weak10),
+        'weak24': sorted(weak24),
+        'details': details,
+        'miss': new_miss,
+        'method': '7d main; 3d/10d confirmation; 24h support only; two-review removal; weekend safety preserved',
+    }
+
+
+def _yver65_auto_blackout_update_once(reason: str = 'scheduled', force: bool = False) -> dict:
+    try:
+        if not _yver65_auto_blackout_enabled() and not force:
+            return {'ok': False, 'skipped': 'disabled'}
+        now_ts = float(time.time())
+        if not force:
+            try:
+                last = float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, 0) or 0)
+                min_gap = float(os.environ.get('PULSE_AUTO_BLACKOUT_MIN_INTERVAL_HOURS', '20') or 20) * 3600.0
+                if last > 0 and now_ts - last < max(3600.0, min_gap):
+                    return {'ok': True, 'skipped': 'recent', 'last_run_ts': last}
+            except Exception:
+                pass
+        rec = _yver65_build_auto_blackout_recommendation(int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+        windows = str((rec or {}).get('windows') or '').strip()
+        if not windows:
+            return {'ok': False, 'skipped': 'no_windows', 'recommendation': rec}
+        old_entry = str(_autotrade_entry_blackout_windows() or '').strip()
+        old_setup = str(_setup_generation_blackout_windows() or '').strip()
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, windows)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, windows)
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, now_ts)
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_LAST_WINDOWS_KEY, windows)
+        state = {
+            'version': YVER65_VERSION,
+            'ts': now_ts,
+            'reason': str(reason or 'scheduled'),
+            'windows': windows,
+            'hours': list((rec or {}).get('daily_hours') or []),
+            'candidate_hours': list((rec or {}).get('candidate_hours') or []),
+            'weak7': list((rec or {}).get('weak7') or []),
+            'weak3': list((rec or {}).get('weak3') or []),
+            'weak10': list((rec or {}).get('weak10') or []),
+            'weak24': list((rec or {}).get('weak24') or []),
+            'miss': dict((rec or {}).get('miss') or {}),
+            'method': str((rec or {}).get('method') or ''),
+        }
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_STATE_KEY, _yver65_json_dump(state))
+        try:
+            logger.info('yver65 auto blackout updated: %s -> %s', old_entry, windows)
+        except Exception:
+            pass
+        return {'ok': True, 'windows': windows, 'old_entry': old_entry, 'old_setup': old_setup, 'recommendation': rec}
+    except Exception as e:
+        try:
+            logger.warning('yver65 auto blackout update failed: %s: %s', type(e).__name__, e)
+        except Exception:
+            pass
+        return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+
+
+def _yver65_seconds_until_next_auto_blackout_review() -> float:
+    try:
+        h, m = _yver65_auto_blackout_review_time()
+        now = datetime.now(MEL_TZ)
+        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if target <= now + timedelta(seconds=30):
+            target = target + timedelta(days=1)
+        return max(60.0, (target - now).total_seconds())
+    except Exception:
+        return 24.0 * 3600.0
+
+
+_YVER65_AUTO_BLACKOUT_THREAD_STARTED = False
+
+
+def _yver65_auto_blackout_scheduler_loop():
+    # Let startup migrations/cache warm-up finish first, then run once per day.
+    try:
+        time.sleep(float(os.environ.get('PULSE_AUTO_BLACKOUT_STARTUP_DELAY_SEC', '75') or 75))
+    except Exception:
+        time.sleep(75)
+    while True:
+        try:
+            _yver65_auto_blackout_update_once(reason='scheduled', force=False)
+        except Exception:
+            pass
+        try:
+            time.sleep(_yver65_seconds_until_next_auto_blackout_review())
+        except Exception:
+            time.sleep(24.0 * 3600.0)
+
+
+def _yver65_start_auto_blackout_scheduler_once() -> None:
+    global _YVER65_AUTO_BLACKOUT_THREAD_STARTED
+    try:
+        if _YVER65_AUTO_BLACKOUT_THREAD_STARTED:
+            return
+        if not _yver65_auto_blackout_enabled():
+            return
+        _YVER65_AUTO_BLACKOUT_THREAD_STARTED = True
+        t = threading.Thread(target=_yver65_auto_blackout_scheduler_loop, name='yver65_auto_blackout_scheduler', daemon=True)
+        t.start()
+    except Exception:
+        pass
+
+
+def _yver65_auto_blackout_status_text() -> str:
+    try:
+        state = _yver65_json_load(_autotrade_config_get(YVER65_AUTO_BLACKOUT_STATE_KEY, '{}'), default={})
+        last_ts = float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, 0) or 0)
+        last_txt = '-'
+        if last_ts > 0:
+            last_txt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        h, m = _yver65_auto_blackout_review_time()
+        return (
+            '🤖 Auto Blackout\n' + HDR + '\n'
+            f"Enabled: {'YES' if _yver65_auto_blackout_enabled() else 'NO'}\n"
+            f"Review time: {h:02d}:{m:02d} Melbourne daily\n"
+            f"Last run: {last_txt}\n"
+            f"Windows: {str(_autotrade_entry_blackout_windows() or '-')}\n"
+            f"Method: {str((state or {}).get('method') or '7d main; 3d/10d confirmation; 24h support only')}\n"
+            f"Candidate hours: {','.join(str(x).zfill(2) for x in (state or {}).get('candidate_hours', [])) or '-'}\n"
+            f"Applied daily hours: {','.join(str(x).zfill(2) for x in (state or {}).get('hours', [])) or '-'}"
+        )
+    except Exception as e:
+        return f'Auto blackout status unavailable: {type(e).__name__}: {e}'
+
+
+try:
+    _YVER65_ORIG_AUTOTRADE_CONFIG_CMD = autotrade_config_cmd
+except Exception:
+    _YVER65_ORIG_AUTOTRADE_CONFIG_CMD = None
+
+
+async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """v65 wrapper: add AUTO_BLACKOUT controls without disturbing existing config keys."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args:
+            key = str(args[0] or '').strip().upper()
+            if key in {'AUTO_BLACKOUT_STATUS', 'AUTO_BLACKOUT'}:
+                await update.message.reply_text(_yver65_auto_blackout_status_text())
+                return
+            if key == 'AUTO_BLACKOUT_ENABLED':
+                val = str(args[1] if len(args) > 1 else '').strip().lower()
+                if val not in {'1', 'true', 'yes', 'on', '0', 'false', 'no', 'off'}:
+                    await update.message.reply_text('Usage: /autotrade_config AUTO_BLACKOUT_ENABLED true|false')
+                    return
+                enabled = val in {'1', 'true', 'yes', 'on'}
+                _autotrade_config_set(YVER65_AUTO_BLACKOUT_ENABLED_KEY, 1 if enabled else 0)
+                if enabled:
+                    _yver65_start_auto_blackout_scheduler_once()
+                await update.message.reply_text(f"✅ Auto blackout {'enabled' if enabled else 'disabled'}.\n" + _yver65_auto_blackout_status_text())
+                return
+            if key == 'AUTO_BLACKOUT_NOW':
+                res = await to_thread_bg(_yver65_auto_blackout_update_once, 'manual', True, timeout=600)
+                if isinstance(res, dict) and res.get('ok'):
+                    await update.message.reply_text('✅ Auto blackout recalculated and applied.\n' + _yver65_auto_blackout_status_text())
+                else:
+                    await update.message.reply_text('⚠️ Auto blackout recalculation did not apply.\n' + html.escape(str(res)))
+                return
+    except Exception as e:
+        await update.message.reply_text(f'⚠️ Auto blackout config wrapper failed: {type(e).__name__}: {e}')
+        return
+    if _YVER65_ORIG_AUTOTRADE_CONFIG_CMD is not None:
+        return await _YVER65_ORIG_AUTOTRADE_CONFIG_CMD(update, context)
+    await update.message.reply_text('AutoTrade config handler unavailable.')
+
+
+try:
+    _YVER65_ORIG_MAIN = main
+except Exception:
+    _YVER65_ORIG_MAIN = None
+
+
+def main():
+    try:
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_ENABLED_KEY, _autotrade_config_get(YVER65_AUTO_BLACKOUT_ENABLED_KEY, '1'))
+    except Exception:
+        pass
+    try:
+        _yver65_start_auto_blackout_scheduler_once()
+    except Exception:
+        pass
+    if _YVER65_ORIG_MAIN is not None:
+        return _YVER65_ORIG_MAIN()
+    return None
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v65'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v65'
+except Exception:
+    pass
+
+# =========================================================
+# end yver65 automatic evidence-based blackout tuning
+# =========================================================
+
+
+# =========================================================
+# yver66 auto blackout simplification: 7d-only decision source
+# =========================================================
+YVER66_VERSION = 'yver66_2026_06_17_auto_blackout_7d_only'
+YVER66_AUTO_BLACKOUT_METHOD_TEXT = '7d-only setup_open_times evidence; add/keep when WR<45%, AvgR<0, decided>=5; two-review removal; weekend safety preserved; setup generation remains SHADOW ON'
+
+
+def _yver65_build_auto_blackout_recommendation(uid: int = 0) -> dict:
+    """Build daily blackout windows from 7d-only KEEP setup evidence.
+
+    v66 method:
+    - 7d is the only automatic decision window.
+    - 24h/3d/10d/14d may still be inspected manually, but they do not control
+      automatic blackout changes.
+    - Add/keep an hour when 7d WR < 45%, AvgR < 0, and decided TP+SL >= 5.
+    - Remove a previously auto-applied hour after two consecutive daily reviews
+      where it no longer qualifies, or immediately when 7d WR is clearly >= 50%.
+    - Weekend safety window is always preserved while the bot is under development.
+    """
+    uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+    stats_7 = _yver65_setup_open_hour_stats(uid_i, '7d')
+
+    weak7 = _yver65_weak_hours_from_stats(stats_7, min_decided=5, wr_lt=45.0, avg_r_lt=0.0)
+
+    candidate = set(int(h) % 24 for h in (weak7 or set()))
+    details = {}
+    for h in sorted(candidate):
+        m7 = _yver65_hour_metric(stats_7, h)
+        details[str(int(h) % 24)] = {
+            'h': int(h) % 24,
+            'wr7': round(float(m7.get('wr', 0.0)), 2),
+            'avg7': round(float(m7.get('avg_r', 0.0)), 3),
+            'dec7': int(m7.get('decided', 0) or 0),
+            'set7': int(m7.get('set', 0) or 0),
+            'open7': int(m7.get('open', 0) or 0),
+            'support': ['7d_only'],
+        }
+
+    # Smooth removals. If an hour was auto-applied previously, require two missed
+    # daily 7d reviews before removing it, unless 7d WR has clearly recovered.
+    state = _yver65_json_load(_autotrade_config_get(YVER65_AUTO_BLACKOUT_STATE_KEY, '{}'), default={})
+    miss = dict((state or {}).get('miss') or {}) if isinstance(state, dict) else {}
+    previous_hours = set()
+    try:
+        previous_hours = {int(x) % 24 for x in (state or {}).get('hours', [])}
+    except Exception:
+        previous_hours = set()
+    if not previous_hours:
+        previous_hours = _yver65_daily_hours_from_windows(str(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_WINDOWS_KEY, '') or ''))
+
+    final_hours = set(candidate)
+    new_miss = {}
+    for h in sorted(previous_hours):
+        h_i = int(h) % 24
+        if h_i in candidate:
+            new_miss[str(h_i)] = 0
+            final_hours.add(h_i)
+            continue
+        m7 = _yver65_hour_metric(stats_7, h_i)
+        recovered = bool(int(m7.get('decided', 0) or 0) >= 5 and float(m7.get('wr', 0.0)) >= 50.0)
+        if recovered:
+            new_miss[str(h_i)] = 2
+            continue
+        n = int(miss.get(str(h_i), 0) or 0) + 1
+        new_miss[str(h_i)] = n
+        if n < 2:
+            final_hours.add(h_i)
+
+    daily_windows = _yver65_compact_daily_hours_to_windows(final_hours)
+    windows_parts = list(daily_windows)
+    if YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW:
+        windows_parts.append(YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW)
+    windows = _normalise_melbourne_blackout_windows(','.join(windows_parts), default='')
+
+    return {
+        'ok': bool(windows),
+        'windows': windows,
+        'daily_hours': sorted(final_hours),
+        'candidate_hours': sorted(candidate),
+        'weak7': sorted(weak7),
+        # Compatibility fields retained so existing status/state code does not break.
+        'weak3': [],
+        'weak10': [],
+        'weak24': [],
+        'details': details,
+        'miss': new_miss,
+        'method': YVER66_AUTO_BLACKOUT_METHOD_TEXT,
+        'version': YVER66_VERSION,
+    }
+
+
+# Make status wording show the v66 method even before the first scheduled/manual v66 run.
+try:
+    _YVER66_ORIG_AUTO_BLACKOUT_STATUS_TEXT = _yver65_auto_blackout_status_text
+except Exception:
+    _YVER66_ORIG_AUTO_BLACKOUT_STATUS_TEXT = None
+
+
+def _yver65_auto_blackout_status_text() -> str:
+    try:
+        state = _yver65_json_load(_autotrade_config_get(YVER65_AUTO_BLACKOUT_STATE_KEY, '{}'), default={})
+        last_ts = float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, 0) or 0)
+        last_txt = '-'
+        if last_ts > 0:
+            last_txt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        h, m = _yver65_auto_blackout_review_time()
+        return (
+            '🤖 Auto Blackout\n' + HDR + '\n'
+            f"Enabled: {'YES' if _yver65_auto_blackout_enabled() else 'NO'}\n"
+            f"Review time: {h:02d}:{m:02d} Melbourne daily\n"
+            f"Last run: {last_txt}\n"
+            f"Windows: {str(_autotrade_entry_blackout_windows() or '-')}\n"
+            f"Method: {YVER66_AUTO_BLACKOUT_METHOD_TEXT}\n"
+            f"7d candidate hours: {','.join(str(x).zfill(2) for x in (state or {}).get('candidate_hours', [])) or '-'}\n"
+            f"Applied daily hours: {','.join(str(x).zfill(2) for x in (state or {}).get('hours', [])) or '-'}"
+        )
+    except Exception as e:
+        return f'Auto blackout status unavailable: {type(e).__name__}: {e}'
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v66'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v66'
+except Exception:
+    pass
+
+# =========================================================
+# end yver66 auto blackout simplification
 # =========================================================
 
 if __name__ == "__main__":
