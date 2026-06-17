@@ -1,6 +1,6 @@
 # yver56: setup-audit results now have unlimited life: each setup is evaluated from creation until now and remains OPEN until price actually hits TP or SL; no NH/NOHIT expiry, no stale OPEN forced to SL, WR stays TP/(TP+SL) with OPEN excluded, and report/cache labels are bumped. No live AutoTrade entry window/risk/TP/SL logic changed.
 # yver54: 17 Jun 09:20 review — appends evidence-based blackout windows 14:00-15:00 and 17:00-18:00 while keeping 07:00-08:00, 10:00-11:00 and SUN 22:00-MON 10:00; setup generation remains shadow-on, only setup delivery and AutoTrade entries are blocked.
-# yver57: report/display sync hardening: /setup_audit shows ATPol (policy at AutoTrade open), /setup_audit_compare no longer labels missing policy snapshots as current DISABLE/TIGHTEN, refines OPEN compare rows with 1m candles, and /autotrade_report SL reasons show SL_HIT when native/realised SL evidence exists.
+# yver58: tightens AutoTrade/report reconciliation: /setup_audit lifecycle, PnL and ATPol now require setup_id/open-time/entry-window safe matching so older same-symbol trades cannot attach to newer setup rows; /autotrade_report adds ATPol to prove AutoTrades were opened from KEEP snapshots; cache namespace bumped.
 # yver53: adds /setup_matrix policy WR beside each row in /setup_audit so policy context and row result are visible together.
 # yver49: makes the multi-day Leaders/Losers direction block explicitly rolling/expiring: 2+ appearances inside the last 3 Melbourne days only; current Leader/Loser still blocks only while current.
 # yver52: adds concise /setup_matrix policy metadata above the table: latest refresh time, actual setup database start, and 1 Jun policy baseline; bumps policy cache key.
@@ -46515,7 +46515,7 @@ def _setup_audit_merge_trade_setup_row(trade_row: dict | None) -> dict:
         merged = dict(setup_row)
         # Keep real trade fields where they are more authoritative for report display.
         for k, v in row.items():
-            if k in {'trade_id', 'uid', 'opened_ts', 'closed_ts', 'pnl_usdt', 'pnl', 'status', 'qty', 'note', 'outcome', 'risk_usd', 'risk_usdt', 'risk_pct', 'tp_usd', 'tp_usdt', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'result_path', 'result_label', 'close_reason', 'source_note'}:
+            if k in {'trade_id', 'uid', 'opened_ts', 'closed_ts', 'pnl_usdt', 'pnl', 'status', 'qty', 'note', 'outcome', 'risk_usd', 'risk_usdt', 'risk_pct', 'tp_usd', 'tp_usdt', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'result_path', 'result_label', 'close_reason', 'source_note', 'policy_at_open', 'policy_combo_at_open', 'policy_execnow_at_open'}:
                 merged[k] = v
             elif not str(merged.get(k) or '').strip():
                 merged[k] = v
@@ -47138,6 +47138,62 @@ def _setup_audit_live_position_present(symbol: str, side: str) -> bool:
     return False
 
 
+def _yver58_setup_audit_trade_match_safe(setup_row: dict, trade_row: dict, uid: int = 0, allow_missing_open_ts: bool = False) -> bool:
+    """Strictly verify that an AutoTrade row belongs to this visible setup row.
+
+    v58: /setup_audit is a setup report, not a loose symbol/side trade report.
+    A real trade can only be attached to a setup row when the trade opened soon
+    after that setup (inside the AutoTrade entry deadline plus a small logging
+    buffer), and when the stored open-time combo snapshot does not contradict the
+    row combo. This prevents older same-symbol trades, or reused/legacy setup_id
+    metadata, from showing AT_CLOSED/ATPol/PnL on a newer setup row.
+    """
+    try:
+        rr = dict(setup_row or {})
+        tr = dict(trade_row or {})
+        setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
+        if setup_ts <= 0:
+            return bool(allow_missing_open_ts)
+        opened_ts = float(tr.get('opened_ts') or tr.get('created_ts') or 0.0)
+        if opened_ts <= 0:
+            return bool(allow_missing_open_ts)
+        try:
+            entry_win = float(max(60, int(_autotrade_entry_window_min()) * 60))
+        except Exception:
+            entry_win = 60.0 * 60.0
+        # Allow fill/logging clock drift, but do not attach positions opened long
+        # before/after this setup. Analysis has no expiry; AutoTrade entry matching does.
+        if opened_ts < setup_ts - 10.0 * 60.0:
+            return False
+        if opened_ts > setup_ts + entry_win + 20.0 * 60.0:
+            return False
+
+        sym_setup = _symbol_base(str(rr.get('symbol') or rr.get('market_symbol') or '')).upper().strip()
+        sym_trade = _symbol_base(str(tr.get('symbol') or tr.get('market_symbol') or '')).upper().strip()
+        if sym_setup and sym_trade and sym_setup != sym_trade:
+            return False
+        side_setup = str(rr.get('side') or '').upper().strip()
+        side_trade = str(tr.get('side') or '').upper().strip()
+        if side_setup in {'BUY','SELL'} and side_trade in {'BUY','SELL'} and side_setup != side_trade:
+            return False
+
+        # If the trade stored an open-time matrix combo, it must agree with this
+        # row's combo.  This catches cases where a Bybit/journal row is enriched
+        # with an older setup while a newer same-symbol setup is also visible.
+        combo_snap = str(tr.get('policy_combo_at_open') or tr.get('setup_combo_at_open') or '').upper().strip()
+        if combo_snap:
+            try:
+                sess = str(rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
+                row_combo = _setup_combo_strategy_side_key(_setup_audit_family_code(rr), sess, rr, side_setup).upper().strip()
+                if row_combo and combo_snap != row_combo:
+                    return False
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
 def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: str = '') -> str:
     """Return setup lifecycle state for /setup_audit display.
 
@@ -47195,6 +47251,14 @@ def _setup_audit_autotrade_state_label(row: dict, uid: int = 0, session_name: st
                         if _symbol_base(rsym) == sym_base or _bybit_linear_symbol(rsym) == sym_lin:
                             rows.append(r)
                             break
+                if rows:
+                    # v58: even an exact setup_id can be stale/legacy metadata.
+                    # Attach lifecycle only if the AutoTrade open time is safe for
+                    # this visible setup row.
+                    try:
+                        rows = [dict(x or {}) for x in rows if _yver58_setup_audit_trade_match_safe(rr, dict(x or {}), uid=int(owner_uid))]
+                    except Exception:
+                        rows = []
                 if rows:
                     r0 = dict(rows[0] or {})
                     st = str(r0.get('status') or '').upper().strip()
@@ -47494,8 +47558,22 @@ def _setup_audit_match_closed_pnl_from_index(row: dict, idx: dict | None = None)
         rr = dict(row or {})
         idx = dict(idx or {})
         sid = str(rr.get('setup_id') or rr.get('id') or '').strip()
-        if sid and sid in (idx.get('by_setup') or {}):
-            return float((idx.get('by_setup') or {}).get(sid) or 0.0)
+        if sid:
+            # v58: exact setup_id alone is not enough for display matching because
+            # older/enriched rows can carry stale setup metadata.  Confirm that
+            # the trade opened inside this setup's AutoTrade entry window.
+            vals = []
+            for cand0 in list((idx or {}).get('candidates') or []):
+                try:
+                    cand = dict(cand0 or {})
+                    if str(cand.get('setup_id') or '').strip() != sid:
+                        continue
+                    if _yver58_setup_audit_trade_match_safe(rr, cand):
+                        vals.append(float(cand.get('pnl') or 0.0))
+                except Exception:
+                    continue
+            if vals:
+                return float(sum(vals))
         setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
         sym_base = _symbol_base(str(rr.get('symbol') or rr.get('market_symbol') or ''))
         side_u = str(rr.get('side') or '').upper().strip()
@@ -47516,6 +47594,8 @@ def _setup_audit_match_closed_pnl_from_index(row: dict, idx: dict | None = None)
                     continue
                 opened = float(cand.get('opened_ts') or 0.0)
                 closed = float(cand.get('closed_ts') or 0.0)
+                if not _yver58_setup_audit_trade_match_safe(rr, cand):
+                    continue
                 if opened > 0:
                     if opened < setup_ts - 30 * 60.0 or opened > setup_ts + entry_win + 45 * 60.0:
                         continue
@@ -47570,17 +47650,28 @@ def _setup_audit_closed_pnl_for_row(row: dict, uid: int = 0, at_state: str = '',
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             if sid:
-                r = cur.execute(
+                # v58: setup_id-only matching can attach an older trade to a newer
+                # visible setup row.  Sum only rows whose open time is safe for
+                # this setup.
+                qrows = cur.execute(
                     """
-                    SELECT COUNT(*) AS n, COALESCE(SUM(COALESCE(pnl_usdt,0)),0) AS pnl
+                    SELECT setup_id, symbol, side, opened_ts, closed_ts, COALESCE(pnl_usdt,0) AS pnl, policy_combo_at_open
                     FROM autotrade_trades
                     WHERE uid=? AND setup_id=? AND closed_ts IS NOT NULL
                     """,
                     (uid_i, sid),
-                ).fetchone()
-                if r and int(r['n'] or 0) > 0:
-                    pnl_val = float(r['pnl'] or 0.0)
-                    n = int(r['n'] or 0)
+                ).fetchall() or []
+                vals = []
+                for qr in qrows:
+                    try:
+                        d = dict(qr)
+                        if _yver58_setup_audit_trade_match_safe(rr, d, uid=uid_i):
+                            vals.append(float(d.get('pnl') or 0.0))
+                    except Exception:
+                        continue
+                if vals:
+                    pnl_val = float(sum(vals))
+                    n = len(vals)
             if pnl_val is None and setup_ts > 0 and sym_base and side_u in {'BUY', 'SELL'}:
                 # Allow a small buffer around the setup entry window so journal rows
                 # created a little late still reconcile to the visible setup row.
@@ -47601,8 +47692,9 @@ def _setup_audit_closed_pnl_for_row(row: dict, uid: int = 0, at_state: str = '',
                 vals = []
                 for r in rows:
                     try:
-                        if _symbol_base(str(r['symbol'] or '')) == sym_base:
-                            vals.append(float(r['pnl'] or 0.0))
+                        d = dict(r)
+                        if _symbol_base(str(d.get('symbol') or '')) == sym_base and _yver58_setup_audit_trade_match_safe(rr, d, uid=uid_i):
+                            vals.append(float(d.get('pnl') or 0.0))
                     except Exception:
                         continue
                 if vals:
@@ -47646,7 +47738,7 @@ def _yver57_policy_at_open_for_setup_row(row: dict, uid: int = 0, at_state: str 
             if sid:
                 vals = [dict(r) for r in cur.execute(
                     """
-                    SELECT policy_at_open, policy_combo_at_open, opened_ts
+                    SELECT policy_at_open, policy_combo_at_open, setup_id, symbol, side, opened_ts
                     FROM autotrade_trades
                     WHERE (?<=0 OR uid=?) AND setup_id=?
                     ORDER BY COALESCE(opened_ts,0) DESC
@@ -47658,7 +47750,7 @@ def _yver57_policy_at_open_for_setup_row(row: dict, uid: int = 0, at_state: str 
                 entry_win = float(max(60, int(_autotrade_entry_window_min()) * 60))
                 vals = [dict(r) for r in cur.execute(
                     """
-                    SELECT policy_at_open, policy_combo_at_open, opened_ts
+                    SELECT policy_at_open, policy_combo_at_open, setup_id, symbol, side, opened_ts
                     FROM autotrade_trades
                     WHERE (?<=0 OR uid=?)
                       AND UPPER(REPLACE(COALESCE(symbol,''),'USDT',''))=?
@@ -47670,6 +47762,13 @@ def _yver57_policy_at_open_for_setup_row(row: dict, uid: int = 0, at_state: str 
                     """,
                     (uid_i, uid_i, sym, side, setup_ts - 30*60.0, setup_ts + entry_win + 45*60.0, setup_ts),
                 ).fetchall() or []]
+        if vals:
+            # v58: policy snapshot is only meaningful for this setup row if the
+            # underlying trade opened inside this setup's AutoTrade entry window.
+            try:
+                vals = [dict(v or {}) for v in vals if _yver58_setup_audit_trade_match_safe(rr, dict(v or {}), uid=uid_i)]
+            except Exception:
+                vals = []
         if vals:
             pol = str(vals[0].get('policy_at_open') or '').upper().strip()
             if pol == 'OFF':
@@ -48131,7 +48230,7 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
 
     try:
         cache_bucket = int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))
-        cache_key = f"keep_only_summary:v57::{uid_i}::{cache_bucket}"
+        cache_key = f"keep_only_summary:v58::{uid_i}::{cache_bucket}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -52776,7 +52875,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v57:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v58:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -52795,7 +52894,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 f"/setup_audit compare {int(cmp_hours)}",
-                f"admin:bg:v57:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                f"admin:bg:v58:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
                 _setup_audit_compare_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
                 parse_mode=ParseMode.HTML,
@@ -52826,7 +52925,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v57:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v58:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -53106,7 +53205,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         uid_i = int(uid or 0)
 
     try:
-        cache_key = f"keep_watch_summary:v57::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
+        cache_key = f"keep_watch_summary:v58::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -53281,7 +53380,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v57:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v58:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -53306,7 +53405,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v57:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v58:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -53324,7 +53423,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v57:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v58:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -53349,7 +53448,7 @@ async def setup_audit_compare_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_compare {int(hours)}",
-        f"admin:bg:v57:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v58:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_compare_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -55057,7 +55156,7 @@ def _autotrade_merge_position_report_rows(rows: list[dict], merge_window_sec: in
                             matched[_sumk] = abs(float(matched.get(_sumk) or 0.0)) + rv
                     except Exception:
                         pass
-                for _mk in ('risk_pct', 'risk_usd_source', 'risk_pct_source', 'tp_usd_source', 'risk_report_quality', 'tp_report_quality', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'entry', 'sl', 'tp', 'qty', 'conf', 'fut_vol_usd', 'ch24', 'ch4', 'ch1', 'setup_strategy', 'strategy', 'strategy_mode', 'original_setup_id', 'original_side', 'strategy_reason'):
+                for _mk in ('risk_pct', 'risk_usd_source', 'risk_pct_source', 'tp_usd_source', 'risk_report_quality', 'tp_report_quality', 'risk_multiplier', 'dynamic_risk_score', 'configured_risk_pct', 'allowed_risk_pct', 'rr_tp', 'entry', 'sl', 'tp', 'qty', 'conf', 'fut_vol_usd', 'ch24', 'ch4', 'ch1', 'setup_strategy', 'strategy', 'strategy_mode', 'original_setup_id', 'original_side', 'strategy_reason', 'policy_at_open', 'policy_combo_at_open', 'policy_execnow_at_open'):
                     try:
                         if float(matched.get(_mk) or 0.0) <= 0 and float(r.get(_mk) or 0.0) > 0:
                             matched[_mk] = r.get(_mk)
@@ -55389,7 +55488,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
     """
     owner_uid = int(owner_uid)
     lookback_h = int(clamp(int(lookback_h or 24), 1, 168))
-    cache_key = f"autotrade_report_text:v146_realised_wr:{owner_uid}:{lookback_h}"
+    cache_key = f"autotrade_report_text:v58_atpol:{owner_uid}:{lookback_h}"
     try:
         if cache_valid(cache_key, int(AUTOTRADE_REPORT_CACHE_TTL_SEC or 20)):
             cached = cache_get(cache_key)
@@ -55536,6 +55635,9 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'session': _autotrade_report_row_session(row),
             'setup_id': str(row.get('setup_id') or ''),
             'trade_id': str(row.get('trade_id') or ''),
+            'policy_at_open': str(row.get('policy_at_open') or ''),
+            'policy_combo_at_open': str(row.get('policy_combo_at_open') or ''),
+            'policy_execnow_at_open': str(row.get('policy_execnow_at_open') or ''),
             'opened_ts': float(row.get('opened_ts') or ts or 0.0),
             'entry': float(row.get('entry') or 0.0),
             'sl': float(row.get('sl') or 0.0),
@@ -55586,6 +55688,9 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             'session': _autotrade_report_row_session(row),
             'setup_id': str(row.get('setup_id') or r.get('setup_id') or ''),
             'trade_id': str(row.get('trade_id') or r.get('trade_id') or ''),
+            'policy_at_open': str(row.get('policy_at_open') or r.get('policy_at_open') or ''),
+            'policy_combo_at_open': str(row.get('policy_combo_at_open') or r.get('policy_combo_at_open') or ''),
+            'policy_execnow_at_open': str(row.get('policy_execnow_at_open') or r.get('policy_execnow_at_open') or ''),
             'opened_ts': float(row.get('opened_ts') or r.get('opened_ts') or 0.0),
             'closed_ts': float(row.get('closed_ts') or r.get('closed_ts') or ts or 0.0),
             'result_path': str(row.get('result_path') or r.get('result_path') or ''),
@@ -55645,7 +55750,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
         HDR,
         f"Window: <b>last {lookback_h}h</b> (Melbourne)" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ""),
         f"Trades: <b>{len(journal_rows)}</b> | Open PnL: <b>{total_open:+.2f}</b> | Closed PnL: <b>{total_closed:+.2f}</b> | Total PnL: <b>{(total_open + total_closed):+.2f} USDT</b>",
-        "Result: TP=win/profitable close, SL=loss, FLAT=near-zero. Reason shows TP_HIT, SL_HIT, CLOSE_BEFORE_ASIA_SESSION, MAX_HOLD, PROFIT_CLOSE, or the best inferred close cause.",
+        "Result: TP=win/profitable close, SL=loss, FLAT=near-zero. ATPol shows the stored AutoTrade open-time policy snapshot. Reason shows TP_HIT, SL_HIT, CLOSE_BEFORE_ASIA_SESSION, MAX_HOLD, PROFIT_CLOSE, or the best inferred close cause.",
     ]
     if external_positions:
         lines.append(f"Ignored unmatched manual/external live positions: <b>{len(external_positions)}</b>")
@@ -55709,6 +55814,20 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 return f'{v:.0f}' if v > 0 else '-'
             except Exception:
                 return '-'
+        def _atpol_cell(r: dict) -> str:
+            try:
+                pol = str((r or {}).get('policy_at_open') or '').upper().strip()
+                if pol == 'OFF':
+                    pol = 'DISABLE'
+                if pol in {'KEEP','WATCH','TIGHTEN','DISABLE'}:
+                    return pol
+                fn = globals().get('_setup_audit_compare_policy_at_open')
+                if callable(fn):
+                    pol2 = str(fn(r, None) or '').upper().strip()
+                    return pol2 if pol2 else 'NO_SNAP*'
+                return 'NO_SNAP*'
+            except Exception:
+                return '-'
         table_rows = []
         for r in display:
             open_ts, close_ts = _report_display_open_close_ts(r)
@@ -55719,6 +55838,7 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
                 r.get('symbol'),
                 r.get('side'),
                 _setup_combo_strategy_side_key(str(r.get('family') or 'F0'), str(r.get('session') or '-'), r, str(r.get('side') or '')),
+                _atpol_cell(r),
                 _autotrade_report_close_session(r),
                 int(float(r.get('conf') or 0.0)) if float(r.get('conf') or 0.0) > 0 else '-',
                 _dyn_cell(r),
@@ -55731,9 +55851,9 @@ def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
             ])
         table = tabulate(
             table_rows,
-            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Combo', 'SesC', 'Conf', 'Dyn', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason'],
+            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Combo', 'ATPol', 'SesC', 'Conf', 'Dyn', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason'],
             tablefmt='plain',
-            colalign=('left', 'left', 'center', 'left', 'center', 'left', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'),
+            colalign=('left', 'left', 'center', 'left', 'center', 'left', 'center', 'center', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'left'),
         )
         raw_count = int(len(bot_positions or [])) + int(len(closed_rows or []))
         lines.append(f"Rows shown: <b>{len(display)}</b> / <b>{len(journal_rows)}</b> merged position rows. Raw fragments: <b>{raw_count}</b>. Time: <b>Melbourne</b>.")
