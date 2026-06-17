@@ -1,3 +1,4 @@
+# yver67: lists and documents AUTO_BLACKOUT commands inside /autotrade_config FULL and adds a dedicated auto-blackout command/help block; no live order/risk/TP/SL logic changed.
 # yver66: simplifies automatic blackout tuning to 7d-only evidence from /setup_open_times (shadow-generated KEEP setups included); 3d/10d/24h no longer control automatic windows; no live order/risk/TP/SL logic changed.
 # yver65: adds automatic daily evidence-based blackout tuning using /setup_open_times logic (7d main, 3d/10d confirmation, 24h early warning only); setup generation stays SHADOW, no order/risk/TP/SL logic changed.
 # yver64: adds WR column to /setup_open_times detail rows using the /setup_matrix policy WR snapshot available at setup generation time (latest matrix refresh <= setup time); no live trading logic changed.
@@ -69100,6 +69101,106 @@ except Exception:
 
 # =========================================================
 # end yver66 auto blackout simplification
+# =========================================================
+
+
+# =========================================================
+# yver67 auto blackout command visibility in /autotrade_config FULL
+# =========================================================
+YVER67_VERSION = 'yver67_2026_06_17_auto_blackout_full_config_visibility'
+
+
+def _yver67_auto_blackout_full_keys_block() -> str:
+    """Small standalone block appended after /autotrade_config FULL.
+
+    v65/v66 already implemented the AUTO_BLACKOUT controls; v67 makes them
+    visible in the FULL command output so the owner can discover and copy them.
+    """
+    try:
+        enabled_txt = 'true' if _yver65_auto_blackout_enabled() else 'false'
+    except Exception:
+        enabled_txt = '-'
+    try:
+        h, m = _yver65_auto_blackout_review_time()
+        review_txt = f'{h:02d}:{m:02d} Melbourne daily'
+    except Exception:
+        review_txt = '-'
+    try:
+        last_ts = float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, 0) or 0)
+        if last_ts > 0:
+            last_txt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M Melbourne')
+        else:
+            last_txt = '-'
+    except Exception:
+        last_txt = '-'
+    try:
+        windows_txt = str(_autotrade_entry_blackout_windows() or '-')
+    except Exception:
+        windows_txt = '-'
+    try:
+        state = _yver65_json_load(_autotrade_config_get(YVER65_AUTO_BLACKOUT_STATE_KEY, '{}'), default={})
+        hours_txt = ','.join(str(int(x)).zfill(2) for x in (state or {}).get('hours', [])) or '-'
+        cand_txt = ','.join(str(int(x)).zfill(2) for x in (state or {}).get('candidate_hours', [])) or '-'
+    except Exception:
+        hours_txt = '-'
+        cand_txt = '-'
+    method_txt = str(globals().get('YVER66_AUTO_BLACKOUT_METHOD_TEXT', '7d-only setup_open_times evidence'))
+    return '\n'.join([
+        '🤖 Auto Blackout — Full Keys',
+        HDR,
+        f'AUTO_BLACKOUT_ENABLED = {enabled_txt}',
+        f'AUTO_BLACKOUT_REVIEW_TIME = {review_txt}',
+        f'AUTO_BLACKOUT_LAST_RUN = {last_txt}',
+        f'AUTO_BLACKOUT_CURRENT_WINDOWS = {windows_txt}',
+        f'AUTO_BLACKOUT_METHOD = {method_txt}',
+        f'AUTO_BLACKOUT_7D_CANDIDATE_HOURS = {cand_txt}',
+        f'AUTO_BLACKOUT_APPLIED_DAILY_HOURS = {hours_txt}',
+        '',
+        'Examples — automatic evidence-based blackout:',
+        '• /autotrade_config AUTO_BLACKOUT_STATUS',
+        '• /autotrade_config AUTO_BLACKOUT_NOW',
+        '• /autotrade_config AUTO_BLACKOUT_ENABLED true',
+        '• /autotrade_config AUTO_BLACKOUT_ENABLED false',
+        '',
+        'Method: last 7d /setup_open_times evidence only; add/keep when WR<45%, AvgR<0, and decided TP+SL>=5; remove only after recovery/two-review miss. Setup generation stays SHADOW ON.',
+    ])
+
+
+try:
+    _YVER67_ORIG_AUTOTRADE_CONFIG_CMD = autotrade_config_cmd
+except Exception:
+    _YVER67_ORIG_AUTOTRADE_CONFIG_CMD = None
+
+
+async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """v67 wrapper: append AUTO_BLACKOUT help to /autotrade_config FULL."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text('⛔ Admin only.')
+        return
+    args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+    key = str(args[0]).strip().upper() if args else ''
+    if key in {'FULL', 'FULL_KEYS', 'SHOW_FULL_KEYS', 'ADVANCED', 'ALL'}:
+        if _YVER67_ORIG_AUTOTRADE_CONFIG_CMD is not None:
+            await _YVER67_ORIG_AUTOTRADE_CONFIG_CMD(update, context)
+        await send_long_message(update, _yver67_auto_blackout_full_keys_block(), parse_mode=None)
+        return
+    if _YVER67_ORIG_AUTOTRADE_CONFIG_CMD is not None:
+        return await _YVER67_ORIG_AUTOTRADE_CONFIG_CMD(update, context)
+    await update.message.reply_text('AutoTrade config handler unavailable.')
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v67'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v67'
+except Exception:
+    pass
+
+# =========================================================
+# end yver67 auto blackout FULL visibility
 # =========================================================
 
 if __name__ == "__main__":
