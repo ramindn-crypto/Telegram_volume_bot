@@ -1,3 +1,4 @@
+# yver59: keeps /screen/email/actionable setup queues clean by hiding setups that have already touched TP/SL, renames entry-window EXPIRED/MANUAL_POS display noise, and labels KEEP journal closes without a safe audit setup as JOURNAL_ONLY instead of scary NO_SETUP. No live TP/SL/risk/order logic changes.
 # yver56: setup-audit results now have unlimited life: each setup is evaluated from creation until now and remains OPEN until price actually hits TP or SL; no NH/NOHIT expiry, no stale OPEN forced to SL, WR stays TP/(TP+SL) with OPEN excluded, and report/cache labels are bumped. No live AutoTrade entry window/risk/TP/SL logic changed.
 # yver54: 17 Jun 09:20 review — appends evidence-based blackout windows 14:00-15:00 and 17:00-18:00 while keeping 07:00-08:00, 10:00-11:00 and SUN 22:00-MON 10:00; setup generation remains shadow-on, only setup delivery and AutoTrade entries are blocked.
 # yver58: tightens AutoTrade/report reconciliation: /setup_audit lifecycle, PnL and ATPol now require setup_id/open-time/entry-window safe matching so older same-symbol trades cannot attach to newer setup rows; /autotrade_report adds ATPol to prove AutoTrades were opened from KEEP snapshots; cache namespace bumped.
@@ -48916,7 +48917,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
             else:
                 setup_time = '-'
                 audit_res = '-'
-                verdict = 'BYBIT_ONLY' if _is_exchange_only_unlinked(tr) else 'NO_SETUP'
+                verdict = 'BYBIT_ONLY' if _is_exchange_only_unlinked(tr) else ('JOURNAL_ONLY' if _setup_audit_compare_policy_at_open(tr, None) == 'KEEP' else 'NO_SETUP')
             if verdict == 'OK':
                 match_ok += 1
             elif verdict == 'DIFF':
@@ -48954,7 +48955,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         colalign=('left', 'left', 'center', 'center', 'right', 'center', 'left', 'center', 'center'),
     )
     lines.append("<pre>" + html.escape(table) + "</pre>")
-    lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close still disagrees with setup path after targeted 1m recheck, NON_TPSL=historical/manual/time/profit/inferred close with mismatched or unresolved setup path ignored for setup-audit scoring, PENDING=audit still OPEN, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
+    lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close still disagrees with setup path after targeted 1m recheck, NON_TPSL=historical/manual/time/profit/inferred close with mismatched or unresolved setup path ignored for setup-audit scoring, PENDING=audit still OPEN, JOURNAL_ONLY=bot journal/Bybit close has KEEP open-policy but no safe audit setup row to compare, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
     return "\n".join(lines)
 # ===========================================================================
 
@@ -67375,4 +67376,211 @@ if __name__ == "__main__":
 
 # =========================================================
 # end yver49 rolling/expiring Leaders-Losers memory window
+# =========================================================
+
+
+# =========================================================
+# yver59 screen/actionable cleanup + clearer diagnostics
+# =========================================================
+YVER59_VERSION = 'yver59_2026_06_17_screen_hides_resolved_setups_clearer_diag_labels'
+
+
+def _yver59_setup_to_row(setup_or_row) -> dict:
+    """Small adapter: support Setup/SimpleNamespace/dict for no-network visibility checks."""
+    try:
+        if isinstance(setup_or_row, dict):
+            return dict(setup_or_row or {})
+        keys = (
+            'setup_id', 'id', 'symbol', 'market_symbol', 'side', 'entry', 'sl', 'tp',
+            'alt_target_a', 'alt_target_b', 'created_ts', 'signal_created_ts',
+            'executable_ts', 'email_logged_ts', 'session', 'source_session', 'fut_vol_usd',
+        )
+        row = {}
+        for k in keys:
+            try:
+                if hasattr(setup_or_row, k):
+                    row[k] = getattr(setup_or_row, k)
+            except Exception:
+                pass
+        if not row.get('setup_id') and row.get('id'):
+            row['setup_id'] = row.get('id')
+        return row
+    except Exception:
+        return {}
+
+
+def _yver59_setup_terminal_for_visibility(setup_or_row) -> tuple[bool, str]:
+    """Return (terminal, reason) when a setup should no longer be shown/emailed/selected.
+
+    This does not change audit scoring and does not close trades.  It only prevents
+    already-resolved emailed/executable rows from staying visible on /screen or being
+    retried noisily after current price has already passed SL/TP.
+    """
+    try:
+        row = _yver59_setup_to_row(setup_or_row)
+        sid = str(row.get('setup_id') or row.get('id') or '').strip()
+        try:
+            if sid:
+                oc = str(((db_get_outcome(sid) or {}).get('outcome')) or '').upper().strip()
+                if oc in {'TP', 'WIN', 'WIN_TP', 'TP1', 'TP2', 'TP3'}:
+                    return True, 'setup_already_hit_tp'
+                if oc in {'SL', 'LOSS', 'LOSE'}:
+                    return True, 'setup_already_hit_sl'
+        except Exception:
+            pass
+
+        side = str(row.get('side') or '').upper().strip()
+        entry = float(row.get('entry') or 0.0)
+        sl = float(row.get('sl') or 0.0)
+        tp = float(_resolve_single_tp(entry, sl, row.get('tp'), row.get('alt_target_a'), row.get('alt_target_b'), side) or 0.0)
+        if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+            return False, ''
+        # Broken geometry is handled elsewhere; do not mark terminal here.
+        if side == 'BUY' and not (sl < entry < tp):
+            return False, ''
+        if side == 'SELL' and not (tp < entry < sl):
+            return False, ''
+
+        px = 0.0
+        try:
+            px = float(_setup_audit_current_price_for_row(row) or 0.0)
+        except Exception:
+            px = 0.0
+        if px <= 0:
+            return False, ''
+        if side == 'BUY':
+            if px <= sl:
+                return True, 'setup_already_hit_sl'
+            if px >= tp:
+                return True, 'setup_already_hit_tp'
+        else:
+            if px >= sl:
+                return True, 'setup_already_hit_sl'
+            if px <= tp:
+                return True, 'setup_already_hit_tp'
+        return False, ''
+    except Exception:
+        return False, ''
+
+
+try:
+    _YVER59_ORIG_RECENT_DELIVERY_LANE_SETUP_OBJECTS = _recent_delivery_lane_setup_objects
+except Exception:
+    _YVER59_ORIG_RECENT_DELIVERY_LANE_SETUP_OBJECTS = None
+
+
+def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int | None = None, limit: int = 3) -> list:
+    rows = []
+    try:
+        if _YVER59_ORIG_RECENT_DELIVERY_LANE_SETUP_OBJECTS is not None:
+            # Ask for extra rows so filtering terminal rows does not make /screen empty
+            # when there are still valid recent emailed/executable alternatives.
+            rows = _YVER59_ORIG_RECENT_DELIVERY_LANE_SETUP_OBJECTS(user_id, session_name=session_name, max_age_min=max_age_min, limit=max(int(limit or 3) * 4, int(limit or 3) + 6)) or []
+    except Exception:
+        rows = []
+    out = []
+    seen = set()
+    for item in list(rows or []):
+        try:
+            sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+            ident = _setup_identity_from_obj(item)
+            key = ident or sid
+            if not sid or key in seen:
+                continue
+            terminal, why = _yver59_setup_terminal_for_visibility(item)
+            if terminal:
+                try:
+                    setattr(item, 'screen_hidden_reason', why)
+                except Exception:
+                    pass
+                continue
+            out.append(item)
+            seen.add(key)
+            if len(out) >= int(limit or 3):
+                break
+        except Exception:
+            continue
+    return out[:int(limit or 3)]
+
+
+try:
+    _YVER59_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = is_executable_setup_eligible
+except Exception:
+    _YVER59_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = None
+
+
+def is_executable_setup_eligible(s: "Setup", session_name: str = "NY", min_quality: float = 68.0, min_conf: int = 74, min_rr_final: float = 0.0) -> tuple[bool, str]:
+    try:
+        terminal, why = _yver59_setup_terminal_for_visibility(s)
+        if terminal:
+            return False, why
+    except Exception:
+        pass
+    if _YVER59_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE is not None:
+        return _YVER59_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE(s, session_name=session_name, min_quality=min_quality, min_conf=min_conf, min_rr_final=min_rr_final)
+    return True, ''
+
+
+try:
+    _YVER59_ORIG_FINAL_QUALITY_GATE_ALLOWS_SETUP = _setup_final_quality_gate_allows_setup
+except Exception:
+    _YVER59_ORIG_FINAL_QUALITY_GATE_ALLOWS_SETUP = None
+
+
+def _setup_final_quality_gate_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    try:
+        terminal, why = _yver59_setup_terminal_for_visibility(setup_or_row)
+        if terminal:
+            return False, why, {'terminal_by_price': True}
+    except Exception:
+        pass
+    if _YVER59_ORIG_FINAL_QUALITY_GATE_ALLOWS_SETUP is not None:
+        return _YVER59_ORIG_FINAL_QUALITY_GATE_ALLOWS_SETUP(setup_or_row, session_name=session_name, user_id=user_id)
+    return True, '', {}
+
+
+try:
+    _YVER59_ORIG_SHORT_AT_REASON = _setup_audit_short_autotrade_reason
+except Exception:
+    _YVER59_ORIG_SHORT_AT_REASON = None
+
+
+def _setup_audit_short_autotrade_reason(reason: str) -> str:
+    r = str(reason or '').lower().strip()
+    if 'stop_invalid' in r or 'invalid_stop' in r or 'setup_already_hit_sl' in r:
+        return 'SL_ALREADY_HIT'
+    if 'setup_already_hit_tp' in r:
+        return 'TP_ALREADY_HIT'
+    # This can be a real manual position or an already-open bot position whose
+    # ownership could not be proven quickly.  OPEN_POS is less misleading than MANUAL_POS.
+    if 'blocked_manual_same_symbol_position' in r or 'manual_same_symbol' in r or 'manual_position' in r or 'external_or_manual_position' in r:
+        return 'OPEN_POS'
+    # Keep setup analysis wording aligned with Ramin's rule: setups do not expire.
+    # Only the AutoTrade entry attempt window becomes old.
+    if 'setup_expired' in r or r == 'expired' or 'entry_window_expired' in r:
+        return 'ENTRY_OLD'
+    if _YVER59_ORIG_SHORT_AT_REASON is not None:
+        lbl = str(_YVER59_ORIG_SHORT_AT_REASON(reason) or '').upper().strip()
+        if lbl == 'EXPIRED':
+            return 'ENTRY_OLD'
+        if lbl == 'MANUAL_POS':
+            return 'OPEN_POS'
+        if lbl.startswith('STOP_INVALID'):
+            return 'SL_ALREADY_HIT'
+        return lbl
+    return re.sub(r'[^A-Z0-9_]+', '_', str(reason or '').upper()).strip('_')[:16] or '-'
+
+
+# Bump common admin/report cache namespaces so v58 cached text does not linger.
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v59'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v59'
+except Exception:
+    pass
+
+# =========================================================
+# end yver59 cleanup
 # =========================================================
