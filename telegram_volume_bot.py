@@ -1,3 +1,4 @@
+# yver56: setup-audit results now have unlimited life: each setup is evaluated from creation until now and remains OPEN until price actually hits TP or SL; no NH/NOHIT expiry, no stale OPEN forced to SL, WR stays TP/(TP+SL) with OPEN excluded, and report/cache labels are bumped. No live AutoTrade entry window/risk/TP/SL logic changed.
 # yver54: 17 Jun 09:20 review — appends evidence-based blackout windows 14:00-15:00 and 17:00-18:00 while keeping 07:00-08:00, 10:00-11:00 and SUN 22:00-MON 10:00; setup generation remains shadow-on, only setup delivery and AutoTrade entries are blocked.
 # yver53: adds /setup_matrix policy WR beside each row in /setup_audit so policy context and row result are visible together.
 # yver49: makes the multi-day Leaders/Losers direction block explicitly rolling/expiring: 2+ appearances inside the last 3 Melbourne days only; current Leader/Loser still blocks only while current.
@@ -26496,7 +26497,8 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
         return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "invalid_trade_levels"}
 
     since_ms = int(created_ts * 1000)
-    until_ms = int(min(time.time(), created_ts + horizon_hours * 3600) * 1000)
+    until_ts = min(time.time(), created_ts + float(horizon_hours) * 3600.0) if int(horizon_hours or 0) > 0 else time.time()
+    until_ms = int(until_ts * 1000)
     if until_ms <= since_ms:
         return {"outcome": "OPEN", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": "empty_window"}
 
@@ -26520,15 +26522,8 @@ def evaluate_signal_hit_order(setup: dict, horizon_hours: int = 24, timeframe: s
             return res
         last_open = dict(res or {})
 
-    # If the signal horizon has already expired and neither TP nor SL was hit, it is not OPEN.
-    # This prevents /signal_report_overall from falsely reporting old signals as open forever.
-    try:
-        horizon_end = float(created_ts) + float(horizon_hours) * 3600.0
-        if float(time.time()) >= horizon_end - 60.0:
-            note = str((last_open or {}).get('note') or 'horizon_expired_no_hit')
-            return {"outcome": "HORIZON_EXPIRED_NO_HIT", "hit_level": "NONE", "hit_ts": None, "best_level": "NONE", "best_ts": None, "note": note if note else "horizon_expired_no_hit"}
-    except Exception:
-        pass
+    # v56: no setup-audit due date. No-hit is not a terminal result; unresolved
+    # setups stay OPEN until a later candle touches TP or SL.
     return last_open
 
 def _signal_setup_eval_payload(setup_id: str) -> dict:
@@ -41970,8 +41965,8 @@ ADMIN_HELP_DESCRIPTIONS = {
     "email_pipeline_status": "Alias of /email_decision for email pipeline visibility",
     "setup_audit": "Setup audit: /setup_audit h for guide; /setup_audit 1/6/24 filters unique setups by hours; /setup_audit compare 24 reconciles real AutoTrade rows vs setup path",
     "setup_quality": "Alias of /setup_audit",
-    "setup_audit_overall": "Overall Family-Session-Strategy-Side summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR",
-    "setup_audit_keep_watch": "Multi-window KEEP + WATCH setup summary table: Last 24h, 7d, 14d, Overall; Keep/Watch combo counts, Set, TP, SL, NH, Open, WR",
+    "setup_audit_overall": "Overall Family-Session-Strategy-Side summary with start/end/duration, avg setups/day, TP/SL/OPEN/WR; no setup expiry",
+    "setup_audit_keep_watch": "Multi-window KEEP + WATCH setup summary table: Last 24h, 7d, 14d, Overall; Keep/Watch combo counts, Set, TP, SL, Open, WR",
     "setup_audit_keep": "Multi-window KEEP-only setup summary table: Last 24h, 7d, 14d, Overall; same columns as /setup_audit_keep_watch",
     "setup_keep_watch_summary": "Alias of /setup_audit_keep_watch",
     "setup_audit_compare": "Reconcile bot-created AutoTrade closes against /setup_audit price-path results; exchange-only rows are marked BYBIT_ONLY: /setup_audit_compare 24",
@@ -45929,7 +45924,7 @@ def _setup_audit_result_from_cached_price_moves(row: dict, horizon_hours: int = 
             return 'OPEN'
 
         now_ts = float(time.time())
-        horizon_end = min(now_ts, created_ts + float(max(1, int(horizon_hours or 24))) * 3600.0) if created_ts > 0 else now_ts
+        horizon_end = (min(now_ts, created_ts + float(max(1, int(horizon_hours or 0))) * 3600.0) if (created_ts > 0 and int(horizon_hours or 0) > 0) else now_ts)
         candles_all = []
         # Prefer cached candles only; never call fetch_ohlcv/fetch_ohlcv_paged here.
         for tf, lim in (('1m', 300), ('5m', 300), ('15m', 200)):
@@ -45983,11 +45978,8 @@ def _setup_audit_result_from_cached_price_moves(row: dict, horizon_hours: int = 
                     return 'WIN'
                 if px >= sl:
                     return 'LOSE'
-        try:
-            if created_ts > 0 and float(time.time()) >= (float(created_ts) + float(max(1, int(horizon_hours or 24))) * 3600.0 - 60.0):
-                return 'NOHIT'
-        except Exception:
-            pass
+        # v56: no audit expiry. If neither TP nor SL has been touched yet,
+        # the setup remains OPEN until a future price path resolves it.
         return 'OPEN'
     except Exception:
         return 'OPEN'
@@ -46052,17 +46044,40 @@ def _setup_audit_short_text(value, max_len: int = 44) -> str:
 
 
 def _setup_audit_result_horizon_hours() -> int:
-    """How long after each setup to check for TP/SL in audit reports.
+    """Setup-audit TP/SL evaluation lifetime.
 
-    The selected /setup_audit window filters which setups are shown. The result
-    horizon stays fixed (default 24h) so "/setup_audit 1" means: show setups
-    generated in the last 1 hour, then check each setup's post-entry price path
-    up to the normal 24h result window (or until now).
+    v56: generated setups do NOT expire for audit/policy purposes. The hour
+    argument on /setup_audit only selects which setup rows to display; outcome
+    evaluation checks the price path from setup time until now. A setup remains
+    OPEN until price actually hits either TP or SL.
+
+    Set SETUP_AUDIT_UNLIMITED_RESULT_HORIZON=0 only for a temporary diagnostic
+    rollback to the old fixed-hour horizon.
     """
     try:
-        return max(1, min(168, int(float(os.environ.get('SETUP_AUDIT_RESULT_HOURS', '24') or 24))))
+        if env_bool('SETUP_AUDIT_UNLIMITED_RESULT_HORIZON', True):
+            return 0
+        return max(1, min(8760, int(float(os.environ.get('SETUP_AUDIT_RESULT_HOURS', '24') or 24))))
     except Exception:
-        return 24
+        return 0
+
+
+def _setup_audit_result_horizon_label(hours: int | None = None) -> str:
+    try:
+        h = _setup_audit_result_horizon_hours() if hours is None else int(hours or 0)
+        if h <= 0:
+            return 'until TP/SL (no expiry)'
+        return f'{int(h)}h'
+    except Exception:
+        return 'until TP/SL (no expiry)'
+
+
+def _setup_audit_result_horizon_is_unlimited(hours: int | None = None) -> bool:
+    try:
+        h = _setup_audit_result_horizon_hours() if hours is None else int(hours or 0)
+        return int(h or 0) <= 0
+    except Exception:
+        return True
 
 
 def _setup_audit_family_code(row_or_family) -> str:
@@ -46172,10 +46187,10 @@ def _setup_audit_help_text() -> str:
         "• Type — BUY/SELL.\n"
         "• Conf — setup confidence.\n"
         "• Family — compact family code, e.g. F1/F2/F3/F8/F9.\n"
-        "• Result — TP, SL, NOHIT, or OPEN.\n"
-        "  OPEN means still inside the result horizon. NOHIT means the horizon expired without TP or SL.\n\n"
+        "• Result — TP, SL, or OPEN.\n"
+        "  OPEN means price has not hit TP or SL yet; it can stay OPEN forever until resolved.\n\n"
         "<b>Important</b>: the hour argument filters setup generation time only. "
-        "TP/SL checking uses the configured result horizon (default 24h)."
+        "TP/SL checking has no due date: it evaluates from setup time until now."
     )
 
 
@@ -46186,7 +46201,22 @@ def _setup_audit_result_label(value: str) -> str:
     if v in {'SL', 'LOSS', 'LOSE', 'HIT_SL_LOSS'}:
         return 'SL'
     if v in {'NOHIT', 'NO_HIT', 'TIMEOUT', 'EXPIRED', 'HORIZON_EXPIRED_NO_HIT', 'NO_TP_SL'}:
-        return 'NOHIT'
+        # v56: setups have no due date. Legacy NOHIT/expired states are unresolved, not terminal.
+        return 'OPEN'
+    return 'OPEN'
+
+
+def _setup_audit_binary_display_result(row: dict | None, result: str, horizon_hours: int | None = None) -> str:
+    """v56 user-facing setup-audit result resolver.
+
+    Setups have no due date. TP and SL are terminal. Any unresolved/no-hit/
+    expired legacy state displays as OPEN until the future price path touches TP
+    or SL. This is reporting-only and does not change live AutoTrade entry,
+    TP/SL placement, or risk logic.
+    """
+    lab = _setup_audit_result_label(result)
+    if lab in {'TP', 'SL'}:
+        return lab
     return 'OPEN'
 
 
@@ -46527,11 +46557,17 @@ def _setup_audit_cached_result(setup_id: str, horizon_hours: int, allow_open_fre
                 return {}
             d = dict(row)
             result = _setup_audit_result_label(d.get('result'))
-            if result in {'TP', 'SL', 'NOHIT'}:
+            if result in {'TP', 'SL'}:
                 return d
-            # OPEN can change while the horizon is still alive; reuse only a very recent OPEN.
+            # v56: old NOHIT/expired cache rows are not terminal anymore; ignore
+            # them so the setup can continue resolving until TP or SL.
+            if result == 'NOHIT':
+                return {}
+            # OPEN can change forever; reuse only a very recent OPEN cache.
             age = float(time.time()) - float(d.get('evaluated_ts') or 0.0)
-            if int(d.get('horizon_hours') or 0) == int(horizon_hours) and age <= max(30, int(allow_open_fresh_sec)):
+            req_h = int(horizon_hours or 0)
+            stored_h = int(d.get('horizon_hours') or 0)
+            if (req_h <= 0 or stored_h == req_h) and age <= max(30, int(allow_open_fresh_sec)):
                 return d
     except Exception:
         pass
@@ -46592,7 +46628,7 @@ def _setup_audit_price_result_payload(row: dict, horizon_hours: int = 24, user_i
     try:
         row = _setup_audit_payload_from_row(row)
         sid = str(row.get('setup_id') or '').strip()
-        horizon_hours = int(max(1, min(int(horizon_hours or 24), 8760)))
+        horizon_hours = 0 if int(horizon_hours or 0) <= 0 else int(max(1, min(int(horizon_hours or 24), 8760)))
         if sid and not force:
             cached = _setup_audit_cached_result(sid, horizon_hours)
             if cached:
@@ -46604,7 +46640,7 @@ def _setup_audit_price_result_payload(row: dict, horizon_hours: int = 24, user_i
             # This keeps /setup_audit responsive and independent from autotrade even when
             # Bybit rate-limits historical 1m/5m requests.
             quick_result = _setup_audit_result_from_cached_price_moves(row, horizon_hours=horizon_hours)
-            if _setup_audit_result_label(quick_result) in {'TP', 'SL', 'NOHIT'}:
+            if _setup_audit_result_label(quick_result) in {'TP', 'SL'}:
                 res = {
                     'result': _setup_audit_result_label(quick_result),
                     'hit_level': _setup_audit_result_label(quick_result),
@@ -46704,7 +46740,7 @@ def _setup_audit_preload_ohlcv(rows: list[dict], hours: int = 24, timeframe: str
         for ms, items in by_symbol.items():
             try:
                 min_created = min(float(x.get('created_ts') or x.get('ts') or x.get('signal_created_ts') or now_ts) for x in items)
-                max_end = max(min(now_ts, float(x.get('created_ts') or x.get('ts') or x.get('signal_created_ts') or now_ts) + float(hours) * 3600.0) for x in items)
+                max_end = now_ts if int(hours or 0) <= 0 else max(min(now_ts, float(x.get('created_ts') or x.get('ts') or x.get('signal_created_ts') or now_ts) + float(hours) * 3600.0) for x in items)
                 # Buffer one candle before and after so a setup created inside a candle can still be evaluated.
                 buf = _setup_audit_tf_seconds(tf) + 60
                 since_ms = int(max(0.0, min_created - buf) * 1000)
@@ -46736,7 +46772,7 @@ def _setup_audit_payload_result_from_candles(row: dict, candles: list, horizon_h
             return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'missing_or_invalid_setup_levels'}
         tf_sec = _setup_audit_tf_seconds(timeframe)
         now_ts = float(time.time())
-        horizon_end = min(now_ts, created_ts + float(max(1, int(horizon_hours or 24))) * 3600.0)
+        horizon_end = (min(now_ts, created_ts + float(max(1, int(horizon_hours or 0))) * 3600.0) if int(horizon_hours or 0) > 0 else now_ts)
         filt = []
         for c in (candles or []):
             try:
@@ -46773,20 +46809,15 @@ def _setup_audit_payload_result_from_candles(row: dict, candles: list, horizon_h
                         return r1
             except Exception:
                 pass
-        if canon == 'OPEN':
-            try:
-                if float(time.time()) >= (float(created_ts) + float(max(1, int(horizon_hours or 24))) * 3600.0 - 60.0):
-                    canon = 'NOHIT'
-                    note = note or 'horizon_expired_no_tp_or_sl'
-            except Exception:
-                pass
+        # v56: no NOHIT expiry. If the filtered post-setup candles have not
+        # touched TP/SL yet, keep the setup OPEN.
         return {
             'result': canon,
             'hit_level': str(res.get('hit_level') or (canon if canon in {'TP', 'SL'} else '')).upper().strip(),
             'hit_ts': res.get('hit_ts'),
             'best_level': res.get('best_level'),
             'best_ts': res.get('best_ts'),
-            'note': (note or f'resolved_{timeframe}') if canon in {'TP', 'SL'} else (note or 'horizon_not_hit'),
+            'note': (note or f'resolved_{timeframe}') if canon in {'TP', 'SL'} else (note or 'not_hit_yet'),
         }
     except Exception as exc:
         return {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': f'candles_eval_error:{type(exc).__name__}'}
@@ -46796,7 +46827,7 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
     """Authoritative result resolver for /setup_audit.
 
     yver86: fresh OHLCV candle path is the authority. Older builds cached some
-    TP/SL/NOHIT decisions before the candle-start filtering fix, so trusting cache
+    TP/SL decisions before the candle-start filtering fix, so trusting cache
     first can keep a wrong setup result alive forever. We now recompute from the
     post-setup candle path whenever candles are available, overwrite the cached
     result, and use cached/outcome rows only as fallback when price candles are not
@@ -46814,7 +46845,7 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
         if candles:
             ev = _setup_audit_payload_result_from_candles(rr, candles, horizon_hours=horizon_hours, timeframe=audit_timeframe)
             canon = _setup_audit_result_label(ev.get('result'))
-            if canon in {'TP', 'SL', 'NOHIT'}:
+            if canon in {'TP', 'SL'}:
                 ev['result'] = canon
                 try:
                     _setup_audit_upsert_result(int(user_id or 0), rr, ev, int(horizon_hours), actual_pnl_usdt=actual_pnl_usdt)
@@ -46829,7 +46860,7 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
         if trust_cache and sid and str((last_ev or {}).get('note') or '').lower() in {'no_grouped_candles', 'no_price_candles'}:
             try:
                 cached = _setup_audit_cached_result(sid, horizon_hours, allow_open_fresh_sec=0) if sid else {}
-                if cached and _setup_audit_result_label(cached.get('result')) in {'TP', 'SL', 'NOHIT'}:
+                if cached and _setup_audit_result_label(cached.get('result')) in {'TP', 'SL'}:
                     return {'result': _setup_audit_result_label(cached.get('result')), 'hit_level': cached.get('hit_level'), 'hit_ts': cached.get('hit_ts'), 'note': cached.get('note') or 'cached_decided_result_no_candles'}
             except Exception:
                 pass
@@ -46850,7 +46881,7 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
             try:
                 tmp = evaluate_signal_hit_order(rr, horizon_hours=int(horizon_hours), timeframe=str(audit_timeframe or '5m'))
                 canon = _setup_audit_result_label((tmp or {}).get('outcome') or (tmp or {}).get('result'))
-                if canon in {'TP', 'SL', 'NOHIT'}:
+                if canon in {'TP', 'SL'}:
                     ev = dict(tmp or {})
                     ev['result'] = canon
                     try:
@@ -46866,13 +46897,11 @@ def _setup_audit_resolve_result(row: dict, horizon_hours: int, user_id: int, can
         canon = _setup_audit_result_label(quick)
         if canon in {'TP', 'SL'}:
             ev = {'result': canon, 'hit_level': canon, 'hit_ts': None, 'note': 'current_price_or_cached_outcome'}
-        elif canon == 'NOHIT':
-            ev = {'result': 'NOHIT', 'hit_level': '', 'hit_ts': None, 'note': 'horizon_expired_no_tp_or_sl'}
         else:
             ev = dict(last_ev or {})
             ev['result'] = _setup_audit_result_label(ev.get('result'))
             if ev['result'] == 'OPEN':
-                ev.setdefault('note', 'not_hit_in_horizon')
+                ev.setdefault('note', 'not_hit_yet')
         try:
             _setup_audit_upsert_result(int(user_id or 0), rr, ev, int(horizon_hours), actual_pnl_usdt=actual_pnl_usdt)
         except Exception:
@@ -47617,7 +47646,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         family_code = _setup_audit_family_code(r)
         actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
         ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
-        result = _setup_audit_result_label(ev.get('result'))
+        result = _setup_audit_binary_display_result(r, ev.get('result'), result_horizon)
         if result == 'TP':
             tp_n += 1
         elif result == 'SL':
@@ -47645,7 +47674,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         table_rows.append([ttxt, sym, side, combo_key, policy_label, policy_wr, at_state, at_why, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", pnl_txt, result])
 
     decided = tp_n + sl_n
-    # yver123: WR excludes NOHIT and OPEN.
+    # v56: WR excludes OPEN/unresolved rows.
     wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
     try:
         now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
@@ -47668,7 +47697,7 @@ def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
         HDR,
         f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
         f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        "AT legend: <b>SENT_OLD</b> = setup email was sent but the entry window has expired; <b>WR</b> is the current /setup_matrix lane WR; <b>ATWhy</b> explains the current non-entry reason; <b>PnL</b> shows realised AutoTrade PnL for AT_CLOSED rows.",
+        "AT legend: <b>SENT_OLD</b> = setup email was sent but the entry window has expired; <b>WR</b> is the current /setup_matrix lane WR; <b>ATWhy</b> explains the current non-entry reason; <b>PnL</b> shows realised AutoTrade PnL for AT_CLOSED rows. Result view has no expiry: unresolved setups stay OPEN until TP or SL is hit.",
     ]
     return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -47758,8 +47787,7 @@ def _setup_open_times_proposals(hour_stats: dict[int, dict], *, scope_hours: int
     """Pick concise blackout candidates from hourly KEEP setup evidence.
 
     A blackout candidate is an hour with decided evidence where TP/SL performance is
-    below target.  Open/NOHIT rows are displayed in the detailed table but excluded
-    from WR, same as the existing setup-audit methodology.
+    below target.  OPEN rows are displayed in the detailed table but excluded from WR; there is no NOHIT expiry.
     """
     try:
         min_decided = 1 if int(scope_hours or 0) and int(scope_hours or 0) <= 48 else 3
@@ -48035,7 +48063,7 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
 
     try:
         cache_bucket = int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))
-        cache_key = f"keep_only_summary:v28::{uid_i}::{cache_bucket}"
+        cache_key = f"keep_only_summary:v56::{uid_i}::{cache_bucket}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -48145,7 +48173,6 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
             st['set'],
             st['tp'],
             st['sl'],
-            st['nh'],
             st['open'],
             f"{st['wr']:.1f}%",
         ])
@@ -48159,9 +48186,9 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
 
     table = tabulate(
         table_rows,
-        headers=['Window', 'Keep', 'Watch', 'UsedK', 'UsedW', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
+        headers=['Window', 'Keep', 'Watch', 'UsedK', 'UsedW', 'Set', 'TP', 'SL', 'Open', 'WR'],
         tablefmt='plain',
-        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
+        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     lines = [
         "📊 <b>Setup KEEP Summary</b>",
@@ -48169,9 +48196,9 @@ def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
         "Policy source: <b>/setup_matrix policy KEEP lanes only</b>",
         f"Current policy combos: <b>{len(keep_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>0</b>)",
         f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
-        f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Evaluation: <b>{_setup_audit_result_horizon_label(result_horizon)}</b> | TF: <b>{html.escape(audit_tf)}</b>",
         "Keep/Watch columns = <b>current policy lane totals</b>; UsedK/UsedW = policy lanes that actually had setup rows in that window.",
-        "WR basis: <b>TP/(TP+SL)</b>; NH and Open are shown but excluded from WR.",
+        "WR basis: <b>TP/(TP+SL)</b>; OPEN means not hit yet and is excluded from WR. Setups have <b>no due date</b>.",
         "Overall row: <b>from start of available setup database</b>.",
         HDR,
         "<pre>" + html.escape(table) + "</pre>",
@@ -48345,13 +48372,14 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
     now_ts = float(time.time())
     start_ts = now_ts - float(hours) * 3600.0
     horizon_hours = int(_setup_audit_result_horizon_hours())
+    compare_lookback_hours = int(os.environ.get('SETUP_AUDIT_COMPARE_SETUP_LOOKBACK_HOURS', '48') or 48) if horizon_hours <= 0 else int(horizon_hours)
     audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
 
     # A closed trade inside the selected window can belong to a setup generated
     # before the window (up to the audit horizon, plus buffer). Load that full
     # pre-close setup history and do not de-duplicate; exact setup matching matters
     # more than compact daily reporting here.
-    compare_setup_start_ts = max(0.0, float(start_ts) - float(horizon_hours + 6) * 3600.0)
+    compare_setup_start_ts = max(0.0, float(start_ts) - float(compare_lookback_hours + 6) * 3600.0)
     try:
         setup_rows = _setup_audit_load_rows(
             owner_uid,
@@ -48493,7 +48521,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
                 entry_deadline_sec = float(_autotrade_entry_window_min()) * 60.0
             except Exception:
                 entry_deadline_sec = 60.0 * 60.0
-            q_start = max(0.0, min(float(compare_setup_start_ts or 0.0), close_ts - float(horizon_hours + 6) * 3600.0))
+            q_start = max(0.0, min(float(compare_setup_start_ts or 0.0), close_ts - float(compare_lookback_hours + 6) * 3600.0))
             q_end = close_ts + 10.0 * 60.0
             with sqlite3.connect(DB_PATH) as conn:
                 conn.row_factory = sqlite3.Row
@@ -48673,7 +48701,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
             if not ms or created_ts <= 0:
                 return cur
             since_ms = int(max(0.0, created_ts - 90.0) * 1000)
-            until_ms = int(min(float(time.time()) + 60.0, created_ts + float(horizon_hours) * 3600.0 + 120.0) * 1000)
+            until_ms = int((min(float(time.time()) + 60.0, created_ts + float(horizon_hours) * 3600.0 + 120.0) if int(horizon_hours or 0) > 0 else float(time.time()) + 60.0) * 1000)
             c1 = fetch_ohlcv_paged(ms, '1m', since_ms=since_ms, until_ms=until_ms, limit=1500) or []
             if not c1:
                 return cur
@@ -48757,7 +48785,7 @@ def _setup_audit_compare_text(uid: int, hours: int = 24) -> str:
         colalign=('left', 'left', 'center', 'center', 'right', 'center', 'left', 'center', 'center'),
     )
     lines.append("<pre>" + html.escape(table) + "</pre>")
-    lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close still disagrees with setup path after targeted 1m recheck, NON_TPSL=historical/manual/time/profit/inferred close with mismatched or unresolved setup path ignored for setup-audit scoring, PENDING=audit still OPEN/NOHIT, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
+    lines.append("Chk: OK=same TP/SL direction, DIFF=natural TP/SL close still disagrees with setup path after targeted 1m recheck, NON_TPSL=historical/manual/time/profit/inferred close with mismatched or unresolved setup path ignored for setup-audit scoring, PENDING=audit still OPEN, NO_SETUP=bot row without safe setup match, BYBIT_ONLY=exchange-only/manual/legacy P&L row ignored for setup-audit scoring.")
     return "\n".join(lines)
 # ===========================================================================
 
@@ -51533,7 +51561,7 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
     nh = sum(int(r.get('nohit') or 0) for r in rows)
     op = sum(int(r.get('open') or 0) for r in rows)
     # yver146: keep /setup_matrix WR basis synced with /setup_audit and
-    # /setup_deep_analysis. NOHIT is shown separately but is not a loss.
+    # /setup_deep_analysis. OPEN/unresolved is shown separately and is not a loss.
     decided = tp + sl
     wr = (tp / max(1, decided) * 100.0) if decided else 0.0
     keep_n = sum(1 for r in rows if str(r.get('action') or '').upper() == 'KEEP')
@@ -51563,7 +51591,7 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
     for r in rows:
         # yver67: Score/WR/AvgR are evidence metrics. Do not show fake -60/0.0
         # for empty or still-open lanes, because that makes untested REV/NOR lanes
-        # look weak before they have decided TP/SL/NOHIT evidence.
+        # look weak before they have decided TP/SL evidence.
         table_rows.append([
             str(r.get('combo') or ''),
             int(r.get('tp') or 0), int(r.get('sl') or 0), int(r.get('open') or 0),
@@ -51595,7 +51623,7 @@ def _setup_combo_matrix_text(uid: int, hours: int = 168, persist: bool = True, a
         HDR,
         f"Window: <b>{html.escape(str(window_txt))}</b> | Run: <b>{html.escape(str(res.get('run_id') or '-'))}</b> | Scores persisted: <b>{'YES' if persist else 'NO'}</b> | Weekly policy updated: <b>{'YES' if bool(res.get('policy_updated')) else 'NO'}</b>",
         f"Policy update time: <b>{html.escape(str(last_pol.get('text') or '-'))}</b> | Kind: <b>{html.escape(str(last_pol.get('kind') or '-'))}</b> | Next scheduled review: <b>{html.escape(str(next_review_txt))}</b>",
-        f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | NOHIT: <b>{nh}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b> | Source: <b>{html.escape(str((res or {}).get('source_label') or 'EXECUTABLE'))}</b>",
+        f"Unique setups: <b>{total}</b> | TP: <b>{tp}</b> | SL: <b>{sl}</b> | OPEN: <b>{op}</b> | WR: <b>{wr:.1f}%</b> | Source: <b>{html.escape(str((res or {}).get('source_label') or 'EXECUTABLE'))}</b>",
         f"Matrix recommendation: KEEP=<b>{keep_n}</b> | WATCH=<b>{watch_n}</b> | DISABLE=<b>{off_n}</b>",
         f"Active live policy: KEEP=<b>{live_keep_n}</b> | WATCH=<b>{live_watch_n}</b> | DISABLE=<b>{live_off_n}</b> | Live enforce=<b>{'ON' if SETUP_COMBO_POLICY_LIVE_ENFORCE else 'OFF'}</b> | WATCH gate=<b>{'STRICT' if SETUP_COMBO_WATCH_STRICT_QUALITY_GATE else ('BLOCK' if SETUP_COMBO_POLICY_BLOCK_WATCH else 'OPEN')}</b>",
         html.escape(_setup_edge_guard_snapshot_text(int(uid), _overall_report_effective_hours(hours) if float((res or {}).get('start_ts') or 0.0) > 0 else None)),
@@ -51810,7 +51838,7 @@ def _setup_edge_deep_text(uid: int, hours: int = 168, start_ts: float | None = N
                 continue
 
         decided = tp_n + sl_n
-        # yver123: deep-analysis WR excludes NOHIT and OPEN.
+        # v56: deep-analysis WR excludes OPEN/unresolved rows.
         wr = (tp_n / max(1, decided) * 100.0) if decided else 0.0
         try:
             start_txt = datetime.fromtimestamp(first_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M') if first_ts else '-'
@@ -51852,7 +51880,7 @@ def _setup_edge_deep_text(uid: int, hours: int = 168, start_ts: float | None = N
             "🧠 <b>Setup Deep Analysis</b>",
             HDR,
             f"Window: <b>{html.escape(str(window_desc))}</b> | Rows evaluated: <b>{evaluated}</b> | Start: <b>{html.escape(start_txt)}</b> | End: <b>{html.escape(end_txt)}</b>",
-            f"Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | Source: <b>{html.escape(str(source_label))}</b> | TP=<b>{tp_n}</b> SL=<b>{sl_n}</b> OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
+            f"Evaluation: <b>{_setup_audit_result_horizon_label(result_horizon)}</b> | TF: <b>{html.escape(audit_tf)}</b> | Min vol: <b>${min_vol_m:.0f}M</b> | Source: <b>{html.escape(str(source_label))}</b> | TP=<b>{tp_n}</b> SL=<b>{sl_n}</b> OPEN=<b>{open_n}</b> | WR=<b>{wr:.1f}%</b>",
             f"Exact disabled policy lanes now: <b>{html.escape(', '.join(coarse_disabled[:12]) if coarse_disabled else '-')}</b> | WATCH rows: <b>{len(watch_now)}</b>",
             f"Micro-edge tightened lanes now: <b>{html.escape(', '.join(guard_lane_blocks[:12]) if guard_lane_blocks else '-')}</b>",
             html.escape(_setup_edge_guard_snapshot_text(uid, _overall_report_effective_hours(hours) if fixed_start_ts > 0 else None)),
@@ -52678,7 +52706,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_cached_or_queue_admin_report(
                 update,
                 "/setup_audit overall",
-                f"admin:bg:v24:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                f"admin:bg:v56:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
                 _setup_audit_overall_text,
                 args=(int(AUTOTRADE_OWNER_UID or uid),),
                 parse_mode=ParseMode.HTML,
@@ -52728,7 +52756,7 @@ async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit {int(hours)}",
-        f"admin:bg:v53:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
+        f"admin:bg:v55:setup_audit:{int(AUTOTRADE_OWNER_UID or uid)}:{int(limit)}:{int(hours)}",
         _setup_audit_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(limit), int(hours)),
         parse_mode=ParseMode.HTML,
@@ -52868,7 +52896,7 @@ def _setup_audit_overall_text(uid: int) -> str:
     # even when no setup has fired yet; zeros are useful for clean forward tests.
     result_horizon = _setup_audit_result_horizon_hours()
     audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
-    # Overall is the command where stale OPEN counts were most wrong. Force grouped
+    # Overall uses the no-expiry setup audit. Force grouped
     # historical candles by symbol so old setups are checked against their real
     # post-setup path instead of the current ticker only.
     candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
@@ -52886,7 +52914,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
         sid = str(r.get('setup_id') or '').strip()
         ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=0.0)
-        result = _setup_audit_result_label(ev.get('result'))
+        result = _setup_audit_binary_display_result(r, ev.get('result'), result_horizon)
         strat = _setup_strategy_short_label(r)
         side_row = _setup_side_suffix(value=str(r.get('side') or ''))
         item = fam_stats.setdefault((fam, sess_row, strat, side_row), {'family': fam, 'session': sess_row, 'strategy': strat, 'side': side_row, 'total': 0, 'tp': 0, 'sl': 0, 'nohit': 0, 'open': 0})
@@ -52909,7 +52937,7 @@ def _setup_audit_overall_text(uid: int) -> str:
         nohit = int(st.get('nohit') or 0)
         op = int(st.get('open') or 0)
         decided = tp + sl
-        # yver123: setup WR excludes NOHIT and OPEN.
+        # v56: setup WR excludes OPEN/unresolved rows.
         wr = (tp / decided * 100.0) if decided > 0 else 0.0
         total_setups += total
         total_tp += tp
@@ -52917,16 +52945,16 @@ def _setup_audit_overall_text(uid: int) -> str:
         total_nohit += nohit
         total_open += op
         combo_key = _setup_combo_strategy_side_key(fam, sess_row, strat_row, side_row)
-        table_rows.append([combo_key, total, tp, sl, nohit, op, f"{wr:.1f}%"])
+        table_rows.append([combo_key, total, tp, sl, op, f"{wr:.1f}%"])
     decided_total = total_tp + total_sl
-    # yver123: WR is TP/(TP+SL). NOHIT and OPEN are informational, not losses.
+    # yver56: WR is TP/(TP+SL); OPEN/unresolved rows are excluded until TP or SL.
     wr_total = (total_tp / decided_total * 100.0) if decided_total > 0 else 0.0
     win = _setup_audit_window_summary(rows)
     dur_days = float(win.get('duration_days') or 0.0)
     avg_daily = float(win.get('avg_daily') or 0.0)
     try:
-        keep_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) >= SETUP_COMBO_POLICY_KEEP_WR and int(r[2]) + int(r[3]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
-        weak_candidates = [r for r in table_rows if str(r[6]).replace('%','') and float(str(r[6]).replace('%','') or 0.0) < SETUP_COMBO_POLICY_DISABLE_WR and int(r[2]) + int(r[3]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
+        keep_candidates = [r for r in table_rows if str(r[5]).replace('%','') and float(str(r[5]).replace('%','') or 0.0) >= SETUP_COMBO_POLICY_KEEP_WR and int(r[2]) + int(r[3]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
+        weak_candidates = [r for r in table_rows if str(r[5]).replace('%','') and float(str(r[5]).replace('%','') or 0.0) < SETUP_COMBO_POLICY_DISABLE_WR and int(r[2]) + int(r[3]) >= SETUP_COMBO_POLICY_MIN_DECIDED_DAILY]
         keep_txt = ', '.join([str(r[0]) for r in keep_candidates[:5]]) or '-'
         weak_txt = ', '.join([str(r[0]) for r in weak_candidates[:5]]) or '-'
     except Exception:
@@ -52940,22 +52968,22 @@ def _setup_audit_overall_text(uid: int) -> str:
     header = [
         "📊 <b>Setup Audit Overall</b>",
         HDR,
-        f"Families: <b>{len(fam_codes_seen or [])}</b> | Family/session/strategy/side rows: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | NOHIT: <b>{total_nohit}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
+        f"Families: <b>{len(fam_codes_seen or [])}</b> | Family/session/strategy/side rows: <b>{len(fam_stats)}</b> | Unique setups: <b>{total_setups}</b> | TP: <b>{total_tp}</b> | SL: <b>{total_sl}</b> | OPEN: <b>{total_open}</b> | WR: <b>{wr_total:.1f}%</b>",
         f"Window: <b>from {_overall_report_start_txt()} Melbourne</b>",
         f"Data start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | Data end: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
-        f"Duration from 1 Jun: <b>{max(0.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0):.1f} days</b> | Avg generated: <b>{(float(total_setups) / max(1.0/24.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0)):.1f}/day</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        f"Duration from 1 Jun: <b>{max(0.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0):.1f} days</b> | Avg generated: <b>{(float(total_setups) / max(1.0/24.0, (float(time.time()) - float(_overall_report_start_ts() or time.time())) / 86400.0)):.1f}/day</b> | Evaluation: <b>{_setup_audit_result_horizon_label(result_horizon)}</b> | TF: <b>{html.escape(audit_tf)}</b>",
         f"Min vol: <b>${min_vol_m:.0f}M</b> | Source: post-setup path; rows={html.escape(str(_overall_source_label or 'EXECUTABLE'))} lane.",
         f"Quick read: strongest now = <b>{html.escape(keep_txt)}</b> | weakest now = <b>{html.escape(weak_txt)}</b>.",
         f"Current live disabled policy combos: <b>{html.escape(pol_txt)}</b>.",
         html.escape(_setup_edge_guard_snapshot_text(int(uid))),
         "For the weekly DB edge review, use <code>/setup_matrix 168</code>. <code>/setup_matrix 24</code> is diagnostic only. Live policy is officially updated by the scheduled Sunday 23:00 Melbourne review; daily 10:00 safety can add temporary severe-disable rows only.",
-        "NOHIT = horizon expired with no TP/SL; OPEN = still inside the result horizon. WR = TP/(TP+SL), excluding NOHIT and OPEN.",
+        "OPEN = unresolved/not hit yet. Setups have no due date. WR = TP/(TP+SL), excluding OPEN.",
     ]
     table = tabulate(
         table_rows,
-        headers=['Combo', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
+        headers=['Combo', 'Set', 'TP', 'SL', 'Open', 'WR'],
         tablefmt='plain',
-        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right'),
+        colalign=('left', 'right', 'right', 'right', 'right', 'right'),
     )
     return "\n".join(header) + "\n<pre>" + html.escape(table) + "</pre>"
 
@@ -52973,35 +53001,33 @@ def _setup_audit_keep_watch_fast_result_label(row: dict, horizon_hours: int) -> 
         sid = str((row or {}).get('setup_id') or '').strip()
         if sid:
             try:
-                cached = _setup_audit_cached_result(sid, int(horizon_hours or 24), allow_open_fresh_sec=900) or {}
+                cached = _setup_audit_cached_result(sid, int(horizon_hours or 0), allow_open_fresh_sec=900) or {}
                 lab = _setup_audit_result_label((cached or {}).get('result'))
                 if lab in {'TP', 'SL', 'NOHIT', 'OPEN'}:
-                    return lab
+                    return _setup_audit_binary_display_result(row or {}, lab, int(horizon_hours or 0))
             except Exception:
                 pass
         try:
-            fast = str(_setup_audit_result_from_cached_price_moves(row or {}, int(horizon_hours or 24)) or '').upper().strip()
+            fast = str(_setup_audit_result_from_cached_price_moves(row or {}, int(horizon_hours or 0)) or '').upper().strip()
             if fast in {'WIN', 'TP'}:
-                return 'TP'
-            if fast in {'LOSE', 'LOSS', 'SL'}:
-                return 'SL'
-            if fast in {'NOHIT', 'NH'}:
-                return 'NOHIT'
-            if fast in {'OPEN', ''}:
-                return 'OPEN'
+                lab = 'TP'
+            elif fast in {'LOSE', 'LOSS', 'SL'}:
+                lab = 'SL'
+            else:
+                lab = 'OPEN'
+            return _setup_audit_binary_display_result(row or {}, lab, int(horizon_hours or 0))
         except Exception:
             pass
     except Exception:
         pass
-    return 'OPEN'
+    return _setup_audit_binary_display_result(row or {}, 'OPEN', int(horizon_hours or 0))
 
 
 def _setup_audit_keep_watch_summary_text(uid: int) -> str:
     """Multi-window totals for current KEEP + WATCH policy lanes only.
 
     yver126: render as a readable table with Last 24h / Last 7d / Last 14d /
-    Overall-from-database rows.  WR is TP/(TP+SL); NOHIT and OPEN are shown but
-    excluded from WR, matching the setup-audit WR basis used elsewhere.
+    Overall-from-database rows.  WR is TP/(TP+SL); OPEN means unresolved/not hit yet and is excluded from WR, matching the setup-audit WR basis used elsewhere.
     """
     try:
         owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
@@ -53010,7 +53036,7 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         uid_i = int(uid or 0)
 
     try:
-        cache_key = f"keep_watch_summary:v28::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
+        cache_key = f"keep_watch_summary:v56::{uid_i}::{int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))}"
         cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
@@ -53135,7 +53161,6 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
             st['set'],
             st['tp'],
             st['sl'],
-            st['nh'],
             st['open'],
             f"{st['wr']:.1f}%",
         ])
@@ -53149,9 +53174,9 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
 
     table = tabulate(
         table_rows,
-        headers=['Window', 'Keep', 'Watch', 'UsedK', 'UsedW', 'Set', 'TP', 'SL', 'NH', 'Open', 'WR'],
+        headers=['Window', 'Keep', 'Watch', 'UsedK', 'UsedW', 'Set', 'TP', 'SL', 'Open', 'WR'],
         tablefmt='plain',
-        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
+        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
     )
     lines = [
         "📊 <b>Setup KEEP + WATCH Summary</b>",
@@ -53159,9 +53184,9 @@ def _setup_audit_keep_watch_summary_text(uid: int) -> str:
         "Policy source: <b>/setup_matrix policy KEEP + WATCH lanes</b>",
         f"Current policy combos: <b>{len(allowed_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>{len(watch_combos)}</b>)",
         f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
-        f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Result horizon: <b>{result_horizon}h</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE'))}</b> | Evaluation: <b>{_setup_audit_result_horizon_label(result_horizon)}</b> | TF: <b>{html.escape(audit_tf)}</b>",
         "Keep/Watch columns = <b>current policy lane totals</b>; UsedK/UsedW = policy lanes that actually had setup rows in that window.",
-        "WR basis: <b>TP/(TP+SL)</b>; NH and Open are shown but excluded from WR.",
+        "WR basis: <b>TP/(TP+SL)</b>; OPEN means not hit yet and is excluded from WR. Setups have <b>no due date</b>.",
         "Overall row: <b>from start of available setup database</b>.",
         HDR,
         "<pre>" + html.escape(table) + "</pre>",
@@ -53186,7 +53211,7 @@ async def setup_audit_keep_watch_cmd(update: Update, context: ContextTypes.DEFAU
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_keep_watch",
-        f"admin:bg:v40:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v56:setup_audit_keep_watch:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_keep_watch_summary_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
@@ -53211,7 +53236,7 @@ async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_audit_keep {int(hours)}",
-        f"admin:bg:v40:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        f"admin:bg:v56:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
         _setup_audit_keep_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
         parse_mode=ParseMode.HTML,
@@ -53229,7 +53254,7 @@ async def setup_audit_overall_cmd(update: Update, context: ContextTypes.DEFAULT_
     await _send_cached_or_queue_admin_report(
         update,
         "/setup_audit_overall",
-        f"admin:bg:v24:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+        f"admin:bg:v56:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
         _setup_audit_overall_text,
         args=(int(AUTOTRADE_OWNER_UID or uid),),
         parse_mode=ParseMode.HTML,
