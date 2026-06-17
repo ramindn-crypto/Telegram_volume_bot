@@ -1,3 +1,4 @@
+# yver69: cleanup /autotrade_config help so Auto Blackout commands are visible in the clean view and old static blackout examples are no longer misleading; no live trading logic changed.
 # yver68: syncs /setup_open_times suggested blackout windows with the exact 7d-only AUTO_BLACKOUT rule (WR<45%, AvgR<0, decided>=5) so manual report and auto status do not disagree; no live order/risk/TP/SL logic changed.
 # yver67: lists and documents AUTO_BLACKOUT commands inside /autotrade_config FULL and adds a dedicated auto-blackout command/help block; no live order/risk/TP/SL logic changed.
 # yver66: simplifies automatic blackout tuning to 7d-only evidence from /setup_open_times (shadow-generated KEEP setups included); 3d/10d/24h no longer control automatic windows; no live order/risk/TP/SL logic changed.
@@ -715,7 +716,7 @@ AUTOTRADE_FLAT_FALLBACK_UNMATCHED_AS_OWNED = env_bool('AUTOTRADE_FLAT_FALLBACK_U
 AUTOTRADE_MAX_POSITION_HOURS_ENABLED = env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', True)
 AUTOTRADE_MAX_POSITION_HOURS = float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18)
 AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC = int(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS_CHECK_INTERVAL_SEC', '600') or 600)
-AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS = '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00'
+AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS = '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00'
 AUTOTRADE_ENTRY_BLACKOUT_ENABLED = env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True)
 AUTOTRADE_ENTRY_BLACKOUT_WINDOWS = tuple(x.strip() for x in str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS) or '').split(',') if x.strip())
 SETUP_GENERATION_BLACKOUT_ENABLED = env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True)
@@ -891,9 +892,9 @@ def _autotrade_bootstrap_runtime_config() -> None:
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY: int(os.environ.get('AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE', '55') or 55),
         AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY: 1 if env_bool('AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP_ENABLED', True) else 0,
         AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY: 1 if env_bool('AUTOTRADE_ENTRY_BLACKOUT_ENABLED', True) else 0,
-        AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY: str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00')) or globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00')),
+        AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY: str(os.environ.get('AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00')) or globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00')),
         SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY: 1 if env_bool('SETUP_GENERATION_BLACKOUT_ENABLED', True) else 0,
-        SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00')) or globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00')),
+        SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY: str(os.environ.get('SETUP_GENERATION_BLACKOUT_WINDOWS', globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00')) or globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00')),
         AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY: 1 if env_bool('AUTOTRADE_MAX_POSITION_HOURS_ENABLED', False) else 0,
         AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY: float(os.environ.get('AUTOTRADE_MAX_POSITION_HOURS', '18') or 18),
         AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 1 if env_bool('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True) else 0,
@@ -1586,9 +1587,9 @@ def _autotrade_max_position_hours() -> float:
 
 def _blackout_default_windows() -> str:
     try:
-        return str(globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00') or '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00').strip()
+        return str(globals().get('AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS', '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00') or '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00').strip()
     except Exception:
-        return '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00'
+        return '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00'
 
 
 _BLACKOUT_DAY_ALIASES = {
@@ -2160,7 +2161,7 @@ def _autotrade_apply_ver31_blackout_defaults() -> None:
         target_version = 'yver31_2026_06_15_blackout_defaults'
         if str(_autotrade_config_get(AUTOTRADE_CFG_VER31_BLACKOUT_DEFAULTS_VERSION_KEY, '') or '').strip().lower() == target_version:
             return
-        required = _normalise_melbourne_blackout_windows(_blackout_default_windows(), default='07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00')
+        required = _normalise_melbourne_blackout_windows(_blackout_default_windows(), default='23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00')
         try:
             cur_entry = _autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, '')
             new_entry = _append_melbourne_blackout_window(cur_entry, required)
@@ -2909,7 +2910,7 @@ def _autotrade_apply_yver32_config_cleanup_defaults() -> None:
         # yver31 introduced the required windows, but old DB rows may still show
         # 10:00-11:00.  Reset both setup and entry blackouts to the required default.
         try:
-            default_w = _normalise_melbourne_blackout_windows(_blackout_default_windows(), default='07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00')
+            default_w = _normalise_melbourne_blackout_windows(_blackout_default_windows(), default='23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00')
             _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
             _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
             _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, default_w)
@@ -43161,17 +43162,23 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP false',
             '',
             'Examples — blackout windows:',
-            'Setup generation is always SHADOW ON. These keys control only /screen setup delivery, setup emails, and AutoTrade entries.',
-            '• /autotrade_config BLACKOUT_WINDOWS 07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00',
+            'Setup generation is always SHADOW ON. Auto Blackout should normally manage these windows automatically.',
+            '• /autotrade_config AUTO_BLACKOUT_STATUS',
+            '• /autotrade_config AUTO_BLACKOUT_NOW',
+            '• /autotrade_config AUTO_BLACKOUT_ENABLED true',
+            '• /autotrade_config AUTO_BLACKOUT_ENABLED false',
+            '',
+            'Manual override examples, only if needed:',
+            '• /autotrade_config BLACKOUT_WINDOWS 23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00',
             '• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00',
             '• /autotrade_config BLACKOUT_ENABLED true',
-            '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS 07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00',
+            '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_WINDOWS 23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00',
             '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_ADD_WINDOW 13:00-14:00',
             '• /autotrade_config AUTOTRADE_ENTRY_BLACKOUT_ENABLED true',
-            '• /autotrade_config SETUP_DELIVERY_BLACKOUT_WINDOWS 07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00',
+            '• /autotrade_config SETUP_DELIVERY_BLACKOUT_WINDOWS 23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00',
             '• /autotrade_config SETUP_DELIVERY_BLACKOUT_ADD_WINDOW 13:00-14:00',
             '• /autotrade_config SETUP_DELIVERY_BLACKOUT_ENABLED true',
-            'Legacy aliases still work: SETUP_GENERATION_BLACKOUT_* now means delivery blackout, not generation stop.',
+            'Legacy aliases still work: SETUP_GENERATION_BLACKOUT_* now means delivery blackout, not generation stop. Auto Blackout may overwrite manual windows on the next review if enabled.',
             '',
             'Examples — policy / router:',
             '• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY false',
@@ -43269,9 +43276,12 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 0   (unlimited)",
             "• /autotrade_config FULL",
             "• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS none",
-            "• /autotrade_config BLACKOUT_WINDOWS 07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00",
-            "• /autotrade_config BLACKOUT_ADD_WINDOW 13:00-14:00",
-            "  (sets AutoTrade entry + setup delivery blackout; setup generation stays SHADOW ON)",
+            "• /autotrade_config AUTO_BLACKOUT_STATUS",
+            "• /autotrade_config AUTO_BLACKOUT_NOW",
+            "• /autotrade_config AUTO_BLACKOUT_ENABLED true",
+            "• /autotrade_config AUTO_BLACKOUT_ENABLED false",
+            f"• Current blackout windows: {str(summary.get('BLACKOUT_WINDOWS', '-') or '-')}",
+            "  (Auto Blackout manages AutoTrade entry + setup delivery blackout; setup generation stays SHADOW ON)",
             "• /autotrade_on  /  /autotrade_off",
             "",
             "For all keys: /autotrade_config FULL",
@@ -66506,7 +66516,7 @@ def pf_evaluate_signal(symbol, trend, ema_pullback, liquidity_event):
 # It wraps shared gates instead of changing the old evidence tables.
 
 YVER47_VERSION = 'yver47_2026_06_16_profitability_blackout_coretrend_risk_tp_hardening'
-YVER47_BLACKOUT_WINDOWS = '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00'
+YVER47_BLACKOUT_WINDOWS = '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00'
 YVER47_CORE_MARKET_SYMBOLS = {'BTC', 'ETH', 'SOL'}
 YVER47_MIN_NEW_TRADE_RISK_PCT = 0.25
 YVER47_MIN_NEW_TRADE_RISK_USD = 5.0
@@ -67437,7 +67447,7 @@ def _yver51_apply_runtime_flags() -> None:
         try:
             cur_entry = str(_autotrade_config_get(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, '') or '').strip()
             cur_delivery = str(_autotrade_config_get(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, '') or '').strip()
-            default_w = _normalise_melbourne_blackout_windows(_blackout_default_windows(), default='07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00')
+            default_w = _normalise_melbourne_blackout_windows(_blackout_default_windows(), default='23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00')
             if not cur_entry:
                 _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, default_w)
             if not cur_delivery:
@@ -67473,7 +67483,7 @@ def main():
 # yver54 17-Jun open-time blackout tuning
 # =========================================================
 YVER54_VERSION = 'yver54_2026_06_17_open_time_blackout_tuning'
-YVER54_BLACKOUT_WINDOWS = '07:00-08:00,10:00-11:00,14:00-15:00,17:00-18:00,SUN 22:00-MON 10:00'
+YVER54_BLACKOUT_WINDOWS = '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00'
 
 
 def _yver54_apply_open_time_blackout_tuning() -> None:
