@@ -70988,6 +70988,36 @@ except Exception:
 # end yver79 fully editable AutoTrade config runtime unlock
 # =========================================================
 
+
+
+# =========================================================
+# yver80 AutoTrade config editable setter NameError fix
+# =========================================================
+# v79 added a generic FULL-key setter but referenced the legacy name
+# AUTOTRADE_CFG_DAILY_RISK_CAP_PCT_KEY.  This codebase stores daily AutoTrade
+# risk cap through AUTOTRADE_DAILY_CAP_MODE_KEY/AUTOTRADE_DAILY_CAP_VALUE_KEY,
+# so the missing alias caused every generic set command to fail before parsing
+# the requested key (example: AUTOTRADE_RISK_PER_TRADE_PCT 0.6).
+# Define the compatibility alias before main() so all /autotrade_config keys
+# remain owner-editable and persistent.
+try:
+    AUTOTRADE_CFG_DAILY_RISK_CAP_PCT_KEY
+except NameError:
+    AUTOTRADE_CFG_DAILY_RISK_CAP_PCT_KEY = AUTOTRADE_DAILY_CAP_VALUE_KEY
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v80'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v80'
+except Exception:
+    pass
+
+# =========================================================
+# end yver80 AutoTrade config editable setter NameError fix
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
