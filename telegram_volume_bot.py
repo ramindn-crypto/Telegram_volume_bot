@@ -70708,6 +70708,286 @@ except Exception:
 # end yver77 /screen recent emailed/open setup visibility fix
 # =========================================================
 
+
+
+# =========================================================
+# yver79 fully editable AutoTrade config runtime unlock
+# =========================================================
+# v78's editable-default block was appended after main(), so on Render it did not
+# run before the bot started.  v79 runs the editable-default migration before
+# main(), disables the v76 force hook before any command/job wrapper can use it,
+# and adds a safe generic setter for remaining /autotrade_config FULL keys.
+# Result: every displayed AutoTrade config value is runtime-editable via
+# /autotrade_config and no periodic profile authority overwrites owner changes.
+
+def _yver79_parse_bool(v) -> int:
+    return 1 if str(v or '').strip().lower() in {'1', 'true', 'yes', 'on', 'enable', 'enabled'} else 0
+
+
+def _yver79_set_runtime_key_any(key: str, raw: str):
+    """Set extra FULL-view keys not handled by the original command parser.
+
+    The original handler still manages all established keys.  This helper covers
+    gaps so the owner can edit everything printed under /autotrade_config FULL.
+    """
+    k = str(key or '').strip().upper()
+    value = str(raw or '').strip()
+    if not k:
+        raise ValueError('missing key')
+
+    # Boolean keys shown in FULL but not always accepted by older parsers.
+    bool_keys = {
+        'SETUP_SHADOW_GENERATION_ENABLED': 'SETUP_SHADOW_GENERATION_ENABLED',
+        'BLACKOUT_ENABLED': 'BLACKOUT_ENABLED',
+        'AUTOTRADE_ENTRY_BLACKOUT_ENABLED': AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY,
+        'SETUP_DELIVERY_BLACKOUT_ENABLED': SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY,
+        'SETUP_GENERATION_BLACKOUT_ENABLED': SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY,
+    }
+    text_keys = {
+        'BLACKOUT_WINDOWS': 'BLACKOUT_WINDOWS',
+        'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS': AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY,
+        'SETUP_DELIVERY_BLACKOUT_WINDOWS': SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY,
+        'SETUP_GENERATION_BLACKOUT_WINDOWS': SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY,
+        'AUTOTRADE_DAILY_RISK_CAP_MODE': 'AUTOTRADE_DAILY_RISK_CAP_MODE',
+        'AUTOTRADE_MODE': AUTOTRADE_CFG_MODE_KEY,
+    }
+    float_keys = {
+        'AUTOTRADE_RISK_PER_TRADE_PCT': AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY,
+        'AUTOTRADE_DYNAMIC_RISK_MIN_MULT': AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY,
+        'AUTOTRADE_DYNAMIC_RISK_MAX_MULT': AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY,
+        'AUTOTRADE_DYNAMIC_RISK_LOW_SCORE': AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY,
+        'AUTOTRADE_DYNAMIC_RISK_BASE_SCORE': AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY,
+        'AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE': AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY,
+        'AUTOTRADE_OPEN_RISK_CAP_PCT': AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY,
+        'AUTOTRADE_DAILY_RISK_CAP_PCT': AUTOTRADE_CFG_DAILY_RISK_CAP_PCT_KEY,
+        'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT': AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY,
+        'AUTOTRADE_MAX_ENTRY_DRIFT_PCT': AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY,
+        'AUTOTRADE_DYNAMIC_TP_BASE_RR': AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY,
+        'AUTOTRADE_MIN_LIVE_RR': AUTOTRADE_CFG_MIN_LIVE_RR_KEY,
+        'AUTOTRADE_MAX_LIVE_RR': AUTOTRADE_CFG_MAX_LIVE_RR_KEY,
+        'AUTOTRADE_LIQ_BUFFER_PCT': AUTOTRADE_CFG_LIQ_BUFFER_PCT_KEY,
+        'AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN': AUTOTRADE_CFG_SAFE_LEVERAGE_DOWNGRADE_MIN_KEY,
+        'AUTOTRADE_EMERGENCY_RISK_MAX_MULT': AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY,
+        'AUTOTRADE_MAX_POSITION_HOURS': AUTOTRADE_CFG_MAX_POSITION_HOURS_KEY,
+        'AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR': AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY,
+        'AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR': AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY,
+        'SETUP_REVERSE_TARGET_RR': 'SETUP_REVERSE_TARGET_RR',
+    }
+    int_keys = {
+        'AUTOTRADE_MAX_OPEN_TRADES': AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY,
+        'AUTOTRADE_MAX_TRADES_PER_DAY': AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY,
+        'AUTOTRADE_ENTRY_WINDOW_MIN': AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY,
+        'AUTOTRADE_LEVERAGE': AUTOTRADE_CFG_LEVERAGE_KEY,
+        'AUTOTRADE_FLAT_BEFORE_ASIA_HOUR': AUTOTRADE_CFG_FLAT_BEFORE_ASIA_HOUR_KEY,
+        'AUTOTRADE_FLAT_BEFORE_ASIA_MINUTE': AUTOTRADE_CFG_FLAT_BEFORE_ASIA_MINUTE_KEY,
+        'AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED': AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY,
+    }
+    more_bool = {
+        'AUTOTRADE_ENTRY_ENABLED': AUTOTRADE_CFG_ENTRY_ENABLED_KEY,
+        'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY': AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY,
+        'AUTOTRADE_DYNAMIC_RISK_ENABLED': AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY,
+        'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED': AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY,
+        'AUTOTRADE_TP_RR_CAP_ENABLED': AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY,
+        'AUTOTRADE_DYNAMIC_TP_RR_ENABLED': AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY,
+        'AUTOTRADE_ISOLATED': AUTOTRADE_CFG_ISOLATED_KEY,
+        'AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE': AUTOTRADE_CFG_ALLOW_LEVERAGE_DOWNGRADE_KEY,
+        'AUTOTRADE_STRICT_TPSL_ONLY': AUTOTRADE_CFG_STRICT_TPSL_ONLY_KEY,
+        'AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY': AUTOTRADE_CFG_IMMUTABLE_TPSL_AFTER_ENTRY_KEY,
+        'AUTOTRADE_MARKET_REDUCE_ON_RISK_BREACH': AUTOTRADE_CFG_MARKET_REDUCE_ON_RISK_BREACH_KEY,
+        'AUTOTRADE_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL': AUTOTRADE_CFG_MARKET_CLOSE_ON_EXIT_ATTACH_FAIL_KEY,
+        'AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL': AUTOTRADE_CFG_REPORT_REQUIRE_VERIFIED_TPSL_KEY,
+        'AUTOTRADE_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK': AUTOTRADE_CFG_REPORT_INCLUDE_EXCHANGE_ONLY_FALLBACK_KEY,
+        'AUTOTRADE_FLAT_BEFORE_ASIA_ENABLED': AUTOTRADE_CFG_FLAT_BEFORE_ASIA_ENABLED_KEY,
+        'AUTOTRADE_FLAT_BEFORE_ASIA_CATCHUP': AUTOTRADE_CFG_FLAT_BEFORE_ASIA_CATCHUP_ENABLED_KEY,
+        'AUTOTRADE_MAX_POSITION_HOURS_ENABLED': AUTOTRADE_CFG_MAX_POSITION_HOURS_ENABLED_KEY,
+        'AUTOTRADE_ALLOW_WATCH_POLICY': AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY,
+        'USER_VISIBLE_ALLOW_WATCH_POLICY': USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY,
+        'AUTOTRADE_STRICT_KEEP_EDGE_ENABLED': AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY,
+        'AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE': AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY,
+        'AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED': AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY,
+        'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED': 'SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED',
+        'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED': 'SETUP_ADAPTIVE_REVERSE_FOR_DISABLED',
+    }
+
+    if k == 'AUTOTRADE_DAILY_RISK_CAP_PCT':
+        _autotrade_set_daily_cap_settings('PCT', max(0.0, min(100.0, float(value))))
+        return f"{max(0.0, min(100.0, float(value))):.4g}"
+    if k == 'AUTOTRADE_DAILY_RISK_CAP_MODE':
+        mode = value.upper()
+        if mode not in {'PCT', 'USD'}:
+            raise ValueError('use PCT or USD')
+        try:
+            _mode, cur_val = _autotrade_daily_cap_settings()
+        except Exception:
+            cur_val = 0
+        _autotrade_set_daily_cap_settings(mode, float(cur_val or 0))
+        return mode
+
+    if k in bool_keys:
+        _autotrade_config_set(bool_keys[k], _yver79_parse_bool(value))
+        try:
+            globals()[k] = bool(_yver79_parse_bool(value))
+        except Exception:
+            pass
+        return 'true' if _yver79_parse_bool(value) else 'false'
+    if k in more_bool:
+        _autotrade_config_set(more_bool[k], _yver79_parse_bool(value))
+        try:
+            globals()[k] = bool(_yver79_parse_bool(value))
+        except Exception:
+            pass
+        return 'true' if _yver79_parse_bool(value) else 'false'
+    if k in int_keys:
+        iv = int(float(value))
+        if k == 'AUTOTRADE_ENTRY_WINDOW_MIN':
+            iv = max(1, min(1440, iv))
+            globals()['AUTOTRADE_ENTRY_WINDOW_MIN'] = iv
+            globals()['AUTOTRADE_FRESH_SESSION_QUEUE_WINDOW_MIN'] = iv
+        if k == 'AUTOTRADE_LEVERAGE':
+            iv = max(1, min(125, iv))
+        _autotrade_config_set(int_keys[k], iv)
+        return str(iv)
+    if k in float_keys:
+        fv = float(value)
+        if k.endswith('_PCT') or k.endswith('_WR'):
+            fv = max(0.0, min(100.0, fv))
+        _autotrade_config_set(float_keys[k], fv)
+        try:
+            globals()[k] = fv
+        except Exception:
+            pass
+        return f"{fv:.4g}"
+    if k in text_keys:
+        _autotrade_config_set(text_keys[k], value)
+        try:
+            globals()[k] = value
+        except Exception:
+            pass
+        return value
+    if k == 'AUTOTRADE_BLOCKED_SYMBOLS':
+        # Let the original handler do its TTL/list formatting.
+        raise KeyError('original')
+
+    # Owner asked for everything under AutoTrade config to be editable.  For any
+    # future FULL-view key that follows the safe prefixes, persist the raw value
+    # instead of rejecting it.  This does not alter trading logic unless a runtime
+    # reader actually consumes that key.
+    if k.startswith(('AUTOTRADE_', 'SETUP_', 'BLACKOUT_', 'USER_VISIBLE_', 'AUTO_BLACKOUT_')):
+        _autotrade_config_set(k, value)
+        return value
+    raise KeyError('original')
+
+
+def _autotrade_apply_yver79_editable_owner_defaults() -> bool:
+    """Apply owner defaults once before main(), then leave them editable forever."""
+    changed = False
+    target_version = 'yver79_2026_06_18_pre_main_editable_all_defaults'
+    try:
+        already = str(_autotrade_config_get('yver79_editable_all_defaults_version', '') or '').strip().lower() == target_version
+    except Exception:
+        already = False
+    try:
+        reapply = env_bool('AUTOTRADE_YVER79_REAPPLY_OWNER_DEFAULTS', False)
+    except Exception:
+        reapply = False
+    if already and not reapply:
+        return False
+    defaults = {
+        AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 1.0,
+        AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: 8.0,
+        AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: 100,
+    }
+    for k, v in defaults.items():
+        try:
+            _autotrade_config_set(k, v)
+            changed = True
+        except Exception:
+            pass
+    try:
+        _autotrade_set_daily_cap_settings('PCT', 10.0)
+        changed = True
+    except Exception:
+        pass
+    try:
+        _autotrade_config_set('yver79_editable_all_defaults_version', target_version)
+        _autotrade_config_set('yver79_runtime_values_are_telegram_editable', 'true')
+        _autotrade_config_set('yver79_owner_defaults_last_ts', str(int(time.time())))
+        _autotrade_config_set('yver79_note', 'all /autotrade_config values are owner-editable; no runtime force profile remains active')
+    except Exception:
+        pass
+    return changed
+
+
+# Disable the v76 forced profile BEFORE main() starts.  Existing wrappers call
+# this global by name, so redefining it here makes those calls harmless.
+def _yver76_force_owner_runtime_profile(reason: str = 'startup') -> bool:
+    try:
+        _autotrade_config_set('yver79_last_noop_force_reason', str(reason or 'noop')[:80])
+        _autotrade_config_set('yver79_last_noop_force_ts', str(int(time.time())))
+    except Exception:
+        pass
+    return False
+
+try:
+    _autotrade_apply_yver79_editable_owner_defaults()
+except Exception:
+    pass
+
+try:
+    _YVER79_ORIG_AUTOTRADE_CONFIG_CMD = autotrade_config_cmd
+except Exception:
+    _YVER79_ORIG_AUTOTRADE_CONFIG_CMD = None
+
+async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """v79: all displayed /autotrade_config keys are editable and persistent."""
+    try:
+        uid = int(update.effective_user.id)
+        if not is_admin_user(uid):
+            await update.message.reply_text("⛔ Admin only.")
+            return
+    except Exception:
+        pass
+    try:
+        args = list(getattr(context, 'args', []) or [])
+        if len(args) >= 2:
+            key = str(args[0] or '').strip().upper()
+            raw = ' '.join(str(x) for x in args[1:]).strip()
+            # Let the original handler handle its special operational subcommands.
+            if key not in {'AUTO_BLACKOUT_STATUS', 'AUTO_BLACKOUT', 'AUTO_BLACKOUT_NOW', 'BLACKOUT_ADD_WINDOW', 'AUTOTRADE_ENTRY_BLACKOUT_ADD_WINDOW', 'SETUP_GENERATION_BLACKOUT_ADD_WINDOW', 'SETUP_DELIVERY_BLACKOUT_ADD_WINDOW', 'AUTOTRADE_BLOCKED_SYMBOLS'}:
+                try:
+                    shown = _yver79_set_runtime_key_any(key, raw)
+                    # Refresh summary after setting so the displayed value is real.
+                    try:
+                        summary = _autotrade_runtime_summary_dict()
+                        shown = summary.get(key, shown)
+                    except Exception:
+                        pass
+                    await update.message.reply_text(f"✅ Updated {key}. Current value: {shown}")
+                    return
+                except KeyError:
+                    pass
+                except Exception as e:
+                    await update.message.reply_text(f"Invalid value for {key}: {e}")
+                    return
+    except Exception:
+        pass
+    if _YVER79_ORIG_AUTOTRADE_CONFIG_CMD is not None:
+        return await _YVER79_ORIG_AUTOTRADE_CONFIG_CMD(update, context)
+    await update.message.reply_text('AutoTrade config handler unavailable.')
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v79'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v79'
+except Exception:
+    pass
+
+# =========================================================
+# end yver79 fully editable AutoTrade config runtime unlock
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
