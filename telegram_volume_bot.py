@@ -1,4 +1,5 @@
 # yver78: makes the owner-selected AutoTrade runtime profile editable again; applies one-time defaults risk=1%, open risk cap=8%, daily risk cap=10%, max trades/day=100, then stops the yver76 recurring force from overwriting /autotrade_config edits. No TP/SL, leverage, blackout, setup generation, or Bybit order logic changed.
+# yver81: dynamic risk now scales the configured base risk by exact lane WR tiers: base risk for pass/min edge, ~1.25x for WR>=60%, and max multiplier for WR>=70%, with no absolute 0.35%/0.50% risk caps. Defaults dynamic risk ON, min/base/high score 55/60/70, max mult 1.50, and remains Telegram-editable.
 # yver76: final runtime profile authority fix. Forces the owner-approved low-risk broad-sampling profile at EOF startup and before /autotrade_config, /autotrade_debug, and autotrade_job so stale Render DB rows cannot keep 50/200 caps, 15/40% caps, 90m/3% entries, dynamic TP, or decided=1. No TP/SL geometry, leverage, blackout, setup generation, or Bybit order mechanics changed.
 # yver75: owner threshold adjustment for broad-sampling live profile: strict KEEP live edge now uses decided>=3, WR>=49%, AvgR>=+0.05; dynamic risk tiers use the same minimum decided threshold while keeping 0.30% base / 0.50% max risk. No TP/SL, leverage, blackout, setup-generation, or Bybit order logic changed.
 # yver74: startup drift-repair for the owner-approved low-risk broad-sampling profile. Re-syncs stale runtime DB/config values so /autotrade_config matches 0.30% risk, 12/35 trade caps, 5%/8% risk caps, 60m/2% entry gates, fixed 1.5R TP, and WR/AvgR-gated dynamic risk. No setup generation, blackout engine, TP/SL geometry, leverage, or order placement mechanics changed.
@@ -14647,10 +14648,15 @@ def _autotrade_dynamic_risk_score(uid: int, setup, session_name: str = '', regim
             mult = 1.0 - ((base_score - score) / max(1.0, base_score - low_score)) * (1.0 - min_mult)
         mult = float(_clamp(mult, min_mult, max_mult))
 
-        # yver73: WR/AvgR-gated dynamic risk.  The score can never boost risk unless
-        # the exact Family-Session-Strategy-Side lane has enough proven evidence.
-        # This keeps broad sampling representative while preventing high-confidence
-        # but low-WR lanes from receiving larger size.
+        # yver81: WR-tier dynamic risk on the configured base risk.
+        # The owner wants dynamic risk to multiply the configured base risk regardless
+        # of whether the base is 0.30%, 0.60%, 1.00%, etc.  Therefore the old absolute
+        # 0.35%/0.50% caps are removed.  Exact lane evidence now controls the multiplier:
+        #   pass/min edge              -> 1.00x base risk
+        #   exact lane WR >= 60%       -> mid tier (~1.25x when max_mult=1.50)
+        #   exact lane WR >= 70%       -> configured max tier (1.50x by default)
+        # AvgR must still pass the configured strict-edge minimum so high-WR/poor-payoff
+        # lanes do not get oversized.
         evidence_dec = 0
         evidence_wr = 0.0
         evidence_avg = 0.0
@@ -14660,11 +14666,6 @@ def _autotrade_dynamic_risk_score(uid: int, setup, session_name: str = '', regim
             evidence_dec = int(exact_m.get('decided') or 0)
             evidence_wr = float(exact_m.get('wr') or 0.0)
             evidence_avg = float(exact_m.get('avg_r') or 0.0)
-            base_pct = max(0.0001, float(_autotrade_risk_per_trade_pct() or 0.0))
-            # yver75: use the owner's live edge minimum for evidence sample size.
-            # Base risk is allowed once the lane passes strict KEEP edge (default now
-            # decided>=3, WR>=49%, AvgR>=+0.05); boosts are still reserved for
-            # stronger 60%/70% WR tiers.
             try:
                 min_dec_for_risk = max(1, int(_autotrade_strict_keep_edge_min_decided()))
             except Exception:
@@ -14677,21 +14678,31 @@ def _autotrade_dynamic_risk_score(uid: int, setup, session_name: str = '', regim
                 min_avg_for_base = float(_autotrade_strict_keep_edge_min_avgr())
             except Exception:
                 min_avg_for_base = 0.05
-            if evidence_dec >= min_dec_for_risk and evidence_wr >= 70.0 and evidence_avg >= 0.40:
-                evidence_target_mult = min(float(max_mult), 0.50 / base_pct)
-                components.append(f"risk_tier:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}->0.50%cap")
-            elif evidence_dec >= min_dec_for_risk and evidence_wr >= 60.0 and evidence_avg >= 0.25:
-                evidence_target_mult = min(float(max_mult), 0.35 / base_pct)
-                components.append(f"risk_tier:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}->0.35%cap")
-            elif evidence_dec >= min_dec_for_risk and evidence_wr >= min_wr_for_base and evidence_avg >= min_avg_for_base:
+
+            high_mult = max(1.0, float(max_mult))
+            mid_mult = 1.0 + ((high_mult - 1.0) * 0.50)  # default max 1.50 -> mid 1.25
+            lane_passes_min_edge = (
+                evidence_dec >= min_dec_for_risk
+                and evidence_wr >= min_wr_for_base
+                and evidence_avg >= min_avg_for_base
+            )
+            if lane_passes_min_edge and evidence_wr >= 70.0:
+                evidence_target_mult = high_mult
+                components.append(f"risk_tier:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}->max_mult_{high_mult:.2f}x")
+            elif lane_passes_min_edge and evidence_wr >= 60.0:
+                evidence_target_mult = min(high_mult, mid_mult)
+                components.append(f"risk_tier:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}->mid_mult_{evidence_target_mult:.2f}x")
+            elif lane_passes_min_edge:
                 evidence_target_mult = 1.0
-                components.append(f"risk_tier:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}->base")
+                components.append(f"risk_tier:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}->base_1.00x")
             else:
                 evidence_target_mult = 1.0
                 components.append(f"risk_tier:no_boost:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}")
-            # Allow the composite score to reduce/keep base, but never exceed the
-            # WR/AvgR evidence tier.
-            mult = float(_clamp(min(float(mult), float(evidence_target_mult)), 1.0, float(max_mult)))
+
+            # v81: use the exact lane WR tier as the dynamic multiplier.  The raw
+            # composite score remains stored for diagnostics, but it no longer imposes
+            # an absolute risk-dollar cap or blocks WR-tier boosts above the base.
+            mult = float(_clamp(float(evidence_target_mult), 1.0, float(max_mult)))
         except Exception as _tier_exc:
             components.append(f"risk_tier_error:{type(_tier_exc).__name__}")
             mult = float(_clamp(float(mult), 1.0, float(max_mult)))
@@ -71016,6 +71027,604 @@ except Exception:
 
 # =========================================================
 # end yver80 AutoTrade config editable setter NameError fix
+# =========================================================
+
+
+# =========================================================
+# yver81 base-risk-relative dynamic risk defaults
+# =========================================================
+# Dynamic risk is now explicitly a multiplier on the configured base risk, not an
+# absolute 0.35%/0.50% cap.  Defaults are applied once and remain Telegram-editable:
+#   base lane / lower WR        -> 1.00x base risk
+#   exact lane WR >= 60%        -> ~1.25x base risk when max_mult=1.50
+#   exact lane WR >= 70%        -> 1.50x base risk by default
+# The existing strict KEEP min decided/WR/AvgR gate remains the minimum evidence
+# threshold before a lane can receive any boost.
+
+def _autotrade_apply_yver81_dynamic_risk_defaults() -> bool:
+    changed = False
+    try:
+        target_version = 'yver81_2026_06_18_base_relative_dynamic_risk_wr_tiers'
+        try:
+            already = str(_autotrade_config_get('yver81_dynamic_risk_defaults_version', '') or '').strip().lower() == target_version
+        except Exception:
+            already = False
+        try:
+            reapply = env_bool('AUTOTRADE_YVER81_REAPPLY_DYNAMIC_RISK_DEFAULTS', False)
+        except Exception:
+            reapply = False
+        if already and not reapply:
+            return False
+        defaults = {
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.50,
+            AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: 55.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: 60.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: 70.0,
+        }
+        for k, v in defaults.items():
+            try:
+                _autotrade_config_set(k, v)
+                changed = True
+            except Exception:
+                pass
+        try:
+            _autotrade_config_set('yver81_dynamic_risk_defaults_version', target_version)
+            _autotrade_config_set('yver81_dynamic_risk_rule', 'base risk * WR-tier multiplier: 1.00x below WR60, ~1.25x at WR60-70, 1.50x at WR70+ by default')
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return bool(changed)
+
+try:
+    _autotrade_apply_yver81_dynamic_risk_defaults()
+except Exception:
+    pass
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v81'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v81'
+except Exception:
+    pass
+
+# =========================================================
+# end yver81 base-risk-relative dynamic risk defaults
+# =========================================================
+
+
+# =========================================================
+# yver82 final KEEP delivery authority: audit KEEP -> email + /screen + AutoTrade
+# =========================================================
+# Owner requirement: every fresh setup that appears as Policy=KEEP in /setup_audit
+# must enter the same delivery lane (setup email + /screen visibility + AutoTrade
+# attempt) unless it is inside delivery/entry blackout or has already resolved.
+#
+# This patch makes /setup_audit KEEP the source of truth for delivery.  It removes
+# the remaining gap where a row could be generated/audited as KEEP but blocked from
+# setup email, hidden from /screen, or skipped by immediate AutoTrade because of a
+# downstream screen/email/context-quality gate.  Exchange/risk/liquidation/TP-SL
+# safety remains inside AutoTrade order placement.
+
+YVER82_KEEP_DELIVERY_WINDOW_MIN = int(os.environ.get('YVER82_KEEP_DELIVERY_WINDOW_MIN', '60') or 60)
+
+try:
+    _YVER82_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = is_executable_setup_eligible
+except Exception:
+    _YVER82_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = None
+try:
+    _YVER82_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS = _setup_user_visible_keep_policy_allows
+except Exception:
+    _YVER82_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS = None
+try:
+    _YVER82_ORIG_SETUP_EMAIL_PRESEND_FILTER = _setup_email_presend_executable_filter
+except Exception:
+    _YVER82_ORIG_SETUP_EMAIL_PRESEND_FILTER = None
+try:
+    _YVER82_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = _screen_recent_db_body_and_kb
+except Exception:
+    _YVER82_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = None
+try:
+    _YVER82_ORIG_BUILD_SCREEN_BODY_AND_KB = _build_screen_body_and_kb
+except Exception:
+    _YVER82_ORIG_BUILD_SCREEN_BODY_AND_KB = None
+try:
+    _YVER82_ORIG_ALERT_JOB = alert_job
+except Exception:
+    _YVER82_ORIG_ALERT_JOB = None
+try:
+    _YVER82_ORIG_AUTONOMOUS_SCREEN_SYNC_JOB = autonomous_screen_sync_job
+except Exception:
+    _YVER82_ORIG_AUTONOMOUS_SCREEN_SYNC_JOB = None
+
+
+def _yver82_basic_setup_valid(item) -> bool:
+    try:
+        side = str(getattr(item, 'side', '') or '').upper().strip()
+        entry = float(getattr(item, 'entry', 0.0) or 0.0)
+        sl = float(getattr(item, 'sl', 0.0) or 0.0)
+        tp = float(_setup_target_tp(item, 0.0) or getattr(item, 'tp', 0.0) or 0.0)
+        if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+            return False
+        if side == 'BUY' and not (sl < entry < tp):
+            return False
+        if side == 'SELL' and not (tp < entry < sl):
+            return False
+        if not _setup_volume_ok(item):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _yver82_setup_is_unresolved(item) -> bool:
+    # Do not re-deliver or show rows whose independent path already touched TP/SL.
+    try:
+        terminal, _why = _yver60_setup_terminal_for_visibility(item) if '_yver60_setup_terminal_for_visibility' in globals() else (False, '')
+        if terminal:
+            return False
+    except Exception:
+        pass
+    try:
+        terminal, _why = _yver61_setup_cached_audit_terminal(item) if '_yver61_setup_cached_audit_terminal' in globals() else (False, '')
+        if terminal:
+            return False
+    except Exception:
+        pass
+    try:
+        sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+        if sid:
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute('SELECT outcome, hit_level FROM signal_outcomes WHERE setup_id=? LIMIT 1', (sid,)).fetchone()
+                if row:
+                    outcome = str(row[0] or '').upper().strip()
+                    hit_level = str(row[1] or '').upper().strip()
+                    if outcome in {'TP', 'WIN_TP', 'SL', 'LOSS', 'LOSS_SL'} or hit_level in {'TP', 'SL'}:
+                        return False
+    except Exception:
+        pass
+    return True
+
+
+def _yver82_delivery_blackout_now() -> tuple[bool, str]:
+    try:
+        if '_setup_delivery_blackout_now' in globals():
+            b, r = _setup_delivery_blackout_now()
+            return bool(b), str(r or '')
+    except Exception:
+        pass
+    try:
+        b, r = _setup_generation_blackout_now()
+        return bool(b), str(r or '')
+    except Exception:
+        return False, ''
+
+
+def _yver82_matrix_state(item, session_name: str = '', user_id: int = 0) -> dict:
+    sess = str(session_name or getattr(item, 'source_session', '') or getattr(item, 'session', '') or '').upper().strip()
+    meta = {}
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        owner_uid = 0
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    policy_uid = owner_uid if owner_uid > 0 else uid
+    try:
+        st = _setup_matrix_policy_source_state_for_setup(item, session_name=sess, user_id=int(policy_uid or uid or 0)) or {}
+        if st:
+            meta.update(st)
+            pol = str(st.get('policy') or st.get('status') or '').upper().strip()
+            if pol:
+                meta['policy'] = pol
+                return meta
+    except Exception as exc:
+        meta['matrix_state_error'] = f'{type(exc).__name__}: {exc}'
+    try:
+        info = _setup_combo_policy_lookup_for_setup(item, session_name=sess, user_id=int(policy_uid or uid or 0)) or {}
+        if info:
+            meta.update(info)
+            raw_status = str(info.get('status') or '').upper().strip()
+            status = _setup_policy_effective_status(raw_status, found=bool(info.get('found')))
+            meta['policy'] = str(status or raw_status or '').upper().strip()
+    except Exception as exc:
+        meta['policy_lookup_error'] = f'{type(exc).__name__}: {exc}'
+    return meta
+
+
+def _yver82_keep_delivery_allows(item, session_name: str = '', user_id: int = 0, lane: str = 'delivery', check_blackout: bool = False) -> tuple[bool, str, dict]:
+    meta = {}
+    try:
+        sess = str(session_name or getattr(item, 'source_session', '') or getattr(item, 'session', '') or '').upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            return False, 'yver82_missing_session', meta
+        if check_blackout:
+            b, r = _yver82_delivery_blackout_now()
+            if b:
+                return False, str(r or 'BLACKOUT'), meta
+        if not _yver82_basic_setup_valid(item):
+            return False, 'yver82_basic_invalid', meta
+        if not _yver82_setup_is_unresolved(item):
+            return False, 'yver82_already_resolved', meta
+        meta = _yver82_matrix_state(item, session_name=sess, user_id=int(user_id or 0)) or {}
+        pol = str(meta.get('policy') or '').upper().strip()
+        if pol != 'KEEP':
+            return False, f'yver82_not_keep:{pol or "UNKNOWN"}', meta
+        return True, 'yver82_matrix_keep_delivery_ok', meta
+    except Exception as exc:
+        return False, f'yver82_exception:{type(exc).__name__}', meta
+
+
+# Matrix KEEP must be sufficient for subscriber surfaces and setup-email delivery.
+def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '', user_id: int = 0, lane: str = 'screen') -> tuple[bool, str, dict]:
+    try:
+        if _YVER82_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS is not None:
+            ok, why, meta = _YVER82_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS(setup_or_row, session_name=session_name, user_id=user_id, lane=lane)
+            if ok:
+                return ok, why, meta
+    except Exception:
+        pass
+    try:
+        l = str(lane or 'screen').lower().strip()
+        # Only delivery/user-facing lanes are broadened. Background learning can keep its own rules.
+        if l in {'screen', '/screen', 'email', 'setup_email', 'screen_sync', 'autotrade_after_email', 'email_autotrade', 'bigmove', 'f8', 'delivery'} or 'email' in l or 'autotrade' in l:
+            ok2, why2, meta2 = _yver82_keep_delivery_allows(setup_or_row, session_name=session_name, user_id=user_id, lane=lane, check_blackout=False)
+            if ok2:
+                return True, 'yver82_matrix_keep_delivery_ok', meta2
+            return False, why2, meta2
+    except Exception as exc:
+        return False, f'yver82_user_visible_exception:{type(exc).__name__}', {}
+    try:
+        if _YVER82_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS is not None:
+            return _YVER82_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS(setup_or_row, session_name=session_name, user_id=user_id, lane=lane)
+    except Exception:
+        pass
+    return False, 'yver82_no_policy_handler', {}
+
+
+# Fresh matrix KEEP rows must be allowed into the executable lane; risk/liquidation/order
+# safety still happens later in _autotrade_place_trade.
+def is_executable_setup_eligible(setup, session_name: str = ''):
+    try:
+        if _YVER82_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE is not None:
+            ok, why = _YVER82_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE(setup, session_name=session_name)
+            if ok:
+                return ok, why
+    except Exception:
+        pass
+    try:
+        ok2, why2, _meta2 = _yver82_keep_delivery_allows(setup, session_name=session_name, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), lane='executable', check_blackout=False)
+        if ok2:
+            try:
+                setattr(setup, 'yver82_keep_delivery_override', True)
+            except Exception:
+                pass
+            return True, 'yver82_matrix_keep_executable_override'
+        return False, why2
+    except Exception as exc:
+        return False, f'yver82_exec_exception:{type(exc).__name__}'
+
+
+# The final setup-email presend gate must not discard a fresh /setup_audit KEEP row.
+def _setup_email_presend_executable_filter(user_id: int, session_name: str, setups: list, lane: str = 'email') -> tuple[list, Counter]:
+    reasons = Counter()
+    out = []
+    try:
+        if _YVER82_ORIG_SETUP_EMAIL_PRESEND_FILTER is not None:
+            out, reasons = _YVER82_ORIG_SETUP_EMAIL_PRESEND_FILTER(user_id, session_name, setups, lane=lane)
+            out = list(out or [])
+            reasons = Counter(reasons or {})
+    except Exception as exc:
+        reasons[f'yver82_orig_presend_exception:{type(exc).__name__}'] += 1
+        out = []
+    seen = set()
+    try:
+        for s in out:
+            seen.add(_setup_identity_from_obj(s) or str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''))
+    except Exception:
+        pass
+    sess = str(session_name or '').upper().strip()
+    for raw in list(setups or []):
+        try:
+            try:
+                eff = _setup_route_candidate_for_executable_lane(raw, sess, int(user_id or 0))
+            except Exception:
+                eff = raw
+            try:
+                setattr(eff, 'source_session', sess)
+                if not getattr(eff, 'session', None):
+                    setattr(eff, 'session', sess)
+                setattr(eff, 'delivery_lane_locked', True)
+            except Exception:
+                pass
+            key = _setup_identity_from_obj(eff) or str(getattr(eff, 'setup_id', '') or getattr(eff, 'id', '') or '')
+            if not key or key in seen:
+                continue
+            ok2, why2, _meta2 = _yver82_keep_delivery_allows(eff, session_name=sess, user_id=int(user_id or 0), lane=lane, check_blackout=False)
+            if ok2:
+                out.append(eff)
+                seen.add(key)
+                reasons['yver82_matrix_keep_restored'] += 1
+            else:
+                reasons[str(why2 or 'yver82_not_restored')] += 1
+        except Exception as exc:
+            reasons[f'yver82_presend_exception:{type(exc).__name__}'] += 1
+    return list(out or []), reasons
+
+
+def _yver82_obj_from_db_row(d: dict, session_name: str = ''):
+    from types import SimpleNamespace
+    try:
+        sess = str(d.get('session') or session_name or '').upper().strip()
+        entry = float(d.get('entry') or 0.0)
+        sl = float(d.get('sl') or 0.0)
+        side = str(d.get('side') or '').upper().strip()
+        tp = float(_resolve_single_tp(entry, sl, d.get('tp'), d.get('alt_target_a'), d.get('alt_target_b'), side) or 0.0)
+        obj = SimpleNamespace(
+            setup_id=str(d.get('setup_id') or '').strip(),
+            id=str(d.get('setup_id') or '').strip(),
+            session=sess,
+            source_session=sess,
+            symbol=str(d.get('symbol') or '').upper().strip(),
+            market_symbol=str(d.get('market_symbol') or ''),
+            side=side,
+            conf=int(float(d.get('conf') or 0)),
+            entry=entry,
+            sl=sl,
+            tp=tp,
+            alt_target_a=float(d.get('alt_target_a') or 0.0),
+            alt_target_b=float(d.get('alt_target_b') or 0.0),
+            fut_vol_usd=float(d.get('fut_vol_usd') or 0.0),
+            ch24=float(d.get('ch24') or 0.0),
+            ch4=float(d.get('ch4') or 0.0),
+            ch1=float(d.get('ch1') or 0.0),
+            ch15=float(d.get('ch15') or 0.0),
+            created_ts=float(d.get('created_ts') or d.get('executable_ts') or d.get('signal_created_ts') or time.time()),
+            signal_created_ts=float(d.get('signal_created_ts') or d.get('created_ts') or 0.0),
+            executable_ts=float(d.get('executable_ts') or d.get('created_ts') or 0.0),
+            email_logged_ts=float(d.get('emailed_ts') or 0.0),
+            emailed_ts=float(d.get('emailed_ts') or 0.0),
+            generated_logged_ts=float(d.get('created_ts') or 0.0),
+            source_kind=str(d.get('source_kind') or 'yver82_keep_delivery_reconcile'),
+            family_id=str(d.get('family_id') or d.get('engine') or ''),
+            engine=str(d.get('engine') or d.get('family_id') or ''),
+            setup_strategy=str(d.get('setup_strategy') or 'NORMAL'),
+            strategy=str(d.get('setup_strategy') or 'NORMAL'),
+            strategy_mode=str(d.get('setup_strategy') or 'NORMAL'),
+            original_setup_id=str(d.get('original_setup_id') or ''),
+            original_side=str(d.get('original_side') or ''),
+            strategy_reason=str(d.get('strategy_reason') or ''),
+            delivery_lane_locked=True,
+            yver82_keep_delivery_reconcile=True,
+        )
+        try:
+            obj = _research_finalize_setup(obj, session_name=sess)
+        except Exception:
+            pass
+        return obj
+    except Exception:
+        return None
+
+
+def _yver82_recent_open_keep_setup_objects(uid: int, session: str = '', max_age_min: int | None = None, limit: int = 8, only_missing_email: bool = False) -> list:
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    if uid_i <= 0:
+        return []
+    sess = str(session or '').upper().strip()
+    if sess not in {'ASIA', 'LON', 'NY'}:
+        return []
+    try:
+        max_age_min = int(max_age_min or max(YVER82_KEEP_DELIVERY_WINDOW_MIN, int(_autotrade_entry_window_min())))
+    except Exception:
+        max_age_min = YVER82_KEEP_DELIVERY_WINDOW_MIN
+    cutoff = float(time.time()) - float(max(5, int(max_age_min))) * 60.0
+    rows = []
+    try:
+        db_init()
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            # generated_setups is the closest durable mirror of /setup_audit generated rows.
+            try:
+                rows += [dict(r) for r in cur.execute(
+                    """
+                    SELECT g.*, COALESCE(o.outcome,'OPEN') AS outcome, COALESCE(o.hit_level,'') AS hit_level
+                    FROM generated_setups g
+                    LEFT JOIN signal_outcomes o ON o.setup_id=g.setup_id
+                    WHERE g.user_id IN (?,0)
+                      AND g.created_ts>=?
+                      AND (UPPER(COALESCE(g.session,''))=? OR COALESCE(g.session,'')='')
+                      AND UPPER(COALESCE(o.outcome,'OPEN')) NOT IN ('TP','WIN_TP','SL','LOSS','LOSS_SL')
+                      AND UPPER(COALESCE(o.hit_level,'')) NOT IN ('TP','SL')
+                    ORDER BY g.created_ts DESC
+                    LIMIT ?
+                    """, (uid_i, float(cutoff), sess, int(max(20, limit * 5)))
+                ).fetchall() or []]
+            except Exception:
+                pass
+            try:
+                rows += [dict(r) for r in cur.execute(
+                    """
+                    SELECT x.*, x.executable_ts AS created_ts, COALESCE(o.outcome,'OPEN') AS outcome, COALESCE(o.hit_level,'') AS hit_level
+                    FROM executable_setups x
+                    LEFT JOIN signal_outcomes o ON o.setup_id=x.setup_id
+                    WHERE x.user_id IN (?,0)
+                      AND x.executable_ts>=?
+                      AND (UPPER(COALESCE(x.session,''))=? OR COALESCE(x.session,'')='')
+                      AND UPPER(COALESCE(o.outcome,'OPEN')) NOT IN ('TP','WIN_TP','SL','LOSS','LOSS_SL')
+                      AND UPPER(COALESCE(o.hit_level,'')) NOT IN ('TP','SL')
+                    ORDER BY x.executable_ts DESC
+                    LIMIT ?
+                    """, (uid_i, float(cutoff), sess, int(max(20, limit * 5)))
+                ).fetchall() or []]
+            except Exception:
+                pass
+    except Exception:
+        rows = []
+
+    out = []
+    seen = set()
+    # newest first across sources
+    def _ts(d):
+        try:
+            return float(d.get('created_ts') or d.get('executable_ts') or d.get('signal_created_ts') or 0.0)
+        except Exception:
+            return 0.0
+    for d in sorted(rows, key=_ts, reverse=True):
+        try:
+            obj = _yver82_obj_from_db_row(d, session_name=sess)
+            if obj is None:
+                continue
+            sid = str(getattr(obj, 'setup_id', '') or '').strip()
+            ident = _setup_identity_from_obj(obj) or sid
+            if not sid or not ident or ident in seen:
+                continue
+            if only_missing_email:
+                try:
+                    if db_has_emailed_setup(uid_i, sid, lookback_hours=12) or _email_setup_identity_recently_sent(uid_i, obj):
+                        continue
+                except Exception:
+                    pass
+            ok, _why, _meta = _yver82_keep_delivery_allows(obj, session_name=sess, user_id=uid_i, lane='delivery', check_blackout=False)
+            if not ok:
+                continue
+            seen.add(ident)
+            out.append(obj)
+            if len(out) >= int(limit):
+                break
+        except Exception:
+            continue
+    return out[:int(limit)]
+
+
+def _yver82_screen_body_for_setups(uid: int, session: str, best_fut: dict, setups: list, note: str = ''):
+    try:
+        sess = str(session or '').upper().strip()
+        up_list, dn_list = compute_directional_lists(best_fut or {})
+        market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
+        body = "\n".join([
+            "", "*Top Trade Setups*", SEP,
+            note or "_Showing recent KEEP setup queue while the live scan refreshes._",
+            _screen_format_setup_cards(list(setups or []), int(uid), sess),
+            "", market_txt or "",
+        ]).strip()
+        kb = [(str(getattr(x, 'symbol', '') or '').upper(), str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or '')) for x in list(setups or [])[:_screen_display_limit()]]
+        return body, kb, list(setups or [])
+    except Exception:
+        return '', [], []
+
+
+def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int | None = None, include_email_source: bool = True):
+    try:
+        if not _yver82_delivery_blackout_now()[0]:
+            recent_keep = _yver82_recent_open_keep_setup_objects(int(uid), str(session or ''), max_age_min=max_age_min or YVER82_KEEP_DELIVERY_WINDOW_MIN, limit=_screen_display_limit(), only_missing_email=False)
+            if recent_keep:
+                return _yver82_screen_body_for_setups(int(uid), str(session or ''), best_fut or {}, recent_keep, "_Showing recent KEEP setup queue while the live scan refreshes._")
+    except Exception:
+        pass
+    if _YVER82_ORIG_SCREEN_RECENT_DB_BODY_AND_KB is not None:
+        return _YVER82_ORIG_SCREEN_RECENT_DB_BODY_AND_KB(uid, session, best_fut, max_age_min=max_age_min, include_email_source=include_email_source)
+    return '', [], []
+
+
+def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
+    # Prefer the authoritative recent KEEP delivery queue if available. This ensures
+    # /screen displays BIO/HOME/BEAT style rows that /setup_audit already shows as KEEP.
+    try:
+        if not _yver82_delivery_blackout_now()[0]:
+            recent_keep = _yver82_recent_open_keep_setup_objects(int(uid), str(session or ''), max_age_min=YVER82_KEEP_DELIVERY_WINDOW_MIN, limit=_screen_display_limit(), only_missing_email=False)
+            if recent_keep:
+                return _yver82_screen_body_for_setups(int(uid), str(session or ''), best_fut or {}, recent_keep, "_Showing recent KEEP setup queue while the live scan refreshes._")
+    except Exception:
+        pass
+    if _YVER82_ORIG_BUILD_SCREEN_BODY_AND_KB is not None:
+        return _YVER82_ORIG_BUILD_SCREEN_BODY_AND_KB(best_fut, session, uid)
+    return '', [], []
+
+
+async def _yver82_reconcile_missing_keep_delivery(uid: int, user: dict | None = None, session: str | None = None, best_fut: dict | None = None) -> dict:
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    if uid_i <= 0:
+        return {'status': 'skip', 'reason': 'bad_uid'}
+    try:
+        if _yver82_delivery_blackout_now()[0]:
+            return {'status': 'skip', 'reason': 'blackout'}
+    except Exception:
+        pass
+    user = dict(user or get_user(uid_i) or {})
+    try:
+        sess_obj = in_session_now(user or {})
+        sess = str(session or (sess_obj or {}).get('name') or scan_session_name_utc(datetime.now(timezone.utc)) or '').upper().strip()
+    except Exception:
+        sess = str(session or scan_session_name_utc(datetime.now(timezone.utc)) or '').upper().strip()
+    if sess not in {'ASIA', 'LON', 'NY'}:
+        return {'status': 'skip', 'reason': f'bad_session:{sess}'}
+    try:
+        best_fut = best_fut or get_cached_futures_tickers() or {}
+    except Exception:
+        best_fut = best_fut or {}
+    rows = _yver82_recent_open_keep_setup_objects(uid_i, sess, max_age_min=YVER82_KEEP_DELIVERY_WINDOW_MIN, limit=10, only_missing_email=True)
+    if not rows:
+        return {'status': 'skip', 'reason': 'no_missing_keep_rows'}
+    try:
+        db_log_setup_pipeline_event(uid_i, stage='yver82_keep_delivery_reconcile', status='start', session=sess, mode='email_screen_autotrade', details={'rows': len(rows), 'setup_ids': [str(getattr(x, 'setup_id', '') or '') for x in rows[:8]]})
+    except Exception:
+        pass
+    res = await _screen_sync_pipeline_async(uid_i, user, sess, sess, best_fut or {}, list(rows or []))
+    try:
+        db_log_setup_pipeline_event(uid_i, stage='yver82_keep_delivery_reconcile', status=str((res or {}).get('status') or 'done'), session=sess, mode='email_screen_autotrade', details=res or {})
+    except Exception:
+        pass
+    return dict(res or {})
+
+
+async def alert_job(context: ContextTypes.DEFAULT_TYPE):
+    if _YVER82_ORIG_ALERT_JOB is not None:
+        await _YVER82_ORIG_ALERT_JOB(context)
+    try:
+        owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+        if owner_uid > 0:
+            await _yver82_reconcile_missing_keep_delivery(owner_uid)
+    except Exception:
+        pass
+
+
+async def autonomous_screen_sync_job(context: ContextTypes.DEFAULT_TYPE):
+    if _YVER82_ORIG_AUTONOMOUS_SCREEN_SYNC_JOB is not None:
+        await _YVER82_ORIG_AUTONOMOUS_SCREEN_SYNC_JOB(context)
+    try:
+        owner_uid = int(AUTOTRADE_OWNER_UID or 0)
+        if owner_uid > 0:
+            await _yver82_reconcile_missing_keep_delivery(owner_uid)
+    except Exception:
+        pass
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v82'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v82'
+except Exception:
+    pass
+
+# =========================================================
+# end yver82 final KEEP delivery authority fix
 # =========================================================
 
 if __name__ == "__main__":
