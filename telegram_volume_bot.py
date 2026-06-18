@@ -71627,6 +71627,215 @@ except Exception:
 # end yver82 final KEEP delivery authority fix
 # =========================================================
 
+
+# =========================================================
+# yver83 /screen multi-card KEEP queue display fix
+# =========================================================
+# v82 correctly sourced all recent KEEP setup rows for /screen, but the downstream
+# generic screen card formatter still applied the old "already traded/consumed"
+# user-visible filter.  That meant /screen could build buttons for TAC/ETH/SOL/BTC
+# but render only the newest visible card.  This patch is display-only: when the
+# input set is the authoritative recent KEEP/email queue, render up to
+# SCREEN_MAX_CARDS_DISPLAY cards directly without the consumed/AT_OPEN filter.
+# It does not make any setup executable again and does not alter AutoTrade, TP/SL,
+# leverage, risk, blackout, or order placement logic.
+
+try:
+    _YVER83_ORIG_SCREEN_FORMAT_SETUP_CARDS = _screen_format_setup_cards
+except Exception:
+    _YVER83_ORIG_SCREEN_FORMAT_SETUP_CARDS = None
+
+try:
+    _YVER83_ORIG_YVER82_SCREEN_BODY_FOR_SETUPS = _yver82_screen_body_for_setups
+except Exception:
+    _YVER83_ORIG_YVER82_SCREEN_BODY_FOR_SETUPS = None
+
+
+def _yver83_is_authoritative_recent_screen_queue_item(s) -> bool:
+    try:
+        if bool(getattr(s, 'yver82_keep_delivery_reconcile', False)):
+            return True
+    except Exception:
+        pass
+    try:
+        if bool(getattr(s, 'delivery_lane_locked', False)):
+            sk = str(getattr(s, 'source_kind', '') or '').lower().strip()
+            if sk in {'emailed_setups', 'recent_email_cache', 'recent_email_lane', 'yver82_keep_delivery_reconcile'}:
+                return True
+    except Exception:
+        pass
+    try:
+        if '_yver77_screen_show_open_flag' in globals() and _yver77_screen_show_open_flag(s):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _yver83_basic_card_valid(s) -> bool:
+    try:
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        entry = float(getattr(s, 'entry', 0.0) or 0.0)
+        sl = float(getattr(s, 'sl', 0.0) or 0.0)
+        tp = float(_setup_target_tp(s, 0.0) or 0.0)
+        if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+            return False
+        if side == 'BUY' and not (sl < entry < tp):
+            return False
+        if side == 'SELL' and not (tp < entry < sl):
+            return False
+        if not _setup_volume_ok(s):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _yver83_screen_format_setup_cards_no_consumed_filter(setups: list, uid: int, session: str) -> str:
+    """Render authoritative recent KEEP/email queue cards without hiding AT_OPEN rows."""
+    if not setups:
+        return "_No high-quality setups right now._"
+
+    def _mv_dot(p: float) -> str:
+        try:
+            p = float(p or 0.0)
+        except Exception:
+            p = 0.0
+        if abs(p) < 2.0:
+            return "🟡"
+        return "🟢" if p >= 0 else "🔴"
+
+    try:
+        lim = int(_screen_display_limit())
+    except Exception:
+        lim = 4
+    lim = max(1, min(4, lim))
+
+    visible_setups = []
+    seen = set()
+    for s in list(setups or []):
+        try:
+            if not _yver83_basic_card_valid(s):
+                continue
+            sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+            ident = str(_setup_identity_from_obj(s) or sid).strip()
+            if ident and ident in seen:
+                continue
+            if ident:
+                seen.add(ident)
+            visible_setups.append(s)
+            if len(visible_setups) >= lim:
+                break
+        except Exception:
+            continue
+
+    if not visible_setups:
+        return "_No high-quality setups right now._"
+
+    lines2 = []
+    for s in visible_setups[:lim]:
+        try:
+            sym = str(getattr(s, "symbol", "") or "").upper()
+            sid = str(getattr(s, "setup_id", "") or getattr(s, "id", "") or "")
+            side = str(getattr(s, "side", "") or "").upper()
+            conf = int(float(getattr(s, "conf", 0) or 0))
+            entry = float(getattr(s, "entry", 0.0) or 0.0)
+            sl = float(getattr(s, "sl", 0.0) or 0.0)
+            tp = float(_setup_target_tp(s, 0.0) or 0.0)
+            vol = float(getattr(s, "fut_vol_usd", 0.0) or 0.0)
+            ch24 = float(getattr(s, "ch24", 0.0) or 0.0)
+            ch4 = float(getattr(s, "ch4", 0.0) or 0.0)
+            ch1 = float(getattr(s, "ch1", 0.0) or 0.0)
+            ch15 = float(getattr(s, "ch15", 0.0) or 0.0)
+            rr_den = abs(entry - sl)
+            rr = (abs(float(tp) - entry) / rr_den) if (rr_den > 0 and tp not in (None, 0, 0.0)) else 0.0
+            pos_word = "long" if side == "BUY" else "short"
+            size_cmd = f"/size {sym} {pos_word} entry {entry:.6g} sl {sl:.6g}"
+            emoji = "🟢" if side == "BUY" else "🔴"
+            fam_code = _setup_audit_family_code(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '')
+            is_bigmove = (fam_code == 'F8') or str(sid).upper().startswith(('BMAT-', 'BIGMOVE-')) or 'BIGMOVE' in str(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '').upper()
+            block = []
+            block.append(f"{emoji} *{side} — {sym}*")
+            block.append(f"`{sid}` | Conf: `{conf}` | Family: `{'F8 BigMove' if is_bigmove else fam_code}`")
+            try:
+                sk = str(getattr(s, 'source_kind', '') or '').lower().strip()
+                email_ts = float(getattr(s, 'email_logged_ts', 0.0) or getattr(s, 'emailed_ts', 0.0) or 0.0)
+                if sk in {'emailed_setups', 'recent_email_cache', 'recent_email_lane'} or email_ts > 0:
+                    when_txt = _screen_ts_label(email_ts) if email_ts > 0 else ''
+                    if is_bigmove:
+                        block.append(f"📩 *Setup emailed at {when_txt}* (F8 BigMove)" if when_txt else "📩 *Setup emailed* (F8 BigMove)")
+                    else:
+                        block.append(f"📩 *Setup emailed at {when_txt}*" if when_txt else "📩 *Setup emailed*")
+                elif (not is_bigmove) and symbol_recently_emailed(uid, sym, side, session):
+                    block.append("📩 *Email cooldown active*")
+            except Exception:
+                pass
+            block.append(f"RR(TP): `{rr:.2f}`")
+            block.append(f"Entry: `{fmt_price(entry)}` | SL: `{fmt_price(sl)}`")
+            block.append(f"TP: `{fmt_price(float(_resolve_single_tp(entry, sl, tp, 0.0, 0.0, side) or 0.0))}`")
+            block.append(
+                f"Moves: 24H {ch24:+.0f}% {_mv_dot(ch24)} • 4H {ch4:+.0f}% {_mv_dot(ch4)} • "
+                f"1H {ch1:+.0f}% {_mv_dot(ch1)} • 15m {ch15:+.0f}% {_mv_dot(ch15)}"
+            )
+            block.append(f"Volume: ~{vol/1e6:.1f}M")
+            block.append(f"Chart: {tv_chart_url(sym)}")
+            block.append(f"`{size_cmd}`")
+            lines2.append("\n".join(block))
+        except Exception:
+            continue
+
+    return ("\n\n".join(lines2)).strip() if lines2 else "_No high-quality setups right now._"
+
+
+def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
+    """v83: render all authoritative recent KEEP/email queue cards, including AT_OPEN."""
+    try:
+        if any(_yver83_is_authoritative_recent_screen_queue_item(s) for s in list(setups or [])):
+            return _yver83_screen_format_setup_cards_no_consumed_filter(list(setups or []), int(uid or 0), str(session or ''))
+    except Exception:
+        pass
+    if _YVER83_ORIG_SCREEN_FORMAT_SETUP_CARDS is not None:
+        return _YVER83_ORIG_SCREEN_FORMAT_SETUP_CARDS(setups, uid, session)
+    return "_No high-quality setups right now._" if not setups else ""
+
+
+def _yver82_screen_body_for_setups(uid: int, session: str, best_fut: dict, setups: list, note: str = ''):
+    """v83: authoritative screen body keeps all cards and matching buttons aligned."""
+    try:
+        sess = str(session or '').upper().strip()
+        up_list, dn_list = compute_directional_lists(best_fut or {})
+        market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
+        cards = _yver83_screen_format_setup_cards_no_consumed_filter(list(setups or []), int(uid or 0), sess)
+        body = "\n".join([
+            "", "*Top Trade Setups*", SEP,
+            note or "_Showing recent KEEP setup queue while the live scan refreshes._",
+            cards,
+            "", market_txt or "",
+        ]).strip()
+        try:
+            lim = int(_screen_display_limit())
+        except Exception:
+            lim = 4
+        kb = [(str(getattr(x, 'symbol', '') or '').upper(), str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or '')) for x in list(setups or [])[:max(1, min(4, lim))]]
+        return body, kb, list(setups or [])
+    except Exception:
+        if _YVER83_ORIG_YVER82_SCREEN_BODY_FOR_SETUPS is not None:
+            return _YVER83_ORIG_YVER82_SCREEN_BODY_FOR_SETUPS(uid, session, best_fut, setups, note)
+        return '', [], []
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v83'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v83'
+except Exception:
+    pass
+
+# =========================================================
+# end yver83 /screen multi-card KEEP queue display fix
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
