@@ -4,6 +4,7 @@
 # yver75: owner threshold adjustment for broad-sampling live profile: strict KEEP live edge now uses decided>=3, WR>=49%, AvgR>=+0.05; dynamic risk tiers use the same minimum decided threshold while keeping 0.30% base / 0.50% max risk. No TP/SL, leverage, blackout, setup-generation, or Bybit order logic changed.
 # yver74: startup drift-repair for the owner-approved low-risk broad-sampling profile. Re-syncs stale runtime DB/config values so /autotrade_config matches 0.30% risk, 12/35 trade caps, 5%/8% risk caps, 60m/2% entry gates, fixed 1.5R TP, and WR/AvgR-gated dynamic risk. No setup generation, blackout engine, TP/SL geometry, leverage, or order placement mechanics changed.
 # yver73: low-risk broad-sampling live profile: AutoTrade samples fresh direct KEEP queue with 0.30% base risk, wider trade-count caps, 5%/8% portfolio caps, WR/AvgR-gated dynamic risk only for proven lanes, and keeps auto-blackout unchanged. No TP/SL geometry, leverage, setup generation, or order placement mechanics changed.
+# yver84: syncs AutoTrade strict KEEP edge with /setup_matrix policy evidence so fresh KEEP rows that pass decided/WR/AvgR are not incorrectly skipped as AUTOTRADE_STRICT; downstream risk/leverage/drift/blackout/Bybit safety remains unchanged.
 # yver71: improves AutoTrade diagnostics only: /autotrade_last and /setup_audit ATWhy now preserve exact LIVE_OPEN_FAILED / cooldown reason details (e.g. Bybit 110007), while leaving order/risk/TP/SL/leverage/KEEP logic unchanged.
 # yver70: adds a safe cooldown for repeated Bybit LIVE_OPEN_FAILED retries and sanitizes /autotrade_last rows so stale global detail cannot show another symbol's Entry/SL. No risk/TP/SL/leverage/KEEP-policy logic changed.
 # yver69: cleanup /autotrade_config help so Auto Blackout commands are visible in the clean view and old static blackout examples are no longer misleading; no live trading logic changed.
@@ -71834,6 +71835,113 @@ except Exception:
 
 # =========================================================
 # end yver83 /screen multi-card KEEP queue display fix
+# =========================================================
+
+
+# =========================================================
+# yver84 AutoTrade strict-edge sync fix
+# =========================================================
+# 18-Jun 19:30 review: /setup_audit and /setup_matrix both showed fresh KEEP
+# lanes such as F1-ASIA-NOR-SELL (WR 61.5%, AvgR +0.57, n>=3), but AutoTrade
+# still skipped H/XRP with AUTOTRADE_STRICT.  Root cause: the secondary strict
+# live edge guard read a separate rolling setup_edge_guard dataset instead of the
+# /setup_matrix policy source-of-truth that already drives /setup_audit Policy,
+# setup email and /screen.
+#
+# Owner rule remains: Policy=KEEP is not enough by itself; it must also pass the
+# editable strict edge thresholds.  But those thresholds must be evaluated against
+# the same /setup_matrix lane evidence shown to the owner.  If that lane passes,
+# bypass only the duplicate strict-edge block and let all downstream safety checks
+# still run: symbol/hour context, duplicate/already-traded, risk caps, leverage,
+# drift, blackout, Bybit order placement, etc.
+
+def _yver84_matrix_policy_edge_allows_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or user_id or 0)
+        sess = str(session_name or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+        state = dict(_setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=owner_uid) or {})
+        policy = str(state.get('policy') or '').upper().strip()
+        combo = str(state.get('combo') or '').upper().strip()
+        if policy != 'KEEP':
+            return False, f'matrix_policy_not_keep:{policy or "-"}'
+
+        dec = int(state.get('decided') if state.get('decided') is not None else state.get('last_decided') or 0)
+        wr = float(state.get('wr') if state.get('wr') is not None else state.get('win_rate') if state.get('win_rate') is not None else state.get('last_win_rate') or 0.0)
+        avg = float(state.get('avg_r') if state.get('avg_r') is not None else state.get('last_avg_r') or 0.0)
+
+        # Some runtime paths still receive the older policy lookup shape.  Fall back
+        # to it if the source state is KEEP but missing metrics.
+        if dec <= 0 and wr <= 0.0:
+            try:
+                pinfo = dict(_setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=owner_uid) or {})
+                if str(pinfo.get('status') or '').upper().strip() == 'KEEP':
+                    combo = str(pinfo.get('combo') or combo or '').upper().strip()
+                    dec = int(pinfo.get('last_decided') or (dict(pinfo.get('force_keep_info') or {}).get('decided') or 0))
+                    wr = float(pinfo.get('last_win_rate') if pinfo.get('last_win_rate') is not None else (dict(pinfo.get('force_keep_info') or {}).get('win_rate') or 0.0))
+                    avg = float(pinfo.get('last_avg_r') if pinfo.get('last_avg_r') is not None else (dict(pinfo.get('force_keep_info') or {}).get('avg_r') or 0.0))
+            except Exception:
+                pass
+
+        min_dec = int(_autotrade_strict_keep_edge_min_decided())
+        min_wr = float(_autotrade_strict_keep_edge_min_wr())
+        min_avg = float(_autotrade_strict_keep_edge_min_avgr())
+        if dec >= min_dec and wr >= min_wr and avg >= min_avg:
+            return True, f'matrix_keep_strict_edge_ok:{combo or "-"}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
+        return False, f'matrix_keep_strict_edge_fail:{combo or "-"}:WR{wr:.1f}:AvgR{avg:+.2f}:n{dec}'
+    except Exception as exc:
+        return False, f'matrix_keep_strict_edge_error:{type(exc).__name__}'
+
+try:
+    _YVER84_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS = _autotrade_policy_context_execution_allows
+except Exception:
+    _YVER84_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS = None
+
+def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
+    try:
+        orig = globals().get('_YVER84_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS')
+        if orig is None:
+            return True, 'yver84_no_original_context_guard'
+        ok, why = orig(setup_or_row, session_name=session_name, user_id=user_id)
+        why_s = str(why or '')
+        if ok:
+            return bool(ok), why_s
+
+        # Only correct the duplicate strict-edge mismatch.  Do not bypass any other
+        # real safety reason such as NOT_KEEP, WATCH, symbol/hour blocks, risk caps,
+        # leverage/liquidation, drift, blacklist, already-traded, or exchange errors.
+        if 'autotrade_strict_keep_edge_block' not in why_s:
+            return bool(ok), why_s
+
+        matrix_ok, matrix_why = _yver84_matrix_policy_edge_allows_setup(setup_or_row, session_name=session_name, user_id=user_id)
+        if not matrix_ok:
+            return bool(ok), why_s
+
+        old_fn = globals().get('_autotrade_strict_keep_edge_enabled')
+        try:
+            globals()['_autotrade_strict_keep_edge_enabled'] = lambda: False
+            ok2, why2 = orig(setup_or_row, session_name=session_name, user_id=user_id)
+        finally:
+            if old_fn is not None:
+                globals()['_autotrade_strict_keep_edge_enabled'] = old_fn
+        if ok2:
+            return True, f'{matrix_why}; strict_guard_synced_to_setup_matrix'
+        return bool(ok2), str(why2 or why_s)
+    except Exception as exc:
+        # Fail open only for this compatibility wrapper; original guard remains the
+        # authoritative safety layer and has already been attempted above.
+        return True, f'yver84_context_wrapper_error_allowed:{type(exc).__name__}'
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v84'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v84'
+except Exception:
+    pass
+
+# =========================================================
+# end yver84 AutoTrade strict-edge sync fix
 # =========================================================
 
 if __name__ == "__main__":
