@@ -70435,5 +70435,277 @@ except Exception:
 # end yver76 final runtime profile authority fix
 # =========================================================
 
+
+
+# =========================================================
+# yver77 /screen recent emailed/open setup visibility fix
+# =========================================================
+# v76 correctly opened HOME/BEAT from recent KEEP setup emails, but /screen could
+# still show an older/empty cached scan because the screen fallback filtered
+# AutoTrade-consumed setup cards as already_traded.  That is correct for preventing
+# re-entry, but wrong for user visibility: an emailed setup that became AT_OPEN
+# should remain visible under /screen for a short delivery window.
+#
+# This patch is display-only. It does NOT make consumed setups executable again and
+# does NOT change AutoTrade selection/order/risk logic.  It only lets /screen show
+# recent emailed KEEP rows that are still unresolved (OPEN) for 30 minutes, even if
+# AutoTrade has already opened them.
+
+YVER77_SCREEN_RECENT_OPEN_MIN = 30
+
+try:
+    _YVER77_ORIG_SCREEN_FORMAT_SETUP_CARDS = _screen_format_setup_cards
+except Exception:
+    _YVER77_ORIG_SCREEN_FORMAT_SETUP_CARDS = None
+
+try:
+    _YVER77_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = _screen_recent_db_body_and_kb
+except Exception:
+    _YVER77_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = None
+
+
+def _yver77_screen_show_open_flag(setup) -> bool:
+    try:
+        until_ts = float(getattr(setup, 'yver77_screen_show_until_ts', 0.0) or 0.0)
+        return bool(getattr(setup, 'yver77_screen_show_recent_open', False)) and until_ts >= float(time.time())
+    except Exception:
+        return False
+
+
+def _yver77_basic_setup_valid_for_screen(item) -> bool:
+    try:
+        side = str(getattr(item, 'side', '') or '').upper().strip()
+        entry = float(getattr(item, 'entry', 0.0) or 0.0)
+        sl = float(getattr(item, 'sl', 0.0) or 0.0)
+        tp = float(_setup_target_tp(item, 0.0) or 0.0)
+        if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+            return False
+        if side == 'BUY' and not (sl < entry < tp):
+            return False
+        if side == 'SELL' and not (tp < entry < sl):
+            return False
+        if not _setup_volume_ok(item):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _yver77_recent_emailed_open_setups_for_screen(uid: int, session: str = '', max_age_min: int | None = None, limit: int = 4) -> list:
+    """Return recent delivered setup cards for /screen, including AT_OPEN rows.
+
+    This deliberately does not call _yver61_setup_consumed_by_autotrade(), because
+    consumed-by-AutoTrade is exactly what we still want to display for 30 minutes.
+    It remains limited to recent emailed rows with OPEN/unresolved setup outcome.
+    """
+    from types import SimpleNamespace
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    if uid_i <= 0:
+        return []
+    try:
+        if max_age_min is None:
+            max_age_min = YVER77_SCREEN_RECENT_OPEN_MIN
+        max_age_min = max(1, min(int(max_age_min or YVER77_SCREEN_RECENT_OPEN_MIN), int(YVER77_SCREEN_RECENT_OPEN_MIN)))
+    except Exception:
+        max_age_min = YVER77_SCREEN_RECENT_OPEN_MIN
+    cutoff = float(time.time()) - float(max_age_min) * 60.0
+    sess = str(session or '').upper().strip()
+    rows = []
+    try:
+        try:
+            _setup_strategy_db_migrate()
+        except Exception:
+            pass
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            params = [int(uid_i), float(cutoff)]
+            where_session = ''
+            if sess:
+                where_session = " AND UPPER(COALESCE(e.session,''))=? "
+                params.append(sess)
+            params.append(int(max(4, int(limit or 4) * 8)))
+            rows = cur.execute(
+                f"""
+                SELECT
+                    e.setup_id, e.session, e.emailed_ts,
+                    COALESCE(s.market_symbol, '') AS market_symbol,
+                    COALESCE(s.symbol, '') AS symbol,
+                    COALESCE(s.side, '') AS side,
+                    COALESCE(s.conf, 0) AS conf,
+                    COALESCE(s.entry, 0) AS entry,
+                    COALESCE(s.sl, 0) AS sl,
+                    COALESCE(s.tp, 0) AS tp,
+                    COALESCE(s.alt_target_a, 0) AS alt_target_a,
+                    COALESCE(s.alt_target_b, 0) AS alt_target_b,
+                    COALESCE(s.fut_vol_usd, 0) AS fut_vol_usd,
+                    COALESCE(s.ch24, 0) AS ch24,
+                    COALESCE(s.ch4, 0) AS ch4,
+                    COALESCE(s.ch1, 0) AS ch1,
+                    COALESCE(s.ch15, 0) AS ch15,
+                    COALESCE(s.created_ts, e.emailed_ts) AS created_ts,
+                    COALESCE(s.created_ts, e.emailed_ts) AS signal_created_ts,
+                    COALESCE(x.engine, '') AS engine,
+                    COALESCE(x.pullback_ready, 0) AS pullback_ready,
+                    COALESCE(x.pullback_bypass_hot, 0) AS pullback_bypass_hot,
+                    COALESCE(x.pullback_ema_dist_pct, 0) AS pullback_ema_dist_pct,
+                    COALESCE(x.ema_support_period, 0) AS ema_support_period,
+                    COALESCE(x.ema_support_dist_pct, 0) AS ema_support_dist_pct,
+                    COALESCE(NULLIF(x.family_id,''), NULLIF(s.family_id,''), '') AS family_id,
+                    COALESCE(NULLIF(x.setup_strategy,''), NULLIF(s.setup_strategy,''), 'NORMAL') AS setup_strategy,
+                    COALESCE(NULLIF(x.original_setup_id,''), NULLIF(s.original_setup_id,''), '') AS original_setup_id,
+                    COALESCE(NULLIF(x.original_side,''), NULLIF(s.original_side,''), '') AS original_side,
+                    COALESCE(NULLIF(x.strategy_reason,''), NULLIF(s.strategy_reason,''), '') AS strategy_reason,
+                    COALESCE(o.outcome, 'OPEN') AS outcome
+                FROM emailed_setups e
+                LEFT JOIN signals s ON s.setup_id = e.setup_id
+                LEFT JOIN executable_setups x ON x.user_id = e.user_id AND x.setup_id = e.setup_id
+                LEFT JOIN signal_outcomes o ON o.setup_id = e.setup_id
+                WHERE e.user_id=?
+                  AND e.emailed_ts>=?
+                  {where_session}
+                  AND UPPER(COALESCE(o.outcome, 'OPEN'))='OPEN'
+                ORDER BY e.emailed_ts DESC, e.setup_id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall() or []
+    except Exception:
+        rows = []
+
+    out = []
+    seen = set()
+    for r in list(rows or []):
+        try:
+            d = dict(r)
+            sid = str(d.get('setup_id') or '').strip()
+            sym = str(d.get('symbol') or '').upper().strip()
+            if not sid or not sym:
+                continue
+            obj = SimpleNamespace(**d)
+            try:
+                setattr(obj, 'id', sid)
+                setattr(obj, 'source_kind', 'emailed_setups')
+                setattr(obj, 'source_session', str(d.get('session') or sess or '').upper().strip())
+                setattr(obj, 'email_logged_ts', float(d.get('emailed_ts') or 0.0))
+                setattr(obj, 'emailed_ts', float(d.get('emailed_ts') or 0.0))
+                setattr(obj, 'delivery_lane_locked', True)
+            except Exception:
+                pass
+            try:
+                obj = _research_finalize_setup(obj, session_name=str(getattr(obj, 'source_session', '') or sess or ''))
+            except Exception:
+                pass
+            if not _yver77_basic_setup_valid_for_screen(obj):
+                continue
+            # Hide if the independent setup outcome already hit TP/SL.  Do not hide merely
+            # because AutoTrade opened it.
+            try:
+                terminal, why = _yver60_setup_terminal_for_visibility(obj) if '_yver60_setup_terminal_for_visibility' in globals() else (False, '')
+                if terminal:
+                    continue
+            except Exception:
+                pass
+            try:
+                terminal, why = _yver61_setup_cached_audit_terminal(obj) if '_yver61_setup_cached_audit_terminal' in globals() else (False, '')
+                if terminal:
+                    continue
+            except Exception:
+                pass
+            try:
+                keep_ok, _keep_why, _keep_meta = _setup_user_visible_keep_policy_allows(obj, session_name=sess, user_id=int(uid_i), lane='screen')
+                if not keep_ok:
+                    continue
+            except Exception:
+                continue
+            ident = str(_setup_identity_from_obj(obj) or sid).strip()
+            if ident in seen:
+                continue
+            seen.add(ident)
+            try:
+                setattr(obj, 'yver77_screen_show_recent_open', True)
+                setattr(obj, 'yver77_screen_show_until_ts', float(d.get('emailed_ts') or time.time()) + float(YVER77_SCREEN_RECENT_OPEN_MIN) * 60.0)
+            except Exception:
+                pass
+            out.append(obj)
+            if len(out) >= int(limit or 4):
+                break
+        except Exception:
+            continue
+    return out[:int(limit or 4)]
+
+
+def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
+    """v77: keep recent emailed/AT_OPEN setup cards visible on /screen."""
+    try:
+        if any(_yver77_screen_show_open_flag(s) for s in list(setups or [])):
+            visible = []
+            for s in list(setups or []):
+                try:
+                    if _yver77_screen_show_open_flag(s):
+                        visible.append(s)
+                        continue
+                    terminal, _why = _yver61_setup_terminal_for_visibility(s, uid=int(uid or 0))
+                    if not terminal:
+                        visible.append(s)
+                except Exception:
+                    visible.append(s)
+            # Bypass the yver61 wrapper because it would hide consumed/AT_OPEN rows again.
+            if '_YVER61_ORIG_SCREEN_FORMAT_SETUP_CARDS' in globals() and _YVER61_ORIG_SCREEN_FORMAT_SETUP_CARDS is not None:
+                return _YVER61_ORIG_SCREEN_FORMAT_SETUP_CARDS(visible, uid, session)
+            if _YVER77_ORIG_SCREEN_FORMAT_SETUP_CARDS is not None:
+                return _YVER77_ORIG_SCREEN_FORMAT_SETUP_CARDS(visible, uid, session)
+            return "_No high-quality setups right now._" if not visible else ""
+    except Exception:
+        pass
+    if _YVER77_ORIG_SCREEN_FORMAT_SETUP_CARDS is not None:
+        return _YVER77_ORIG_SCREEN_FORMAT_SETUP_CARDS(setups, uid, session)
+    return "_No high-quality setups right now._" if not setups else ""
+
+
+def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int | None = None, include_email_source: bool = True):
+    """v77: make recent emailed/open setups win over an empty cached /screen."""
+    try:
+        if include_email_source:
+            recent = _yver77_recent_emailed_open_setups_for_screen(int(uid), session=str(session or ''), max_age_min=YVER77_SCREEN_RECENT_OPEN_MIN, limit=_screen_display_limit())
+            if recent:
+                try:
+                    up_list, dn_list = compute_directional_lists(best_fut or {})
+                except Exception:
+                    up_list, dn_list = [], []
+                market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
+                body = "\n".join([
+                    "",
+                    "*Top Trade Setups*",
+                    SEP,
+                    "_Showing recent emailed/open setup queue while the live scan refreshes._",
+                    _screen_format_setup_cards(recent, int(uid), str(session or '').upper().strip()),
+                    "",
+                    market_txt or "",
+                ]).strip()
+                kb = [(str(getattr(x, 'symbol', '') or '').upper(), str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or '')) for x in recent]
+                return body, kb, list(recent)
+    except Exception:
+        pass
+    if _YVER77_ORIG_SCREEN_RECENT_DB_BODY_AND_KB is not None:
+        return _YVER77_ORIG_SCREEN_RECENT_DB_BODY_AND_KB(uid, session, best_fut, max_age_min=max_age_min, include_email_source=include_email_source)
+    return '', [], []
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v77'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v77'
+except Exception:
+    pass
+
+# =========================================================
+# end yver77 /screen recent emailed/open setup visibility fix
+# =========================================================
+
 if __name__ == "__main__":
     main()
