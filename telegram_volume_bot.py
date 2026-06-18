@@ -1,3 +1,4 @@
+# yver76: final runtime profile authority fix. Forces the owner-approved low-risk broad-sampling profile at EOF startup and before /autotrade_config, /autotrade_debug, and autotrade_job so stale Render DB rows cannot keep 50/200 caps, 15/40% caps, 90m/3% entries, dynamic TP, or decided=1. No TP/SL geometry, leverage, blackout, setup generation, or Bybit order mechanics changed.
 # yver75: owner threshold adjustment for broad-sampling live profile: strict KEEP live edge now uses decided>=3, WR>=49%, AvgR>=+0.05; dynamic risk tiers use the same minimum decided threshold while keeping 0.30% base / 0.50% max risk. No TP/SL, leverage, blackout, setup-generation, or Bybit order logic changed.
 # yver74: startup drift-repair for the owner-approved low-risk broad-sampling profile. Re-syncs stale runtime DB/config values so /autotrade_config matches 0.30% risk, 12/35 trade caps, 5%/8% risk caps, 60m/2% entry gates, fixed 1.5R TP, and WR/AvgR-gated dynamic risk. No setup generation, blackout engine, TP/SL geometry, leverage, or order placement mechanics changed.
 # yver73: low-risk broad-sampling live profile: AutoTrade samples fresh direct KEEP queue with 0.30% base risk, wider trade-count caps, 5%/8% portfolio caps, WR/AvgR-gated dynamic risk only for proven lanes, and keeps auto-blackout unchanged. No TP/SL geometry, leverage, setup generation, or order placement mechanics changed.
@@ -43620,10 +43621,10 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90',
-            '• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 20',
+            '• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5',
             '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 8',
             '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true',
-            '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 25',
+            '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5',
             '',
             'Examples — entry controls:',
             '• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 12',
@@ -43648,7 +43649,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_LIQ_BUFFER_PCT 2',
             '• /autotrade_config AUTOTRADE_ALLOW_LEVERAGE_DOWNGRADE true',
             '• /autotrade_config AUTOTRADE_SAFE_LEVERAGE_DOWNGRADE_MIN 4',
-            '• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.25',
+            '• /autotrade_config AUTOTRADE_EMERGENCY_RISK_MAX_MULT 1.0',
             '',
             'Examples — reports / exits:',
             '• /autotrade_config AUTOTRADE_REPORT_REQUIRE_VERIFIED_TPSL true',
@@ -43683,8 +43684,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY false',
             '• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY false',
             '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true',
-            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 8',
-            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 55',
+            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 3',
+            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 49',
             '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.05',
             '• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false',
             '• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true',
@@ -70237,8 +70238,201 @@ try:
 except Exception:
     pass
 
+
 # =========================================================
-# end yver71 exact LIVE_OPEN_FAILED diagnostics
+# yver76 final runtime profile authority fix
+# =========================================================
+# The 18-Jun 12:00 v75 output still showed the old persisted Render DB runtime
+# values in /autotrade_config FULL (max-open 50, max/day 200, open cap 15%,
+# daily cap 40%, loss stop 30%, drift 3%, entry window 90m, dynamic TP/RR ON,
+# and strict edge decided>=1).  Earlier startup syncs were defined before the
+# final patch blocks and were not authoritative enough.  This EOF patch runs
+# after all definitions and also before /autotrade_config, /autotrade_debug and
+# each AutoTrade tick, so stale DB rows cannot silently override the selected
+# owner-approved profile.
+
+def _yver76_force_owner_runtime_profile(reason: str = 'startup') -> bool:
+    """Force the owner-approved broad-sampling / low-risk live profile.
+
+    Keeps the user's selected broad sampling idea:
+      - DIRECT KEEP queue entry, not email-only sampling
+      - base risk 0.30%
+      - dynamic risk ON, but capped to ~0.50% max and WR/AvgR-gated elsewhere
+      - max-open 12, max/day 35
+      - open cap 5%, daily cap 8%, realised-loss stop 5%
+      - entry drift 2%, entry window 60m
+      - fixed 1.5R TP for cleaner audit/live comparison
+      - strict KEEP edge decided>=3, WR>=49%, AvgR>=+0.05
+
+    Does not touch blackout windows, TP/SL geometry, leverage, liquidation guard,
+    setup generation, or Bybit order mechanics.
+    """
+    changed = False
+    try:
+        targets = {
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 0,
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 0.30,
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.67,
+            AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: 55.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: 60.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: 70.0,
+            AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: 12,
+            AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: 35,
+            AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: 5.0,
+            AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: 2.0,
+            AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY: 60,
+            AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MIN_LIVE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MAX_LIVE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: 3,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: 49.0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: 0.05,
+            AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 0,
+            AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: 5.0,
+        }
+
+        def _same(cur, target) -> bool:
+            try:
+                if isinstance(target, int) and not isinstance(target, bool):
+                    return int(float(cur)) == int(target)
+                if isinstance(target, float):
+                    return abs(float(cur) - float(target)) < 1e-9
+                return str(cur).strip() == str(target).strip()
+            except Exception:
+                return False
+
+        for k, target in targets.items():
+            try:
+                cur = _autotrade_config_get(k, None)
+                if cur is None or str(cur).strip() == '' or not _same(cur, target):
+                    _autotrade_config_set(k, target)
+                    changed = True
+            except Exception:
+                try:
+                    _autotrade_config_set(k, target)
+                    changed = True
+                except Exception:
+                    pass
+
+        try:
+            mode, val = _autotrade_daily_cap_settings()
+            if str(mode or '').upper() != 'PCT' or abs(float(val or 0.0) - 8.0) > 1e-9:
+                _autotrade_set_daily_cap_settings('PCT', 8.0)
+                changed = True
+        except Exception:
+            try:
+                _autotrade_set_daily_cap_settings('PCT', 8.0)
+                changed = True
+            except Exception:
+                pass
+
+        try:
+            _autotrade_config_set('yver76_owner_runtime_profile_authority_version', 'yver76_2026_06_18_final_runtime_profile_authority')
+            _autotrade_config_set('yver76_owner_runtime_profile_last_reason', str(reason or 'startup')[:80])
+            _autotrade_config_set('yver76_owner_runtime_profile_last_ts', str(int(time.time())))
+        except Exception:
+            pass
+
+        try:
+            cfg = load_strategy_config(force=True)
+            if isinstance(cfg, dict):
+                prof = {
+                    'version': 'yver76_2026_06_18_final_runtime_profile_authority',
+                    'risk_pct': 0.30,
+                    'dynamic_risk_enabled': True,
+                    'dynamic_risk_max_effective_pct': 0.50,
+                    'max_open_trades': 12,
+                    'max_trades_per_day': 35,
+                    'open_risk_cap_pct': 5.0,
+                    'daily_risk_cap_pct': 8.0,
+                    'daily_realized_loss_stop_pct': 5.0,
+                    'require_setup_email_for_entry': False,
+                    'entry_window_min': 60,
+                    'max_entry_drift_pct': 2.0,
+                    'fixed_rr': 1.5,
+                    'strict_keep_edge_min_decided': 3,
+                    'strict_keep_edge_min_wr': 49.0,
+                    'strict_keep_edge_min_avgr': 0.05,
+                    'auto_blackout': 'unchanged/evidence-driven',
+                    'authority': 'forced at EOF startup, /autotrade_config, /autotrade_debug, and autotrade_job',
+                }
+                if cfg.get('yver76_owner_runtime_profile') != prof:
+                    cfg['yver76_owner_runtime_profile'] = prof
+                    save_strategy_config(cfg)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return bool(changed)
+
+try:
+    _yver76_force_owner_runtime_profile('eof_startup')
+except Exception:
+    pass
+
+try:
+    _YVER76_ORIG_AUTOTRADE_CONFIG_CMD = autotrade_config_cmd
+except Exception:
+    _YVER76_ORIG_AUTOTRADE_CONFIG_CMD = None
+
+async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _yver76_force_owner_runtime_profile('autotrade_config_cmd')
+    except Exception:
+        pass
+    if _YVER76_ORIG_AUTOTRADE_CONFIG_CMD is not None:
+        return await _YVER76_ORIG_AUTOTRADE_CONFIG_CMD(update, context)
+    await update.message.reply_text('AutoTrade config handler unavailable.')
+
+try:
+    _YVER76_ORIG_AUTOTRADE_DEBUG_CMD = autotrade_debug_cmd
+except Exception:
+    _YVER76_ORIG_AUTOTRADE_DEBUG_CMD = None
+
+async def autotrade_debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _yver76_force_owner_runtime_profile('autotrade_debug_cmd')
+    except Exception:
+        pass
+    if _YVER76_ORIG_AUTOTRADE_DEBUG_CMD is not None:
+        return await _YVER76_ORIG_AUTOTRADE_DEBUG_CMD(update, context)
+    await update.message.reply_text('AutoTrade debug handler unavailable.')
+
+try:
+    _YVER76_ORIG_AUTOTRADE_JOB = autotrade_job
+except Exception:
+    _YVER76_ORIG_AUTOTRADE_JOB = None
+
+async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _yver76_force_owner_runtime_profile('autotrade_job')
+    except Exception:
+        pass
+    if _YVER76_ORIG_AUTOTRADE_JOB is not None:
+        return await _YVER76_ORIG_AUTOTRADE_JOB(context)
+    return None
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v76'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v76'
+except Exception:
+    pass
+
+# =========================================================
+# end yver76 final runtime profile authority fix
 # =========================================================
 
 if __name__ == "__main__":
