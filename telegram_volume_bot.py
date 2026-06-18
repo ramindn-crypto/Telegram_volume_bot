@@ -1,3 +1,4 @@
+# yver78: makes the owner-selected AutoTrade runtime profile editable again; applies one-time defaults risk=1%, open risk cap=8%, daily risk cap=10%, max trades/day=100, then stops the yver76 recurring force from overwriting /autotrade_config edits. No TP/SL, leverage, blackout, setup generation, or Bybit order logic changed.
 # yver76: final runtime profile authority fix. Forces the owner-approved low-risk broad-sampling profile at EOF startup and before /autotrade_config, /autotrade_debug, and autotrade_job so stale Render DB rows cannot keep 50/200 caps, 15/40% caps, 90m/3% entries, dynamic TP, or decided=1. No TP/SL geometry, leverage, blackout, setup generation, or Bybit order mechanics changed.
 # yver75: owner threshold adjustment for broad-sampling live profile: strict KEEP live edge now uses decided>=3, WR>=49%, AvgR>=+0.05; dynamic risk tiers use the same minimum decided threshold while keeping 0.30% base / 0.50% max risk. No TP/SL, leverage, blackout, setup-generation, or Bybit order logic changed.
 # yver74: startup drift-repair for the owner-approved low-risk broad-sampling profile. Re-syncs stale runtime DB/config values so /autotrade_config matches 0.30% risk, 12/35 trade caps, 5%/8% risk caps, 60m/2% entry gates, fixed 1.5R TP, and WR/AvgR-gated dynamic risk. No setup generation, blackout engine, TP/SL geometry, leverage, or order placement mechanics changed.
@@ -43614,21 +43615,21 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (direct KEEP queue entry)',
             '',
             'Examples — risk / caps:',
-            '• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 0.3',
+            '• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 1.0',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.67',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90',
-            '• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5',
-            '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 8',
+            '• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 8',
+            '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10',
             '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true',
             '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5',
             '',
             'Examples — entry controls:',
             '• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 12',
-            '• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 35',
+            '• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 100',
             '• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0',
             '• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60',
             '',
@@ -43761,19 +43762,19 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Router: {'ON' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'OFF'} | Reverse disabled lanes: {'ON' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'OFF'} | Reverse setup RR/base: {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.50)):.2f}R",
             "",
             "Common commands",
-            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 0.3",
+            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.67",
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false",
             "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
             "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 1.5",
-            "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
-            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 8",
+            "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 8",
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0",
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
             "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (open fresh KEEP directly)",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 12",
-            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 35",
+            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 100",
             "• /autotrade_config FULL",
             "• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS none",
             "• /autotrade_config AUTO_BLACKOUT_STATUS",
@@ -70709,3 +70710,137 @@ except Exception:
 
 if __name__ == "__main__":
     main()
+
+
+# =========================================================
+# yver78 editable AutoTrade runtime defaults
+# =========================================================
+# v76/v77 intentionally forced the recovery profile before /autotrade_config,
+# /autotrade_debug and each autotrade_job tick so stale Render DB values could not
+# override the selected profile.  The owner now wants those values to be runtime
+# editable again from Telegram.  Therefore yver78 applies the new owner defaults
+# once, records a migration marker, then replaces the recurring yver76 force with
+# a no-op so future /autotrade_config edits persist.
+#
+# Owner-selected defaults:
+#   AUTOTRADE_RISK_PER_TRADE_PCT = 1.0
+#   AUTOTRADE_OPEN_RISK_CAP_PCT = 8.0
+#   AUTOTRADE_DAILY_RISK_CAP_PCT = 10.0 (PCT mode)
+#   AUTOTRADE_MAX_TRADES_PER_DAY = 100
+#
+# Everything else from the broad-sampling profile remains Telegram-editable too.
+# No TP/SL geometry, leverage, blackout, setup generation, or Bybit order logic is
+# changed.
+
+def _autotrade_apply_yver78_editable_owner_defaults() -> bool:
+    """Apply owner defaults once, without locking future Telegram edits."""
+    changed = False
+    try:
+        target_version = 'yver78_2026_06_18_editable_owner_defaults_risk1_cap8_daily10_maxday100'
+        try:
+            already = str(_autotrade_config_get('yver78_editable_owner_defaults_version', '') or '').strip().lower() == target_version
+        except Exception:
+            already = False
+        try:
+            reapply = env_bool('AUTOTRADE_YVER78_REAPPLY_OWNER_DEFAULTS', False)
+        except Exception:
+            reapply = False
+        if already and not reapply:
+            return False
+
+        targets = {
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 1.0,
+            AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: 8.0,
+            AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: 100,
+        }
+
+        def _same(cur, target) -> bool:
+            try:
+                if isinstance(target, int) and not isinstance(target, bool):
+                    return int(float(cur)) == int(target)
+                if isinstance(target, float):
+                    return abs(float(cur) - float(target)) < 1e-9
+                return str(cur).strip() == str(target).strip()
+            except Exception:
+                return False
+
+        for k, target in targets.items():
+            try:
+                cur = _autotrade_config_get(k, None)
+                if cur is None or str(cur).strip() == '' or not _same(cur, target):
+                    _autotrade_config_set(k, target)
+                    changed = True
+            except Exception:
+                try:
+                    _autotrade_config_set(k, target)
+                    changed = True
+                except Exception:
+                    pass
+
+        try:
+            mode, val = _autotrade_daily_cap_settings()
+            if str(mode or '').upper() != 'PCT' or abs(float(val or 0.0) - 10.0) > 1e-9:
+                _autotrade_set_daily_cap_settings('PCT', 10.0)
+                changed = True
+        except Exception:
+            try:
+                _autotrade_set_daily_cap_settings('PCT', 10.0)
+                changed = True
+            except Exception:
+                pass
+
+        try:
+            _autotrade_config_set('yver78_editable_owner_defaults_version', target_version)
+            _autotrade_config_set('yver78_runtime_values_are_telegram_editable', 'true')
+            _autotrade_config_set('yver78_owner_defaults_last_ts', str(int(time.time())))
+        except Exception:
+            pass
+
+        try:
+            cfg = load_strategy_config(force=True)
+            if isinstance(cfg, dict):
+                cfg['yver78_editable_owner_defaults'] = {
+                    'version': target_version,
+                    'risk_pct_default': 1.0,
+                    'open_risk_cap_pct_default': 8.0,
+                    'daily_risk_cap_pct_default': 10.0,
+                    'max_trades_per_day_default': 100,
+                    'editable_from_telegram': True,
+                    'note': 'Defaults applied once; yver76 recurring force is disabled so /autotrade_config edits persist.',
+                }
+                save_strategy_config(cfg)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return bool(changed)
+
+try:
+    _autotrade_apply_yver78_editable_owner_defaults()
+except Exception:
+    pass
+
+# Override the yver76 recurring authority hook.  autotrade_config_cmd,
+# autotrade_debug_cmd and autotrade_job are wrappers that call this global by name;
+# redefining it here makes those calls harmless, so Telegram config edits are not
+# overwritten on the next command/job tick.
+def _yver76_force_owner_runtime_profile(reason: str = 'startup') -> bool:
+    try:
+        _autotrade_config_set('yver78_last_noop_force_reason', str(reason or 'noop')[:80])
+        _autotrade_config_set('yver78_last_noop_force_ts', str(int(time.time())))
+    except Exception:
+        pass
+    return False
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v78'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v78'
+except Exception:
+    pass
+
+# =========================================================
+# end yver78 editable AutoTrade runtime defaults
+# =========================================================
