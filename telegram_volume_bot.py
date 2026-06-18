@@ -1,3 +1,4 @@
+# yver86: disables v85 automatic 24h self-block for Bybit trading-terms/permission errors, clears existing CL-style permission blocks, records a manual-acceptance notice instead, and adds lightweight setup-activity diagnostics. Bybit V5 exposes 110125 as an order rejection; no documented API endpoint is used to auto-accept legal trading terms. No TP/SL, leverage, setup generation, blackout, or order sizing logic changed.
 # yver78: makes the owner-selected AutoTrade runtime profile editable again; applies one-time defaults risk=1%, open risk cap=8%, daily risk cap=10%, max trades/day=100, then stops the yver76 recurring force from overwriting /autotrade_config edits. No TP/SL, leverage, blackout, setup generation, or Bybit order logic changed.
 # yver81: dynamic risk now scales the configured base risk by exact lane WR tiers: base risk for pass/min edge, ~1.25x for WR>=60%, and max multiplier for WR>=70%, with no absolute 0.35%/0.50% risk caps. Defaults dynamic risk ON, min/base/high score 55/60/70, max mult 1.50, and remains Telegram-editable.
 # yver76: final runtime profile authority fix. Forces the owner-approved low-risk broad-sampling profile at EOF startup and before /autotrade_config, /autotrade_debug, and autotrade_job so stale Render DB rows cannot keep 50/200 caps, 15/40% caps, 90m/3% entries, dynamic TP, or decided=1. No TP/SL geometry, leverage, blackout, setup generation, or Bybit order mechanics changed.
@@ -72225,6 +72226,387 @@ except Exception:
 
 # =========================================================
 # end yver85 analysis self-correction patch
+# =========================================================
+
+
+
+# =========================================================
+# yver86 Bybit trading-terms permission handling + no-setup diagnostics
+# =========================================================
+# Owner requested that the bot should not permanently self-block CL-style symbols
+# after Bybit retCode 110125.  Official Bybit V5 exposes this as an order rejection
+# ("You must agree to the Trading Terms before trading this contract"); the public
+# API surface used by this bot has no documented endpoint to sign/accept legal
+# trading terms on behalf of the account owner.  Therefore v86 disables the v85
+# 24h product-permission auto-block, clears any imported v85 CL block, preserves the
+# exact Bybit failure in diagnostics, and records an owner-action notice.  Once the
+# owner accepts the terms in Bybit UI, later orders are not blocked by the bot.
+#
+# Also records lightweight no-setup diagnostics so long quiet periods can be
+# distinguished from bot failure (session NONE / blackout / no eligible KEEP rows).
+
+YVER86_VERSION = 'yver86_2026_06_19_permission_notice_no_forced_block'
+YVER86_PERMISSION_NOTICE_KEY = 'yver86_last_bybit_trading_terms_notice'
+YVER86_PERMISSION_NOTICE_TS_KEY = 'yver86_last_bybit_trading_terms_notice_ts'
+YVER86_SETUP_ACTIVITY_KEY = 'yver86_last_setup_activity_note'
+YVER86_SETUP_ACTIVITY_TS_KEY = 'yver86_last_setup_activity_ts'
+
+
+def _yver86_permission_auto_block_enabled() -> bool:
+    """Default OFF: do not self-block CL after Bybit trading-terms errors.
+
+    The user can still enable the old v85 behaviour explicitly if they want a
+    temporary block instead of repeated exchange rejections:
+      /autotrade_config AUTOTRADE_EXCHANGE_PERMISSION_AUTO_BLOCK true
+    """
+    try:
+        raw = _autotrade_config_get('AUTOTRADE_EXCHANGE_PERMISSION_AUTO_BLOCK', os.environ.get('AUTOTRADE_EXCHANGE_PERMISSION_AUTO_BLOCK', 'false'))
+        return str(raw or '').strip().lower() in {'1', 'true', 'yes', 'on', 'enabled'}
+    except Exception:
+        return False
+
+
+def _yver86_clear_v85_permission_blocks() -> None:
+    try:
+        if not _yver86_permission_auto_block_enabled():
+            try:
+                _autotrade_config_set(globals().get('YVER85_EXCHANGE_PERMISSION_BLOCK_KEY', 'autotrade_exchange_permission_symbol_blocks_json'), '{}')
+            except Exception:
+                pass
+            try:
+                _autotrade_config_set('AUTOTRADE_EXCHANGE_PERMISSION_AUTO_BLOCK', 'false')
+                _autotrade_config_set('yver86_permission_mode', 'manual_accept_required_no_symbol_self_block')
+                _autotrade_config_set('yver86_permission_note', 'Bybit trading terms cannot be accepted through a documented V5 endpoint; accept manually in Bybit UI; bot will not keep a 24h v85 self-block.')
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+try:
+    _YVER86_ORIG_YVER85_NOTE_EXCHANGE_PERMISSION_BLOCK = _yver85_note_exchange_permission_block
+except Exception:
+    _YVER86_ORIG_YVER85_NOTE_EXCHANGE_PERMISSION_BLOCK = None
+
+
+def _yver85_note_exchange_permission_block(symbol: str, reason: str) -> None:
+    """v86: record notice; only self-block if owner explicitly enables it."""
+    try:
+        base = _symbol_base(str(symbol or '')).upper().strip()
+    except Exception:
+        base = str(symbol or '').upper().strip()
+    try:
+        reason_s = str(reason or '')[:300]
+        _autotrade_config_set(YVER86_PERMISSION_NOTICE_KEY, f'{base}:{reason_s}')
+        _autotrade_config_set(YVER86_PERMISSION_NOTICE_TS_KEY, str(int(time.time())))
+    except Exception:
+        pass
+    try:
+        if _yver86_permission_auto_block_enabled() and _YVER86_ORIG_YVER85_NOTE_EXCHANGE_PERMISSION_BLOCK is not None:
+            return _YVER86_ORIG_YVER85_NOTE_EXCHANGE_PERMISSION_BLOCK(symbol, reason)
+    except Exception:
+        pass
+
+
+try:
+    _YVER86_ORIG_YVER85_EXCHANGE_PERMISSION_BLOCKED = _yver85_exchange_permission_blocked
+except Exception:
+    _YVER86_ORIG_YVER85_EXCHANGE_PERMISSION_BLOCKED = None
+
+
+def _yver85_exchange_permission_blocked(symbol: str) -> tuple[bool, str]:
+    """v86: no symbol self-block by default; retain owner-editable opt-in."""
+    try:
+        if not _yver86_permission_auto_block_enabled():
+            return False, ''
+    except Exception:
+        return False, ''
+    if _YVER86_ORIG_YVER85_EXCHANGE_PERMISSION_BLOCKED is not None:
+        return _YVER86_ORIG_YVER85_EXCHANGE_PERMISSION_BLOCKED(symbol)
+    return False, ''
+
+
+try:
+    _YVER86_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON = _yver70_live_open_fail_block_reason
+except Exception:
+    _YVER86_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON = None
+
+
+def _yver70_live_open_fail_block_reason(uid: int, setup_id: str, symbol: str, side: str) -> str:
+    """Do not convert trading-terms failure into a v85 24h self-block by default."""
+    try:
+        if _yver86_permission_auto_block_enabled() and _YVER86_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON is not None:
+            return _YVER86_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON(uid, setup_id, symbol, side)
+    except Exception:
+        pass
+    try:
+        # Use the normal v70/v71 live-open cooldown path if available, but remove
+        # v85's extra exchange-permission symbol block from the reason chain.
+        if globals().get('_YVER85_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON') is not None:
+            return globals()['_YVER85_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON'](uid, setup_id, symbol, side)
+    except Exception:
+        pass
+    return ''
+
+
+def _yver86_record_setup_activity_note(note: str) -> None:
+    try:
+        _autotrade_config_set(YVER86_SETUP_ACTIVITY_KEY, str(note or '')[:240])
+        _autotrade_config_set(YVER86_SETUP_ACTIVITY_TS_KEY, str(int(time.time())))
+    except Exception:
+        pass
+
+
+try:
+    _YVER86_ORIG_SCREEN_REJECT_REASONS = globals().get('_scan_reject_reasons_cmd')
+except Exception:
+    _YVER86_ORIG_SCREEN_REJECT_REASONS = None
+
+
+# Wrap the background scan completion marker when present.  This is deliberately
+# best-effort only; it does not change setup generation.  It just leaves a small
+# breadcrumb in config for future analysis when the owner asks why no setup appeared.
+try:
+    _YVER86_ORIG_SETUP_MATRIX_POLICY_SOURCE_STATE_FOR_SETUP = _setup_matrix_policy_source_state_for_setup
+except Exception:
+    _YVER86_ORIG_SETUP_MATRIX_POLICY_SOURCE_STATE_FOR_SETUP = None
+
+
+def _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name: str = '', user_id: int = 0):
+    state = None
+    if _YVER86_ORIG_SETUP_MATRIX_POLICY_SOURCE_STATE_FOR_SETUP is not None:
+        state = _YVER86_ORIG_SETUP_MATRIX_POLICY_SOURCE_STATE_FOR_SETUP(setup_or_row, session_name=session_name, user_id=user_id)
+    try:
+        sym = str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or '').upper().strip()
+        pol = str((state or {}).get('policy') or '').upper().strip() if isinstance(state, dict) else ''
+        if sym and pol:
+            _yver86_record_setup_activity_note(f'last_policy_lookup:{sym}:{pol}:session={str(session_name or "").upper()}')
+    except Exception:
+        pass
+    return state
+
+
+try:
+    _yver86_clear_v85_permission_blocks()
+except Exception:
+    pass
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v86'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v86'
+except Exception:
+    pass
+
+# =========================================================
+# end yver86 Bybit trading-terms permission handling
+# =========================================================
+
+
+# =========================================================
+# yver87 Bybit trading-terms acceptance email alert
+# =========================================================
+# v87 keeps the v86 policy: the bot does not try to sign/accept legal Bybit
+# trading terms through an undocumented API.  Instead, whenever Bybit rejects a
+# live open with a trading-terms / risk-disclosure / contract-permission error
+# (e.g. retCode 110125 for CLUSDT), the owner gets a system email immediately so
+# they can open Bybit and accept the contract terms manually at the right time.
+# This is alert/diagnostic only; no TP/SL, sizing, entry gating, blacklist,
+# leverage, or order placement logic is changed.
+
+YVER87_VERSION = 'yver87_2026_06_19_bybit_permission_acceptance_email_alert'
+YVER87_PERMISSION_EMAIL_LAST_PREFIX = 'yver87_permission_email_last_ts'
+YVER87_PERMISSION_EMAIL_NOTICE_PREFIX = 'yver87_permission_email_last_notice'
+
+
+def _yver87_permission_email_enabled() -> bool:
+    try:
+        raw = _autotrade_config_get('AUTOTRADE_PERMISSION_EMAIL_ALERTS_ENABLED', os.environ.get('AUTOTRADE_PERMISSION_EMAIL_ALERTS_ENABLED', 'true'))
+        return str(raw or '').strip().lower() in {'1', 'true', 'yes', 'on', 'enabled'}
+    except Exception:
+        return True
+
+
+def _yver87_permission_email_cooldown_sec() -> float:
+    try:
+        return max(300.0, float(_autotrade_config_get('AUTOTRADE_PERMISSION_EMAIL_COOLDOWN_SEC', os.environ.get('AUTOTRADE_PERMISSION_EMAIL_COOLDOWN_SEC', '21600')) or 21600.0))
+    except Exception:
+        return 21600.0
+
+
+def _yver87_permission_error(reason: str) -> bool:
+    try:
+        r = str(reason or '').lower()
+        return (
+            '110125' in r
+            or '110123' in r
+            or 'trading terms' in r
+            or 'agree to the trading terms' in r
+            or ('risk disclosure' in r and ('confirm' in r or 'agree' in r or 'read' in r))
+            or ('permission' in r and 'trade' in r)
+            or ('contract' in r and 'terms' in r and ('agree' in r or 'accept' in r))
+        )
+    except Exception:
+        return False
+
+
+def _yver87_permission_email_key(uid: int, symbol: str) -> str:
+    try:
+        base = _symbol_base(str(symbol or '')).upper().strip()
+    except Exception:
+        base = str(symbol or '').upper().replace('USDT','').strip()
+    return f'{YVER87_PERMISSION_EMAIL_LAST_PREFIX}_{int(uid)}_{base}'
+
+
+def _yver87_permission_notice_key(uid: int, symbol: str) -> str:
+    try:
+        base = _symbol_base(str(symbol or '')).upper().strip()
+    except Exception:
+        base = str(symbol or '').upper().replace('USDT','').strip()
+    return f'{YVER87_PERMISSION_EMAIL_NOTICE_PREFIX}_{int(uid)}_{base}'
+
+
+def _yver87_should_send_permission_email(uid: int, symbol: str) -> bool:
+    try:
+        if not _yver87_permission_email_enabled():
+            return False
+        key = _yver87_permission_email_key(uid, symbol)
+        last = float(_autotrade_config_get(key, '0') or 0.0)
+        return (time.time() - last) >= _yver87_permission_email_cooldown_sec()
+    except Exception:
+        return True
+
+
+def _yver87_mark_permission_email_sent(uid: int, symbol: str, reason: str) -> None:
+    try:
+        _autotrade_config_set(_yver87_permission_email_key(uid, symbol), str(int(time.time())))
+        _autotrade_config_set(_yver87_permission_notice_key(uid, symbol), str(reason or '')[:240])
+        _autotrade_config_set('yver87_last_permission_email_alert', f'{int(uid)}:{str(symbol or "").upper()}:{str(reason or "")[:160]}')
+        _autotrade_config_set('yver87_last_permission_email_alert_ts', str(int(time.time())))
+    except Exception:
+        pass
+
+
+def _yver87_permission_email_body(symbol: str, side: str, setup_id: str, reason: str) -> tuple[str, str]:
+    try:
+        sym_linear = _bybit_linear_symbol(str(symbol or '').upper())
+    except Exception:
+        sym_linear = str(symbol or '').upper().strip()
+    try:
+        base = _symbol_base(sym_linear).upper()
+    except Exception:
+        base = sym_linear.replace('USDT','').upper()
+    side_s = str(side or '').upper().strip() or '-'
+    reason_s = str(reason or '').strip()
+    subject = f'⚠️ Bybit permission required — {sym_linear}'
+    trade_hint = f'https://www.bybit.com/trade/usdt/{sym_linear}' if sym_linear else 'Bybit Derivatives trade page'
+    body = (
+        f'PulseFutures tried to AutoTrade {base} / {sym_linear} {side_s}, but Bybit rejected the order because this contract needs your manual acceptance first.\n\n'
+        f'Symbol: {sym_linear}\n'
+        f'Side: {side_s}\n'
+        f'Setup ID: {str(setup_id or "-")}\n'
+        f'Bybit response: {reason_s}\n\n'
+        'What you need to do:\n'
+        f'1) Open Bybit on web or app.\n'
+        f'2) Go to Derivatives / USDT Perpetual and open the {sym_linear} contract page.\n'
+        f'3) Try to open the contract/trade panel. Bybit should show a Trading Terms / risk disclosure / agreement popup.\n'
+        f'4) Read and accept/confirm the terms.\n'
+        f'5) After acceptance, future PulseFutures AutoTrade attempts for this contract should be allowed by Bybit.\n\n'
+        f'Quick page hint: {trade_hint}\n\n'
+        'No live position was opened by the bot for this rejected attempt. Normal cooldown/diagnostics remain active.'
+    )
+    return subject, body
+
+
+def _yver87_send_permission_email_now(uid: int, symbol: str, side: str, setup_id: str, reason: str) -> bool:
+    try:
+        if int(uid or 0) <= 0:
+            return False
+        if not _yver87_permission_error(reason):
+            return False
+        if not _yver87_should_send_permission_email(int(uid), symbol):
+            return False
+        subject, body = _yver87_permission_email_body(symbol, side, setup_id, reason)
+        ok = bool(send_email(
+            subject,
+            body,
+            user_id_for_debug=int(uid),
+            enforce_trade_window=False,
+            bypass_user_email_master=True,
+        ))
+        if ok:
+            _yver87_mark_permission_email_sent(int(uid), symbol, reason)
+        else:
+            try:
+                _autotrade_config_set('yver87_last_permission_email_send_failed', f'{int(uid)}:{str(symbol or "").upper()}:{str(reason or "")[:160]}')
+                _autotrade_config_set('yver87_last_permission_email_send_failed_ts', str(int(time.time())))
+            except Exception:
+                pass
+        return ok
+    except Exception as e:
+        try:
+            _autotrade_config_set('yver87_last_permission_email_exception', f'{type(e).__name__}:{str(e)[:200]}')
+            _autotrade_config_set('yver87_last_permission_email_exception_ts', str(int(time.time())))
+        except Exception:
+            pass
+        return False
+
+
+def _yver87_send_permission_email_async(uid: int, symbol: str, side: str, setup_id: str, reason: str) -> None:
+    try:
+        if not _yver87_permission_email_enabled():
+            return
+        if int(uid or 0) <= 0 or not _yver87_permission_error(reason):
+            return
+        if not _yver87_should_send_permission_email(int(uid), symbol):
+            return
+        t = threading.Thread(
+            target=_yver87_send_permission_email_now,
+            args=(int(uid), str(symbol or ''), str(side or ''), str(setup_id or ''), str(reason or '')),
+            daemon=True,
+        )
+        t.start()
+    except Exception:
+        pass
+
+
+try:
+    _YVER87_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL = _yver70_note_live_open_fail
+except Exception:
+    _YVER87_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL = None
+
+
+def _yver70_note_live_open_fail(uid: int, setup_id: str, symbol: str, side: str, reason: str) -> None:
+    """v87: preserve v70/v85/v86 diagnostics, plus send owner email for terms/permission acceptance errors."""
+    try:
+        if _YVER87_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL is not None:
+            _YVER87_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL(uid, setup_id, symbol, side, reason)
+    finally:
+        try:
+            _yver87_send_permission_email_async(int(uid), str(symbol or ''), str(side or ''), str(setup_id or ''), str(reason or ''))
+        except Exception:
+            pass
+
+
+try:
+    _autotrade_config_set('AUTOTRADE_PERMISSION_EMAIL_ALERTS_ENABLED', _autotrade_config_get('AUTOTRADE_PERMISSION_EMAIL_ALERTS_ENABLED', 'true'))
+    _autotrade_config_set('AUTOTRADE_PERMISSION_EMAIL_COOLDOWN_SEC', _autotrade_config_get('AUTOTRADE_PERMISSION_EMAIL_COOLDOWN_SEC', '21600'))
+    _autotrade_config_set('yver87_permission_email_mode', 'send_manual_acceptance_email_on_bybit_trading_terms_or_permission_error')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v87'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v87'
+except Exception:
+    pass
+
+# =========================================================
+# end yver87 Bybit trading-terms acceptance email alert
 # =========================================================
 
 if __name__ == "__main__":
