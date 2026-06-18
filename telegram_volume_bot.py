@@ -4,7 +4,7 @@
 # yver75: owner threshold adjustment for broad-sampling live profile: strict KEEP live edge now uses decided>=3, WR>=49%, AvgR>=+0.05; dynamic risk tiers use the same minimum decided threshold while keeping 0.30% base / 0.50% max risk. No TP/SL, leverage, blackout, setup-generation, or Bybit order logic changed.
 # yver74: startup drift-repair for the owner-approved low-risk broad-sampling profile. Re-syncs stale runtime DB/config values so /autotrade_config matches 0.30% risk, 12/35 trade caps, 5%/8% risk caps, 60m/2% entry gates, fixed 1.5R TP, and WR/AvgR-gated dynamic risk. No setup generation, blackout engine, TP/SL geometry, leverage, or order placement mechanics changed.
 # yver73: low-risk broad-sampling live profile: AutoTrade samples fresh direct KEEP queue with 0.30% base risk, wider trade-count caps, 5%/8% portfolio caps, WR/AvgR-gated dynamic risk only for proven lanes, and keeps auto-blackout unchanged. No TP/SL geometry, leverage, setup generation, or order placement mechanics changed.
-# yver84: syncs AutoTrade strict KEEP edge with /setup_matrix policy evidence so fresh KEEP rows that pass decided/WR/AvgR are not incorrectly skipped as AUTOTRADE_STRICT; downstream risk/leverage/drift/blackout/Bybit safety remains unchanged.
+# yver85: adds final self-correction fixes: strict KEEP edge re-enabled/synced, legacy dynamic-risk max migrated from 1.67 to 1.50, and non-tradable Bybit product-permission failures (e.g. CL crude-oil agreement 110125) auto-block the symbol instead of retrying repeatedly.
 # yver71: improves AutoTrade diagnostics only: /autotrade_last and /setup_audit ATWhy now preserve exact LIVE_OPEN_FAILED / cooldown reason details (e.g. Bybit 110007), while leaving order/risk/TP/SL/leverage/KEEP logic unchanged.
 # yver70: adds a safe cooldown for repeated Bybit LIVE_OPEN_FAILED retries and sanitizes /autotrade_last rows so stale global detail cannot show another symbol's Entry/SL. No risk/TP/SL/leverage/KEEP-policy logic changed.
 # yver69: cleanup /autotrade_config help so Auto Blackout commands are visible in the clean view and old static blackout examples are no longer misleading; no live trading logic changed.
@@ -43630,7 +43630,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 1.0',
-            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.67',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90',
@@ -43776,7 +43776,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "Common commands",
             "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.67",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5",
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false",
             "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
             "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 1.5",
@@ -71942,6 +71942,289 @@ except Exception:
 
 # =========================================================
 # end yver84 AutoTrade strict-edge sync fix
+# =========================================================
+
+
+# =========================================================
+# yver85 analysis self-correction patch
+# =========================================================
+# 19-Jun 09:30 review checklist:
+# 1) Data consistency: AutoTrade/report/closed PnL were mostly aligned and the bot
+#    was profitable over the reviewed 24h, but /autotrade_config FULL showed
+#    AUTOTRADE_STRICT_KEEP_EDGE_ENABLED=false even though the owner's live-edge
+#    rule is decided>=3, WR>=49%, AvgR>=+0.05.
+# 2) Fault: CL repeatedly retried after Bybit error 110125 (crude-oil agreement
+#    required). This is not a strategy failure; it is an exchange/product permission
+#    failure. Repeating the same symbol every few minutes pollutes attempts and can
+#    consume AutoTrade cycles.
+# 3) Profitability/self-correction: keep WATCH off, keep matrix KEEP source-of-
+#    truth, but block known non-tradable permission errors automatically and use
+#    base-risk-relative dynamic risk max 1.50x by default.
+#
+# This patch does NOT change TP/SL geometry, order placement, leverage, blackout,
+# setup generation, or Bybit API order logic.
+
+YVER85_VERSION = 'yver85_2026_06_19_self_correction_strict_edge_exchange_permission_block'
+YVER85_EXCHANGE_PERMISSION_BLOCK_KEY = 'autotrade_exchange_permission_symbol_blocks_json'
+YVER85_EXCHANGE_PERMISSION_BLOCK_HOURS = float(os.environ.get('AUTOTRADE_EXCHANGE_PERMISSION_BLOCK_HOURS', '24') or 24)
+
+
+def _yver85_json_load(raw, default):
+    try:
+        if raw is None or str(raw).strip() == '':
+            return default
+        return json.loads(str(raw))
+    except Exception:
+        return default
+
+
+def _yver85_json_save(obj) -> str:
+    try:
+        return json.dumps(obj or {}, separators=(',', ':'), sort_keys=True)
+    except Exception:
+        return '{}'
+
+
+def _yver85_is_permission_error(reason: str) -> bool:
+    r = str(reason or '').lower()
+    # Bybit 110125: must agree to the crude-oil trading/risk agreement before CL can trade.
+    # Keep this generic enough for other product-agreement / permission-required messages.
+    return (
+        '110125' in r
+        or 'must_agree_to_the_crude_oil' in r
+        or 'crude_oil_tra' in r
+        or 'must agree to the crude oil' in r
+        or 'permission' in r and 'trade' in r
+        or 'agreement' in r and 'trade' in r
+    )
+
+
+def _yver85_note_exchange_permission_block(symbol: str, reason: str) -> None:
+    try:
+        base = _symbol_base(str(symbol or '')).upper().strip()
+        if not base:
+            return
+        ttl = max(1.0, min(72.0, float(globals().get('YVER85_EXCHANGE_PERMISSION_BLOCK_HOURS', 24) or 24)))
+        now = float(time.time())
+        exp = now + ttl * 3600.0
+        raw = _autotrade_config_get(YVER85_EXCHANGE_PERMISSION_BLOCK_KEY, '{}')
+        data = _yver85_json_load(raw, {})
+        if not isinstance(data, dict):
+            data = {}
+        data[base] = {
+            'expires_ts': float(exp),
+            'reason': str(reason or '')[:240],
+            'created_ts': float(now),
+            'source': 'yver85_exchange_permission_self_block',
+        }
+        _autotrade_config_set(YVER85_EXCHANGE_PERMISSION_BLOCK_KEY, _yver85_json_save(data))
+        _autotrade_config_set('yver85_last_exchange_permission_block', f'{base}:{str(reason or "")[:120]}')
+        _autotrade_config_set('yver85_last_exchange_permission_block_ts', str(int(now)))
+    except Exception:
+        pass
+
+
+def _yver85_exchange_permission_blocked(symbol: str) -> tuple[bool, str]:
+    try:
+        base = _symbol_base(str(symbol or '')).upper().strip()
+        if not base:
+            return False, ''
+        raw = _autotrade_config_get(YVER85_EXCHANGE_PERMISSION_BLOCK_KEY, '{}')
+        data = _yver85_json_load(raw, {})
+        if not isinstance(data, dict):
+            return False, ''
+        now = float(time.time())
+        changed = False
+        for k in list(data.keys()):
+            try:
+                exp = float((data.get(k) or {}).get('expires_ts') or 0.0)
+                if exp <= now:
+                    data.pop(k, None)
+                    changed = True
+            except Exception:
+                data.pop(k, None)
+                changed = True
+        if changed:
+            try:
+                _autotrade_config_set(YVER85_EXCHANGE_PERMISSION_BLOCK_KEY, _yver85_json_save(data))
+            except Exception:
+                pass
+        item = data.get(base)
+        if not item:
+            return False, ''
+        exp = float((item or {}).get('expires_ts') or 0.0)
+        if exp > now:
+            return True, f'exchange_permission_block:{base}:expires_ts={int(exp)}'
+    except Exception:
+        pass
+    return False, ''
+
+
+try:
+    _YVER85_ORIG_AUTOTRADE_SYMBOL_BLOCKED = _autotrade_symbol_blocked
+except Exception:
+    _YVER85_ORIG_AUTOTRADE_SYMBOL_BLOCKED = None
+
+
+def _autotrade_symbol_blocked(sym: str) -> tuple[bool, str]:
+    try:
+        ok, why = _yver85_exchange_permission_blocked(sym)
+        if ok:
+            return True, why
+    except Exception:
+        pass
+    if _YVER85_ORIG_AUTOTRADE_SYMBOL_BLOCKED is not None:
+        return _YVER85_ORIG_AUTOTRADE_SYMBOL_BLOCKED(sym)
+    return False, ''
+
+
+try:
+    _YVER85_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL = _yver70_note_live_open_fail
+except Exception:
+    _YVER85_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL = None
+
+
+def _yver70_note_live_open_fail(uid: int, setup_id: str, symbol: str, side: str, reason: str) -> None:
+    try:
+        if _YVER85_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL is not None:
+            _YVER85_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL(uid, setup_id, symbol, side, reason)
+    finally:
+        try:
+            if _yver85_is_permission_error(reason):
+                _yver85_note_exchange_permission_block(symbol, reason)
+        except Exception:
+            pass
+
+
+try:
+    _YVER85_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON = _yver70_live_open_fail_block_reason
+except Exception:
+    _YVER85_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON = None
+
+
+def _yver70_live_open_fail_block_reason(uid: int, setup_id: str, symbol: str, side: str) -> str:
+    try:
+        ok, why = _yver85_exchange_permission_blocked(symbol)
+        if ok:
+            return f'blocked_by_exchange_permission:{_symbol_base(str(symbol or "")).upper()}:{why}'
+    except Exception:
+        pass
+    if _YVER85_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON is not None:
+        return _YVER85_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON(uid, setup_id, symbol, side)
+    return ''
+
+
+def _autotrade_apply_yver85_runtime_sanity_defaults() -> bool:
+    """One-time sanity migration. Values remain owner-editable after this."""
+    changed = False
+    try:
+        target = YVER85_VERSION
+        already = str(_autotrade_config_get('yver85_runtime_sanity_version', '') or '').strip().lower() == target
+        reapply = False
+        try:
+            reapply = env_bool('AUTOTRADE_YVER85_REAPPLY_RUNTIME_SANITY', False)
+        except Exception:
+            reapply = False
+        if already and not reapply:
+            return False
+
+        # Owner's preferred live edge.  v84 had disabled the boolean while keeping
+        # thresholds visible; that is inconsistent with the requested runtime rule.
+        try:
+            cur = _autotrade_config_get(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, None)
+            if cur is None or str(cur).strip().lower() in {'0', 'false', 'off', 'no', ''}:
+                _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 1)
+                changed = True
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY, 3)
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY, 49.0)
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY, 0.05)
+        except Exception:
+            pass
+
+        # Migrate the old 1.67 recovery-profile multiplier to the owner's intended
+        # base-risk-relative max of 1.50x.  Do not overwrite other custom values.
+        try:
+            cur = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.5) or 1.5)
+            if abs(cur - 1.67) < 0.011:
+                _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.50)
+                changed = True
+        except Exception:
+            pass
+
+        try:
+            _autotrade_config_set('yver85_runtime_sanity_version', target)
+            _autotrade_config_set('yver85_runtime_sanity_note', 'strict KEEP edge enabled; old dynamic max 1.67 migrated to 1.50 if present; exchange permission errors auto-block symbols temporarily')
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return bool(changed)
+
+
+def _yver85_import_existing_permission_failures() -> None:
+    """Import already-recorded live-open permission failures once."""
+    try:
+        marker = 'yver85_existing_permission_failures_imported'
+        if str(_autotrade_config_get(marker, '') or '').strip() == YVER85_VERSION:
+            return
+        _yver70_live_open_fail_migrate()
+        now = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT symbol, reason, last_ts FROM autotrade_live_open_failures WHERE last_ts>=?",
+                (now - 7 * 86400.0,)
+            ).fetchall()
+        imported = 0
+        for r in rows or []:
+            try:
+                reason = str(r['reason'] or '')
+                if _yver85_is_permission_error(reason):
+                    _yver85_note_exchange_permission_block(str(r['symbol'] or ''), reason)
+                    imported += 1
+            except Exception:
+                pass
+        try:
+            _autotrade_config_set(marker, YVER85_VERSION)
+            _autotrade_config_set('yver85_existing_permission_failures_imported_count', int(imported))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+try:
+    _autotrade_apply_yver85_runtime_sanity_defaults()
+except Exception:
+    pass
+
+try:
+    _yver85_import_existing_permission_failures()
+except Exception:
+    pass
+
+# Update user-facing examples so /autotrade_config FULL reflects the intended
+# base-risk multiplier model.
+try:
+    _YVER85_ORIG_AUTOTRADE_CONFIG_CMD = autotrade_config_cmd
+except Exception:
+    _YVER85_ORIG_AUTOTRADE_CONFIG_CMD = None
+
+async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _YVER85_ORIG_AUTOTRADE_CONFIG_CMD is None:
+        return
+    return await _YVER85_ORIG_AUTOTRADE_CONFIG_CMD(update, context)
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v85'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v85'
+except Exception:
+    pass
+
+# =========================================================
+# end yver85 analysis self-correction patch
 # =========================================================
 
 if __name__ == "__main__":
