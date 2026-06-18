@@ -1,4 +1,6 @@
-# yver72: profit-protection profile after 18 Jun drawdown review: hardens AutoTrade live gate, re-enables email-matched execution, lowers risk/caps, disables dynamic risk/TP, and stops matrix KEEP from bypassing strict live edge. No TP/SL geometry, leverage calculation, setup generation, or order placement mechanics changed.
+# yver75: owner threshold adjustment for broad-sampling live profile: strict KEEP live edge now uses decided>=3, WR>=49%, AvgR>=+0.05; dynamic risk tiers use the same minimum decided threshold while keeping 0.30% base / 0.50% max risk. No TP/SL, leverage, blackout, setup-generation, or Bybit order logic changed.
+# yver74: startup drift-repair for the owner-approved low-risk broad-sampling profile. Re-syncs stale runtime DB/config values so /autotrade_config matches 0.30% risk, 12/35 trade caps, 5%/8% risk caps, 60m/2% entry gates, fixed 1.5R TP, and WR/AvgR-gated dynamic risk. No setup generation, blackout engine, TP/SL geometry, leverage, or order placement mechanics changed.
+# yver73: low-risk broad-sampling live profile: AutoTrade samples fresh direct KEEP queue with 0.30% base risk, wider trade-count caps, 5%/8% portfolio caps, WR/AvgR-gated dynamic risk only for proven lanes, and keeps auto-blackout unchanged. No TP/SL geometry, leverage, setup generation, or order placement mechanics changed.
 # yver71: improves AutoTrade diagnostics only: /autotrade_last and /setup_audit ATWhy now preserve exact LIVE_OPEN_FAILED / cooldown reason details (e.g. Bybit 110007), while leaving order/risk/TP/SL/leverage/KEEP logic unchanged.
 # yver70: adds a safe cooldown for repeated Bybit LIVE_OPEN_FAILED retries and sanitizes /autotrade_last rows so stale global detail cannot show another symbol's Entry/SL. No risk/TP/SL/leverage/KEEP-policy logic changed.
 # yver69: cleanup /autotrade_config help so Auto Blackout commands are visible in the clean view and old static blackout examples are no longer misleading; no live trading logic changed.
@@ -3305,6 +3307,311 @@ def _autotrade_apply_yver72_profit_protection_defaults() -> None:
         _autotrade_config_set('yver72_profit_protection_profile_version', target_version)
     except Exception:
         pass
+
+
+def _autotrade_apply_yver73_low_risk_broad_sampling_defaults() -> None:
+    """yver73: owner-approved low-risk broad-sampling profile.
+
+    Goal: take a broader, more representative sample of fresh KEEP setups without
+    repeating the 18-Jun drawdown pattern.  The account risk per trade is much
+    smaller, trade-count caps are wider, and dynamic risk is allowed only when the
+    exact lane has enough WR/AvgR evidence.  Auto-blackout remains evidence-driven
+    and unchanged.
+    """
+    try:
+        target_version = 'yver73_2026_06_18_low_risk_broad_sampling_profile'
+        if (not env_bool('AUTOTRADE_YVER73_REAPPLY_BROAD_SAMPLING_PROFILE', False)) and str(_autotrade_config_get('yver73_broad_sampling_profile_version', '') or '').strip().lower() == target_version:
+            return
+
+        desired = {
+            # Owner choice: broad sample, but tiny account risk per setup.
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 0.30,
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            # 0.30% base -> 0.50% max for the very best proven lanes.
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.67,
+            AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: 55.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: 60.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: 70.0,
+            AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: 1.0,
+
+            # Broader sample, bounded portfolio exposure.
+            AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: 12,
+            AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: 35,
+            AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: 5.0,
+            AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: 2.0,
+            AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY: 60,
+
+            # Direct KEEP queue is required for representative sampling. Emails are
+            # notifications; execution still must pass KEEP/edge/drift/risk/safety gates.
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 0,
+
+            # Keep fixed TP/RR while measuring whether broad sampling is profitable.
+            AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MIN_LIVE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MAX_LIVE_RR_KEY: 1.5,
+
+            # KEEP-only live mode.  Do not trade WATCH/TIGHTEN rows.  Exact lane must
+            # have enough evidence to justify real money, but 55-60% WR lanes stay at
+            # base risk rather than being boosted.
+            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: 8,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: 55.0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: 0.05,
+
+            # To keep the AutoTrade sample aligned with setup-audit KEEP, do not use
+            # realised AutoTrade combo edge as a separate biased filter at this stage.
+            AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 0,
+            AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
+
+            # Hard daily loss protection.
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: 5.0,
+        }
+        for k, v in desired.items():
+            try:
+                _autotrade_config_set(k, v)
+            except Exception:
+                pass
+        try:
+            _autotrade_set_daily_cap_settings('PCT', 8.0)
+        except Exception:
+            pass
+
+        try:
+            cfg = load_strategy_config(force=True)
+            cfg['yver73_low_risk_broad_sampling_profile'] = {
+                'risk_pct': 0.30,
+                'dynamic_risk_enabled': True,
+                'dynamic_risk_rule': 'base risk for WR>=55%; risk boost only when exact lane WR>=60/70 with AvgR evidence',
+                'max_open_trades': 12,
+                'max_trades_per_day': 35,
+                'open_risk_cap_pct': 5.0,
+                'daily_risk_cap_pct': 8.0,
+                'daily_realized_loss_stop_pct': 5.0,
+                'require_setup_email_for_entry': False,
+                'entry_window_min': 60,
+                'max_entry_drift_pct': 2.0,
+                'strict_keep_edge_min_decided': 8,
+                'strict_keep_edge_min_wr': 55.0,
+                'strict_keep_edge_min_avgr': 0.05,
+                'auto_blackout': 'unchanged/evidence-driven',
+            }
+            save_strategy_config(cfg)
+            apply_strategy_config(cfg)
+        except Exception:
+            pass
+
+        _autotrade_config_set('yver73_broad_sampling_profile_version', target_version)
+    except Exception:
+        pass
+
+
+def _autotrade_apply_yver74_broad_sampling_profile_sync() -> None:
+    """yver74: repair stale runtime config drift after yver73.
+
+    The 18-Jun 11:45 output showed only the 0.30% base risk had taken effect while
+    stale runtime DB values still showed max-open 50, max/day 200, open cap 15%,
+    daily cap 40%, entry window 90m, drift 3%, dynamic TP/RR ON, and weak strict
+    edge thresholds.  yver73 used a one-time marker, so a partially-applied DB could
+    remain out of sync.  This startup repair compares the live config to the
+    owner-approved broad-sampling profile and rewrites only mismatched keys.
+
+    Telegram edits after startup still work for that running process; a restart
+    intentionally restores this recovery profile until the owner changes version.
+    """
+    try:
+        target_version = 'yver74_2026_06_18_broad_sampling_profile_runtime_sync'
+        targets = {
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 0.30,
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.67,
+            AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY: 55.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY: 60.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY: 70.0,
+            AUTOTRADE_CFG_EMERGENCY_RISK_MAX_MULT_KEY: 1.0,
+
+            # Broad sampling, but bounded account exposure.
+            AUTOTRADE_CFG_MAX_OPEN_TRADES_KEY: 12,
+            AUTOTRADE_CFG_MAX_TRADES_PER_DAY_KEY: 35,
+            AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: 5.0,
+            AUTOTRADE_CFG_MAX_ENTRY_DRIFT_PCT_KEY: 2.0,
+            AUTOTRADE_CFG_ENTRY_WINDOW_MIN_KEY: 60,
+            AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY: 0,
+
+            # Fixed 1.5R for audit/live comparison while forward testing.
+            AUTOTRADE_CFG_TP_RR_CAP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_TP_RR_ENABLED_KEY: 0,
+            AUTOTRADE_CFG_DYNAMIC_TP_BASE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MIN_LIVE_RR_KEY: 1.5,
+            AUTOTRADE_CFG_MAX_LIVE_RR_KEY: 1.5,
+
+            # KEEP-only + exact lane edge threshold before live money.
+            AUTOTRADE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            USER_VISIBLE_CFG_ALLOW_WATCH_POLICY_KEY: 0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: 8,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: 55.0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: 0.05,
+            AUTOTRADE_CFG_REQUIRE_REALIZED_COMBO_EDGE_KEY: 0,
+            AUTOTRADE_CFG_CONTEXT_FEED_GUARD_ENABLED_KEY: 1,
+
+            # Hard daily-loss protection.
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: 5.0,
+        }
+
+        def _same_value(cur, target) -> bool:
+            try:
+                if isinstance(target, int) and not isinstance(target, bool):
+                    return int(float(cur)) == int(target)
+                if isinstance(target, float):
+                    return abs(float(cur) - float(target)) < 1e-9
+                return str(cur).strip() == str(target).strip()
+            except Exception:
+                return False
+
+        changed = False
+        for k, target in targets.items():
+            try:
+                cur = _autotrade_config_get(k, None)
+                if cur is None or str(cur).strip() == '' or not _same_value(cur, target):
+                    _autotrade_config_set(k, target)
+                    changed = True
+            except Exception:
+                try:
+                    _autotrade_config_set(k, target)
+                    changed = True
+                except Exception:
+                    pass
+
+        try:
+            mode, val = _autotrade_daily_cap_settings()
+            if str(mode or '').upper() != 'PCT' or abs(float(val or 0.0) - 8.0) > 1e-9:
+                _autotrade_set_daily_cap_settings('PCT', 8.0)
+                changed = True
+        except Exception:
+            try:
+                _autotrade_set_daily_cap_settings('PCT', 8.0)
+                changed = True
+            except Exception:
+                pass
+
+        # Keep a readable profile marker for /why/debugging and also repair strategy_config
+        # metadata so future reviews can see which risk profile was active.
+        try:
+            cfg = load_strategy_config(force=True)
+            prof = dict(cfg.get('yver74_broad_sampling_profile_sync') or {})
+            new_prof = {
+                'risk_pct': 0.30,
+                'dynamic_risk_enabled': True,
+                'dynamic_risk_rule': 'boost only by exact lane WR/AvgR evidence: base 55-60%, 0.35% at 60%+/AvgR>=0.25, 0.50% at 70%+/AvgR>=0.40',
+                'max_open_trades': 12,
+                'max_trades_per_day': 35,
+                'open_risk_cap_pct': 5.0,
+                'daily_risk_cap_pct': 8.0,
+                'daily_realized_loss_stop_pct': 5.0,
+                'require_setup_email_for_entry': False,
+                'entry_window_min': 60,
+                'max_entry_drift_pct': 2.0,
+                'fixed_rr': 1.5,
+                'strict_keep_edge_min_decided': 8,
+                'strict_keep_edge_min_wr': 55.0,
+                'strict_keep_edge_min_avgr': 0.05,
+                'blackout': 'unchanged; auto-blackout still evidence-driven',
+            }
+            if prof != new_prof:
+                cfg['yver74_broad_sampling_profile_sync'] = new_prof
+                save_strategy_config(cfg)
+                try:
+                    apply_strategy_config(cfg)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if changed or str(_autotrade_config_get('yver74_broad_sampling_profile_sync_version', '') or '').strip().lower() != target_version:
+            _autotrade_config_set('yver74_broad_sampling_profile_sync_version', target_version)
+    except Exception:
+        pass
+
+
+def _autotrade_apply_yver75_owner_edge_threshold_sync() -> None:
+    """yver75: owner-approved live edge threshold adjustment.
+
+    Review of /setup_matrix policy at 18-Jun 11:48 showed many KEEP rows with
+    meaningful but still small samples.  The owner wants broad sampling to stay
+    representative, but not to include 1-2 sample lanes.  Therefore the live
+    strict KEEP edge is set to decided>=3, WR>=49%, AvgR>=+0.05.
+
+    This does not change matrix generation, blackout, TP/SL geometry, leverage,
+    liquidation safety, Bybit order placement, or the 0.30% base risk profile.
+    """
+    try:
+        target_version = 'yver75_2026_06_18_owner_edge_threshold_3_49_005'
+        targets = {
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY: 3,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY: 49.0,
+            AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY: 0.05,
+        }
+
+        def _same_value(cur, target) -> bool:
+            try:
+                if isinstance(target, int) and not isinstance(target, bool):
+                    return int(float(cur)) == int(target)
+                if isinstance(target, float):
+                    return abs(float(cur) - float(target)) < 1e-9
+                return str(cur).strip() == str(target).strip()
+            except Exception:
+                return False
+
+        changed = False
+        for k, target in targets.items():
+            try:
+                cur = _autotrade_config_get(k, None)
+                if cur is None or str(cur).strip() == '' or not _same_value(cur, target):
+                    _autotrade_config_set(k, target)
+                    changed = True
+            except Exception:
+                try:
+                    _autotrade_config_set(k, target)
+                    changed = True
+                except Exception:
+                    pass
+
+        try:
+            cfg = load_strategy_config(force=True)
+            prof = dict(cfg.get('yver75_owner_edge_threshold_sync') or {})
+            new_prof = {
+                'strict_keep_edge_min_decided': 3,
+                'strict_keep_edge_min_wr': 49.0,
+                'strict_keep_edge_min_avgr': 0.05,
+                'dynamic_risk_rule': 'base risk once exact lane passes decided>=3/WR>=49/AvgR>=+0.05; boost only at 60%+/70%+ WR tiers',
+                'risk_pct': 0.30,
+                'dynamic_risk_max_effective_pct': 0.50,
+                'reason': 'owner requested broader representative sampling while excluding 1-2 sample lanes',
+            }
+            if prof != new_prof:
+                cfg['yver75_owner_edge_threshold_sync'] = new_prof
+                save_strategy_config(cfg)
+                try:
+                    apply_strategy_config(cfg)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if changed or str(_autotrade_config_get('yver75_owner_edge_threshold_sync_version', '') or '').strip().lower() != target_version:
+            _autotrade_config_set('yver75_owner_edge_threshold_sync_version', target_version)
+    except Exception:
+        pass
+
 
 def _setup_identity_key(symbol: str = '', side: str = '', entry: float = 0.0, sl: float = 0.0, tp: float = 0.0, engine: str = '') -> str:
     try:
@@ -8003,6 +8310,9 @@ try:
     _autotrade_apply_yver44_direct_keep_queue_fix()
     _autotrade_apply_yver45_directional_guard_and_direct_queue_fix()
     _autotrade_apply_yver72_profit_protection_defaults()
+    _autotrade_apply_yver73_low_risk_broad_sampling_defaults()
+    _autotrade_apply_yver74_broad_sampling_profile_sync()
+    _autotrade_apply_yver75_owner_edge_threshold_sync()
 except Exception:
     pass
 
@@ -14334,12 +14644,65 @@ def _autotrade_dynamic_risk_score(uid: int, setup, session_name: str = '', regim
         else:
             mult = 1.0 - ((base_score - score) / max(1.0, base_score - low_score)) * (1.0 - min_mult)
         mult = float(_clamp(mult, min_mult, max_mult))
+
+        # yver73: WR/AvgR-gated dynamic risk.  The score can never boost risk unless
+        # the exact Family-Session-Strategy-Side lane has enough proven evidence.
+        # This keeps broad sampling representative while preventing high-confidence
+        # but low-WR lanes from receiving larger size.
+        evidence_dec = 0
+        evidence_wr = 0.0
+        evidence_avg = 0.0
+        evidence_target_mult = 1.0
+        try:
+            exact_m = dict(((data or {}).get('combo_strategy_side_metrics') or {}).get(str(combo_strategy_side or '').upper().strip()) or {})
+            evidence_dec = int(exact_m.get('decided') or 0)
+            evidence_wr = float(exact_m.get('wr') or 0.0)
+            evidence_avg = float(exact_m.get('avg_r') or 0.0)
+            base_pct = max(0.0001, float(_autotrade_risk_per_trade_pct() or 0.0))
+            # yver75: use the owner's live edge minimum for evidence sample size.
+            # Base risk is allowed once the lane passes strict KEEP edge (default now
+            # decided>=3, WR>=49%, AvgR>=+0.05); boosts are still reserved for
+            # stronger 60%/70% WR tiers.
+            try:
+                min_dec_for_risk = max(1, int(_autotrade_strict_keep_edge_min_decided()))
+            except Exception:
+                min_dec_for_risk = 3
+            try:
+                min_wr_for_base = float(_autotrade_strict_keep_edge_min_wr())
+            except Exception:
+                min_wr_for_base = 49.0
+            try:
+                min_avg_for_base = float(_autotrade_strict_keep_edge_min_avgr())
+            except Exception:
+                min_avg_for_base = 0.05
+            if evidence_dec >= min_dec_for_risk and evidence_wr >= 70.0 and evidence_avg >= 0.40:
+                evidence_target_mult = min(float(max_mult), 0.50 / base_pct)
+                components.append(f"risk_tier:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}->0.50%cap")
+            elif evidence_dec >= min_dec_for_risk and evidence_wr >= 60.0 and evidence_avg >= 0.25:
+                evidence_target_mult = min(float(max_mult), 0.35 / base_pct)
+                components.append(f"risk_tier:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}->0.35%cap")
+            elif evidence_dec >= min_dec_for_risk and evidence_wr >= min_wr_for_base and evidence_avg >= min_avg_for_base:
+                evidence_target_mult = 1.0
+                components.append(f"risk_tier:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}->base")
+            else:
+                evidence_target_mult = 1.0
+                components.append(f"risk_tier:no_boost:WR{evidence_wr:.1f}/AvgR{evidence_avg:+.2f}/n{evidence_dec}")
+            # Allow the composite score to reduce/keep base, but never exceed the
+            # WR/AvgR evidence tier.
+            mult = float(_clamp(min(float(mult), float(evidence_target_mult)), 1.0, float(max_mult)))
+        except Exception as _tier_exc:
+            components.append(f"risk_tier_error:{type(_tier_exc).__name__}")
+            mult = float(_clamp(float(mult), 1.0, float(max_mult)))
         return {
             'enabled': True,
             'score': float(score),
             'unclamped_score': float(unclamped_score),
             'multiplier': float(mult),
-            'components': components[:18],
+            'components': components[:22],
+            'edge_decided': int(evidence_dec),
+            'edge_wr': float(evidence_wr),
+            'edge_avg_r': float(evidence_avg),
+            'edge_target_mult': float(evidence_target_mult),
             'family': fam,
             'session': sess,
             'side': side,
@@ -14403,6 +14766,10 @@ def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd:
                 'dynamic_risk_side': str(score_info.get('side') or ''),
                 'dynamic_risk_hour': str(score_info.get('hour') or ''),
                 'dynamic_risk_rr': float(score_info.get('rr') or 0.0),
+                'dynamic_risk_edge_decided': int(score_info.get('edge_decided') or 0),
+                'dynamic_risk_edge_wr': float(score_info.get('edge_wr') or 0.0),
+                'dynamic_risk_edge_avg_r': float(score_info.get('edge_avg_r') or 0.0),
+                'dynamic_risk_edge_target_mult': float(score_info.get('edge_target_mult') or 0.0),
             })
         except Exception:
             pass
@@ -43246,29 +43613,29 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (direct KEEP queue entry)',
             '',
             'Examples — risk / caps:',
-            '• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.5',
+            '• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 0.3',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 1.0',
-            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.67',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90',
             '• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 20',
-            '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 20',
+            '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 8',
             '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true',
             '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 25',
             '',
             'Examples — entry controls:',
-            '• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20',
-            '• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 0   (unlimited)',
+            '• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 12',
+            '• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 35',
             '• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0',
             '• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60',
             '',
             'Examples — TP/SL and RR:',
-            '• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED true',
+            '• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false',
             '• /autotrade_config AUTOTRADE_DYNAMIC_TP_BASE_RR 1.5',
             '• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5',
-            '• /autotrade_config AUTOTRADE_MAX_LIVE_RR 2.0',
+            '• /autotrade_config AUTOTRADE_MAX_LIVE_RR 1.5',
             '• /autotrade_config AUTOTRADE_TP_RR_CAP_ENABLED true',
             '• /autotrade_config AUTOTRADE_STRICT_TPSL_ONLY true',
             '• /autotrade_config AUTOTRADE_IMMUTABLE_TPSL_AFTER_ENTRY true',
@@ -43316,8 +43683,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_ALLOW_WATCH_POLICY false',
             '• /autotrade_config USER_VISIBLE_ALLOW_WATCH_POLICY false',
             '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_ENABLED true',
-            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 1',
-            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 49',
+            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_DECIDED 8',
+            '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_WR 55',
             '• /autotrade_config AUTOTRADE_STRICT_KEEP_EDGE_MIN_AVGR 0.05',
             '• /autotrade_config AUTOTRADE_REQUIRE_REALIZED_COMBO_EDGE false',
             '• /autotrade_config AUTOTRADE_CONTEXT_FEED_GUARD_ENABLED true',
@@ -43393,19 +43760,19 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Router: {'ON' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'OFF'} | Reverse disabled lanes: {'ON' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'OFF'} | Reverse setup RR/base: {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.50)):.2f}R",
             "",
             "Common commands",
-            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1.5",
+            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 0.3",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5",
-            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED true",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.67",
+            "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false",
             "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
-            "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 2.0",
+            "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 1.5",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 5",
-            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 8",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0",
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
             "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (open fresh KEEP directly)",
-            "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 20",
-            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 0   (unlimited)",
+            "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 12",
+            "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 35",
             "• /autotrade_config FULL",
             "• /autotrade_config AUTOTRADE_BLOCKED_SYMBOLS none",
             "• /autotrade_config AUTO_BLACKOUT_STATUS",
