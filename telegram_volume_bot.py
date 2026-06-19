@@ -41934,7 +41934,7 @@ KNOWN_COMMANDS = sorted(set([
     "notify_on", "notify_off",
     "trade_window",
     "email_test", "email_decision",
-    "bigmove_alert",
+    "bigmove_alert", "engine_health", "engine_probe",
 
     # Cooldowns (user)
     "cooldowns", "cooldown",
@@ -65913,6 +65913,8 @@ def main():
     app.add_handler(CommandHandler("sessions_unlimited_off", sessions_unlimited_off_cmd, block=False))
 
     app.add_handler(CommandHandler("bigmove_alert", bigmove_alert_cmd, block=False))
+    app.add_handler(CommandHandler("engine_health", engine_health_cmd, block=False))
+    app.add_handler(CommandHandler("engine_probe", engine_probe_cmd, block=False))
     app.add_handler(CommandHandler("notify_on", notify_on, block=False))
     app.add_handler(CommandHandler("notify_off", notify_off, block=False))
     # Fallback: pasted "invisible-prefix" /size from mobile email clients
@@ -72890,6 +72892,367 @@ except Exception:
     pass
 # =========================================================
 # end yver89 BigMove/F8 setup pipeline sync fix
+# =========================================================
+
+
+# =========================================================
+# yver90 Engine Health / Probe for F8 BigMove and F9 Multi-Day
+# =========================================================
+# Adds admin diagnostics proving the two special engines are alive and flowing
+# through the normal setup pipeline.  These commands are read-only/dry-run:
+#   /engine_health F8 [hours]
+#   /engine_health F9 [hours]
+#   /engine_probe F8
+#   /engine_probe F9
+# No email, no live trade, no setup row pollution.
+
+def _yver90_owner_uid(update=None) -> int:
+    try:
+        return int(globals().get('AUTOTRADE_OWNER_UID') or 0) or int(getattr(getattr(update, 'effective_user', None), 'id', 0) or 0)
+    except Exception:
+        return int(globals().get('AUTOTRADE_OWNER_UID') or 0) if str(globals().get('AUTOTRADE_OWNER_UID') or '').strip().isdigit() else 0
+
+
+def _yver90_melb_time(ts: float | None) -> str:
+    try:
+        ts_f = float(ts or 0.0)
+        if ts_f <= 0:
+            return '-'
+        return datetime.fromtimestamp(ts_f, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        return '-'
+
+
+def _yver90_table_exists(conn, table: str) -> bool:
+    try:
+        return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (str(table),)).fetchone())
+    except Exception:
+        return False
+
+
+def _yver90_table_columns(conn, table: str) -> list[str]:
+    try:
+        return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall() or []]
+    except Exception:
+        return []
+
+
+def _yver90_time_col(cols: list[str], table: str = '') -> str:
+    for c in ('created_ts', 'event_ts', 'executable_ts', 'emailed_ts', 'updated_ts', 'signal_created_ts'):
+        if c in cols:
+            return c
+    if str(table) == 'setup_combo_policy' and 'updated_ts' in cols:
+        return 'updated_ts'
+    return ''
+
+
+def _yver90_fetch_rows(conn, table: str, since_ts: float = 0.0, uid: int = 0, limit: int = 2500) -> list[dict]:
+    try:
+        if not _yver90_table_exists(conn, table):
+            return []
+        cols = _yver90_table_columns(conn, table)
+        if not cols:
+            return []
+        where = []
+        params = []
+        if 'user_id' in cols and int(uid or 0) > 0:
+            where.append('user_id IN (?,0)')
+            params.extend([int(uid), 0])
+        tcol = _yver90_time_col(cols, table)
+        if tcol and float(since_ts or 0.0) > 0:
+            where.append(f'{tcol} >= ?')
+            params.append(float(since_ts))
+        sql = f"SELECT * FROM {table}"
+        if where:
+            sql += ' WHERE ' + ' AND '.join(where)
+        if tcol:
+            sql += f' ORDER BY {tcol} DESC'
+        sql += f' LIMIT {int(limit or 2500)}'
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall() or []]
+    except Exception:
+        return []
+
+
+def _yver90_engine_match(row: dict, engine: str, family_map: dict | None = None) -> bool:
+    try:
+        eng = str(engine or '').upper().strip()
+        sid = str((row or {}).get('setup_id') or '').strip()
+        if sid and family_map:
+            mapped = str(family_map.get(sid) or '').upper()
+            if eng == 'F8' and ('F8' in mapped or 'BIGMOVE' in mapped or 'BIG_MOVE' in mapped):
+                return True
+            if eng == 'F9' and ('F9' in mapped or 'MULTIDAY' in mapped or 'MULTI_DAY' in mapped):
+                return True
+        fields = []
+        for k in ('family','engine','family_id','source','source_kind','stage','mode','status','details_json','note','entry_reason','strategy_reason','setup_id'):
+            v = (row or {}).get(k)
+            if v is not None:
+                fields.append(str(v))
+        text = ' '.join(fields).upper()
+        if eng == 'F8':
+            return ('F8' in text) or ('BIGMOVE' in text) or ('BIG_MOVE' in text)
+        if eng == 'F9':
+            return ('F9' in text) or ('MULTIDAY' in text) or ('MULTI_DAY' in text) or ('MULTI-DAY' in text)
+        return False
+    except Exception:
+        return False
+
+
+def _yver90_build_family_map(rows_by_table: dict[str, list[dict]]) -> dict:
+    out = {}
+    try:
+        for table in ('setup_audit_results', 'generated_setups', 'executable_setups', 'signals'):
+            for r in rows_by_table.get(table, []) or []:
+                sid = str(r.get('setup_id') or '').strip()
+                if not sid:
+                    continue
+                fam_txt = ' '.join(str(r.get(k) or '') for k in ('family','engine','family_id','source_kind','source','details_json','note'))
+                if fam_txt.strip():
+                    out[sid] = fam_txt.upper()
+    except Exception:
+        pass
+    return out
+
+
+def _yver90_status_counts(rows: list[dict], field_candidates: tuple[str, ...]) -> dict[str, int]:
+    d = {}
+    try:
+        for r in rows or []:
+            val = ''
+            for f in field_candidates:
+                if str(r.get(f) or '').strip():
+                    val = str(r.get(f) or '').strip().upper()
+                    break
+            if not val:
+                val = '-'
+            d[val] = d.get(val, 0) + 1
+    except Exception:
+        pass
+    return d
+
+
+def _yver90_counts_line(title: str, rows: list[dict], time_fields: tuple[str, ...] = ('created_ts','event_ts','executable_ts','emailed_ts','updated_ts')) -> str:
+    try:
+        latest = 0.0
+        for r in rows or []:
+            for f in time_fields:
+                if f in r and float(r.get(f) or 0.0) > latest:
+                    latest = float(r.get(f) or 0.0)
+        return f"{title}: {len(rows or [])} | latest: {_yver90_melb_time(latest)}"
+    except Exception:
+        return f"{title}: {len(rows or [])} | latest: -"
+
+
+def _yver90_top_counts(d: dict, max_items: int = 5) -> str:
+    try:
+        items = sorted(d.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:int(max_items or 5)]
+        return ', '.join([f'{k}:{v}' for k, v in items]) or '-'
+    except Exception:
+        return '-'
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    hours = max(1, min(168, int(hours or 24)))
+    since_ts = float(time.time()) - float(hours) * 3600.0
+    now_txt = _yver90_melb_time(time.time())
+    try:
+        _setup_audit_migrate()
+    except Exception:
+        pass
+    rows_by_table = {}
+    tables = ['setup_audit_results', 'generated_setups', 'executable_setups', 'signals', 'emailed_setups', 'setup_pipeline_events']
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            for t in tables:
+                rows_by_table[t] = _yver90_fetch_rows(conn, t, since_ts=since_ts, uid=int(uid or 0), limit=3500)
+            family_map = _yver90_build_family_map(rows_by_table)
+            matched = {t: [r for r in rows_by_table.get(t, []) if _yver90_engine_match(r, eng, family_map)] for t in tables}
+            # Policy rows are current-state, not window-limited.
+            policy_rows = []
+            if _yver90_table_exists(conn, 'setup_combo_policy'):
+                policy_all = _yver90_fetch_rows(conn, 'setup_combo_policy', since_ts=0.0, uid=int(uid or 0), limit=1000)
+                policy_rows = [r for r in policy_all if _yver90_engine_match(r, eng, family_map)]
+    except Exception as e:
+        return f"🧪 Engine Health — {eng}\n━━━━━━━━━━━━━━━━━━━━\nStatus: ERROR | {type(e).__name__}: {e}"
+
+    audit = matched.get('setup_audit_results', [])
+    gen = matched.get('generated_setups', [])
+    exe = matched.get('executable_setups', [])
+    sig = matched.get('signals', [])
+    emailed = matched.get('emailed_setups', [])
+    pipe = matched.get('setup_pipeline_events', [])
+    audit_counts = _yver90_status_counts(audit, ('result', 'status'))
+    policy_counts = _yver90_status_counts(policy_rows, ('status',))
+    pipe_stage_counts = _yver90_status_counts(pipe, ('stage',))
+    pipe_status_counts = _yver90_status_counts(pipe, ('status',))
+
+    status = 'OK'
+    reasons = []
+    if eng == 'F8':
+        reasons.append('BigMove alert email is separate; setup generation should continue even when alert email is OFF.')
+        if len(pipe) == 0 and len(audit) == 0 and len(gen) == 0 and len(exe) == 0:
+            status = 'NO_RECENT_F8_ACTIVITY'
+            reasons.append('No F8 rows/events found in this window. Wait for BigMove trigger or run /engine_probe F8 to verify code path.')
+    else:
+        if len(sig) == 0 and len(audit) == 0 and len(gen) == 0 and len(exe) == 0:
+            status = 'OK_NO_RECENT_F9_SETUP'
+            reasons.append('No F9 setup rows in this window. This can be normal if repeated-leader/loser entry conditions did not pass.')
+    if len(policy_rows) == 0:
+        reasons.append(f'No current setup_matrix policy rows for {eng}; this is expected until the lane has evidence, but should be visible once candidates are created.')
+
+    lines = []
+    lines.append(f"🧪 Engine Health — {eng} {'BigMove' if eng == 'F8' else 'Multi-Day'}")
+    lines.append('━━━━━━━━━━━━━━━━━━━━')
+    lines.append(f"Window: last {hours}h | Now: {now_txt}")
+    try:
+        cfg = load_strategy_config(force=False) or {}
+        engines = ','.join([str(x).upper().strip() for x in (cfg.get('execution_engines_allowed') or []) if str(x).strip()]) or '-'
+        lines.append(f"Configured engines: {engines} | {eng} active: {'YES' if eng in {x.strip().upper() for x in engines.split(',')} else 'UNKNOWN'}")
+    except Exception:
+        pass
+    if eng == 'F8':
+        try:
+            user = get_user(int(uid)) or {}
+            p15, p1, p4 = _user_bigmove_thresholds(user)
+            minv = _user_bigmove_min_vol_usd(user)
+            on = bool(int((user or {}).get('bigmove_alert_on', (user or {}).get('bigmove_alert', 1)) or 0))
+            lines.append(f"BigMove alert email: {'ON' if on else 'OFF'} | setup generation: ALWAYS ON")
+            lines.append(f"BigMove thresholds: 15m≥{float(p15):.2f}% | 1H≥{float(p1):.2f}% | 4H≥{float(p4):.2f}% | min vol ${float(minv)/1_000_000:.1f}M")
+        except Exception:
+            pass
+    else:
+        lines.append(f"F9 settings: days≥{int(F9_MIN_DAYS or 2)} in {int(F9_LOOKBACK_DAYS or 4)}d | min vol ${float(F9_MIN_FUT_VOL_USD or 0.0)/1_000_000:.1f}M | max items {int(F9_MAX_ITEMS or 0)}")
+    lines.append('────────────────────')
+    lines.append(f"Status: {status}")
+    lines.append(_yver90_counts_line('Signals rows', sig))
+    lines.append(_yver90_counts_line('Generated setup rows', gen))
+    lines.append(_yver90_counts_line('Executable queue rows', exe, ('executable_ts','created_ts','signal_created_ts')))
+    lines.append(_yver90_counts_line('Setup audit rows', audit))
+    lines.append(_yver90_counts_line('Emailed setup rows', emailed, ('emailed_ts','created_ts')))
+    lines.append(_yver90_counts_line('Pipeline events', pipe, ('event_ts','created_ts')))
+    lines.append(f"Audit results: {_yver90_top_counts(audit_counts)}")
+    lines.append(f"Pipeline stages: {_yver90_top_counts(pipe_stage_counts)}")
+    lines.append(f"Pipeline statuses: {_yver90_top_counts(pipe_status_counts)}")
+    lines.append('────────────────────')
+    lines.append(f"Current /setup_matrix policy rows for {eng}: {len(policy_rows)} | statuses: {_yver90_top_counts(policy_counts)}")
+    try:
+        sample = sorted(audit or gen or exe or sig, key=lambda r: max([float(r.get(c) or 0.0) for c in ('created_ts','event_ts','executable_ts','emailed_ts') if c in r] or [0.0]), reverse=True)[:5]
+        if sample:
+            lines.append('Recent rows:')
+            for r in sample:
+                ts = 0.0
+                for c in ('created_ts','event_ts','executable_ts','emailed_ts'):
+                    if c in r and float(r.get(c) or 0.0) > ts:
+                        ts = float(r.get(c) or 0.0)
+                lines.append(f"• {_yver90_melb_time(ts)[5:16]} {str(r.get('symbol') or '-').upper()} {str(r.get('side') or '-').upper()} | {str(r.get('family') or r.get('engine') or r.get('family_id') or '-')} | {str(r.get('result') or r.get('status') or '-').upper()}")
+    except Exception:
+        pass
+    if reasons:
+        lines.append('Notes:')
+        for reason in reasons[:5]:
+            lines.append(f"• {reason}")
+    lines.append('────────────────────')
+    lines.append('Probe: /engine_probe F8 or /engine_probe F9')
+    return '\n'.join(lines)
+
+
+def _yver90_engine_probe_text(engine: str = 'F8') -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    checks = []
+    def add(name, ok, detail=''):
+        checks.append((str(name), bool(ok), str(detail or '')))
+    try:
+        cfg = load_strategy_config(force=False) or {}
+        allowed = _strategy_cfg_execution_engines_allowed(cfg)
+        add('Runtime engine allowlist', eng in allowed, ','.join(sorted(allowed)) or '-')
+    except Exception as e:
+        add('Runtime engine allowlist', False, f'{type(e).__name__}: {e}')
+    required_common = ['_setup_audit_migrate', 'db_insert_signal', 'db_mark_executable_setup', 'db_mark_emailed_setup', '_setup_combo_policy_lookup_for_setup', '_setup_final_quality_gate_allows_setup']
+    for fn in required_common:
+        add(fn, callable(globals().get(fn)), 'callable' if callable(globals().get(fn)) else 'missing')
+    if eng == 'F8':
+        for fn in ['_bigmove_candidates', '_bigmove_confirm_next_15m_for_user', '_bigmove_candidate_to_autotrade_setup', '_bigmove_autotrade_price_plan', '_bigmove_pending_migrate']:
+            add(fn, callable(globals().get(fn)), 'callable' if callable(globals().get(fn)) else 'missing')
+    else:
+        for fn in ['pick_multiday_mover_family_setups', 'make_multiday_mover_family_setup', '_f9_repeated_bucket_days', '_f9_ema_entry_limit_pct']:
+            add(fn, callable(globals().get(fn)), 'callable' if callable(globals().get(fn)) else 'missing')
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            for table in ['signals', 'generated_setups', 'executable_setups', 'setup_audit_results', 'setup_pipeline_events', 'setup_combo_policy']:
+                add(f'DB table {table}', _yver90_table_exists(conn, table), 'exists' if _yver90_table_exists(conn, table) else 'missing')
+    except Exception as e:
+        add('DB connection', False, f'{type(e).__name__}: {e}')
+    ok_all = all(ok for _, ok, _ in checks)
+    lines = []
+    lines.append(f"🧪 Engine Probe — {eng} {'BigMove' if eng == 'F8' else 'Multi-Day'}")
+    lines.append('━━━━━━━━━━━━━━━━━━━━')
+    lines.append('Dry run: no email, no live trade, no setup row written.')
+    lines.append(f"Overall: {'OK' if ok_all else 'CHECK'}")
+    lines.append('────────────────────')
+    for name, ok, detail in checks:
+        lines.append(f"{'✅' if ok else '❌'} {name}: {detail or ('OK' if ok else 'FAIL')}")
+    lines.append('────────────────────')
+    if eng == 'F8':
+        lines.append('Meaning: F8 is healthy when BigMove detector + F8 builder + audit/executable/email queue paths are all callable and /engine_health F8 shows rows after a BigMove trigger.')
+    else:
+        lines.append('Meaning: F9 is healthy when scanner/builder paths are callable. No F9 rows can still be normal if repeated leader/loser entry conditions did not pass.')
+    return '\n'.join(lines)
+
+
+async def engine_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('❌ Admin only.')
+        return
+    args = list(getattr(context, 'args', []) or [])
+    eng = str(args[0] if args else 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        await update.message.reply_text('Usage: /engine_health F8 [hours] or /engine_health F9 [hours]')
+        return
+    hours = 24
+    if len(args) >= 2:
+        try:
+            hours = int(float(args[1]))
+        except Exception:
+            hours = 24
+    uid = _yver90_owner_uid(update)
+    try:
+        txt = await asyncio.wait_for(asyncio.shield(_safe_create_task(to_thread_fast(_yver90_engine_health_text, uid, eng, hours), f'yver90_engine_health_{eng}')), timeout=2.0)
+        await send_long_message(update, txt, parse_mode=None)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⏳ /engine_health {eng} is building in background. I’ll post it when ready.")
+        task = _safe_create_task(to_thread_fast(_yver90_engine_health_text, uid, eng, hours), f'yver90_engine_health_late_{eng}')
+        _safe_create_task(_reply_later_when_done(task, context.bot, int(update.effective_chat.id)), f'yver90_engine_health_reply_{eng}')
+    except Exception as e:
+        await update.message.reply_text(f"❌ /engine_health failed: {type(e).__name__}: {e}")
+
+
+async def engine_probe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('❌ Admin only.')
+        return
+    args = list(getattr(context, 'args', []) or [])
+    eng = str(args[0] if args else 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        await update.message.reply_text('Usage: /engine_probe F8 or /engine_probe F9')
+        return
+    try:
+        await send_long_message(update, _yver90_engine_probe_text(eng), parse_mode=None)
+    except Exception as e:
+        await update.message.reply_text(f"❌ /engine_probe failed: {type(e).__name__}: {e}")
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v90'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v90'
+except Exception:
+    pass
+# =========================================================
+# end yver90 Engine Health / Probe
 # =========================================================
 
 
