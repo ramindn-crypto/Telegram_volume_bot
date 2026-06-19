@@ -73915,6 +73915,208 @@ except Exception:
 # end yver93 dynamic-risk hard validation + owner default live risk profile
 # =========================================================
 
+
+
+# =========================================================
+# yver94 — BigMove/F8 alert-to-setup audit fallback
+# =========================================================
+# A BigMove alert email proves the BigMove detector confirmed a symbol, but older
+# versions could still fail to create a durable F8 setup row when the stricter
+# AutoTrade-conversion path returned None.  That made the alert visible in Gmail
+# while /setup_audit, /screen and AutoTrade had no matching F8 row.  From here on,
+# every confirmed BigMove candidate is converted into a normal F8 Setup object for
+# the generated/audit lane using the same ATR/fallback price plan where possible.
+# Delivery/email/AutoTrade gates still decide KEEP vs WATCH and safety; this only
+# guarantees the candidate enters the same durable pipeline as other families.
+
+try:
+    _yver94_orig_bigmove_candidate_to_autotrade_setup = _bigmove_candidate_to_autotrade_setup
+except Exception:
+    _yver94_orig_bigmove_candidate_to_autotrade_setup = None
+
+
+def _yver94_bigmove_candidate_to_f8_setup_fallback(candidate: dict, best_fut: dict | None = None, session_name: str = '') -> Optional[Setup]:
+    try:
+        c = dict(candidate or {})
+        sym = str(c.get('symbol') or '').upper().strip()
+        direction = str(c.get('direction') or '').upper().strip()
+        if not sym or direction not in {'UP', 'DOWN'}:
+            return None
+        sess = str(session_name or _bigmove_autotrade_session_name()).upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            sess = _bigmove_autotrade_session_name()
+
+        # Prefer the canonical F8 AutoTrade plan.  If ATR is unavailable, the
+        # canonical function already has a safe fixed fallback.  If even that fails,
+        # use a minimal deterministic plan only when a live entry price is available,
+        # so /setup_audit can still reconcile the BigMove event.
+        try:
+            plan = _bigmove_autotrade_price_plan(c, best_fut) or {}
+        except Exception:
+            plan = {}
+        side = str(plan.get('side') or ('BUY' if direction == 'UP' else 'SELL')).upper().strip()
+        entry = float(plan.get('entry') or 0.0)
+        sl = float(plan.get('sl') or 0.0)
+        tp = float(plan.get('tp') or 0.0)
+        rr_hint = float(plan.get('rr') or BIGMOVE_AUTOTRADE_RR or 1.5)
+        plan_reason = str(plan.get('reason') or '')
+        plan_ok = bool(plan.get('ok'))
+
+        if entry <= 0:
+            try:
+                entry = float(_bigmove_candidate_entry_price(c, best_fut) or 0.0)
+            except Exception:
+                entry = 0.0
+        if entry <= 0:
+            return None
+
+        if side not in {'BUY', 'SELL'}:
+            side = 'BUY' if direction == 'UP' else 'SELL'
+
+        if sl <= 0 or tp <= 0 or (side == 'BUY' and not (sl < entry < tp)) or (side == 'SELL' and not (tp < entry < sl)):
+            try:
+                sl_pct = float(BIGMOVE_AUTOTRADE_SL_MAX_PCT or 10.0)
+            except Exception:
+                sl_pct = 10.0
+            try:
+                rr_hint = max(1.0, float(BIGMOVE_AUTOTRADE_RR or 1.5))
+            except Exception:
+                rr_hint = 1.5
+            tp_pct = min(20.0, sl_pct * rr_hint)
+            if side == 'BUY':
+                sl = entry * (1.0 - sl_pct / 100.0)
+                tp = entry * (1.0 + tp_pct / 100.0)
+            else:
+                sl = entry * (1.0 + sl_pct / 100.0)
+                tp = entry * (1.0 - tp_pct / 100.0)
+            plan_reason = plan_reason or 'yver94_fallback_fixed_plan'
+
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            return None
+        if side == 'BUY' and not (sl < entry < tp):
+            return None
+        if side == 'SELL' and not (tp < entry < sl):
+            return None
+
+        mv = _bigmove_candidate_marketvol(c, best_fut)
+        try:
+            fut_vol = float(c.get('vol') or (usd_notional(mv) if mv is not None else 0.0) or 0.0)
+        except Exception:
+            fut_vol = 0.0
+        ch15 = float(c.get('confirm_15m_pct', c.get('ch15', 0.0)) or 0.0)
+        ch1 = float(c.get('ch1', 0.0) or 0.0)
+        ch4 = float(c.get('ch4', 0.0) or 0.0)
+        ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0) if mv is not None else 0.0
+        try:
+            conf = int(clamp(max(float(_bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, fut_vol, 0.0)), 80.0), 68.0, 96.0))
+        except Exception:
+            conf = 82
+        market_symbol = _bigmove_candidate_market_symbol(c, best_fut) or f'{sym}/USDT:USDT'
+        setup_id = f"F8-{sym}-{side}-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+        s = Setup(
+            setup_id=setup_id,
+            symbol=sym,
+            market_symbol=market_symbol,
+            side=side,
+            conf=int(conf),
+            entry=float(entry),
+            sl=float(sl),
+            tp=float(tp),
+            alt_target_a=0.0,
+            alt_target_b=0.0,
+            fut_vol_usd=float(fut_vol),
+            ch24=float(ch24),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
+            ema_support_period=0,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=0,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=True,
+            leader_base_override=True,
+            engine='F8',
+            is_trailing_alt_target_b=False,
+            created_ts=float(time.time()),
+            family_id=BIGMOVE_FAMILY_ID,
+            family_name=BIGMOVE_FAMILY_NAME,
+            session=sess,
+        )
+        try:
+            s = _setup_route_candidate_for_executable_lane(s, session_name=sess, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+        except Exception:
+            pass
+        try:
+            setattr(s, 'atr_pct', float(plan.get('atr_pct') or 0.0))
+        except Exception:
+            setattr(s, 'atr_pct', 0.0)
+        try:
+            setattr(s, 'quality_score', float(getattr(s, 'quality_score', 0.0) or 0.0))
+        except Exception:
+            setattr(s, 'quality_score', 0.0)
+        setattr(s, 'source_kind', 'bigmove_f8')
+        setattr(s, 'source_session', sess)
+        setattr(s, 'bigmove_signal', True)
+        setattr(s, 'bigmove_alert_autotrade', bool(plan_ok))
+        setattr(s, 'bigmove_direction', direction)
+        setattr(s, 'bigmove_conversion_fallback', True)
+        setattr(s, 'bigmove_conversion_reason', plan_reason or 'fallback_created_from_confirmed_bigmove_alert')
+        setattr(s, 'risk_source', 'autotrade_config')
+        setattr(s, 'why', f"Confirmed Big-Move alert {direction}; F8 setup audit fallback; plan={plan_reason or 'ok'}")
+        try:
+            return _research_finalize_setup(s, session_name=sess)
+        except Exception:
+            return s
+    except Exception:
+        return None
+
+
+def _bigmove_candidate_to_autotrade_setup(candidate: dict, best_fut: dict | None = None, session_name: str = '') -> Optional[Setup]:
+    # Wrapper: use the original conversion first; if it fails, still create a
+    # durable F8 setup row so /setup_audit and /engine_health prove the event.
+    try:
+        if callable(_yver94_orig_bigmove_candidate_to_autotrade_setup):
+            s = _yver94_orig_bigmove_candidate_to_autotrade_setup(candidate, best_fut, session_name=session_name)
+            if s is not None:
+                return s
+    except Exception:
+        pass
+    return _yver94_bigmove_candidate_to_f8_setup_fallback(candidate, best_fut, session_name=session_name)
+
+
+def _bigmove_candidates_to_autotrade_setups(candidates: list, best_fut: dict | None = None, session_name: str = '') -> list:
+    out = []
+    try:
+        max_n = max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 1))
+    except Exception:
+        max_n = 8
+    seen = set()
+    for c in list(candidates or [])[:max_n]:
+        try:
+            sym = str((c or {}).get('symbol') or '').upper().strip()
+            direction = str((c or {}).get('direction') or '').upper().strip()
+            key = (sym, direction)
+            if key in seen:
+                continue
+            seen.add(key)
+            s = _bigmove_candidate_to_autotrade_setup(c, best_fut, session_name=session_name)
+            if s is not None:
+                out.append(s)
+        except Exception:
+            continue
+    return out
+
+# Make audit/report cache versions distinct after F8 fallback patch.
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(ADMIN_REPORT_CACHE_VERSION) + ':v94'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v94'
+except Exception:
+    pass
+
 if __name__ == "__main__":
     main()
 
