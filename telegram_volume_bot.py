@@ -43517,7 +43517,7 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Per-trade manual risk is separate: /riskmode\n\n"
             "AutoTrade risk caps are separate and are NOT changed by /dailycap:\n"
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 15\n"
-            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15\n\n"
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 20\n\n"
             "Set manual examples:\n"
             "• /dailycap pct 5\n"
             "• /dailycap pct 100\n"
@@ -43636,9 +43636,9 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90',
             '• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 15',
-            '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15',
+            '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 20',
             '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true',
-            '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5',
+            '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 15',
             '',
             'Examples — entry controls:',
             '• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 12',
@@ -43782,7 +43782,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
             "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 1.5",
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 15",
-            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 20",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0",
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
             "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (open fresh KEEP directly)",
@@ -73740,6 +73740,179 @@ except Exception:
     pass
 # =========================================================
 # end yver92 setup-email duplicate send lock
+# =========================================================
+
+
+# =========================================================
+# yver93 dynamic-risk hard validation + owner default live risk profile
+# =========================================================
+# Owner-confirmed live defaults:
+#   base risk/trade             = 1.00%
+#   dynamic risk max multiplier = 1.50x  (effective max 1.50% when base=1%)
+#   open risk cap               = 15.00%
+#   daily risk cap              = 20.00% PCT
+#   realised daily loss stop    = 15.00%
+#
+# This patch fixes the remaining stale DB/display case where dynamic max could
+# still show as 1.67x.  Dynamic risk is now capped at 1.50x in the getter itself,
+# in the config setter wrapper, and by a one-time owner-default migration.  It
+# remains Telegram-editable within the safe 1.00x-1.50x range.
+
+YVER93_VERSION = 'yver93_2026_06_19_dynrisk_max150_defaults_risk1_open15_daily20_loss15'
+
+try:
+    _YVER93_ORIG_DYNAMIC_RISK_MAX_MULT = _autotrade_dynamic_risk_max_mult
+except Exception:
+    _YVER93_ORIG_DYNAMIC_RISK_MAX_MULT = None
+
+
+def _autotrade_dynamic_risk_max_mult() -> float:
+    """Owner safety clamp: dynamic risk must never exceed 1.50x base risk."""
+    try:
+        if _YVER93_ORIG_DYNAMIC_RISK_MAX_MULT is not None:
+            val = float(_YVER93_ORIG_DYNAMIC_RISK_MAX_MULT() or 1.0)
+        else:
+            val = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.5) or 1.5)
+    except Exception:
+        val = 1.5
+    return max(1.00, min(1.50, float(val)))
+
+
+def _yver93_apply_owner_risk_defaults(force: bool = False) -> bool:
+    """Apply the requested live defaults once and repair stale unsafe dynamic max."""
+    changed = False
+    try:
+        try:
+            already = str(_autotrade_config_get('yver93_owner_defaults_version', '') or '').strip().lower() == YVER93_VERSION
+        except Exception:
+            already = False
+        try:
+            reapply = bool(force) or env_bool('AUTOTRADE_YVER93_REAPPLY_OWNER_DEFAULTS', False)
+        except Exception:
+            reapply = bool(force)
+
+        # Always repair dynamic max if stale above 1.50, because this is a hard owner rule.
+        try:
+            cur_dyn = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.5) or 1.5)
+            if cur_dyn > 1.50 or cur_dyn < 1.00:
+                _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.50)
+                changed = True
+        except Exception:
+            try:
+                _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.50)
+                changed = True
+            except Exception:
+                pass
+
+        if already and not reapply:
+            return bool(changed)
+
+        targets = {
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.50,
+            AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: 15.0,
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY: 15.0,
+        }
+        for k, v in targets.items():
+            try:
+                cur = _autotrade_config_get(k, None)
+                if cur is None or str(cur).strip() == '' or abs(float(cur) - float(v)) > 1e-9:
+                    _autotrade_config_set(k, v)
+                    changed = True
+            except Exception:
+                try:
+                    _autotrade_config_set(k, v)
+                    changed = True
+                except Exception:
+                    pass
+
+        try:
+            mode, val = _autotrade_daily_cap_settings()
+            if str(mode or '').upper() != 'PCT' or abs(float(val or 0.0) - 20.0) > 1e-9:
+                _autotrade_set_daily_cap_settings('PCT', 20.0)
+                changed = True
+        except Exception:
+            try:
+                _autotrade_set_daily_cap_settings('PCT', 20.0)
+                changed = True
+            except Exception:
+                pass
+
+        # Keep strict edge enabled; dynamic boost depends on this evidence gate.
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 1)
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY, 3)
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY, 49.0)
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY, 0.05)
+        except Exception:
+            pass
+
+        try:
+            _autotrade_config_set('yver93_owner_defaults_version', YVER93_VERSION)
+            _autotrade_config_set('yver93_dynamic_risk_rule', 'effective risk = base risk * multiplier; multiplier hard-clamped 1.00x-1.50x; WR>=60 => mid, WR>=70 => max when lane edge passes')
+            _autotrade_config_set('yver93_owner_defaults_note', 'Defaults: base risk 1%, dynamic max 1.50x, open cap 15%, daily cap 20% PCT, realised loss stop 15%.')
+            _autotrade_config_set('yver93_owner_defaults_ts', str(int(time.time())))
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return bool(changed)
+
+
+try:
+    _yver93_apply_owner_risk_defaults()
+except Exception:
+    pass
+
+try:
+    _YVER93_ORIG_AUTOTRADE_CONFIG_CMD = autotrade_config_cmd
+except Exception:
+    _YVER93_ORIG_AUTOTRADE_CONFIG_CMD = None
+
+
+async def autotrade_config_cmd(update, context):
+    """yver93 wrapper: repair stale dynamic max before display and clamp setter."""
+    try:
+        args = list(getattr(context, 'args', []) or [])
+        if args:
+            key = str(args[0] or '').strip().upper()
+            if key == 'AUTOTRADE_DYNAMIC_RISK_MAX_MULT' and len(args) >= 2:
+                try:
+                    req = float(' '.join(str(x) for x in args[1:]).strip())
+                    if req > 1.50:
+                        args = [args[0], '1.5']
+                        try:
+                            context.args = args
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        # Before read/full view, repair stale dyn max but do not reset user-edited risk/caps.
+        try:
+            cur_dyn = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.5) or 1.5)
+            if cur_dyn > 1.50 or cur_dyn < 1.00:
+                _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.50)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    if _YVER93_ORIG_AUTOTRADE_CONFIG_CMD is not None:
+        return await _YVER93_ORIG_AUTOTRADE_CONFIG_CMD(update, context)
+    return None
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v93'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v93'
+except Exception:
+    pass
+# =========================================================
+# end yver93 dynamic-risk hard validation + owner default live risk profile
 # =========================================================
 
 if __name__ == "__main__":
