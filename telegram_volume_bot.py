@@ -43517,7 +43517,7 @@ async def dailycap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Per-trade manual risk is separate: /riskmode\n\n"
             "AutoTrade risk caps are separate and are NOT changed by /dailycap:\n"
             "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 15\n"
-            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10\n\n"
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15\n\n"
             "Set manual examples:\n"
             "• /dailycap pct 5\n"
             "• /dailycap pct 100\n"
@@ -43635,8 +43635,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_LOW_SCORE 40',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_BASE_SCORE 65',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_HIGH_SCORE 90',
-            '• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 8',
-            '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10',
+            '• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 15',
+            '• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15',
             '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_ENABLED true',
             '• /autotrade_config AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT 5',
             '',
@@ -43781,8 +43781,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false",
             "• /autotrade_config AUTOTRADE_MIN_LIVE_RR 1.5",
             "• /autotrade_config AUTOTRADE_MAX_LIVE_RR 1.5",
-            "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 8",
-            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 10",
+            "• /autotrade_config AUTOTRADE_OPEN_RISK_CAP_PCT 15",
+            "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 15",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0",
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
             "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (open fresh KEEP directly)",
@@ -72609,6 +72609,118 @@ except Exception:
 # end yver87 Bybit trading-terms acceptance email alert
 # =========================================================
 
+
+
+# =========================================================
+# yver88 owner AutoTrade defaults: risk 1%, caps 15%, dynamic max 1.50x
+# =========================================================
+# Purpose:
+#   The owner-confirmed default live profile is:
+#     AUTOTRADE_RISK_PER_TRADE_PCT      = 1.0
+#     AUTOTRADE_DYNAMIC_RISK_MAX_MULT   = 1.50
+#     AUTOTRADE_OPEN_RISK_CAP_PCT       = 15.0
+#     AUTOTRADE_DAILY_RISK_CAP_PCT      = 15.0 (PCT mode)
+#
+# This patch applies those values once at startup for v88, after all earlier
+# migration blocks but before polling starts. Values remain fully editable from
+# /autotrade_config after deployment. It does not change TP/SL, leverage,
+# blackout, setup generation, email delivery, screen rendering, or live order
+# mechanics.
+
+YVER88_VERSION = 'yver88_2026_06_19_owner_defaults_risk1_caps15_dynmax150'
+
+def _autotrade_apply_yver88_owner_defaults() -> bool:
+    changed = False
+    try:
+        target = YVER88_VERSION
+        try:
+            already = str(_autotrade_config_get('yver88_owner_defaults_version', '') or '').strip().lower() == target
+        except Exception:
+            already = False
+        try:
+            reapply = env_bool('AUTOTRADE_YVER88_REAPPLY_OWNER_DEFAULTS', False)
+        except Exception:
+            reapply = False
+        if already and not reapply:
+            return False
+
+        targets = {
+            AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY: 1,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY: 1.0,
+            AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY: 1.50,
+            AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY: 15.0,
+        }
+
+        def _num_same(cur, target) -> bool:
+            try:
+                return abs(float(cur) - float(target)) < 1e-9
+            except Exception:
+                return False
+
+        for k, v in targets.items():
+            try:
+                cur = _autotrade_config_get(k, None)
+                if cur is None or str(cur).strip() == '' or not _num_same(cur, v):
+                    _autotrade_config_set(k, v)
+                    changed = True
+            except Exception:
+                try:
+                    _autotrade_config_set(k, v)
+                    changed = True
+                except Exception:
+                    pass
+
+        # Daily AutoTrade cap is stored via the daily-cap helper in this codebase.
+        try:
+            mode, val = _autotrade_daily_cap_settings()
+            if str(mode or '').upper() != 'PCT' or abs(float(val or 0.0) - 15.0) > 1e-9:
+                _autotrade_set_daily_cap_settings('PCT', 15.0)
+                changed = True
+        except Exception:
+            try:
+                _autotrade_set_daily_cap_settings('PCT', 15.0)
+                changed = True
+            except Exception:
+                pass
+
+        # Keep strict edge synced to the owner-approved minimum gate.
+        try:
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 1)
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY, 3)
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY, 49.0)
+            _autotrade_config_set(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY, 0.05)
+        except Exception:
+            pass
+
+        try:
+            _autotrade_config_set('yver88_owner_defaults_version', target)
+            _autotrade_config_set('yver88_owner_defaults_note', 'Defaults applied: risk=1.0%, dynamic max=1.50x, open cap=15%, daily cap=15% PCT. Values remain Telegram-editable.')
+            _autotrade_config_set('yver88_owner_defaults_ts', str(int(time.time())))
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return bool(changed)
+
+try:
+    _autotrade_apply_yver88_owner_defaults()
+except Exception:
+    pass
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v88'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v88'
+except Exception:
+    pass
+
+# =========================================================
+# end yver88 owner AutoTrade defaults
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
@@ -72625,8 +72737,8 @@ if __name__ == "__main__":
 #
 # Owner-selected defaults:
 #   AUTOTRADE_RISK_PER_TRADE_PCT = 1.0
-#   AUTOTRADE_OPEN_RISK_CAP_PCT = 8.0
-#   AUTOTRADE_DAILY_RISK_CAP_PCT = 10.0 (PCT mode)
+#   AUTOTRADE_OPEN_RISK_CAP_PCT = 15.0
+#   AUTOTRADE_DAILY_RISK_CAP_PCT = 15.0 (PCT mode)
 #   AUTOTRADE_MAX_TRADES_PER_DAY = 100
 #
 # Everything else from the broad-sampling profile remains Telegram-editable too.
@@ -72703,8 +72815,8 @@ def _autotrade_apply_yver78_editable_owner_defaults() -> bool:
                 cfg['yver78_editable_owner_defaults'] = {
                     'version': target_version,
                     'risk_pct_default': 1.0,
-                    'open_risk_cap_pct_default': 8.0,
-                    'daily_risk_cap_pct_default': 10.0,
+                    'open_risk_cap_pct_default': 15.0,
+                    'daily_risk_cap_pct_default': 15.0,
                     'max_trades_per_day_default': 100,
                     'editable_from_telegram': True,
                     'note': 'Defaults applied once; yver76 recurring force is disabled so /autotrade_config edits persist.',
