@@ -73256,6 +73256,309 @@ except Exception:
 # =========================================================
 
 
+
+# =========================================================
+# yver91 risk-cap retry window + clearer queued ATWhy
+# =========================================================
+# v91 makes risk/cap blocks temporary while the setup is still inside the
+# AutoTrade entry window.  If the owner raises risk/open/daily caps after a setup
+# was skipped for OPEN_CAP / DAILY_CAP, AutoTrade should retry it until the normal
+# 60m deadline instead of treating the cap result as final.
+#
+# Also replaces ATWhy=PENDING with ATWhy=QUEUED in /setup_audit so it is clearer:
+# the setup is still fresh/eligible and waiting for an AutoTrade attempt/result.
+
+YVER91_VERSION = 'yver91_2026_06_19_risk_cap_retry_until_entry_deadline'
+YVER91_CAP_RETRY_TOKENS = (
+    'open_risk_cap_reached',
+    'open_risk_cap',
+    'daily_remaining_risk_zero',
+    'daily_risk_cap_reached',
+    'daily_cap_would_be_exceeded_by_new_trade',
+    'daily_risk_cap_already_exceeded',
+    'daily_cap_reached',
+    'max_open_trades_reached',
+)
+YVER91_CAP_CONFIG_KEYS = {
+    'AUTOTRADE_RISK_PER_TRADE_PCT',
+    'AUTOTRADE_DYNAMIC_RISK_ENABLED',
+    'AUTOTRADE_DYNAMIC_RISK_MIN_MULT',
+    'AUTOTRADE_DYNAMIC_RISK_MAX_MULT',
+    'AUTOTRADE_OPEN_RISK_CAP_PCT',
+    'AUTOTRADE_DAILY_RISK_CAP_PCT',
+    'AUTOTRADE_DAILY_RISK_CAP_MODE',
+    'AUTOTRADE_DAILY_REALIZED_LOSS_STOP_PCT',
+    'AUTOTRADE_MAX_OPEN_TRADES',
+    'AUTOTRADE_MAX_TRADES_PER_DAY',
+}
+
+
+def _yver91_is_cap_retry_reason(reason: str) -> bool:
+    try:
+        r = str(reason or '').lower().strip()
+        if not r:
+            return False
+        return any(tok in r for tok in YVER91_CAP_RETRY_TOKENS)
+    except Exception:
+        return False
+
+
+try:
+    _YVER91_ORIG_SHOULD_TRY_NEXT_AFTER_SKIP = _autotrade_should_try_next_after_skip
+except Exception:
+    _YVER91_ORIG_SHOULD_TRY_NEXT_AFTER_SKIP = None
+
+
+def _autotrade_should_try_next_after_skip(reason: str) -> bool:
+    """v91: cap/risk skips are not final; retry until normal entry deadline.
+
+    They still block the actual order while caps are full.  The difference is only
+    queue behaviour: the candidate remains retryable if the owner later raises the
+    caps or risk capacity is freed before expiry.
+    """
+    try:
+        if _yver91_is_cap_retry_reason(reason):
+            return True
+    except Exception:
+        pass
+    if _YVER91_ORIG_SHOULD_TRY_NEXT_AFTER_SKIP is not None:
+        try:
+            return bool(_YVER91_ORIG_SHOULD_TRY_NEXT_AFTER_SKIP(reason))
+        except Exception:
+            pass
+    return False
+
+
+def _yver91_clear_autotrade_selector_caches(uid: int | None = None) -> None:
+    try:
+        owner_uid = int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        owner_uid = 0
+    try:
+        for sess in ('ASIA', 'LON', 'NY', ''):
+            for hrs in (4, 8, 12, 24, 48):
+                for lim in (1, 5, 10, 30, 60):
+                    try:
+                        cache_delete(f"autotrade_db_setups_v129:{owner_uid}:{sess}:{hrs}:{lim}")
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def _yver91_cap_retry_candidates(uid: int, session_label: str, window_min: int | None = None, limit: int = 20) -> list:
+    """Return fresh setup rows that were skipped only because caps were full.
+
+    This reads the same executable queue used by normal AutoTrade and only boosts
+    recently cap-blocked rows back to the front of the queue. It does not bypass
+    policy/blackout/geometry/exchange safety and does not extend the entry window.
+    """
+    try:
+        owner_uid = int(uid or 0)
+    except Exception:
+        owner_uid = 0
+    sess = str(session_label or '').upper().strip()
+    if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
+        return []
+    try:
+        win_min = int(window_min if window_min is not None else _autotrade_entry_window_min())
+    except Exception:
+        win_min = 60
+    win_min = max(1, min(int(win_min or 60), int(max(1, _autotrade_entry_window_min()))))
+    cutoff = float(time.time()) - float(win_min) * 60.0
+    lim = max(1, min(int(limit or 20), 60))
+    rows = []
+    try:
+        _admin_setup_lifecycle_migrate()
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = [dict(r) for r in (cur.execute(
+                """
+                SELECT x.*, COALESCE(e.emailed_ts, 0) AS emailed_ts,
+                       COALESCE(l.last_reason, '') AS cap_last_reason,
+                       COALESCE(l.attempted_ts, 0) AS cap_attempted_ts
+                FROM executable_setups x
+                LEFT JOIN emailed_setups e
+                       ON e.user_id = x.user_id
+                      AND e.setup_id = x.setup_id
+                LEFT JOIN admin_setup_lifecycle l
+                       ON l.setup_id = x.setup_id
+                LEFT JOIN signal_outcomes o
+                       ON o.setup_id = x.setup_id
+                WHERE x.user_id = ?
+                  AND UPPER(COALESCE(x.session, '')) = ?
+                  AND x.executable_ts >= ?
+                  AND COALESCE(o.outcome, 'OPEN') = 'OPEN'
+                  AND (
+                        LOWER(COALESCE(l.last_reason,'')) LIKE '%open_risk_cap%'
+                     OR LOWER(COALESCE(l.last_reason,'')) LIKE '%daily_remaining_risk_zero%'
+                     OR LOWER(COALESCE(l.last_reason,'')) LIKE '%daily_risk_cap%'
+                     OR LOWER(COALESCE(l.last_reason,'')) LIKE '%daily_cap%'
+                     OR LOWER(COALESCE(l.last_reason,'')) LIKE '%max_open_trades%'
+                  )
+                ORDER BY COALESCE(l.attempted_ts, x.executable_ts) DESC, x.executable_ts DESC, x.setup_id DESC
+                LIMIT ?
+                """,
+                (int(owner_uid), sess, float(cutoff), int(lim * 3)),
+            ).fetchall() or [])]
+    except Exception as e:
+        try:
+            db_log_setup_pipeline_event(owner_uid, stage='autotrade_cap_retry_queue', status='error', session=sess, mode='autotrade', details={'error': f'{type(e).__name__}: {e}'})
+        except Exception:
+            pass
+        return []
+    out = []
+    rejects = Counter()
+    now_ts = float(time.time())
+    for row in rows:
+        try:
+            objs = _executable_rows_to_setup_objects([row], session_name=sess) or []
+            if not objs:
+                rejects['object_hydration_failed'] += 1
+                continue
+            obj = objs[0]
+            # Preserve the original setup deadline. Do not revive expired rows.
+            cts = float(getattr(obj, 'created_ts', 0.0) or row.get('created_ts') or row.get('executable_ts') or 0.0)
+            ets = float(getattr(obj, 'email_logged_ts', 0.0) or row.get('emailed_ts') or 0.0)
+            xts = float(getattr(obj, 'executable_ts', 0.0) or row.get('executable_ts') or 0.0)
+            canonical_ts = max(cts, ets, xts)
+            if canonical_ts <= 0 or now_ts - canonical_ts > float(_autotrade_entry_window_min()) * 60.0:
+                rejects['entry_window_expired'] += 1
+                continue
+            ok, why = _autotrade_db_signal_structurally_valid(obj, session_name=sess)
+            if not ok:
+                rejects[str(why or 'structural_reject')] += 1
+                continue
+            try:
+                setattr(obj, 'source_kind', str(getattr(obj, 'source_kind', '') or 'cap_retry_queue'))
+                setattr(obj, 'yver91_cap_retry', True)
+                setattr(obj, 'yver91_cap_last_reason', str(row.get('cap_last_reason') or ''))
+            except Exception:
+                pass
+            out.append(obj)
+            if len(out) >= lim:
+                break
+        except Exception as e:
+            rejects[f'exception:{type(e).__name__}'] += 1
+            continue
+    try:
+        db_log_setup_pipeline_event(owner_uid, stage='autotrade_cap_retry_queue', status='ok' if out else 'empty', session=sess, mode='autotrade', details={'window_min': int(win_min), 'scanned': len(rows or []), 'selected': len(out or []), 'top_rejects': _pipeline_top_reasons(rejects, 6)})
+    except Exception:
+        pass
+    return _autotrade_merge_candidate_lists_fresh_first(out, limit=lim)
+
+
+try:
+    _YVER91_ORIG_FRESH_SESSION_SELECTOR = _autotrade_select_fresh_session_executable_setups
+except Exception:
+    _YVER91_ORIG_FRESH_SESSION_SELECTOR = None
+
+
+def _autotrade_select_fresh_session_executable_setups(uid: int, session_label: str, window_min: int | None = None, limit: int | None = None) -> list:
+    cap_retry = []
+    try:
+        cap_retry = _yver91_cap_retry_candidates(uid, session_label, window_min=window_min, limit=max(10, int(limit or 60)))
+    except Exception:
+        cap_retry = []
+    normal = []
+    if _YVER91_ORIG_FRESH_SESSION_SELECTOR is not None:
+        try:
+            normal = _YVER91_ORIG_FRESH_SESSION_SELECTOR(uid, session_label, window_min=window_min, limit=limit)
+        except Exception:
+            normal = []
+    try:
+        return _autotrade_merge_candidate_lists_fresh_first(cap_retry, normal, limit=max(10, int(limit or 60)))
+    except Exception:
+        return list(cap_retry or normal or [])
+
+
+try:
+    _YVER91_ORIG_AUTOTRADE_CONFIG_CMD = autotrade_config_cmd
+except Exception:
+    _YVER91_ORIG_AUTOTRADE_CONFIG_CMD = None
+
+
+async def _yver91_delayed_autotrade_retry(context, reason: str = 'cap_config_changed'):
+    try:
+        await asyncio.sleep(1.5)
+        _yver91_clear_autotrade_selector_caches()
+        try:
+            uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+            if uid:
+                _LAST_AUTOTRADE_DECISION[uid] = {
+                    'status': 'RETRY',
+                    'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'reason': f'yver91_retry_after_{reason}',
+                    'trigger': 'autotrade_config_cap_change',
+                }
+        except Exception:
+            pass
+        await autotrade_job(context)
+    except Exception:
+        pass
+
+
+async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key = ''
+    try:
+        args = list(getattr(context, 'args', []) or [])
+        if args:
+            key = str(args[0] or '').strip().upper()
+    except Exception:
+        key = ''
+    if _YVER91_ORIG_AUTOTRADE_CONFIG_CMD is not None:
+        res = await _YVER91_ORIG_AUTOTRADE_CONFIG_CMD(update, context)
+    else:
+        res = None
+    try:
+        if key in YVER91_CAP_CONFIG_KEYS:
+            _yver91_clear_autotrade_selector_caches()
+            try:
+                _autotrade_config_set('yver91_last_cap_config_change_key', key)
+                _autotrade_config_set('yver91_last_cap_config_change_ts', str(int(time.time())))
+            except Exception:
+                pass
+            try:
+                _safe_create_task(_yver91_delayed_autotrade_retry(context, key.lower()), f'yver91_retry_after_{key.lower()}')
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return res
+
+
+try:
+    _YVER91_ORIG_SETUP_AUDIT_ATWHY = _setup_audit_autotrade_skip_reason
+except Exception:
+    _YVER91_ORIG_SETUP_AUDIT_ATWHY = None
+
+
+def _setup_audit_autotrade_skip_reason(row: dict, uid: int = 0, policy_label: str = '', at_state: str = '', session_name: str = '') -> str:
+    try:
+        if _YVER91_ORIG_SETUP_AUDIT_ATWHY is not None:
+            out = _YVER91_ORIG_SETUP_AUDIT_ATWHY(row, uid=uid, policy_label=policy_label, at_state=at_state, session_name=session_name)
+        else:
+            out = '-'
+        return 'QUEUED' if str(out or '').upper().strip() == 'PENDING' else out
+    except Exception:
+        return '-'
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v91'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v91'
+except Exception:
+    pass
+# =========================================================
+# end yver91 risk-cap retry window + clearer queued ATWhy
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
