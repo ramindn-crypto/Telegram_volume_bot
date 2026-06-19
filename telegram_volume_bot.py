@@ -73559,6 +73559,189 @@ except Exception:
 # end yver91 risk-cap retry window + clearer queued ATWhy
 # =========================================================
 
+
+# =========================================================
+# yver92 setup-email duplicate send lock
+# =========================================================
+# Some deployments can trigger the same setup-email lane twice in the same
+# minute (normal email job + /screen/autonomous sync, or concurrent background
+# ticks).  The old post-send identity table prevented later duplicates, but it
+# did not protect against two concurrent sends that both passed the pre-send
+# check before either one marked the setup as emailed.
+#
+# yver92 adds an atomic pre-SMTP per-setup lock.  The first pipeline that sees a
+# setup owns the right to send it; any concurrent duplicate skips before SMTP.
+# Locks are retained for a cooldown after a successful send and are released on
+# a hard send failure so a later retry can still happen.
+
+YVER92_SETUP_EMAIL_DEDUP_COOLDOWN_SEC = int(os.environ.get('YVER92_SETUP_EMAIL_DEDUP_COOLDOWN_SEC', '3600') or 3600)
+
+
+def _yver92_setup_email_item_key(uid: int, session_name: str, setup) -> str:
+    try:
+        sym = str(_bybit_linear_symbol(getattr(setup, 'symbol', '') or '') or '').upper().strip()
+    except Exception:
+        sym = str(getattr(setup, 'symbol', '') or '').upper().strip()
+    side = str(getattr(setup, 'side', '') or '').upper().strip()
+    try:
+        entry = round(float(getattr(setup, 'entry', 0.0) or 0.0), 8)
+    except Exception:
+        entry = 0.0
+    try:
+        sl = round(float(getattr(setup, 'sl', 0.0) or 0.0), 8)
+    except Exception:
+        sl = 0.0
+    try:
+        tp = round(float(_setup_target_tp(setup, 0.0) or 0.0), 8)
+    except Exception:
+        tp = 0.0
+    # setup_id is intentionally not the primary identity because the same market
+    # setup can be reconstructed through different queues with different ids.
+    sess = str(session_name or getattr(setup, 'source_session', '') or '').upper().strip()
+    return f"{int(uid)}|{sess}|{sym}|{side}|{entry:.8f}|{sl:.8f}|{tp:.8f}"
+
+
+def _yver92_acquire_setup_email_item_locks(uid: int, session_name: str, setups: list) -> tuple[list, list[str]]:
+    """Atomically keep only setups that have not been emailed/locked recently."""
+    uid = int(uid or 0)
+    now_ts = float(time.time())
+    cooldown = max(60.0, float(globals().get('YVER92_SETUP_EMAIL_DEDUP_COOLDOWN_SEC', 3600) or 3600))
+    kept = []
+    skipped = []
+    if not uid or not setups:
+        return list(setups or []), []
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            cur = conn.cursor()
+            cur.execute("""CREATE TABLE IF NOT EXISTS setup_email_send_locks (
+                user_id INTEGER NOT NULL,
+                item_key TEXT NOT NULL,
+                symbol TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                setup_id TEXT NOT NULL DEFAULT '',
+                session TEXT NOT NULL DEFAULT '',
+                locked_ts REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'sending',
+                PRIMARY KEY(user_id, item_key)
+            )""")
+            try:
+                cur.execute("DELETE FROM setup_email_send_locks WHERE locked_ts < ?", (float(now_ts - cooldown),))
+            except Exception:
+                pass
+            conn.commit()
+            for s in list(setups or []):
+                try:
+                    key = _yver92_setup_email_item_key(uid, session_name, s)
+                    if not key:
+                        kept.append(s)
+                        continue
+                    try:
+                        sym = str(_bybit_linear_symbol(getattr(s, 'symbol', '') or '') or '').upper().strip()
+                    except Exception:
+                        sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+                    side = str(getattr(s, 'side', '') or '').upper().strip()
+                    sid = str(getattr(s, 'setup_id', '') or '').strip()
+                    cur.execute(
+                        "INSERT OR IGNORE INTO setup_email_send_locks(user_id,item_key,symbol,side,setup_id,session,locked_ts,status) VALUES(?,?,?,?,?,?,?,?)",
+                        (uid, key, sym, side, sid, str(session_name or '').upper().strip(), now_ts, 'sending'),
+                    )
+                    if int(cur.rowcount or 0) > 0:
+                        kept.append(s)
+                    else:
+                        skipped.append(f"{side} {sym}".strip())
+                except Exception:
+                    # If lock bookkeeping fails for one setup, do not kill the email lane.
+                    kept.append(s)
+            conn.commit()
+    except Exception:
+        return list(setups or []), []
+    return kept, skipped
+
+
+def _yver92_release_setup_email_item_locks(uid: int, session_name: str, setups: list, sent: bool) -> None:
+    uid = int(uid or 0)
+    if not uid or not setups:
+        return
+    try:
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            cur = conn.cursor()
+            for s in list(setups or []):
+                try:
+                    key = _yver92_setup_email_item_key(uid, session_name, s)
+                    if not key:
+                        continue
+                    if sent:
+                        cur.execute(
+                            "UPDATE setup_email_send_locks SET locked_ts=?, status='sent' WHERE user_id=? AND item_key=?",
+                            (float(time.time()), uid, key),
+                        )
+                    else:
+                        cur.execute("DELETE FROM setup_email_send_locks WHERE user_id=? AND item_key=?", (uid, key))
+                except Exception:
+                    continue
+            conn.commit()
+    except Exception:
+        pass
+
+
+try:
+    _YVER92_ORIG_SEND_EMAIL_ALERT_MULTI = send_email_alert_multi
+except Exception:
+    _YVER92_ORIG_SEND_EMAIL_ALERT_MULTI = None
+
+
+def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
+    """yver92 wrapper: atomic duplicate suppression before SMTP."""
+    if _YVER92_ORIG_SEND_EMAIL_ALERT_MULTI is None:
+        return False
+    try:
+        uid = int((user or {}).get('user_id') or 0)
+    except Exception:
+        uid = 0
+    try:
+        session_name = str((sess or {}).get('name') or getattr((setups or [None])[0], 'source_session', '') or '').upper().strip()
+    except Exception:
+        session_name = str((sess or {}).get('name') or '').upper().strip()
+
+    original_setups = list(setups or [])
+    kept, skipped = _yver92_acquire_setup_email_item_locks(uid, session_name, original_setups)
+    if skipped:
+        try:
+            db_log_setup_pipeline_event(int(uid), stage='setup_email_duplicate_lock', status='skip', session=session_name, mode='email', details={'skipped': skipped[:12], 'input': len(original_setups), 'kept': len(kept)})
+        except Exception:
+            pass
+    if not kept:
+        try:
+            tz, _ = _zoneinfo_or_default((user or {}).get('tz') or (user or {}).get('timezone'))
+            _LAST_EMAIL_DECISION[int(uid)] = {
+                'status': 'SKIP',
+                'picked': '-',
+                'when': datetime.now(tz).isoformat(timespec='seconds'),
+                'reasons': ['duplicate_setup_email_suppressed', f'skipped={skipped[:5]}'],
+            }
+        except Exception:
+            pass
+        return False
+
+    sent = False
+    try:
+        sent = bool(_YVER92_ORIG_SEND_EMAIL_ALERT_MULTI(user, sess, kept, best_fut))
+        return sent
+    finally:
+        _yver92_release_setup_email_item_locks(uid, session_name, kept, bool(sent))
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v92'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v92'
+except Exception:
+    pass
+# =========================================================
+# end yver92 setup-email duplicate send lock
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
