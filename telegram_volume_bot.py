@@ -74117,6 +74117,157 @@ try:
 except Exception:
     pass
 
+
+# =========================================================
+# yver95 — reporting reconciliation clarity for closed/report/audit
+# =========================================================
+# /autotrade_closed is Bybit Closed-PnL raw fragments. /autotrade_report is the
+# merged practical position view. /setup_audit is an independent setup-path view.
+# This patch keeps the data sources unchanged, but makes the reconciliation visible
+# so repeated raw fragments (same symbol/side/combo) do not look inconsistent with
+# the single merged /autotrade_report row.
+
+try:
+    _YVER95_ORIG_AUTOTRADE_CLOSED_POSITIONS_TEXT_CACHED = _autotrade_closed_positions_text_cached
+except Exception:
+    _YVER95_ORIG_AUTOTRADE_CLOSED_POSITIONS_TEXT_CACHED = None
+try:
+    _YVER95_ORIG_SETUP_AUDIT_TEXT = _setup_audit_text
+except Exception:
+    _YVER95_ORIG_SETUP_AUDIT_TEXT = None
+
+
+def _yver95_parse_money_number(v) -> float:
+    try:
+        txt = str(v or '').strip().replace('$', '').replace(',', '').replace('+', '')
+        if txt in {'', '-', '—'}:
+            return 0.0
+        return float(txt)
+    except Exception:
+        return 0.0
+
+
+def _yver95_append_closed_fragment_reconciliation(text: str) -> str:
+    """Append a compact raw-fragment → merged-position note for /autotrade_closed.
+
+    This is display-only. Bybit remains the authority for raw closed rows, while
+    /autotrade_report remains the authority for merged practical positions.
+    """
+    try:
+        out = str(text or '')
+        if '<pre>' not in out or '</pre>' not in out:
+            return out
+        raw_table = out.split('<pre>', 1)[1].split('</pre>', 1)[0]
+        try:
+            raw_table = html.unescape(raw_table)
+        except Exception:
+            pass
+        groups = {}
+        for ln in str(raw_table or '').splitlines():
+            try:
+                parts = [x for x in str(ln or '').split() if x]
+                # Expected closed table row:
+                # 06-19 23:45:38  F1-ASIA-NOR-SELL  ZEC  SELL  $40.45  -40.45
+                if len(parts) < 7:
+                    continue
+                if not re.match(r'^\d{2}-\d{2}$', parts[0] or ''):
+                    continue
+                combo = str(parts[2] or '-').upper().strip() or '-'
+                sym = str(parts[3] or '-').upper().strip() or '-'
+                side = str(parts[4] or '-').upper().strip() or '-'
+                pnl = _yver95_parse_money_number(parts[-1])
+                key = (combo, sym, side)
+                g = groups.setdefault(key, {'combo': combo, 'sym': sym, 'side': side, 'parts': 0, 'pnl': 0.0})
+                g['parts'] += 1
+                g['pnl'] += float(pnl or 0.0)
+            except Exception:
+                continue
+        multi = [g for g in groups.values() if int(g.get('parts') or 0) > 1]
+        if not multi:
+            note = (
+                "\n" + SEP + "\n"
+                "Reconciliation: <b>/autotrade_closed</b> shows raw Bybit Closed-PnL rows. "
+                "<b>/autotrade_report</b> can merge those rows into one practical position when needed."
+            )
+            if 'Reconciliation:' not in out:
+                return out + note
+            return out
+        multi.sort(key=lambda r: (str(r.get('sym') or ''), str(r.get('combo') or ''), str(r.get('side') or '')))
+        rows = []
+        for g in multi:
+            rows.append([
+                g.get('combo') or '-',
+                g.get('sym') or '-',
+                g.get('side') or '-',
+                int(g.get('parts') or 0),
+                f"{float(g.get('pnl') or 0.0):+.2f}",
+                'merged in /autotrade_report',
+            ])
+        tbl = tabulate(
+            rows,
+            headers=['Combo', 'Symbol', 'Side', 'RawParts', 'NetPnL', 'Report meaning'],
+            tablefmt='plain',
+            colalign=('left', 'left', 'center', 'right', 'right', 'left'),
+        )
+        add = (
+            "\n" + SEP + "\n"
+            "<b>Reconciliation note</b>\n"
+            "Raw Bybit fragments below are expected to appear as one merged row in <code>/autotrade_report</code>.\n"
+            "<pre>" + html.escape(tbl) + "</pre>"
+        )
+        if 'Reconciliation note' not in out:
+            return out + add
+        return out
+    except Exception:
+        return str(text or '')
+
+
+def _autotrade_closed_positions_text_cached(owner_uid: int, lookback_h: int) -> str:
+    if callable(_YVER95_ORIG_AUTOTRADE_CLOSED_POSITIONS_TEXT_CACHED):
+        base = _YVER95_ORIG_AUTOTRADE_CLOSED_POSITIONS_TEXT_CACHED(owner_uid, lookback_h)
+    else:
+        base = ''
+    return _yver95_append_closed_fragment_reconciliation(base)
+
+
+def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
+    """yver95 wrapper: clarify audit vs real AutoTrade reconciliation semantics."""
+    if callable(_YVER95_ORIG_SETUP_AUDIT_TEXT):
+        out = _YVER95_ORIG_SETUP_AUDIT_TEXT(uid, limit=limit, hours=hours)
+    else:
+        out = ''
+    try:
+        old = "<b>PnL</b> shows realised AutoTrade PnL for AT_CLOSED rows. Result view has no expiry: unresolved setups stay OPEN until TP or SL is hit."
+        new = (
+            "<b>PnL</b> shows realised AutoTrade PnL for AT_CLOSED rows. "
+            "<b>Res</b> is the independent setup price-path result, not the same thing as merged Bybit PnL. "
+            "Use <code>/setup_audit_compare 24</code> to reconcile setup path vs real AutoTrade close. "
+            "Result view has no expiry: unresolved setups stay OPEN until TP or SL is hit."
+        )
+        if old in out:
+            out = out.replace(old, new)
+        elif 'Result view has no expiry' in out and 'setup price-path result' not in out:
+            out = out.replace('Result view has no expiry:', '<b>Res</b> is the independent setup price-path result; use <code>/setup_audit_compare 24</code> for reconciliation. Result view has no expiry:')
+    except Exception:
+        pass
+    return out
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v95_reconcile'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v95'
+except Exception:
+    pass
+try:
+    AUTOTRADE_REPORT_CACHE_TTL_SEC = min(int(globals().get('AUTOTRADE_REPORT_CACHE_TTL_SEC', 20) or 20), 5)
+except Exception:
+    pass
+# =========================================================
+# end yver95 reporting reconciliation clarity
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
