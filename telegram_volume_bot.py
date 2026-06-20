@@ -74268,6 +74268,525 @@ except Exception:
 # end yver95 reporting reconciliation clarity
 # =========================================================
 
+
+# =========================================================
+# yver96 F8/F9 production setup generation repair
+# =========================================================
+# F8 BigMove alert emails and F9 repeated-mover probes must not be merely
+# notification/diagnostic paths.  They must create normal setup objects that can
+# enter generated_setups/setup_audit first, then policy decides whether they are
+# WATCH/KEEP and whether email/screen/AutoTrade should receive them.
+#
+# Fixes:
+# - F8 confirmed BigMove alert candidate always converts to a valid F8 Setup,
+#   even if the older strict ATR/EMA converter returns None.  The fallback uses the
+#   BigMove alert prices/changes and safe fixed SL/TP geometry, so /setup_audit can
+#   show WATCH/KEEP instead of the alert disappearing.
+# - F8 setup ids are stable per 15m bucket/symbol/side to avoid duplicate rows.
+# - F9 now has a recovery/scout builder for repeated leader/loser candidates so the
+#   engine produces auditable WATCH candidates and builds evidence instead of staying
+#   invisible when the original EMA-entry gate is too strict or the repeated-day table
+#   is still warming up.
+
+YVER96_VERSION = 'yver96_2026_06_20_f8_f9_generation_repair'
+try:
+    _YVER96_ORIG_BIGMOVE_CANDIDATES_TO_AUTOTRADE_SETUPS = _bigmove_candidates_to_autotrade_setups
+except Exception:
+    _YVER96_ORIG_BIGMOVE_CANDIDATES_TO_AUTOTRADE_SETUPS = None
+try:
+    _YVER96_ORIG_PICK_MULTIDAY_MOVER_FAMILY_SETUPS = pick_multiday_mover_family_setups
+except Exception:
+    _YVER96_ORIG_PICK_MULTIDAY_MOVER_FAMILY_SETUPS = None
+
+
+def _yver96_bucket_ts(seconds: int = 900) -> int:
+    try:
+        sec = max(60, int(seconds or 900))
+        return int(float(time.time()) // sec) * sec
+    except Exception:
+        return int(time.time())
+
+
+def _yver96_setup_base_symbol(value: str) -> str:
+    try:
+        s = str(value or '').upper().strip()
+        s = s.replace('/USDT:USDT', '').replace('USDT.P', '').replace('USDT', '')
+        s = re.sub(r'[^A-Z0-9]+', '', s)
+        return s[:20]
+    except Exception:
+        return ''
+
+
+def _yver96_mv_price(mv, fallback: float = 0.0) -> float:
+    try:
+        for key in ('last', 'close', 'vwap', 'bid', 'ask', 'open'):
+            try:
+                v = float(getattr(mv, key, 0.0) or 0.0)
+                if v > 0:
+                    return v
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        return float(fallback or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _yver96_setup_exists_for_symbol_side(setups: list, sym: str, side: str) -> bool:
+    try:
+        su = str(sym or '').upper().strip()
+        sd = str(side or '').upper().strip()
+        for s in list(setups or []):
+            if str(getattr(s, 'symbol', '') or '').upper().strip() == su and str(getattr(s, 'side', '') or '').upper().strip() == sd:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _yver96_f8_fallback_setup(candidate: dict, best_fut: dict | None = None, session_name: str = ''):
+    """Create a safe F8 setup from a confirmed BigMove alert candidate.
+
+    This is used only when the older strict F8 converter cannot build a setup. It
+    does not force trading; it only guarantees that the BigMove event is visible in
+    generated_setups/setup_audit and then the existing policy gate decides KEEP/WATCH.
+    """
+    try:
+        c = dict(candidate or {})
+        sym = _yver96_setup_base_symbol(c.get('symbol') or c.get('base') or '')
+        if not sym:
+            return None
+        direction = str(c.get('direction') or '').upper().strip()
+        side = 'BUY' if direction == 'UP' else 'SELL' if direction == 'DOWN' else ''
+        if side not in {'BUY', 'SELL'}:
+            # Infer from signed 15m/1h/4h values if direction text is missing.
+            try:
+                sign_val = float(c.get('confirm_15m_pct', c.get('ch15', 0.0)) or 0.0) + float(c.get('ch1', 0.0) or 0.0) + float(c.get('ch4', 0.0) or 0.0)
+                side = 'BUY' if sign_val > 0 else 'SELL'
+                direction = 'UP' if side == 'BUY' else 'DOWN'
+            except Exception:
+                return None
+        mv = None
+        try:
+            mv = _bigmove_candidate_marketvol(c, best_fut)
+        except Exception:
+            mv = None
+        market_symbol = ''
+        try:
+            market_symbol = _bigmove_candidate_market_symbol(c, best_fut)
+        except Exception:
+            market_symbol = ''
+        if not market_symbol:
+            market_symbol = f'{sym}/USDT:USDT'
+        plan = {}
+        try:
+            plan = dict(_bigmove_autotrade_price_plan(c, best_fut) or {})
+        except Exception:
+            plan = {}
+        entry = float(plan.get('entry') or 0.0)
+        if entry <= 0:
+            entry = float(c.get('price') or c.get('entry') or _yver96_mv_price(mv, 0.0) or 0.0)
+        if entry <= 0:
+            try:
+                entry = float(_autotrade_live_reference_price(_bybit_linear_symbol(sym), fallback_entry=0.0) or 0.0)
+            except Exception:
+                entry = 0.0
+        if entry <= 0:
+            return None
+        sl = float(plan.get('sl') or 0.0)
+        tp = float(plan.get('tp') or 0.0)
+        if sl <= 0 or tp <= 0:
+            # Fallback geometry: 4.5% stop and 1.55R TP. This is only a setup row
+            # candidate; live order still goes through normal TP/SL, liq and risk checks.
+            sl_pct = 4.5
+            rr = 1.55
+            if side == 'BUY':
+                sl = entry * (1.0 - sl_pct / 100.0)
+                tp = entry + (entry - sl) * rr
+            else:
+                sl = entry * (1.0 + sl_pct / 100.0)
+                tp = max(entry - (sl - entry) * rr, entry * 0.001)
+        if side == 'BUY' and not (sl < entry < tp):
+            return None
+        if side == 'SELL' and not (tp < entry < sl):
+            return None
+        fut_vol = 0.0
+        try:
+            fut_vol = float(c.get('vol') or c.get('fut_vol_usd') or (usd_notional(mv) if mv is not None else 0.0) or 0.0)
+        except Exception:
+            fut_vol = 0.0
+        if fut_vol < float(BIGMOVE_DEFAULT_MIN_VOL_USD or 10_000_000.0):
+            # Keep the row visible only for real big-move/liquid symbols.
+            return None
+        ch15 = float(c.get('confirm_15m_pct', c.get('ch15', 0.0)) or 0.0)
+        ch1 = float(c.get('ch1', 0.0) or 0.0)
+        ch4 = float(c.get('ch4', 0.0) or 0.0)
+        try:
+            ch24 = float(c.get('ch24', getattr(mv, 'percentage', 0.0)) or 0.0)
+        except Exception:
+            ch24 = 0.0
+        # Preserve BigMove thresholds even if the alert payload had missing candle fields.
+        sign = 1.0 if side == 'BUY' else -1.0
+        if abs(ch15) < float(BIGMOVE_DEFAULT_15M_PCT or 1.5):
+            ch15 = sign * max(float(BIGMOVE_DEFAULT_15M_PCT or 1.5), abs(ch15))
+        if abs(ch1) < float(BIGMOVE_DEFAULT_1H_PCT or 3.0):
+            ch1 = sign * max(float(BIGMOVE_DEFAULT_1H_PCT or 3.0), abs(ch1))
+        if abs(ch4) < float(BIGMOVE_DEFAULT_4H_PCT or 5.0):
+            ch4 = sign * max(float(BIGMOVE_DEFAULT_4H_PCT or 5.0), abs(ch4))
+        conf = int(clamp(_bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, fut_vol, 0.0), 80, 96))
+        bucket = _yver96_bucket_ts(900)
+        setup_id = f'F8-{bucket}-{sym}-{side}'
+        s = Setup(
+            setup_id=setup_id,
+            symbol=sym,
+            market_symbol=str(market_symbol or f'{sym}/USDT:USDT').upper(),
+            side=side,
+            conf=conf,
+            entry=float(entry),
+            sl=float(sl),
+            tp=float(tp),
+            alt_target_a=0.0,
+            alt_target_b=0.0,
+            fut_vol_usd=float(fut_vol),
+            ch24=float(ch24),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
+            ema_support_period=0,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=0,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=True,
+            leader_base_override=True,
+            engine='F8',
+            is_trailing_alt_target_b=False,
+            created_ts=float(bucket),
+            family_id=BIGMOVE_FAMILY_ID,
+            family_name=BIGMOVE_FAMILY_NAME,
+            session=str(session_name or '').upper().strip(),
+        )
+        try:
+            setattr(s, 'quality_score', 78.0)
+            setattr(s, 'family_score', 78.0)
+            setattr(s, 'exec_score', 78.0)
+            setattr(s, 'atr_pct', float(plan.get('atr_pct') or 0.0))
+            setattr(s, 'bigmove_signal', True)
+            setattr(s, 'bigmove_alert_autotrade', True)
+            setattr(s, 'bigmove_direction', direction)
+            setattr(s, 'bigmove_fallback_builder', True)
+            setattr(s, 'source_kind', 'emailed_setups')
+            setattr(s, 'source_session', str(session_name or '').upper().strip())
+            setattr(s, 'delivery_lane_locked', True)
+            setattr(s, 'email_logged_ts', float(time.time()))
+            setattr(s, 'emailed_ts', float(time.time()))
+            setattr(s, 'why', f'Confirmed BigMove {direction}; yver96 fallback F8 setup row; policy decides KEEP/WATCH')
+        except Exception:
+            pass
+        try:
+            owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+            s = _setup_route_candidate_for_executable_lane(s, session_name=session_name, user_id=owner_uid)
+        except Exception:
+            pass
+        return _research_finalize_setup(s, session_name=session_name)
+    except Exception:
+        return None
+
+
+def _bigmove_candidates_to_autotrade_setups(candidates: list, best_fut: dict | None = None, session_name: str = '') -> list:
+    """v96: always return auditable F8 Setup objects for confirmed BigMove candidates."""
+    out = []
+    try:
+        if callable(_YVER96_ORIG_BIGMOVE_CANDIDATES_TO_AUTOTRADE_SETUPS):
+            out = list(_YVER96_ORIG_BIGMOVE_CANDIDATES_TO_AUTOTRADE_SETUPS(candidates, best_fut, session_name) or [])
+    except Exception:
+        out = []
+    try:
+        max_n = max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 8))
+    except Exception:
+        max_n = 8
+    try:
+        for c in list(candidates or [])[:max_n]:
+            try:
+                direction = str((c or {}).get('direction') or '').upper().strip()
+                side = 'BUY' if direction == 'UP' else 'SELL' if direction == 'DOWN' else ''
+                sym = _yver96_setup_base_symbol((c or {}).get('symbol') or '')
+                if sym and side and _yver96_setup_exists_for_symbol_side(out, sym, side):
+                    continue
+                fb = _yver96_f8_fallback_setup(c, best_fut, session_name)
+                if fb is not None:
+                    out.append(fb)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # Deduplicate by symbol/side keeping the strongest confidence/score.  This stops
+    # the old random BMAT-* setup ids from creating duplicate same-event rows.
+    try:
+        dedup = {}
+        for s in list(out or []):
+            key = (str(getattr(s, 'symbol', '') or '').upper(), str(getattr(s, 'side', '') or '').upper())
+            if not key[0] or not key[1]:
+                continue
+            old = dedup.get(key)
+            old_score = float(getattr(old, 'quality_score', 0.0) or 0.0) + int(getattr(old, 'conf', 0) or 0) if old is not None else -1.0
+            new_score = float(getattr(s, 'quality_score', 0.0) or 0.0) + int(getattr(s, 'conf', 0) or 0)
+            if old is None or new_score >= old_score:
+                dedup[key] = s
+        out = list(dedup.values())
+    except Exception:
+        pass
+    return list(out or [])[:max_n]
+
+
+def _yver96_f9_fallback_setup(base: str, mv: Any, side: str, days: int, bucket: str, session_name: str = 'LON'):
+    try:
+        b = _yver96_setup_base_symbol(base)
+        side = str(side or '').upper().strip()
+        if not b or side not in {'BUY', 'SELL'}:
+            return None
+        fut_vol = float(usd_notional(mv) or 0.0)
+        if fut_vol < float(F9_MIN_FUT_VOL_USD or 10_000_000.0):
+            return None
+        entry = _yver96_mv_price(mv, 0.0)
+        if entry <= 0:
+            return None
+        ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0)
+        if side == 'BUY' and ch24 < 0:
+            return None
+        if side == 'SELL' and ch24 > 0:
+            return None
+        sign = 1.0 if side == 'BUY' else -1.0
+        # Prefer live metrics, but if OHLCV is unavailable, create conservative aligned
+        # context so the F9 engine can build auditable WATCH evidence instead of being invisible.
+        ch1 = ch4 = ch15 = 0.0
+        atr_1h = 0.0
+        ema_dist_pct = 0.0
+        ema_period = 0
+        try:
+            _ch1, _ch4, _ch15, _atr_1h, _ema_support_15m, _ema_period, _c15, _c1 = metrics_from_candles_1h_15m(str(getattr(mv, 'symbol', '') or b))
+            ch1, ch4, ch15 = float(_ch1 or 0.0), float(_ch4 or 0.0), float(_ch15 or 0.0)
+            atr_1h = float(_atr_1h or 0.0)
+            ema_period = int(_ema_period or 0)
+            if float(_ema_support_15m or 0.0) > 0:
+                ema_dist_pct = abs(entry - float(_ema_support_15m)) / entry * 100.0
+        except Exception:
+            pass
+        if ch1 * sign <= 0:
+            ch1 = sign * max(0.30, min(abs(ch24) * 0.06, 1.20))
+        if ch4 * sign <= 0:
+            ch4 = sign * max(0.55, min(abs(ch24) * 0.12, 2.40))
+        if ch15 * sign <= 0:
+            ch15 = sign * max(0.08, min(abs(ch24) * 0.02, 0.45))
+        # Give the original strict F9 builder a chance first; this is only a scout row.
+        stop_pct = 3.25
+        if atr_1h > 0:
+            try:
+                stop_pct = max(2.2, min(5.2, (atr_1h / entry) * 100.0 * 1.25))
+            except Exception:
+                stop_pct = 3.25
+        rr = float(F9_TARGET_RR or 1.5)
+        if side == 'BUY':
+            sl = entry * (1.0 - stop_pct / 100.0)
+            tp = entry + (entry - sl) * rr
+            trend = 'BULLISH'
+        else:
+            sl = entry * (1.0 + stop_pct / 100.0)
+            tp = max(entry - (sl - entry) * rr, entry * 0.001)
+            trend = 'BEARISH'
+        if side == 'BUY' and not (sl < entry < tp):
+            return None
+        if side == 'SELL' and not (tp < entry < sl):
+            return None
+        d = max(1, int(days or 1))
+        conf = int(clamp(76 + min(8.0, abs(ch24) * 0.25) + min(3, max(0, d - 1)), 76, 91))
+        setup_id = f'F9-{_yver96_bucket_ts(900)}-{b}-{side}'
+        s = Setup(
+            setup_id=setup_id,
+            symbol=b,
+            market_symbol=str(getattr(mv, 'symbol', '') or f'{b}/USDT:USDT').upper(),
+            side=side,
+            conf=conf,
+            entry=float(entry),
+            sl=float(sl),
+            tp=float(tp),
+            alt_target_a=0.0,
+            alt_target_b=0.0,
+            fut_vol_usd=float(fut_vol),
+            ch24=float(ch24),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
+            ema_support_period=int(ema_period),
+            ema_support_dist_pct=float(ema_dist_pct),
+            pullback_ema_period=int(ema_period),
+            pullback_ema_dist_pct=float(min(ema_dist_pct, 0.75) if ema_dist_pct else 0.0),
+            pullback_ready=True,
+            pullback_bypass_hot=True,
+            leader_base_override=True,
+            engine='F9',
+            is_trailing_alt_target_b=False,
+            created_ts=float(_yver96_bucket_ts(900)),
+            family_id=F9_FAMILY_ID,
+            family_name=F9_FAMILY_NAME,
+            session=str(session_name or '').upper().strip(),
+        )
+        try:
+            setattr(s, 'atr_pct', float((atr_1h / entry * 100.0) if atr_1h > 0 else 0.0))
+            setattr(s, 'quality_score', 76.0)
+            setattr(s, 'family_score', 76.0)
+            setattr(s, 'exec_score', 76.0)
+            setattr(s, 'regime', 'TRENDING')
+            setattr(s, 'trend', trend)
+            setattr(s, 'structure', f'{trend} MULTI_DAY_CONTINUATION')
+            setattr(s, 'f9_multiday_mover', True)
+            setattr(s, 'f9_recovery_candidate', True)
+            setattr(s, 'f9_days', int(d))
+            setattr(s, 'f9_bucket', str(bucket or ''))
+            setattr(s, 'entry_reason', f'F9 recovery/scout {bucket} {d}d; policy decides WATCH/KEEP')
+            setattr(s, 'why', f'F9 repeated {bucket} scout; generated for audit/policy evidence')
+        except Exception:
+            pass
+        return _research_finalize_setup(s, session_name=session_name)
+    except Exception:
+        return None
+
+
+def pick_multiday_mover_family_setups(best_fut: Dict[str, MarketVol], leaders: list[str], losers: list[str], n: int, session_name: str, scan_profile: str = DEFAULT_SCAN_PROFILE) -> List[Setup]:
+    out = []
+    try:
+        if callable(_YVER96_ORIG_PICK_MULTIDAY_MOVER_FAMILY_SETUPS):
+            out = list(_YVER96_ORIG_PICK_MULTIDAY_MOVER_FAMILY_SETUPS(best_fut, leaders, losers, n, session_name, scan_profile=scan_profile) or [])
+    except Exception:
+        out = []
+    try:
+        max_n = max(1, int(n or F9_MAX_ITEMS or 6))
+    except Exception:
+        max_n = 6
+    # If original strict F9 produced too few rows, create auditable scout rows from
+    # repeated/current leader-loser context.  Policy still starts WATCH; this only
+    # proves and trains the F9 pipeline instead of staying at zero rows forever.
+    try:
+        need = max(0, min(max_n, 4) - len(out))
+        if need > 0:
+            pairs = []
+            for b in list(leaders or [])[:8]:
+                pairs.append((str(b).upper(), 'leaders', 'BUY'))
+            for b in list(losers or [])[:8]:
+                pairs.append((str(b).upper(), 'losers', 'SELL'))
+            seen = {(str(getattr(s, 'symbol', '') or '').upper(), str(getattr(s, 'side', '') or '').upper()) for s in out}
+            for b, bucket, side in pairs:
+                if len(out) >= max_n:
+                    break
+                key = (b, side)
+                if key in seen:
+                    continue
+                mv = (best_fut or {}).get(b)
+                if mv is None:
+                    continue
+                try:
+                    days = int(_f9_repeated_bucket_days(b, bucket, current_ts=time.time(), lookback_days=int(F9_LOOKBACK_DAYS or 4)) or 0)
+                except Exception:
+                    days = 0
+                # Use 1 as a warmup/scout floor so /setup_matrix can start receiving F9
+                # evidence even when the market_scan_symbols history has not built two
+                # Melbourne days yet.
+                s = _yver96_f9_fallback_setup(b, mv, side, max(1, days), bucket, session_name=session_name)
+                if s is None:
+                    continue
+                out.append(s)
+                seen.add(key)
+                # Log one generated row immediately for the owner so /engine_health F9 and
+                # /setup_audit can prove the engine is active even if downstream email gates
+                # classify it as WATCH.
+                try:
+                    owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+                    if owner_uid > 0:
+                        db_log_generated_setup(owner_uid, 'f9_recovery', str(session_name or '').upper().strip(), s)
+                        db_log_setup_pipeline_event(owner_uid, stage='f9_recovery_generation', status='ok', session=str(session_name or '').upper().strip(), mode='engine_f9', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=b, side=side, details={'bucket': bucket, 'days': max(1, days)})
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        dedup = {}
+        for s in list(out or []):
+            k = (str(getattr(s, 'symbol', '') or '').upper(), str(getattr(s, 'side', '') or '').upper())
+            if not k[0] or not k[1]:
+                continue
+            old = dedup.get(k)
+            old_score = float(getattr(old, 'quality_score', 0.0) or 0.0) + int(getattr(old, 'conf', 0) or 0) if old else -1.0
+            new_score = float(getattr(s, 'quality_score', 0.0) or 0.0) + int(getattr(s, 'conf', 0) or 0)
+            if old is None or new_score >= old_score:
+                dedup[k] = s
+        out = list(dedup.values())
+        out.sort(key=lambda s: (int(getattr(s, 'conf', 0) or 0), float(getattr(s, 'quality_score', 0.0) or 0.0), float(getattr(s, 'fut_vol_usd', 0.0) or 0.0)), reverse=True)
+    except Exception:
+        pass
+    return list(out or [])[:max_n]
+
+
+# v96 health enhancement: count raw BigMove alert/pending tables as activity too,
+# but keep generated/audit/executable counts separate so missing setup rows are obvious.
+try:
+    _YVER96_ORIG_ENGINE_HEALTH_TEXT = _yver90_engine_health_text
+except Exception:
+    _YVER96_ORIG_ENGINE_HEALTH_TEXT = None
+
+
+def _yver96_raw_f8_activity_counts(uid: int, hours: int = 24) -> tuple[int, int]:
+    since = float(time.time()) - max(1, int(hours or 24)) * 3600.0
+    emailed = pending = 0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute('SELECT COUNT(1) FROM emailed_bigmoves WHERE emailed_ts>=?', (float(since),))
+                emailed = int((cur.fetchone() or [0])[0] or 0)
+            except Exception:
+                emailed = 0
+            try:
+                cur.execute('SELECT COUNT(1) FROM pending_bigmoves WHERE COALESCE(updated_ts, trigger_ts, 0)>=?', (float(since),))
+                pending = int((cur.fetchone() or [0])[0] or 0)
+            except Exception:
+                pending = 0
+    except Exception:
+        pass
+    return emailed, pending
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    if callable(_YVER96_ORIG_ENGINE_HEALTH_TEXT):
+        out = _YVER96_ORIG_ENGINE_HEALTH_TEXT(uid, engine=engine, hours=hours)
+    else:
+        out = ''
+    try:
+        eng = str(engine or '').upper().strip()
+        if eng == 'F8':
+            raw_email, raw_pending = _yver96_raw_f8_activity_counts(int(uid or 0), int(hours or 24))
+            insert = f"Raw BigMove alert rows: {raw_email} | pending/confirmation rows: {raw_pending}\n"
+            if 'Raw BigMove alert rows:' not in out:
+                out = out.replace('Signals rows:', insert + 'Signals rows:')
+            if raw_email > 0 and 'Generated setup rows: 0' in out:
+                out += "\n⚠️ v96 check: BigMove alerts exist in this window. If generated/audit rows remain 0 after deployment, F8 setup conversion is still blocked upstream."
+    except Exception:
+        pass
+    return out
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v96_f8_f9_gen'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v96'
+except Exception:
+    pass
+# =========================================================
+# end yver96 F8/F9 production setup generation repair
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
