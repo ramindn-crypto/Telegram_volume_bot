@@ -78754,6 +78754,346 @@ except Exception:
 # end yver110
 # =========================================================
 
+
+
+# =========================================================
+# yver114: restore /setup_matrix policy from stable v110 baseline
+# =========================================================
+# Problem being fixed:
+# - v111/v112/v113 added an F9 policy-reset/quarantine layer and rewrote the
+#   policy table from a post-reset slice. On the live DB this made
+#   /setup_matrix policy look like most lanes had zero evidence and added the
+#   "F9 policy reset" note. That was a policy-display/rewrite fault, not a real
+#   market/statistical reset.
+#
+# This build is intentionally based on the uploaded yver110 baseline.  It does
+# NOT include the v111/v112/v113 policy reset/rewrite layer.  It also repairs a
+# DB that was already touched by that layer by promoting the last good pre-reset
+# setup_combo_scores run back to the latest score snapshot and restoring the
+# setup_combo_policy rows from that run.
+YVER114_VERSION = 'yver114_2026_06_21_restore_setup_matrix_from_v110_baseline'
+_YVER114_ORIG_SETUP_COMBO_POLICY_TEXT = globals().get('_setup_combo_policy_text')
+_YVER114_ORIG_SETUP_MATRIX_CMD = globals().get('setup_matrix_cmd')
+
+
+def _yver114_policy_run_stats(cur, run_id: str, uid: int) -> dict:
+    try:
+        ids = [int(uid or 0), 0]
+        qmarks = ','.join(['?'] * len(ids))
+        row = cur.execute(
+            f"""
+            SELECT run_id,
+                   MAX(COALESCE(evaluated_ts,0)) AS evaluated_ts,
+                   COUNT(1) AS rows_n,
+                   SUM(CASE WHEN COALESCE(decided,0)>0 THEN 1 ELSE 0 END) AS nonzero_lanes,
+                   SUM(COALESCE(decided,0)) AS total_decided,
+                   SUM(CASE WHEN UPPER(COALESCE(action,''))='KEEP' THEN 1 ELSE 0 END) AS keep_lanes,
+                   SUM(CASE WHEN UPPER(COALESCE(family,''))='F9' THEN 1 ELSE 0 END) AS f9_rows,
+                   SUM(CASE WHEN UPPER(COALESCE(family,''))='F9' AND UPPER(COALESCE(action,''))='KEEP' THEN 1 ELSE 0 END) AS f9_keep_lanes
+            FROM setup_combo_scores
+            WHERE run_id=? AND user_id IN ({qmarks})
+            GROUP BY run_id
+            """,
+            tuple([str(run_id)] + ids),
+        ).fetchone()
+        if not row:
+            return {}
+        return {
+            'run_id': str(row[0] or run_id),
+            'evaluated_ts': float(row[1] or 0.0),
+            'rows_n': int(row[2] or 0),
+            'nonzero_lanes': int(row[3] or 0),
+            'total_decided': int(row[4] or 0),
+            'keep_lanes': int(row[5] or 0),
+            'f9_rows': int(row[6] or 0),
+            'f9_keep_lanes': int(row[7] or 0),
+        }
+    except Exception:
+        return {}
+
+
+def _yver114_find_good_policy_run(cur, uid: int) -> tuple[dict, dict, str]:
+    """Return (selected_good, latest, reason)."""
+    try:
+        ids = [int(uid or 0), 0]
+        qmarks = ','.join(['?'] * len(ids))
+        latest = cur.execute(
+            f"SELECT run_id, MAX(COALESCE(evaluated_ts,0)) AS et FROM setup_combo_scores WHERE user_id IN ({qmarks}) GROUP BY run_id ORDER BY et DESC LIMIT 1",
+            tuple(ids),
+        ).fetchone()
+        if not latest:
+            return {}, {}, 'no_score_runs'
+        latest_stats = _yver114_policy_run_stats(cur, str(latest[0] or ''), int(uid or 0))
+        if str((latest_stats or {}).get('run_id') or '').startswith('SCM-YVER114-RESTORE-'):
+            return {}, latest_stats, 'already_restored_latest'
+
+        cutoff = 0.0
+        try:
+            cutoff = float(_autotrade_config_get('yver111_f9_policy_strict_cutoff_ts', 0) or 0.0)
+        except Exception:
+            cutoff = 0.0
+        reset_marker = ''
+        try:
+            reset_marker = str(_autotrade_config_get('yver111_f9_policy_reset_version', '') or '')
+        except Exception:
+            reset_marker = ''
+
+        # Inspect recent score runs and choose the healthiest older evidence run.
+        cand_rows = cur.execute(
+            f"""
+            SELECT run_id, MAX(COALESCE(evaluated_ts,0)) AS et,
+                   COUNT(1) AS rows_n,
+                   SUM(COALESCE(decided,0)) AS total_decided,
+                   SUM(CASE WHEN COALESCE(decided,0)>0 THEN 1 ELSE 0 END) AS nonzero_lanes,
+                   SUM(CASE WHEN UPPER(COALESCE(action,''))='KEEP' THEN 1 ELSE 0 END) AS keep_lanes
+            FROM setup_combo_scores
+            WHERE user_id IN ({qmarks})
+            GROUP BY run_id
+            ORDER BY et DESC
+            LIMIT 120
+            """,
+            tuple(ids),
+        ).fetchall() or []
+        candidates = []
+        for r in cand_rows:
+            try:
+                rid = str(r[0] or '')
+                if not rid or rid.startswith('SCM-YVER114-RESTORE-'):
+                    continue
+                st = _yver114_policy_run_stats(cur, rid, int(uid or 0))
+                if not st:
+                    continue
+                # Prefer pre-reset runs when the bad v111 marker exists.  If there
+                # is no marker, still allow recovery from the highest-evidence run
+                # when the latest run is clearly collapsed.
+                if cutoff > 0 and float(st.get('evaluated_ts') or 0.0) >= cutoff:
+                    continue
+                candidates.append(st)
+            except Exception:
+                continue
+        if not candidates:
+            # Fallback: best non-restore run overall if latest is obviously small.
+            for r in cand_rows:
+                try:
+                    rid = str(r[0] or '')
+                    if not rid or rid.startswith('SCM-YVER114-RESTORE-'):
+                        continue
+                    st = _yver114_policy_run_stats(cur, rid, int(uid or 0))
+                    if st:
+                        candidates.append(st)
+                except Exception:
+                    continue
+        if not candidates:
+            return {}, latest_stats, 'no_candidate_runs'
+
+        # Score by total decided evidence, then nonzero lanes, then keep lanes,
+        # then recency. This picks the last full historical matrix instead of the
+        # broken post-reset short slice.
+        best = sorted(candidates, key=lambda x: (int(x.get('total_decided') or 0), int(x.get('nonzero_lanes') or 0), int(x.get('keep_lanes') or 0), float(x.get('evaluated_ts') or 0.0)), reverse=True)[0]
+        latest_total = int((latest_stats or {}).get('total_decided') or 0)
+        best_total = int((best or {}).get('total_decided') or 0)
+        latest_nonzero = int((latest_stats or {}).get('nonzero_lanes') or 0)
+        best_nonzero = int((best or {}).get('nonzero_lanes') or 0)
+
+        # Recovery triggers:
+        # 1) the v111 marker exists and latest is post-cutoff/collapsed; or
+        # 2) latest has far less decided evidence than a recent good run.
+        latest_ts = float((latest_stats or {}).get('evaluated_ts') or 0.0)
+        marker_trigger = bool(reset_marker) and cutoff > 0 and latest_ts >= cutoff and best_total > 0
+        collapse_trigger = best_total >= max(50, int(latest_total * 1.35) + 1) and best_nonzero >= max(5, latest_nonzero)
+        if marker_trigger or collapse_trigger:
+            reason = 'v111_policy_reset_marker' if marker_trigger else 'latest_score_run_collapsed'
+            return best, latest_stats, reason
+        return {}, latest_stats, 'latest_score_run_ok'
+    except Exception as exc:
+        return {}, {}, f'find_good_run_error:{type(exc).__name__}'
+
+
+def _yver114_restore_policy_from_score_run(uid: int = 0, force: bool = False) -> dict:
+    """Repair setup_combo_scores/setup_combo_policy if v111-v113 collapsed the matrix."""
+    out = {'ok': False, 'changed': False, 'reason': 'not_run'}
+    try:
+        _setup_combo_policy_migrate()
+        owner_uid = int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        now_ts = float(time.time())
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            good, latest, reason = _yver114_find_good_policy_run(cur, int(owner_uid or 0))
+            out.update({'reason': reason, 'latest': latest, 'selected': good})
+            if not force and not good:
+                out['ok'] = True
+                return out
+            if not good:
+                return out
+            old_run = str(good.get('run_id') or '')
+            if not old_run:
+                out['reason'] = 'selected_run_missing'
+                return out
+            new_run = 'SCM-YVER114-RESTORE-' + datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
+            score_rows = [dict(r) for r in cur.execute("SELECT * FROM setup_combo_scores WHERE run_id=?", (old_run,)).fetchall() or []]
+            if not score_rows:
+                out['reason'] = 'selected_run_empty'
+                return out
+            cols = [str(r[1]) for r in cur.execute('PRAGMA table_info(setup_combo_scores)').fetchall() or []]
+            if not cols:
+                out['reason'] = 'score_schema_missing'
+                return out
+            placeholders = ','.join(['?'] * len(cols))
+            col_sql = ','.join(cols)
+            copied = 0
+            for r in score_rows:
+                try:
+                    d = {c: r.get(c) for c in cols}
+                    d['run_id'] = new_run
+                    d['evaluated_ts'] = now_ts
+                    vals = [d.get(c) for c in cols]
+                    cur.execute(f"INSERT OR REPLACE INTO setup_combo_scores ({col_sql}) VALUES ({placeholders})", vals)
+                    copied += 1
+                except Exception:
+                    continue
+
+            # Restore active policy rows from the copied run. This reverses the
+            # v111 demotion/notes without deleting any audit history.
+            restored_policy = 0
+            for r in score_rows:
+                try:
+                    fam = str(r.get('family') or '').upper().strip()
+                    sess = str(r.get('session') or '').upper().strip()
+                    strat = _setup_strategy_suffix(value=str(r.get('strategy') or 'NOR'))
+                    side = _setup_side_suffix(value=str(r.get('side') or 'BOTH'))
+                    if not fam or not sess or side not in {'BUY', 'SELL'}:
+                        continue
+                    status = str(r.get('action') or 'WATCH').upper().strip() or 'WATCH'
+                    if status not in {'KEEP', 'WATCH', 'DISABLE', 'TIGHTEN'}:
+                        status = 'WATCH'
+                    enabled = int(r.get('enabled_next') if r.get('enabled_next') is not None else (0 if status == 'DISABLE' else 1))
+                    if status == 'DISABLE':
+                        enabled = 0
+                    else:
+                        enabled = 1
+                    note = str(r.get('notes') or '')[:350]
+                    note = ('yver114 restored from stable v110 score run ' + old_run + ((' | ' + note) if note else ''))[:500]
+                    for pol_uid in list(dict.fromkeys([int(owner_uid or 0), int(r.get('user_id') or 0), 0])):
+                        if int(pol_uid or 0) < 0:
+                            continue
+                        cur.execute("""INSERT OR REPLACE INTO setup_combo_policy
+                            (user_id, family, session, strategy, side, status, enabled, last_score, last_win_rate, last_avg_r, last_setups, last_decided, last_run_id, updated_ts, notes, policy_kind, scheduled_for_ts, expires_ts, policy_tz)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (int(pol_uid), fam, sess, strat, side, status, int(enabled), float(r.get('score') or 0.0), float(r.get('win_rate') or 0.0), float(r.get('avg_r') or 0.0), int(r.get('setups') or 0), int(r.get('decided') or 0), new_run, now_ts, note, 'yver114_restore_v110', 0.0, 0.0, str(globals().get('SETUP_COMBO_POLICY_REVIEW_TZ', 'Australia/Melbourne') or 'Australia/Melbourne')))
+                        restored_policy += 1
+                except Exception:
+                    continue
+
+            try:
+                _autotrade_config_set('yver114_setup_matrix_recovery_version', YVER114_VERSION)
+                _autotrade_config_set('yver114_setup_matrix_recovered_from_run', old_run)
+                _autotrade_config_set('yver114_setup_matrix_restored_run', new_run)
+                _autotrade_config_set('yver114_setup_matrix_recovery_ts', str(int(now_ts)))
+                _autotrade_config_set('yver114_setup_matrix_recovery_reason', str(reason))
+            except Exception:
+                pass
+            conn.commit()
+
+        # Invalidate policy/score/report caches so /setup_matrix policy uses the
+        # restored snapshot immediately.
+        try:
+            globals().setdefault('_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE', {'ts': 0.0})['ts'] = 0.0
+        except Exception:
+            pass
+        try:
+            globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0})['ts'] = 0.0
+        except Exception:
+            pass
+        try:
+            globals().setdefault('_SETUP_COMBO_POLICY_CACHE', {'ts': 0.0})['ts'] = 0.0
+        except Exception:
+            pass
+        out.update({'ok': True, 'changed': True, 'copied_score_rows': copied, 'restored_policy_rows': restored_policy, 'restored_run_id': new_run})
+        return out
+    except Exception as exc:
+        out.update({'ok': False, 'reason': f'{type(exc).__name__}: {exc}'})
+        return out
+
+
+def _setup_combo_policy_text(uid: int) -> str:
+    """v114 wrapper: repair any v111-v113 policy collapse, then render v110 policy."""
+    recovery = {}
+    try:
+        recovery = _yver114_restore_policy_from_score_run(int(uid or 0), force=False)
+    except Exception:
+        recovery = {'ok': False, 'reason': 'recovery_exception'}
+    if callable(_YVER114_ORIG_SETUP_COMBO_POLICY_TEXT):
+        txt = _YVER114_ORIG_SETUP_COMBO_POLICY_TEXT(uid)
+    else:
+        txt = '❌ setup_combo_policy unavailable'
+    try:
+        if isinstance(recovery, dict) and recovery.get('changed'):
+            selected = (recovery.get('selected') or {})
+            txt += ("\nPolicy repair: v114 restored /setup_matrix policy from the stable v110 score run "
+                    f"{html.escape(str(selected.get('run_id') or recovery.get('yver114_setup_matrix_recovered_from_run') or '-'))}; "
+                    "v111-v113 F9 policy-reset rewrite is not included in this build.")
+        elif 'F9 policy reset:' in str(txt or ''):
+            # Defensive cleanup if a stale cached text somehow leaks into the new key.
+            txt = re.sub(r'\n?F9 policy reset:.*$', '', str(txt), flags=re.IGNORECASE | re.MULTILINE)
+    except Exception:
+        pass
+    return txt
+
+
+async def setup_matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """v114: policy command uses a new cache key so stale v111/v113 output is not reused."""
+    try:
+        uid = int(update.effective_user.id)
+        if not is_admin_user(uid):
+            await update.message.reply_text("⛔ Admin only.")
+            return
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and args[0].lower() in {'policy', 'rules', 'status'}:
+            await _send_cached_or_queue_admin_report(
+                update,
+                "/setup_matrix policy",
+                f"admin:bg:v114:setup_matrix_policy:{int(AUTOTRADE_OWNER_UID or uid)}",
+                _setup_combo_policy_text,
+                args=(int(AUTOTRADE_OWNER_UID or uid),),
+                parse_mode=ParseMode.HTML,
+                fresh_ttl=30,
+                stale_ttl=12 * 3600,
+                background_timeout=900,
+            )
+            return
+    except Exception:
+        pass
+    if callable(_YVER114_ORIG_SETUP_MATRIX_CMD):
+        return await _YVER114_ORIG_SETUP_MATRIX_CMD(update, context)
+    try:
+        await update.message.reply_text("❌ /setup_matrix unavailable after v114 wrapper.")
+    except Exception:
+        pass
+
+
+try:
+    # Run once before polling starts so the first /setup_matrix policy is already
+    # repaired.  This is intentionally lightweight (DB rows only, no OHLCV fetch).
+    _yver114_restore_policy_from_score_run(int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), force=False)
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v114'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v114'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver114_version', YVER114_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver114
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
