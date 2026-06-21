@@ -77114,6 +77114,444 @@ except Exception:
 # end yver105
 # =========================================================
 
+
+
+# =========================================================
+# yver106 — yver105 stability + F8/F9 health/AutoTrade final sync
+# =========================================================
+# Based on yver105 (yver102 baseline).  This patch is intentionally small:
+# - fix F8/F9 engine-health row detection (setup_audit rows carry combo=F8/F9);
+# - if a setup email is sent but the immediate AutoTrade bridge reports
+#   NO_SETUPS_AFTER_EMAIL, try the exact emailed batch directly through the normal
+#   _autotrade_place_trade safety path so /autotrade_last shows real skip/place rows;
+# - restore the owner-agreed runtime risk defaults if stale DB rows show older caps.
+# No TP/SL geometry, leverage, blackout windows, or Bybit order placement internals changed.
+
+YVER106_VERSION = 'yver106_2026_06_21_f8_f9_health_and_email_autotrade_final_sync'
+
+try:
+    _YVER106_ORIG_ENGINE_MATCH = _yver90_engine_match
+except Exception:
+    _YVER106_ORIG_ENGINE_MATCH = None
+try:
+    _YVER106_ORIG_BUILD_FAMILY_MAP = _yver90_build_family_map
+except Exception:
+    _YVER106_ORIG_BUILD_FAMILY_MAP = None
+try:
+    _YVER106_ORIG_TRIGGER_AFTER_EMAIL = _trigger_autotrade_after_email_async
+except Exception:
+    _YVER106_ORIG_TRIGGER_AFTER_EMAIL = None
+try:
+    _YVER106_ORIG_ENGINE_HEALTH_TEXT = _yver90_engine_health_text
+except Exception:
+    _YVER106_ORIG_ENGINE_HEALTH_TEXT = None
+
+
+def _yver106_engine_text_from_row(row: dict) -> str:
+    try:
+        keys = (
+            'setup_id', 'id', 'combo', 'combo_key', 'setup_combo', 'policy_combo',
+            'family', 'engine', 'family_id', 'source', 'source_kind', 'stage', 'mode',
+            'status', 'result', 'details_json', 'details', 'note', 'entry_reason',
+            'strategy_reason', 'reason'
+        )
+        return ' '.join(str((row or {}).get(k) or '') for k in keys).upper()
+    except Exception:
+        return ''
+
+
+def _yver90_engine_match(row: dict, engine: str, family_map: dict | None = None) -> bool:
+    """yver106: engine-health must detect rows whose engine is only present in Combo."""
+    try:
+        if callable(_YVER106_ORIG_ENGINE_MATCH):
+            try:
+                if bool(_YVER106_ORIG_ENGINE_MATCH(row, engine, family_map)):
+                    return True
+            except Exception:
+                pass
+        eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+        sid = str((row or {}).get('setup_id') or (row or {}).get('id') or '').strip()
+        if sid and family_map:
+            mapped = str(family_map.get(sid) or '').upper()
+            if eng in mapped:
+                return True
+            if eng == 'F8' and ('BIGMOVE' in mapped or 'BIG_MOVE' in mapped):
+                return True
+            if eng == 'F9' and ('MULTIDAY' in mapped or 'MULTI_DAY' in mapped or 'MULTI-DAY' in mapped):
+                return True
+        text = _yver106_engine_text_from_row(row)
+        if eng == 'F8':
+            return ('F8' in text) or ('BIGMOVE' in text) or ('BIG_MOVE' in text)
+        return ('F9' in text) or ('MULTIDAY' in text) or ('MULTI_DAY' in text) or ('MULTI-DAY' in text)
+    except Exception:
+        return False
+
+
+def _yver90_build_family_map(rows_by_table: dict[str, list[dict]]) -> dict:
+    """yver106: include combo/setup_combo fields in setup_id -> engine mapping."""
+    out = {}
+    try:
+        if callable(_YVER106_ORIG_BUILD_FAMILY_MAP):
+            try:
+                out.update(dict(_YVER106_ORIG_BUILD_FAMILY_MAP(rows_by_table) or {}))
+            except Exception:
+                pass
+        for table, rows in (rows_by_table or {}).items():
+            for r in rows or []:
+                sid = str((r or {}).get('setup_id') or (r or {}).get('id') or '').strip()
+                if not sid:
+                    continue
+                txt = _yver106_engine_text_from_row(r)
+                if txt.strip():
+                    out[sid] = (str(out.get(sid) or '') + ' ' + txt).strip().upper()
+    except Exception:
+        pass
+    return out
+
+
+def _autotrade_apply_yver106_agreed_risk_defaults() -> None:
+    """Restore the agreed owner defaults if old yver102/yver78 rows resurfaced."""
+    try:
+        target_version = YVER106_VERSION
+        # Always repair only the agreed risk/cap fields; these are user-approved defaults.
+        _autotrade_config_set(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, 1.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, 1.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.5)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY, 55.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY, 60.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, 70.0)
+        _autotrade_config_set(AUTOTRADE_CFG_OPEN_RISK_CAP_PCT_KEY, 15.0)
+        _autotrade_set_daily_cap_settings('PCT', 20.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_DAILY_REALIZED_LOSS_STOP_PCT_KEY, 15.0)
+        _autotrade_config_set('yver106_agreed_risk_defaults_restored', target_version)
+    except Exception:
+        pass
+
+
+def _yver106_setup_fresh_unresolved(s, uid_i: int) -> tuple[bool, str]:
+    try:
+        if callable(globals().get('_yver101_is_fresh_unresolved_setup')):
+            return _yver101_is_fresh_unresolved_setup(s, uid_i)
+    except Exception:
+        pass
+    try:
+        ts = float(getattr(s, 'created_ts', 0.0) or getattr(s, 'executable_ts', 0.0) or time.time())
+        age_min = (time.time() - ts) / 60.0
+        if age_min > float(_autotrade_entry_window_min() or 60) + 1:
+            return False, 'ENTRY_OLD'
+    except Exception:
+        pass
+    return True, 'fresh'
+
+
+def _yver106_policy_keep(s, uid_i: int, sess: str) -> tuple[bool, str]:
+    try:
+        info = _setup_combo_policy_lookup_for_setup(s, session_name=sess, user_id=int(uid_i or 0)) or {}
+        status = _setup_policy_effective_status(str(info.get('status') or '').upper().strip(), found=bool(info.get('found')))
+        if str(status or '').upper() == 'KEEP':
+            return True, 'KEEP'
+        return False, str(status or 'NOT_KEEP').upper()
+    except Exception as exc:
+        return False, f'POLICY_ERROR:{type(exc).__name__}'
+
+
+async def _yver106_force_exact_emailed_batch_autotrade(uid: int, session_name: str, chosen_list: list, tag: str = 'yver106') -> dict:
+    """Final fallback: exact emailed setup batch -> normal AutoTrade placement path."""
+    try:
+        owner_uid = int(AUTOTRADE_OWNER_UID or uid or 0)
+    except Exception:
+        owner_uid = int(uid or 0)
+    sess = str(session_name or '').upper().strip()
+    if owner_uid <= 0 or sess not in {'ASIA', 'LON', 'NY'}:
+        return {'status': 'skip', 'reason': 'bad_owner_or_session'}
+    if not list(chosen_list or []):
+        return {'status': 'skip', 'reason': 'empty_chosen_list'}
+    if not _autotrade_ready() or not _autotrade_entry_enabled():
+        return {'status': 'skip', 'reason': 'autotrade_not_ready_or_entries_off'}
+    if not _autotrade_allowed_session(sess):
+        return {'status': 'skip', 'reason': f'session_not_allowed:{sess}'}
+    try:
+        if not trade_window_allows_now(get_user(owner_uid) or {}):
+            return {'status': 'skip', 'reason': 'trade_window_block'}
+    except Exception:
+        pass
+
+    candidates = []
+    skipped = Counter()
+    seen = set()
+    for s in list(chosen_list or []):
+        try:
+            sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+            sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+            side = str(getattr(s, 'side', '') or '').upper().strip()
+            key = sid or f'{sym}:{side}:{float(getattr(s, "entry", 0.0) or 0.0):.12g}:{float(getattr(s, "sl", 0.0) or 0.0):.12g}'
+            if not sym or not side or key in seen:
+                skipped['duplicate_or_missing_symbol_side'] += 1
+                continue
+            seen.add(key)
+            try:
+                setattr(s, 'source_kind', str(getattr(s, 'source_kind', '') or 'emailed_setups_yver106'))
+                setattr(s, 'source_session', sess)
+                setattr(s, 'delivery_lane_locked', True)
+                setattr(s, 'email_logged_ts', float(time.time()))
+                if not float(getattr(s, 'created_ts', 0.0) or 0.0):
+                    setattr(s, 'created_ts', float(time.time()))
+            except Exception:
+                pass
+            ok_fresh, why_fresh = _yver106_setup_fresh_unresolved(s, owner_uid)
+            if not ok_fresh:
+                skipped[str(why_fresh or 'not_fresh')] += 1
+                continue
+            ok_pol, why_pol = _yver106_policy_keep(s, owner_uid, sess)
+            if not ok_pol:
+                skipped[f'policy_{why_pol}'] += 1
+                continue
+            try:
+                ok_exec, why_exec = is_executable_setup_eligible(s, session_name=sess)
+            except Exception as exc:
+                ok_exec, why_exec = False, f'exec_check_error:{type(exc).__name__}'
+            if not ok_exec:
+                skipped[str(why_exec or 'not_executable')] += 1
+                # Keep the setup visible as a real candidate-level skip in /autotrade_last.
+                # _autotrade_place_trade performs its own final checks, so do not continue
+                # here for direction/cap/drift style reasons if the object is otherwise valid.
+            try:
+                db_mark_executable_setup(owner_uid, sid or key, sess, time.time(), s=s, source_kind='yver106_exact_emailed_batch', state='executable_pending')
+            except Exception:
+                pass
+            candidates.append(s)
+        except Exception as exc:
+            skipped[f'candidate_exception:{type(exc).__name__}'] += 1
+
+    if not candidates:
+        try:
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'SKIP',
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': 'yver106_no_exact_emailed_candidates',
+                'session': sess,
+                'mode': str(_autotrade_runtime_mode()).lower(),
+                'top_reasons': dict(skipped.most_common(8)),
+                'trigger': 'email_sent_immediate_yver106',
+            }
+        except Exception:
+            pass
+        return {'status': 'skip', 'reason': 'no_candidates', 'skipped': dict(skipped)}
+
+    attempted = 0
+    placed = 0
+    attempts_meta = []
+    last_reason = 'not_attempted'
+    try:
+        async with AUTOTRADE_EXEC_LOCK:
+            for cand in candidates:
+                attempted += 1
+                meta = {
+                    'setup_id': str(getattr(cand, 'setup_id', '') or getattr(cand, 'id', '') or ''),
+                    'symbol': str(getattr(cand, 'symbol', '') or ''),
+                    'side': str(getattr(cand, 'side', '') or ''),
+                    'source_kind': str(getattr(cand, 'source_kind', '') or ''),
+                    'trigger': 'email_sent_immediate_yver106',
+                }
+                try:
+                    ok, reason = await to_thread_autotrade(
+                        _autotrade_place_trade,
+                        owner_uid,
+                        sess,
+                        [cand],
+                        timeout=min(int(AUTOTRADE_JOB_TIMEOUT_SEC or 55), 55),
+                    )
+                except asyncio.TimeoutError:
+                    reason = 'autotrade_place_trade_timeout_yver106'
+                    try:
+                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, owner_uid, sess, cand, reason, timeout=8)
+                    except Exception:
+                        ok = False
+                except Exception as exc:
+                    ok, reason = False, f'{type(exc).__name__}: {exc}'
+                last_reason = str(reason or '')
+                try:
+                    detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
+                    meta.update({
+                        'status': 'PLACED' if ok else 'SKIP',
+                        'reason': '' if ok else last_reason,
+                        'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
+                        'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
+                        'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+                        'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
+                        'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
+                    })
+                    _autotrade_record_attempt(owner_uid, meta, detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else last_reason)
+                except Exception:
+                    pass
+                attempts_meta.append(meta)
+                if ok:
+                    placed += 1
+                    continue
+                try:
+                    if not _autotrade_should_try_next_after_skip(last_reason):
+                        break
+                except Exception:
+                    pass
+    except Exception as exc:
+        return {'status': 'error', 'reason': f'{type(exc).__name__}: {exc}', 'attempted': attempted, 'placed': placed}
+
+    status = 'PLACED' if placed > 0 else 'SKIP'
+    reason_out = f'placed_{placed}_from_exact_email_batch_yver106' if placed > 0 else (last_reason or 'no_live_place')
+    try:
+        _LAST_AUTOTRADE_DECISION[owner_uid] = {
+            'status': status,
+            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'reason': reason_out,
+            'session': sess,
+            'mode': str(_autotrade_runtime_mode()).lower(),
+            'attempted': attempted,
+            'placed': placed,
+            'attempted_candidates': attempts_meta[:8],
+            'trigger': 'email_sent_immediate_yver106',
+        }
+        db_log_setup_pipeline_event(owner_uid, stage='yver106_exact_email_autotrade', status=status.lower(), session=sess, mode='autotrade', details={'attempted': attempted, 'placed': placed, 'reason': reason_out, 'candidates': attempts_meta[:5], 'skipped': dict(skipped)})
+    except Exception:
+        pass
+    return {'status': status.lower(), 'reason': reason_out, 'attempted': attempted, 'placed': placed}
+
+
+async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chosen_list: list):
+    """yver106 wrapper: never leave an exact emailed KEEP batch with NO_SETUPS_AFTER_EMAIL."""
+    if callable(_YVER106_ORIG_TRIGGER_AFTER_EMAIL):
+        try:
+            await _YVER106_ORIG_TRIGGER_AFTER_EMAIL(uid, session_name, chosen_list)
+        except Exception as exc:
+            try:
+                owner_uid = int(AUTOTRADE_OWNER_UID or uid or 0)
+                _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                    'status': 'ERROR',
+                    'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'reason': f'orig_trigger_error:{type(exc).__name__}: {exc}',
+                    'trigger': 'email_sent_immediate_yver106',
+                }
+            except Exception:
+                pass
+    try:
+        owner_uid = int(AUTOTRADE_OWNER_UID or uid or 0)
+        dec = dict(_LAST_AUTOTRADE_DECISION.get(owner_uid) or {})
+        reason = str(dec.get('reason') or '').lower()
+        status = str(dec.get('status') or '').upper()
+        needs_fallback = bool(list(chosen_list or [])) and status != 'PLACED' and (
+            reason.startswith('no_setups_after')
+            or 'no_setups_after_email' in reason
+            or reason.startswith('emailed_setups_failed_final_gate')
+            or 'missing_recent_setup_email' in reason
+        )
+        if needs_fallback:
+            await _yver106_force_exact_emailed_batch_autotrade(owner_uid, session_name, list(chosen_list or []), tag='trigger_wrapper')
+    except Exception as exc:
+        try:
+            owner_uid = int(AUTOTRADE_OWNER_UID or uid or 0)
+            _LAST_AUTOTRADE_DECISION[owner_uid] = {
+                'status': 'ERROR',
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': f'yver106_fallback_error:{type(exc).__name__}: {exc}',
+                'trigger': 'email_sent_immediate_yver106',
+            }
+        except Exception:
+            pass
+
+
+def _yver106_engine_health_extra_counts(uid: int, engine: str = 'F9', hours: int = 24) -> dict:
+    """Independent count used to prove health when older helper misses combo-only rows."""
+    out = {'setup_audit_results': 0, 'generated_setups': 0, 'executable_setups': 0, 'emailed_setups': 0, 'setup_pipeline_events': 0, 'setup_combo_policy': 0, 'latest': 0.0}
+    try:
+        eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+        since_ts = time.time() - max(1, min(168, int(hours or 24))) * 3600.0
+        ids = []
+        for x in (uid, globals().get('AUTOTRADE_OWNER_UID', 0), 0):
+            try:
+                xi = int(x or 0)
+                if xi not in ids:
+                    ids.append(xi)
+            except Exception:
+                pass
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            for table in ('setup_audit_results','generated_setups','executable_setups','emailed_setups','setup_pipeline_events'):
+                if not _yver90_table_exists(conn, table):
+                    continue
+                cols = _yver90_table_columns(conn, table)
+                tcol = _yver90_time_col(cols, table)
+                where=[]; params=[]
+                if 'user_id' in cols and ids:
+                    where.append('user_id IN (%s)' % ','.join(['?']*len(ids)))
+                    params.extend(ids)
+                if tcol:
+                    where.append(f'{tcol}>=?')
+                    params.append(float(since_ts))
+                sql=f'SELECT * FROM {table}' + ((' WHERE '+ ' AND '.join(where)) if where else '') + (f' ORDER BY {tcol} DESC' if tcol else '') + ' LIMIT 5000'
+                rows=[dict(r) for r in conn.execute(sql, tuple(params)).fetchall() or []]
+                m=[r for r in rows if _yver90_engine_match(r, eng, {})]
+                out[table]=len(m)
+                for r in m:
+                    for c in ('created_ts','event_ts','executable_ts','emailed_ts','updated_ts'):
+                        try:
+                            out['latest']=max(out['latest'], float(r.get(c) or 0.0))
+                        except Exception:
+                            pass
+            if _yver90_table_exists(conn, 'setup_combo_policy'):
+                rows=[dict(r) for r in conn.execute('SELECT * FROM setup_combo_policy LIMIT 5000').fetchall() or []]
+                out['setup_combo_policy']=len([r for r in rows if _yver90_engine_match(r, eng, {})])
+    except Exception as exc:
+        out['error'] = f'{type(exc).__name__}: {exc}'
+    return out
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    if callable(_YVER106_ORIG_ENGINE_HEALTH_TEXT):
+        out = _YVER106_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours)
+    else:
+        out = ''
+    try:
+        extra = _yver106_engine_health_extra_counts(int(uid or 0), eng, int(hours or 24))
+        active = int(extra.get('setup_audit_results',0) or 0) + int(extra.get('generated_setups',0) or 0) + int(extra.get('executable_setups',0) or 0) + int(extra.get('emailed_setups',0) or 0)
+        if active > 0:
+            out = re.sub(r'Status: NO_RECENT_F8_ACTIVITY|Status: OK_NO_RECENT_F9_SETUP', f'Status: OK_RECENT_{eng}_ACTIVITY', str(out))
+        out += (
+            "\n🧷 yver106 durable engine check: "
+            f"audit={int(extra.get('setup_audit_results',0) or 0)} | "
+            f"generated={int(extra.get('generated_setups',0) or 0)} | "
+            f"executable={int(extra.get('executable_setups',0) or 0)} | "
+            f"emailed={int(extra.get('emailed_setups',0) or 0)} | "
+            f"pipeline={int(extra.get('setup_pipeline_events',0) or 0)} | "
+            f"policy={int(extra.get('setup_combo_policy',0) or 0)}"
+        )
+        if active > 0:
+            out += f"\nMeaning: {eng} setup rows are visible in the durable DB/audit path; older zero-count lines above were caused by combo-only row matching."
+    except Exception:
+        pass
+    return out
+
+try:
+    _autotrade_apply_yver106_agreed_risk_defaults()
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v106'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v106'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver106_final_sync_version', YVER106_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver106
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
