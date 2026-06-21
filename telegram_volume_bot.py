@@ -79094,6 +79094,301 @@ except Exception:
 # end yver114
 # =========================================================
 
+
+# =========================================================
+# yver115 /screen delivery-source lock
+# =========================================================
+# Problem fixed:
+# /screen could show a Top Trade Setup from generated_setups only (example: NEAR),
+# while no setup email was sent and /setup_audit did not show the row because the
+# row had not reached the durable executable/email/audit lane.  That creates a
+# ghost setup: visible to the owner, but not actionable by the email/AutoTrade
+# pipeline.
+#
+# Rule from this build:
+#   /screen Top Trade Setups must come from the same user-visible delivery lane:
+#   recent emailed setup OR recent executable row with a matching delivery log.
+#   generated_setups alone is background learning only and must never appear as a
+#   Top Trade Setup card.
+#
+# This does NOT change risk, TP/SL, leverage, blackout, policy WR, or order sizing.
+
+YVER115_VERSION = 'yver115_screen_email_audit_sync_lock_20260621'
+
+try:
+    _YVER115_ORIG_YVER82_RECENT_OPEN_KEEP = _yver82_recent_open_keep_setup_objects
+except Exception:
+    _YVER115_ORIG_YVER82_RECENT_OPEN_KEEP = None
+try:
+    _YVER115_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = _screen_recent_db_body_and_kb
+except Exception:
+    _YVER115_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = None
+try:
+    _YVER115_ORIG_BUILD_SCREEN_BODY_AND_KB = _build_screen_body_and_kb
+except Exception:
+    _YVER115_ORIG_BUILD_SCREEN_BODY_AND_KB = None
+
+
+def _yver115_setup_id(setup) -> str:
+    try:
+        return str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip()
+    except Exception:
+        return ''
+
+
+def _yver115_has_recent_executable_row(user_id: int, setup_id: str, session_name: str = '', lookback_hours: float | None = None) -> bool:
+    try:
+        sid = str(setup_id or '').strip()
+        if not sid:
+            return False
+        uid_i = int(user_id or 0)
+        sess = str(session_name or '').upper().strip()
+        if lookback_hours is None:
+            try:
+                lookback_hours = max(1.0, float(_screen_actionable_fallback_max_age_min()) / 60.0)
+            except Exception:
+                lookback_hours = 1.0
+        cutoff = float(time.time()) - float(max(0.25, float(lookback_hours or 1.0))) * 3600.0
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            if sess:
+                row = cur.execute(
+                    """
+                    SELECT 1 FROM executable_setups
+                    WHERE setup_id=? AND user_id IN (?,0) AND executable_ts>=?
+                      AND (UPPER(COALESCE(session,''))=? OR COALESCE(session,'')='')
+                    LIMIT 1
+                    """,
+                    (sid, uid_i, float(cutoff), sess),
+                ).fetchone()
+            else:
+                row = cur.execute(
+                    "SELECT 1 FROM executable_setups WHERE setup_id=? AND user_id IN (?,0) AND executable_ts>=? LIMIT 1",
+                    (sid, uid_i, float(cutoff)),
+                ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _yver115_recent_email_ok(user_id: int, setup, lookback_hours: float | None = None) -> bool:
+    try:
+        if _screen_attach_email_delivery_or_skip(int(user_id or 0), setup, lookback_hours=lookback_hours):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _yver115_basic_visible_keep(setup, uid: int, session_name: str = '') -> tuple[bool, str]:
+    try:
+        if not _yver83_basic_card_valid(setup):
+            return False, 'invalid_geometry_or_volume'
+    except Exception:
+        try:
+            side = str(getattr(setup, 'side', '') or '').upper().strip()
+            entry = float(getattr(setup, 'entry', 0.0) or 0.0)
+            sl = float(getattr(setup, 'sl', 0.0) or 0.0)
+            tp = float(_setup_target_tp(setup, 0.0) or 0.0)
+            if side not in {'BUY', 'SELL'} or entry <= 0 or sl <= 0 or tp <= 0:
+                return False, 'invalid_geometry'
+            if side == 'BUY' and not (sl < entry < tp):
+                return False, 'invalid_buy_geometry'
+            if side == 'SELL' and not (tp < entry < sl):
+                return False, 'invalid_sell_geometry'
+            if not _setup_volume_ok(setup):
+                return False, 'volume_floor'
+        except Exception:
+            return False, 'basic_exception'
+    try:
+        ok, why, _meta = _setup_user_visible_keep_policy_allows(setup, session_name=session_name, user_id=int(uid or 0), lane='screen')
+        if not ok:
+            return False, str(why or 'policy_not_visible')
+    except Exception:
+        return False, 'policy_gate_exception'
+    return True, 'ok'
+
+
+def _yver115_filter_to_synced_screen_setups(setups: list, uid: int, session_name: str = '', require_email: bool | None = None) -> list:
+    """Keep only setups that are synced with the user delivery/executable lane.
+
+    A generated-only setup is intentionally removed so /screen cannot show symbols
+    that never reached setup email, /setup_audit or AutoTrade.
+    """
+    out = []
+    seen = set()
+    sess = str(session_name or '').upper().strip()
+    try:
+        hours = max(1.0, float(_screen_actionable_fallback_max_age_min()) / 60.0)
+    except Exception:
+        hours = 1.0
+    try:
+        if require_email is None:
+            require_email = bool(_screen_requires_emailed_delivery_for_setup())
+    except Exception:
+        require_email = True
+    for s in list(setups or []):
+        try:
+            sid = _yver115_setup_id(s)
+            ident = str(_setup_identity_from_obj(s) or sid).strip()
+            if not sid or (ident and ident in seen):
+                continue
+            ok, why = _yver115_basic_visible_keep(s, int(uid or 0), sess)
+            if not ok:
+                try:
+                    setattr(s, 'yver115_screen_hidden_reason', why)
+                except Exception:
+                    pass
+                continue
+            emailed_ok = _yver115_recent_email_ok(int(uid or 0), s, lookback_hours=hours)
+            exec_ok = _yver115_has_recent_executable_row(int(uid or 0), sid, sess, lookback_hours=hours)
+            # /screen is user-facing.  Default is strict: it should match an actual
+            # setup email/recent delivery.  If an env disables that rule, still require
+            # an executable row so generated-only ghosts never appear.
+            if require_email:
+                if not emailed_ok:
+                    try:
+                        setattr(s, 'yver115_screen_hidden_reason', 'missing_recent_setup_email')
+                    except Exception:
+                        pass
+                    continue
+            elif not (emailed_ok or exec_ok):
+                try:
+                    setattr(s, 'yver115_screen_hidden_reason', 'not_emailed_or_executable')
+                except Exception:
+                    pass
+                continue
+            if ident:
+                seen.add(ident)
+            out.append(s)
+        except Exception:
+            continue
+    return list(out)
+
+
+def _yver82_recent_open_keep_setup_objects(uid: int, session: str = '', max_age_min: int | None = None, limit: int = 8, only_missing_email: bool = False) -> list:
+    """v115: recent screen queue is emailed/executable only; no generated_setups-only source."""
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    if uid_i <= 0:
+        return []
+    sess = str(session or '').upper().strip()
+    if sess not in {'ASIA', 'LON', 'NY'}:
+        return []
+    try:
+        max_age_min = int(max_age_min or max(YVER82_KEEP_DELIVERY_WINDOW_MIN, int(_autotrade_entry_window_min())))
+    except Exception:
+        max_age_min = int(globals().get('YVER82_KEEP_DELIVERY_WINDOW_MIN', 60) or 60)
+    limit_i = max(1, int(limit or 8))
+    candidates = []
+    # 1) Exact emailed/recent delivery lane.
+    try:
+        candidates.extend(_recent_delivery_lane_setup_objects(uid_i, session_name=sess, max_age_min=max_age_min, limit=max(limit_i * 3, 12)) or [])
+    except Exception:
+        pass
+    # 2) Recent executable rows only. generated_setups is intentionally not queried.
+    try:
+        cutoff = float(time.time()) - float(max(5, int(max_age_min))) * 60.0
+        rows = db_list_executable_setups(uid_i, session_name=sess, ts_from=float(cutoff), limit=max(limit_i * 5, 20)) or []
+        candidates.extend(_executable_rows_to_setup_objects(rows, session_name=sess) or [])
+    except Exception:
+        pass
+    synced = _yver115_filter_to_synced_screen_setups(candidates, uid_i, sess, require_email=None)
+    if only_missing_email:
+        # In v115 this should normally be empty by design: /screen visible queue is
+        # already synced with recent email.  Keep the parameter compatible for callers.
+        synced = []
+    try:
+        db_log_setup_pipeline_event(uid_i, stage='yver115_screen_synced_queue', status='ok' if synced else 'empty', session=sess, mode='screen', details={'input': len(candidates), 'shown': len(synced), 'generated_source_allowed': False})
+    except Exception:
+        pass
+    return list(synced or [])[:limit_i]
+
+
+def _yver115_no_setup_screen_body(uid: int, session: str, best_fut: dict, note: str = ''):
+    try:
+        up_list, dn_list = compute_directional_lists(best_fut or {})
+        market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
+    except Exception:
+        market_txt = ''
+    body = "\n".join([
+        "", "*Top Trade Setups*", SEP,
+        note or "_No emailed/executable KEEP setup is available right now._",
+        "_Generated-only scan candidates are hidden until they reach the setup-email/executable/audit lane._",
+        "", market_txt or "",
+    ]).strip()
+    return body, [], []
+
+
+def _yver115_body_contains_setup_card(body: str) -> bool:
+    try:
+        t = str(body or '')
+        return ('BUY —' in t or 'SELL —' in t or 'BUY -' in t or 'SELL -' in t) and ('PF-' in t or 'ID-' in t or 'F8-' in t or 'F9-' in t)
+    except Exception:
+        return False
+
+
+def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int | None = None, include_email_source: bool = True):
+    """v115: cached/recent /screen body cannot be built from generated_setups-only rows."""
+    try:
+        if not _yver82_delivery_blackout_now()[0]:
+            recent_keep = _yver82_recent_open_keep_setup_objects(int(uid), str(session or ''), max_age_min=max_age_min or YVER82_KEEP_DELIVERY_WINDOW_MIN, limit=_screen_display_limit(), only_missing_email=False)
+            if recent_keep:
+                return _yver82_screen_body_for_setups(int(uid), str(session or ''), best_fut or {}, recent_keep, "_Showing recent emailed/executable KEEP setup queue while the live scan refreshes._")
+    except Exception:
+        pass
+    # Do not fall back to older generated-candidate recent body.  Show clean market context instead.
+    return _yver115_no_setup_screen_body(int(uid or 0), str(session or ''), best_fut or {})
+
+
+def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
+    """v115 final /screen guard: remove any screen-only ghost setup before display."""
+    try:
+        if callable(_YVER115_ORIG_BUILD_SCREEN_BODY_AND_KB):
+            body, kb, setups = _YVER115_ORIG_BUILD_SCREEN_BODY_AND_KB(best_fut, session, uid)
+        else:
+            body, kb, setups = ('', [], [])
+    except Exception:
+        body, kb, setups = ('', [], [])
+    try:
+        setups_l = list(setups or [])
+        synced = _yver115_filter_to_synced_screen_setups(setups_l, int(uid or 0), str(session or ''), require_email=None)
+        if synced and len(synced) == len(setups_l):
+            return body, kb, setups_l
+        if synced:
+            return _yver82_screen_body_for_setups(int(uid or 0), str(session or ''), best_fut or {}, synced[:_screen_display_limit()], "_Showing recent emailed/executable KEEP setup queue while the live scan refreshes._")
+        if setups_l or _yver115_body_contains_setup_card(body):
+            try:
+                db_log_setup_pipeline_event(int(uid or 0), stage='yver115_screen_ghost_block', status='blocked', session=str(session or ''), mode='screen', details={'input_setups': len(setups_l), 'body_had_card': _yver115_body_contains_setup_card(body), 'reason': 'not_recently_emailed_or_executable'})
+            except Exception:
+                pass
+            return _yver115_no_setup_screen_body(int(uid or 0), str(session or ''), best_fut or {})
+    except Exception:
+        pass
+    return body, kb, setups
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v115'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v115'
+except Exception:
+    pass
+try:
+    _screen_cache_put('yver115:deploy:screen_sync_lock', 'v115 deployed', [], ts=float(time.time()), allow_empty_overwrite=True)
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver115_version', YVER115_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver115
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
