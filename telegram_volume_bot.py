@@ -77886,6 +77886,439 @@ except Exception:
 # end yver107
 # =========================================================
 
+
+# =========================================================
+# yver108 — F9 strict 2-day proof gate + screen/email cooldown cleanup
+# =========================================================
+# Why: v107 correctly added an AutoTrade guard, but the recent emailed /screen
+# queue and some setup-email paths could still display or re-email stale F9 rows
+# that were created before the strict rule, and F9 cards did not show the 2-day
+# evidence.  This patch centralises the F9 rule for /screen, email, generated /
+# executable persistence and AutoTrade, without changing risk/caps/TP/SL/leverage.
+
+YVER108_VERSION = 'yver108_2026_06_21_f9_strict_2day_screen_email_persistence'
+
+
+def _yver108_is_f9_setup(s) -> bool:
+    try:
+        if callable(globals().get('_yver107_is_f9_setup')) and _yver107_is_f9_setup(s):
+            return True
+    except Exception:
+        pass
+    try:
+        sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').upper()
+        fam = str(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '').upper()
+        return sid.startswith('F9-') or fam == 'F9' or 'MULTI_DAY' in fam
+    except Exception:
+        return False
+
+
+def _yver108_setup_created_ts(s) -> float:
+    try:
+        ts = float(getattr(s, 'created_ts', 0.0) or getattr(s, 'signal_created_ts', 0.0) or getattr(s, 'emailed_ts', 0.0) or getattr(s, 'executable_ts', 0.0) or 0.0)
+        if ts > 0:
+            return ts
+    except Exception:
+        pass
+    try:
+        sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '')
+        m = re.search(r'F9-(\d{9,12})-', sid.upper())
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return float(time.time())
+
+
+def _yver108_mel_day(ts: float | None = None) -> str:
+    try:
+        return _f9_melbourne_day(float(ts or time.time()))
+    except Exception:
+        try:
+            return datetime.fromtimestamp(float(ts or time.time()), MEL_TZ).date().isoformat()
+        except Exception:
+            return datetime.now(MEL_TZ).date().isoformat()
+
+
+def _yver108_f9_explicit_days(symbol: str, side: str, created_ts: float | None = None) -> tuple[int, str, list[str]]:
+    """Return distinct Melbourne days from the scan-intelligence table.
+
+    Unlike the older helper, this does not blindly count the current day unless it
+    is in the persisted market_scan_symbols table.  That prevents current one-day
+    Leaders/Losers from becoming F9 only because they are on today's /screen.
+    """
+    sym = str(symbol or '').upper().strip()
+    sd = str(side or '').upper().strip()
+    bucket = 'leaders' if sd == 'BUY' else ('losers' if sd == 'SELL' else '')
+    if not sym or not bucket:
+        return 0, bucket, []
+    ts = float(created_ts or time.time())
+    try:
+        lookback = int(globals().get('F9_LOOKBACK_DAYS', 4) or 4)
+    except Exception:
+        lookback = 4
+    cutoff = ts - 86400.0 * max(2, lookback)
+    end_ts = ts + 3600.0
+    days = set()
+    try:
+        _scan_intel_migrate_tables()
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                """SELECT created_ts FROM market_scan_symbols
+                     WHERE UPPER(symbol)=? AND LOWER(bucket)=? AND created_ts>=? AND created_ts<=?
+                     ORDER BY created_ts DESC LIMIT 500""",
+                (sym, bucket, float(cutoff), float(end_ts)),
+            ).fetchall() or []
+        for (tsv,) in rows:
+            try:
+                days.add(_yver108_mel_day(float(tsv or 0.0)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # If a proper builder already stamped f9_days higher than the explicit table,
+    # keep it only as an auxiliary note; the hard rule still prefers table days.
+    return len(days), bucket, sorted(days)
+
+
+def _yver108_f9_rule_allows_setup(s) -> tuple[bool, str, dict]:
+    if not _yver108_is_f9_setup(s):
+        return True, 'not_f9', {}
+    try:
+        sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        created_ts = _yver108_setup_created_ts(s)
+        explicit_days, bucket, days_list = _yver108_f9_explicit_days(sym, side, created_ts=created_ts)
+        try:
+            required = int(globals().get('F9_MIN_DAYS', 2) or 2)
+        except Exception:
+            required = 2
+        meta = {
+            'symbol': sym,
+            'side': side,
+            'bucket': bucket,
+            'days': int(explicit_days),
+            'required': int(required),
+            'day_list': list(days_list or []),
+            'created_day': _yver108_mel_day(created_ts),
+        }
+        if int(explicit_days or 0) < int(required or 2):
+            return False, f'F9_REQUIRES_{required}_DISTINCT_DAYS_HAS_{explicit_days}', meta
+        try:
+            setattr(s, 'f9_days', int(explicit_days))
+            setattr(s, 'f9_bucket', str(bucket))
+            setattr(s, 'f9_day_list', ','.join(days_list or []))
+            setattr(s, 'f9_two_day_rule_ok', True)
+        except Exception:
+            pass
+        return True, 'F9_2DAY_OK', meta
+    except Exception as exc:
+        return False, f'F9_RULE_ERROR_{type(exc).__name__}', {}
+
+
+def _yver108_filter_f9_strict(setups: list, uid: int = 0, session: str = '', *, enforce_email_cooldown: bool = False, source: str = '') -> tuple[list, dict]:
+    kept_by_key = {}
+    skipped = Counter()
+    examples = []
+    uid_i = int(uid or 0) if str(uid or '').lstrip('-').isdigit() else 0
+    sess = str(session or '').upper().strip()
+    for s in list(setups or []):
+        try:
+            if not _yver108_is_f9_setup(s):
+                key = ('NONF9', str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or id(s)))
+                kept_by_key[key] = s
+                continue
+            sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+            side = str(getattr(s, 'side', '') or '').upper().strip()
+            ok, why, meta = _yver108_f9_rule_allows_setup(s)
+            if not ok:
+                skipped[str(why)] += 1
+                if len(examples) < 8:
+                    examples.append({'symbol': sym, 'side': side, 'reason': why, **dict(meta or {})})
+                try:
+                    db_log_setup_pipeline_event(uid_i, stage='yver108_f9_strict_2day_filter', status='skip', session=sess, mode='engine_f9', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=sym, side=side, details={'source': source, 'reason': why, **dict(meta or {})})
+                except Exception:
+                    pass
+                continue
+            if enforce_email_cooldown and uid_i > 0:
+                try:
+                    if _email_symbol_recently_sent(uid_i, sym, side, sess, setup_id=str(getattr(s, 'setup_id', '') or '')):
+                        skipped['F9_SYMBOL_SIDE_EMAIL_COOLDOWN'] += 1
+                        if len(examples) < 8:
+                            examples.append({'symbol': sym, 'side': side, 'reason': 'F9_SYMBOL_SIDE_EMAIL_COOLDOWN'})
+                        continue
+                except Exception:
+                    pass
+            key = (sym, side)
+            old = kept_by_key.get(key)
+            if old is None:
+                kept_by_key[key] = s
+            else:
+                def _rank(x):
+                    try:
+                        return (float(getattr(x, 'created_ts', 0.0) or _yver108_setup_created_ts(x)), int(getattr(x, 'conf', 0) or 0), float(getattr(x, 'fut_vol_usd', 0.0) or 0.0))
+                    except Exception:
+                        return (0.0, 0, 0.0)
+                if _rank(s) >= _rank(old):
+                    kept_by_key[key] = s
+                skipped['F9_DUPLICATE_SYMBOL_SIDE_COLLAPSED'] += 1
+        except Exception as exc:
+            skipped[f'F9_FILTER_EXCEPTION_{type(exc).__name__}'] += 1
+    out = list(kept_by_key.values())
+    return out, {'input': len(list(setups or [])), 'kept': len(out), 'skipped': dict(skipped), 'examples': examples}
+
+
+# Enforce symbol/side email lock for F9 regardless of changing entry/SL/TP/bucket.
+try:
+    _YVER108_ORIG_YVER92_ITEM_KEY = _yver92_setup_email_item_key
+except Exception:
+    _YVER108_ORIG_YVER92_ITEM_KEY = None
+
+
+def _yver92_setup_email_item_key(uid: int, session_name: str, setup) -> str:
+    try:
+        if _yver108_is_f9_setup(setup):
+            sym = str(_bybit_linear_symbol(getattr(setup, 'symbol', '') or '') or getattr(setup, 'symbol', '') or '').upper().strip()
+            side = str(getattr(setup, 'side', '') or '').upper().strip()
+            sess = str(session_name or getattr(setup, 'source_session', '') or '').upper().strip()
+            return f"{int(uid)}|{sess}|F9|{sym}|{side}"
+    except Exception:
+        pass
+    if callable(_YVER108_ORIG_YVER92_ITEM_KEY):
+        return _YVER108_ORIG_YVER92_ITEM_KEY(uid, session_name, setup)
+    return f"{int(uid)}|{str(session_name or '').upper()}|{str(getattr(setup,'symbol','')).upper()}|{str(getattr(setup,'side','')).upper()}"
+
+
+# Do not let invalid/stale one-day F9 rows enter generated/executable queues.
+try:
+    _YVER108_ORIG_DB_LOG_GENERATED_SETUP = db_log_generated_setup
+except Exception:
+    _YVER108_ORIG_DB_LOG_GENERATED_SETUP = None
+
+
+def db_log_generated_setup(user_id: int, source: str, session_name: str, s) -> None:
+    try:
+        ok, why, meta = _yver108_f9_rule_allows_setup(s)
+        if not ok:
+            try:
+                db_log_setup_pipeline_event(int(user_id or 0), stage='yver108_f9_generated_block', status='skip', session=str(session_name or ''), mode='engine_f9', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=str(getattr(s, 'symbol', '') or ''), side=str(getattr(s, 'side', '') or ''), details={'source': source, 'reason': why, **dict(meta or {})})
+            except Exception:
+                pass
+            return None
+    except Exception:
+        pass
+    if callable(_YVER108_ORIG_DB_LOG_GENERATED_SETUP):
+        return _YVER108_ORIG_DB_LOG_GENERATED_SETUP(user_id, source, session_name, s)
+    return None
+
+try:
+    _YVER108_ORIG_DB_MARK_EXECUTABLE_SETUP = db_mark_executable_setup
+except Exception:
+    _YVER108_ORIG_DB_MARK_EXECUTABLE_SETUP = None
+
+
+def db_mark_executable_setup(user_id: int, setup_id: str, session: str, executable_ts: float, s=None, source_kind: str = 'executable_setups', state: str = 'executable_pending') -> None:
+    try:
+        if s is not None:
+            ok, why, meta = _yver108_f9_rule_allows_setup(s)
+            if not ok:
+                try:
+                    db_log_setup_pipeline_event(int(user_id or 0), stage='yver108_f9_executable_block', status='skip', session=str(session or ''), mode='engine_f9', setup_id=str(setup_id or ''), symbol=str(getattr(s, 'symbol', '') or ''), side=str(getattr(s, 'side', '') or ''), details={'source_kind': source_kind, 'reason': why, **dict(meta or {})})
+                except Exception:
+                    pass
+                return None
+    except Exception:
+        pass
+    if callable(_YVER108_ORIG_DB_MARK_EXECUTABLE_SETUP):
+        return _YVER108_ORIG_DB_MARK_EXECUTABLE_SETUP(user_id, setup_id, session, executable_ts, s=s, source_kind=source_kind, state=state)
+    return None
+
+
+# Filter recent /screen queues that bypass the normal formatter.
+try:
+    _YVER108_ORIG_YVER82_RECENT_OPEN_KEEP = _yver82_recent_open_keep_setup_objects
+except Exception:
+    _YVER108_ORIG_YVER82_RECENT_OPEN_KEEP = None
+
+
+def _yver82_recent_open_keep_setup_objects(uid: int, session: str = '', max_age_min: int | None = None, limit: int = 8, only_missing_email: bool = False) -> list:
+    rows = _YVER108_ORIG_YVER82_RECENT_OPEN_KEEP(uid, session, max_age_min=max_age_min, limit=max(int(limit or 8) * 4, 20), only_missing_email=only_missing_email) if callable(_YVER108_ORIG_YVER82_RECENT_OPEN_KEEP) else []
+    filtered, stats = _yver108_filter_f9_strict(list(rows or []), int(uid or 0), str(session or ''), enforce_email_cooldown=False, source='recent_keep_screen_queue')
+    try:
+        db_log_setup_pipeline_event(int(uid or 0), stage='yver108_f9_screen_recent_filter', status='ok', session=str(session or ''), mode='screen', details=stats)
+    except Exception:
+        pass
+    return list(filtered or [])[:int(limit or 8)]
+
+try:
+    _YVER108_ORIG_RECENT_DELIVERY_LANE = _recent_delivery_lane_setup_objects
+except Exception:
+    _YVER108_ORIG_RECENT_DELIVERY_LANE = None
+
+
+def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int | None = None, limit: int = 3) -> list:
+    rows = _YVER108_ORIG_RECENT_DELIVERY_LANE(user_id, session_name=session_name, max_age_min=max_age_min, limit=max(int(limit or 3) * 4, 20)) if callable(_YVER108_ORIG_RECENT_DELIVERY_LANE) else []
+    filtered, stats = _yver108_filter_f9_strict(list(rows or []), int(user_id or 0), str(session_name or ''), enforce_email_cooldown=False, source='recent_delivery_lane')
+    try:
+        db_log_setup_pipeline_event(int(user_id or 0), stage='yver108_f9_recent_delivery_filter', status='ok', session=str(session_name or ''), mode='screen', details=stats)
+    except Exception:
+        pass
+    return list(filtered or [])[:int(limit or 3)]
+
+
+# Pre-SMTP F9 strict filter + cooldown, for every setup-email sender path.
+try:
+    _YVER108_ORIG_SEND_EMAIL_ALERT_MULTI = send_email_alert_multi
+except Exception:
+    _YVER108_ORIG_SEND_EMAIL_ALERT_MULTI = None
+
+
+def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
+    if not callable(_YVER108_ORIG_SEND_EMAIL_ALERT_MULTI):
+        return False
+    try:
+        uid = int((user or {}).get('user_id') or 0)
+    except Exception:
+        uid = 0
+    try:
+        session_name = str((sess or {}).get('name') or getattr((setups or [None])[0], 'source_session', '') or '').upper().strip()
+    except Exception:
+        session_name = str((sess or {}).get('name') or '').upper().strip()
+    filtered, stats = _yver108_filter_f9_strict(list(setups or []), uid, session_name, enforce_email_cooldown=True, source='send_email_alert_multi')
+    if not filtered:
+        try:
+            tz, _ = _zoneinfo_or_default((user or {}).get('tz') or (user or {}).get('timezone'))
+            _LAST_EMAIL_DECISION[int(uid or 0)] = {
+                'status': 'SKIP',
+                'picked': '-',
+                'when': datetime.now(tz).isoformat(timespec='seconds'),
+                'reasons': ['yver108_f9_strict_or_cooldown_empty', str((stats or {}).get('skipped') or {})[:220]],
+            }
+        except Exception:
+            pass
+        try:
+            db_log_setup_pipeline_event(int(uid or 0), stage='yver108_f9_pre_email_filter', status='empty', session=session_name, mode='email', details=stats)
+        except Exception:
+            pass
+        return False
+    try:
+        db_log_setup_pipeline_event(int(uid or 0), stage='yver108_f9_pre_email_filter', status='ok', session=session_name, mode='email', details=stats)
+    except Exception:
+        pass
+    return bool(_YVER108_ORIG_SEND_EMAIL_ALERT_MULTI(user, sess, list(filtered or []), best_fut))
+
+
+# Screen-card formatter wrapper with F9 proof text and invalid F9 filtering.
+try:
+    _YVER108_ORIG_SCREEN_FORMAT_SETUP_CARDS = _screen_format_setup_cards
+except Exception:
+    _YVER108_ORIG_SCREEN_FORMAT_SETUP_CARDS = None
+
+
+def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
+    filtered, stats = _yver108_filter_f9_strict(list(setups or []), int(uid or 0), str(session or ''), enforce_email_cooldown=False, source='screen_format_final')
+    try:
+        db_log_setup_pipeline_event(int(uid or 0), stage='yver108_f9_screen_format_filter', status='ok', session=str(session or ''), mode='screen', details=stats)
+    except Exception:
+        pass
+    return _YVER108_ORIG_SCREEN_FORMAT_SETUP_CARDS(list(filtered or []), uid, session) if callable(_YVER108_ORIG_SCREEN_FORMAT_SETUP_CARDS) else "_No high-quality setups right now._"
+
+
+# Ensure the authoritative v82/v83 screen body also uses the filtered list.
+try:
+    _YVER108_ORIG_YVER82_SCREEN_BODY = _yver82_screen_body_for_setups
+except Exception:
+    _YVER108_ORIG_YVER82_SCREEN_BODY = None
+
+
+def _yver82_screen_body_for_setups(uid: int, session: str, best_fut: dict, setups: list, note: str = ''):
+    filtered, stats = _yver108_filter_f9_strict(list(setups or []), int(uid or 0), str(session or ''), enforce_email_cooldown=False, source='yver82_screen_body')
+    try:
+        db_log_setup_pipeline_event(int(uid or 0), stage='yver108_f9_yver82_screen_body_filter', status='ok', session=str(session or ''), mode='screen', details=stats)
+    except Exception:
+        pass
+    return _YVER108_ORIG_YVER82_SCREEN_BODY(uid, session, best_fut, list(filtered or []), note) if callable(_YVER108_ORIG_YVER82_SCREEN_BODY) else ('', [], [])
+
+
+# AutoTrade guard uses the same final rule and writes complete reason/meta.
+try:
+    _YVER108_ORIG_AUTOTRADE_PLACE_TRADE = _autotrade_place_trade
+except Exception:
+    _YVER108_ORIG_AUTOTRADE_PLACE_TRADE = None
+
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    filtered = []
+    skipped = Counter()
+    examples = []
+    for s in list(setups or []):
+        try:
+            ok, why, meta = _yver108_f9_rule_allows_setup(s)
+            if not ok:
+                skipped[str(why)] += 1
+                if len(examples) < 5:
+                    examples.append({'symbol': str(getattr(s, 'symbol', '') or ''), 'side': str(getattr(s, 'side', '') or ''), 'reason': why, **dict(meta or {})})
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='yver108_autotrade_f9_2day_guard', status='skip', session=str(session_label or ''), mode='autotrade', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=str(getattr(s, 'symbol', '') or ''), side=str(getattr(s, 'side', '') or ''), details={'reason': why, **dict(meta or {})})
+                except Exception:
+                    pass
+                continue
+            filtered.append(s)
+        except Exception:
+            filtered.append(s)
+    if not filtered:
+        try:
+            _LAST_AUTOTRADE_DECISION[int(uid or 0)] = {
+                'status': 'SKIP',
+                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                'reason': 'F9_REQUIRES_2_DISTINCT_DAYS' if skipped else 'NO_SETUPS_AFTER_F9_FILTER',
+                'session': str(session_label or ''),
+                'mode': str(_autotrade_runtime_mode()).lower(),
+                'top_reasons': dict(skipped.most_common(5)),
+                'examples': examples,
+            }
+        except Exception:
+            pass
+        return False, 'F9_REQUIRES_2_DISTINCT_DAYS' if skipped else 'NO_SETUPS_AFTER_F9_FILTER'
+    return _YVER108_ORIG_AUTOTRADE_PLACE_TRADE(uid, session_label, filtered) if callable(_YVER108_ORIG_AUTOTRADE_PLACE_TRADE) else (False, 'autotrade_place_trade_missing')
+
+
+# Engine health add-on: show strict F9 proof counters and make old zero-count lines less misleading.
+try:
+    _YVER108_ORIG_ENGINE_HEALTH_TEXT = _yver90_engine_health_text
+except Exception:
+    _YVER108_ORIG_ENGINE_HEALTH_TEXT = None
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    out = _YVER108_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours) if callable(_YVER108_ORIG_ENGINE_HEALTH_TEXT) else ''
+    try:
+        if str(engine or '').upper().strip() == 'F9':
+            out += ("\n🧷 yver108 F9 final gate: /screen, setup email, generated_setups, executable_setups and AutoTrade all use the same strict 2-distinct-Melbourne-day rule. "
+                    "F9 email cooldown is symbol+side, not setup-id/price based. Invalid one-day F9 rows are hidden from /screen and blocked before email/AutoTrade.")
+    except Exception:
+        pass
+    return out
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v108'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v108'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver108_f9_strict_screen_email_persistence_version', YVER108_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver108
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
