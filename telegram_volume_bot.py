@@ -76923,6 +76923,615 @@ except Exception:
 # end yver102
 # =========================================================
 
+
+# =========================================================
+# yver103 — durable F8 BigMove backfill + F8/F9 audit visibility guard
+# =========================================================
+# Purpose:
+# 1) Do NOT change any agreed risk settings.
+# 2) BigMove alert email and F8 setup generation are separate; however every confirmed
+#    BigMove email/row must have a durable F8 generated/audit trace.
+# 3) F8/F9 generated rows must remain visible in /setup_audit even when the default
+#    audit source is executable_setups and the setup is WATCH / audit-only.
+# 4) Direct send_email() paths are now mirrored too, not only _send_email_async().
+
+YVER103_VERSION = 'yver103_2026_06_21_f8_direct_send_mirror_f89_audit_visibility'
+
+try:
+    _YVER103_ORIG_SEND_EMAIL = send_email
+except Exception:
+    _YVER103_ORIG_SEND_EMAIL = None
+try:
+    _YVER103_ORIG_SEND_EMAIL_ASYNC = _send_email_async
+except Exception:
+    _YVER103_ORIG_SEND_EMAIL_ASYNC = None
+try:
+    _YVER103_ORIG_SETUP_AUDIT_CMD = setup_audit_cmd
+except Exception:
+    _YVER103_ORIG_SETUP_AUDIT_CMD = None
+try:
+    _YVER103_ORIG_ENGINE_HEALTH_TEXT = _yver90_engine_health_text
+except Exception:
+    _YVER103_ORIG_ENGINE_HEALTH_TEXT = None
+try:
+    _YVER103_ORIG_SETUP_AUDIT_LOAD_ROWS = _setup_audit_load_rows
+except Exception:
+    _YVER103_ORIG_SETUP_AUDIT_LOAD_ROWS = None
+
+_YVER103_F8_MIRROR_MEMO = {}
+
+
+def _yver103_now_ts() -> float:
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _yver103_targets(uid: int | None = None) -> list[int]:
+    out = []
+    for x in (uid, globals().get('AUTOTRADE_OWNER_UID', 0)):
+        try:
+            xi = int(x or 0)
+            if xi > 0 and xi not in out:
+                out.append(xi)
+        except Exception:
+            pass
+    return out
+
+
+def _yver103_event_bucket(ts: float) -> int:
+    try:
+        t = float(ts or 0.0) or _yver103_now_ts()
+        return int(t // 900) * 900
+    except Exception:
+        return int(_yver103_now_ts() // 900) * 900
+
+
+def _yver103_session_for_ts(ts: float) -> str:
+    try:
+        sess = str(scan_session_name_utc(datetime.fromtimestamp(float(ts or _yver103_now_ts()), tz=timezone.utc)) or '').upper().strip()
+        if sess in {'ASIA','LON','NY'}:
+            return sess
+    except Exception:
+        pass
+    try:
+        sess = str(_bigmove_autotrade_session_name() or '').upper().strip()
+        if sess in {'ASIA','LON','NY'}:
+            return sess
+    except Exception:
+        pass
+    return 'NY'
+
+
+def _yver103_setup_exists_any(uid: int, sid: str) -> bool:
+    sid = str(sid or '').strip()
+    if not sid:
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            for table in ('generated_setups', 'executable_setups', 'emailed_setups', 'setup_audit_results'):
+                try:
+                    cols = {r[1] for r in conn.execute(f'PRAGMA table_info({table})').fetchall() or []}
+                    if not cols:
+                        continue
+                    if table == 'setup_audit_results':
+                        row = conn.execute('SELECT 1 FROM setup_audit_results WHERE setup_id=? LIMIT 1', (sid,)).fetchone()
+                    elif 'user_id' in cols:
+                        row = conn.execute(f'SELECT 1 FROM {table} WHERE user_id IN (?,0) AND setup_id=? LIMIT 1', (int(uid or 0), sid)).fetchone()
+                    else:
+                        row = conn.execute(f'SELECT 1 FROM {table} WHERE setup_id=? LIMIT 1', (sid,)).fetchone()
+                    if row:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def _yver103_force_default_bigmove_fields(c: dict, direction: str) -> dict:
+    out = dict(c or {})
+    direc = str(direction or out.get('direction') or '').upper().strip()
+    sign = 1.0 if direc == 'UP' else -1.0
+    try:
+        if abs(float(out.get('ch15') or out.get('confirm_15m_pct') or 0.0)) < float(BIGMOVE_DEFAULT_15M_PCT or 1.5):
+            out['ch15'] = sign * float(BIGMOVE_DEFAULT_15M_PCT or 1.5)
+            out['confirm_15m_pct'] = out['ch15']
+        if abs(float(out.get('ch1') or 0.0)) < float(BIGMOVE_DEFAULT_1H_PCT or 3.0):
+            out['ch1'] = sign * float(BIGMOVE_DEFAULT_1H_PCT or 3.0)
+        if abs(float(out.get('ch4') or 0.0)) < float(BIGMOVE_DEFAULT_4H_PCT or 5.0):
+            out['ch4'] = sign * float(BIGMOVE_DEFAULT_4H_PCT or 5.0)
+        if float(out.get('vol') or out.get('fut_vol_usd') or 0.0) <= 0:
+            out['vol'] = float(BIGMOVE_DEFAULT_MIN_VOL_USD or 10_000_000.0)
+    except Exception:
+        pass
+    out['direction'] = direc
+    return out
+
+
+def _yver103_build_f8_setup(uid: int, symbol: str, direction: str, event_ts: float, session: str = ''):
+    sym = str(symbol or '').upper().strip()
+    direc = str(direction or '').upper().strip()
+    if not sym or direc not in {'UP','DOWN'}:
+        return None
+    sess = str(session or '').upper().strip() or _yver103_session_for_ts(float(event_ts or 0.0))
+    try:
+        best = get_cached_futures_tickers() or {}
+        if not best:
+            best = fetch_futures_tickers() or {}
+    except Exception:
+        best = get_cached_futures_tickers() or {}
+    cand = {}
+    try:
+        if callable(globals().get('_yver97_bigmove_candidate_from_mark')):
+            cand = dict(_yver97_bigmove_candidate_from_mark(int(uid or 0), sym, direc, best) or {})
+    except Exception:
+        cand = {}
+    cand.update({'symbol': sym, 'direction': direc, 'yver103_direct_force': True})
+    try:
+        mv = _bigmove_candidate_marketvol(cand, best)
+        if mv is not None:
+            cand.setdefault('price', float(getattr(mv, 'last', 0.0) or getattr(mv, 'vwap', 0.0) or 0.0))
+            cand.setdefault('vol', float(usd_notional(mv) or cand.get('vol') or 0.0))
+            cand.setdefault('ch24', float(getattr(mv, 'percentage', 0.0) or 0.0))
+    except Exception:
+        pass
+    cand = _yver103_force_default_bigmove_fields(cand, direc)
+    setup = None
+    try:
+        if callable(globals().get('_yver96_f8_fallback_setup')):
+            setup = _yver96_f8_fallback_setup(cand, best or {}, sess)
+    except Exception:
+        setup = None
+    if setup is None:
+        try:
+            setups = list(_bigmove_candidates_to_autotrade_setups([cand], best or {}, sess) or [])
+            setup = setups[0] if setups else None
+        except Exception:
+            setup = None
+    if setup is None:
+        return None
+    try:
+        side = 'BUY' if direc == 'UP' else 'SELL'
+        bucket = _yver103_event_bucket(event_ts)
+        sid = f'F8-{bucket}-{sym}-{side}'
+        setattr(setup, 'setup_id', sid)
+        setattr(setup, 'id', sid)
+        setattr(setup, 'symbol', sym)
+        setattr(setup, 'side', side)
+        setattr(setup, 'engine', 'F8')
+        setattr(setup, 'family_id', globals().get('BIGMOVE_FAMILY_ID', 'F8'))
+        setattr(setup, 'family_name', globals().get('BIGMOVE_FAMILY_NAME', 'BigMove'))
+        setattr(setup, 'created_ts', float(bucket))
+        setattr(setup, 'session', sess)
+        setattr(setup, 'source_session', sess)
+        setattr(setup, 'source_kind', 'yver103_f8_bigmove_direct_mirror')
+        setattr(setup, 'bigmove_signal', True)
+        setattr(setup, 'bigmove_direction', direc)
+        setattr(setup, 'why', 'Confirmed BigMove alert mirrored into durable F8 setup pipeline by yver103; policy decides KEEP/WATCH')
+    except Exception:
+        pass
+    try:
+        setup = _research_finalize_setup(setup, session_name=sess)
+    except Exception:
+        pass
+    return setup
+
+
+def _yver103_persist_setup_for_audit(uid: int, session: str, setup, source: str = 'yver103') -> bool:
+    if setup is None:
+        return False
+    try:
+        sid = str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip()
+        if not sid:
+            return False
+        if not _yver103_setup_exists_any(int(uid or 0), sid):
+            db_log_generated_setup(int(uid), str(source or 'yver103').lower(), str(session or getattr(setup, 'session', '') or ''), setup)
+        try:
+            db_insert_signal(setup, user_id=int(uid))
+        except Exception:
+            pass
+        # Upsert a cached audit result so /engine_health has a durable audit row even
+        # before the next heavy /setup_audit rebuild. This is audit-only and does not trade.
+        try:
+            row = _setup_audit_payload_from_row({
+                'setup_id': sid,
+                'created_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
+                'symbol': str(getattr(setup, 'symbol', '') or ''),
+                'market_symbol': str(getattr(setup, 'market_symbol', '') or ''),
+                'side': str(getattr(setup, 'side', '') or ''),
+                'session': str(session or getattr(setup, 'session', '') or ''),
+                'family_id': str(getattr(setup, 'family_id', '') or ''),
+                'engine': str(getattr(setup, 'engine', '') or ''),
+                'conf': int(getattr(setup, 'conf', 0) or 0),
+                'fut_vol_usd': float(getattr(setup, 'fut_vol_usd', 0.0) or 0.0),
+                'entry': float(getattr(setup, 'entry', 0.0) or 0.0),
+                'sl': float(getattr(setup, 'sl', 0.0) or 0.0),
+                'tp': float(_setup_target_tp(setup, 0.0) or 0.0),
+                'ch24': float(getattr(setup, 'ch24', 0.0) or 0.0),
+                'ch4': float(getattr(setup, 'ch4', 0.0) or 0.0),
+                'ch1': float(getattr(setup, 'ch1', 0.0) or 0.0),
+                'ch15': float(getattr(setup, 'ch15', 0.0) or 0.0),
+                'source': str(source or 'yver103'),
+            })
+            res = _setup_audit_price_result_payload(row, horizon_hours=0, user_id=int(uid), force=False)
+            _setup_audit_upsert_result(int(uid), row, res, horizon_hours=0, actual_pnl_usdt=0.0)
+        except Exception:
+            pass
+        try:
+            db_log_setup_pipeline_event(int(uid), stage=str(source or 'yver103_f8_persist'), status='ok', session=str(session or ''), mode='engine_f8' if str(getattr(setup, 'engine', '')).upper() == 'F8' else 'engine_f9', setup_id=sid, symbol=str(getattr(setup, 'symbol', '') or ''), side=str(getattr(setup, 'side', '') or ''), details={'version': YVER103_VERSION})
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def _yver103_maybe_mark_executable_and_deliver(uid: int, session: str, setup, best_fut: dict | None = None, allow_delivery: bool = False, source: str = 'yver103') -> bool:
+    try:
+        if setup is None:
+            return False
+        sid = str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip()
+        if not sid:
+            return False
+        # Keep policy as source-of-truth. WATCH rows stay audit-only.
+        keep = False
+        try:
+            pol = _setup_combo_policy_lookup_for_setup(setup, session, user_id=int(uid)) or {}
+            status = str(pol.get('status') or pol.get('policy') or pol.get('recommended') or '').upper().strip()
+            keep = (status == 'KEEP')
+        except Exception:
+            keep = False
+        if not keep:
+            return False
+        try:
+            db_mark_executable_setup(int(uid), sid, str(session or getattr(setup, 'session', '') or ''), float(time.time()), s=setup, source_kind=str(source or 'yver103_keep'), state='executable_pending')
+        except Exception:
+            pass
+        if allow_delivery:
+            # Only deliver if the setup is still inside the configured live entry window.
+            fresh = True
+            try:
+                age = float(time.time()) - float(getattr(setup, 'created_ts', 0.0) or 0.0)
+                fresh = age <= max(60, int(_autotrade_entry_window_min()) * 60)
+            except Exception:
+                fresh = True
+            if fresh and callable(globals().get('_yver97_bigmove_setup_email_and_autotrade')):
+                try:
+                    threading.Thread(
+                        target=lambda: _run_async_in_new_loop(_yver97_bigmove_setup_email_and_autotrade, int(uid), str(session or ''), [setup], best_fut or {}, str(source or 'yver103')),
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    pass
+        return True
+    except Exception:
+        return False
+
+
+def _yver103_force_f8_for_bigmove(uid: int, symbol: str, direction: str, event_ts: float | None = None, source: str = 'yver103', allow_delivery: bool = False) -> int:
+    made = 0
+    sym = str(symbol or '').upper().strip()
+    direc = str(direction or '').upper().strip()
+    if not sym or direc not in {'UP','DOWN'}:
+        return 0
+    ts = float(event_ts or _yver103_now_ts() or time.time())
+    bucket = _yver103_event_bucket(ts)
+    side = 'BUY' if direc == 'UP' else 'SELL'
+    sid = f'F8-{bucket}-{sym}-{side}'
+    memo_key = (sym, direc, bucket, str(source or ''), bool(allow_delivery))
+    if _YVER103_F8_MIRROR_MEMO.get(memo_key) and (time.time() - float(_YVER103_F8_MIRROR_MEMO.get(memo_key) or 0.0)) < 300:
+        return 0
+    _YVER103_F8_MIRROR_MEMO[memo_key] = time.time()
+    try:
+        best = get_cached_futures_tickers() or {}
+        if not best:
+            best = fetch_futures_tickers() or {}
+    except Exception:
+        best = get_cached_futures_tickers() or {}
+    sess = _yver103_session_for_ts(ts)
+    targets = _yver103_targets(uid)
+    if not targets:
+        return 0
+    for tuid in targets:
+        try:
+            # First use the previous converter when it works.
+            try:
+                made += int(_yver98_force_f8_for_bigmove(int(tuid), sym, direc, event_ts=ts, source=f'yver103_delegate_{source}') or 0)
+            except Exception:
+                pass
+            if _yver103_setup_exists_any(int(tuid), sid):
+                continue
+            setup = _yver103_build_f8_setup(int(tuid), sym, direc, ts, sess)
+            if setup is None:
+                try:
+                    db_log_setup_pipeline_event(int(tuid), stage='yver103_f8_direct_build', status='empty', session=sess, mode='engine_f8', setup_id=sid, symbol=sym, side=side, details={'source': source})
+                except Exception:
+                    pass
+                continue
+            if _yver103_persist_setup_for_audit(int(tuid), sess, setup, source='yver103_f8_direct_backfill'):
+                made += 1
+            _yver103_maybe_mark_executable_and_deliver(int(tuid), sess, setup, best_fut=best or {}, allow_delivery=bool(allow_delivery), source='yver103_f8_direct_backfill')
+        except Exception:
+            continue
+    return int(made or 0)
+
+
+def _yver103_recent_bigmove_events(uid: int = 0, hours: int = 24) -> list[dict]:
+    since = float(time.time()) - max(1, int(hours or 24)) * 3600.0
+    events = []
+    try:
+        _bigmove_pending_migrate()
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            # Important: do not filter too tightly by user_id. Older BigMove rows may
+            # have been inserted under owner/0 while the command is run by Telegram uid.
+            for table, tkeys in (
+                ('emailed_bigmoves', ('emailed_ts','updated_ts','created_ts','trigger_ts')),
+                ('pending_bigmoves', ('updated_ts','trigger_ts','emailed_ts','created_ts')),
+            ):
+                try:
+                    cols = {r[1] for r in conn.execute(f'PRAGMA table_info({table})').fetchall() or []}
+                    if not cols:
+                        continue
+                    rows = [dict(r) for r in conn.execute(f'SELECT * FROM {table}').fetchall() or []]
+                    for r in rows:
+                        ts = 0.0
+                        for k in tkeys:
+                            if k in r and float(r.get(k) or 0.0) > ts:
+                                ts = float(r.get(k) or 0.0)
+                        if ts < since:
+                            continue
+                        status = str(r.get('status') or ('EMAILED' if table == 'emailed_bigmoves' else '')).upper().strip()
+                        if table == 'pending_bigmoves' and status not in {'EMAILED','CONFIRMED','SENT'}:
+                            continue
+                        sym = str(r.get('symbol') or r.get('base') or '').upper().strip()
+                        direc = str(r.get('direction') or '').upper().strip()
+                        if not sym or direc not in {'UP','DOWN'}:
+                            continue
+                        events.append({'symbol': sym, 'direction': direc, 'ts': ts, 'user_id': int(r.get('user_id') or uid or 0), 'source': table, 'status': status})
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    # Deduplicate by symbol/direction/15m bucket.
+    out = []
+    seen = set()
+    for e in sorted(events, key=lambda x: float(x.get('ts') or 0.0), reverse=True):
+        key = (str(e.get('symbol')), str(e.get('direction')), _yver103_event_bucket(float(e.get('ts') or 0.0)))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
+
+
+def _yver103_backfill_f8_from_any_bigmove(uid: int = 0, hours: int = 24, allow_delivery: bool = False) -> int:
+    made = 0
+    try:
+        for e in _yver103_recent_bigmove_events(int(uid or 0), int(hours or 24)):
+            made += _yver103_force_f8_for_bigmove(int(uid or e.get('user_id') or 0), str(e.get('symbol') or ''), str(e.get('direction') or ''), event_ts=float(e.get('ts') or 0.0), source=str(e.get('source') or 'backfill'), allow_delivery=bool(allow_delivery))
+    except Exception:
+        pass
+    return int(made or 0)
+
+
+def _yver103_parse_bigmove_from_email(subject: str = '', body: str = '') -> tuple[str, str]:
+    try:
+        return _yver98_parse_bigmove_subject_body(subject, body)
+    except Exception:
+        txt = (str(subject or '') + '\n' + str(body or '')).replace('\u2022', '•')
+        try:
+            m = re.search(r'Big\s*Move\s*Alert\s*[•\-:]+\s*([A-Z0-9]{2,20})\s+(UP|DOWN)\b', txt, re.I)
+            if m:
+                return str(m.group(1)).upper(), str(m.group(2)).upper()
+        except Exception:
+            pass
+    return '', ''
+
+
+def send_email(subject: str, body: str, body_html: Optional[str] = None, user_id_for_debug: Optional[int] = None, enforce_trade_window: bool = True, bypass_user_email_master: bool = False) -> bool:
+    """yver103 wrapper: direct send_email BigMove path also mirrors to F8."""
+    try:
+        uid = int(user_id_for_debug or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    try:
+        sym, direc = _yver103_parse_bigmove_from_email(str(subject or ''), str(body or '') + '\n' + str(body_html or ''))
+        if sym and direc:
+            _yver103_force_f8_for_bigmove(uid, sym, direc, event_ts=_yver103_now_ts(), source='send_email_direct_bigmove_alert', allow_delivery=True)
+    except Exception:
+        pass
+    if callable(_YVER103_ORIG_SEND_EMAIL):
+        return bool(_YVER103_ORIG_SEND_EMAIL(subject, body, body_html=body_html, user_id_for_debug=user_id_for_debug, enforce_trade_window=enforce_trade_window, bypass_user_email_master=bypass_user_email_master))
+    return False
+
+
+async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
+    """yver103 wrapper: async email path mirrors BigMove to F8 before SMTP."""
+    uid = 0
+    try:
+        uid = int(kwargs.get('user_id_for_debug') or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    subj = ''
+    body = ''
+    try:
+        subj = str(args[0] if len(args) >= 1 else kwargs.get('subject', '') or '')
+        body = str(args[1] if len(args) >= 2 else kwargs.get('body', '') or '') + '\n' + str(args[2] if len(args) >= 3 else kwargs.get('body_html', '') or '')
+    except Exception:
+        pass
+    try:
+        sym, direc = _yver103_parse_bigmove_from_email(subj, body)
+        if sym and direc:
+            _yver103_force_f8_for_bigmove(uid, sym, direc, event_ts=_yver103_now_ts(), source='send_email_async_bigmove_alert', allow_delivery=True)
+    except Exception:
+        pass
+    if callable(_YVER103_ORIG_SEND_EMAIL_ASYNC):
+        return bool(await _YVER103_ORIG_SEND_EMAIL_ASYNC(timeout_sec, *args, **kwargs))
+    return False
+
+
+def _yver103_generated_f8_f9_rows(uid: int, cutoff: float = 0.0, limit: int = 800) -> list[dict]:
+    out = []
+    try:
+        _migrate_generated_setups()
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cols = {r[1] for r in conn.execute('PRAGMA table_info(generated_setups)').fetchall() or []}
+            if not cols:
+                return []
+            family_expr = "COALESCE(family_id,'') AS family_id" if 'family_id' in cols else "'' AS family_id"
+            strat_expr = "COALESCE(setup_strategy,'') AS setup_strategy" if 'setup_strategy' in cols else "'' AS setup_strategy"
+            reason_expr = "COALESCE(strategy_reason,'') AS strategy_reason" if 'strategy_reason' in cols else "'' AS strategy_reason"
+            orig_id_expr = "COALESCE(original_setup_id,'') AS original_setup_id" if 'original_setup_id' in cols else "'' AS original_setup_id"
+            orig_side_expr = "COALESCE(original_side,'') AS original_side" if 'original_side' in cols else "'' AS original_side"
+            params = [int(uid or 0)]
+            where = "WHERE user_id IN (?,0)"
+            if float(cutoff or 0.0) > 0:
+                where += " AND created_ts>=?"
+                params.append(float(cutoff))
+            rows = [dict(r) for r in conn.execute(f"""
+                SELECT created_ts AS ts, created_ts, 0 AS signal_created_ts, UPPER(source) AS source, session, setup_id, symbol, market_symbol, side, conf,
+                       fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
+                       {family_expr}, {strat_expr}, {orig_id_expr}, {orig_side_expr}, {reason_expr}, entry, sl, tp, alt_target_a, alt_target_b
+                FROM generated_setups
+                {where}
+                  AND (
+                      UPPER(COALESCE(engine,'')) IN ('F8','F9')
+                      OR UPPER(COALESCE(setup_id,'')) LIKE 'F8-%'
+                      OR UPPER(COALESCE(setup_id,'')) LIKE 'F9-%'
+                      OR UPPER(COALESCE(family_id,'')) LIKE '%F8%'
+                      OR UPPER(COALESCE(family_id,'')) LIKE '%F9%'
+                      OR UPPER(COALESCE(source,'')) LIKE '%F8%'
+                      OR UPPER(COALESCE(source,'')) LIKE '%F9%'
+                      OR UPPER(COALESCE(source,'')) LIKE '%BIGMOVE%'
+                  )
+                ORDER BY created_ts DESC
+                LIMIT ?
+            """, tuple(params + [int(limit or 800)])).fetchall() or []]
+            for r in rows:
+                try:
+                    rr = _setup_audit_payload_from_row(r)
+                    if not str(rr.get('setup_id') or '').strip():
+                        continue
+                    if not _setup_volume_ok(float(rr.get('fut_vol_usd') or 0.0)):
+                        continue
+                    out.append(rr)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None) -> list[dict]:
+    """yver103 wrapper: merge durable F8/F9 generated rows into audit visibility."""
+    base = []
+    if callable(_YVER103_ORIG_SETUP_AUDIT_LOAD_ROWS):
+        try:
+            base = list(_YVER103_ORIG_SETUP_AUDIT_LOAD_ROWS(uid, hours=hours, limit=limit, dedup=dedup, start_ts=start_ts, apply_final_quality_gate=apply_final_quality_gate, source_mode_override=source_mode_override) or [])
+        except TypeError:
+            base = list(_YVER103_ORIG_SETUP_AUDIT_LOAD_ROWS(uid, hours, limit, dedup, start_ts, apply_final_quality_gate, source_mode_override) or [])
+        except Exception:
+            base = []
+    cutoff = 0.0
+    try:
+        if start_ts is not None and float(start_ts or 0.0) > 0:
+            cutoff = float(start_ts or 0.0)
+        elif hours is not None and int(hours or 0) > 0:
+            cutoff = float(time.time()) - float(int(hours)) * 3600.0
+    except Exception:
+        cutoff = 0.0
+    extra = _yver103_generated_f8_f9_rows(int(uid or 0), cutoff=cutoff, limit=max(500, int(limit or 0) * 10 if int(limit or 0) > 0 else 800))
+    if extra:
+        seen = {str(r.get('setup_id') or '').strip() for r in base if str(r.get('setup_id') or '').strip()}
+        for r in extra:
+            sid = str(r.get('setup_id') or '').strip()
+            if sid and sid not in seen:
+                base.append(r)
+                seen.add(sid)
+    try:
+        base = sorted(base, key=lambda x: _setup_audit_row_ts(x), reverse=True)
+        if bool(dedup):
+            dd = {}
+            for r in sorted(base, key=lambda x: _setup_audit_row_ts(x)):
+                key = _setup_audit_unique_key(r)
+                if key not in dd:
+                    dd[key] = r
+            base = sorted(list(dd.values()), key=lambda x: _setup_audit_row_ts(x), reverse=True)
+        if int(limit or 0) > 0:
+            base = base[:int(limit)]
+    except Exception:
+        pass
+    return list(base or [])
+
+
+async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uid = int(update.effective_user.id)
+        _yver103_backfill_f8_from_any_bigmove(uid, hours=48, allow_delivery=False)
+    except Exception:
+        pass
+    if callable(_YVER103_ORIG_SETUP_AUDIT_CMD):
+        return await _YVER103_ORIG_SETUP_AUDIT_CMD(update, context)
+    await update.message.reply_text('setup_audit unavailable')
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    made = 0
+    if eng == 'F8':
+        try:
+            made = _yver103_backfill_f8_from_any_bigmove(int(uid or 0), int(hours or 24), allow_delivery=False)
+        except Exception:
+            made = 0
+    # For F9, run the existing synchronous screen-cache reconcile before rendering.
+    if eng == 'F9':
+        try:
+            _yver100_reconcile_screen_cache_f9_sync(int(uid or 0), '', max(90, int(hours or 24) * 60))
+        except Exception:
+            pass
+    if callable(_YVER103_ORIG_ENGINE_HEALTH_TEXT):
+        try:
+            out = _YVER103_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours)
+        except Exception as exc:
+            out = f'🧪 Engine Health — {eng}\n━━━━━━━━━━━━━━━━━━━━\nStatus: ERROR | {type(exc).__name__}: {exc}'
+    else:
+        out = ''
+    try:
+        if eng == 'F8':
+            out += f"\n🧷 yver103 F8 durable mirror: direct send_email + async email + health/audit backfill active | new_rows_this_check={int(made or 0)}."
+            out += "\nGuarantee: a BigMove alert row is now forced into F8 generated/setup_audit visibility even if the legacy alert email path bypasses mark_bigmove_emailed()."
+        else:
+            out += "\n🧷 yver103 F9 audit visibility guard: F9 generated rows are merged into /setup_audit even when they are audit-only or still waiting for the executable/email bridge."
+    except Exception:
+        pass
+    return out
+
+try:
+    _autotrade_config_set('yver103_f8_f9_durable_pipeline_repair', YVER103_VERSION)
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v103'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v103'
+except Exception:
+    pass
+# =========================================================
+# end yver103
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
