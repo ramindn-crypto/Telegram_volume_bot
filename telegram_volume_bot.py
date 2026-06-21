@@ -78319,6 +78319,225 @@ except Exception:
 # end yver108
 # =========================================================
 
+
+
+# =========================================================
+# yver109 — setup audit freshness + engine-health primary durable counts
+# =========================================================
+# v109 keeps the agreed live risk profile untouched.  It fixes two reporting
+# mismatches observed on 2026-06-21:
+#   1) /setup_audit could serve a stale cached result after a fresh setup email /
+#      AutoTrade placement, so the new setup was missing until the background
+#      rebuild posted.
+#   2) /engine_health F8/F9 still printed legacy zero-count lines even though
+#      the durable combo-aware scan proved rows existed.
+
+YVER109_VERSION = 'yver109_2026_06_21_audit_cache_freshness_engine_health_counts'
+
+
+def _yver109_latest_setup_activity_ts(uid: int = 0, hours: int = 24) -> float:
+    """Latest setup/email/executable/attempt activity used to version report cache keys."""
+    latest = 0.0
+    try:
+        ids = []
+        for x in (uid, globals().get('AUTOTRADE_OWNER_UID', 0), 0):
+            try:
+                xi = int(x or 0)
+                if xi not in ids:
+                    ids.append(xi)
+            except Exception:
+                pass
+        since_ts = float(time.time()) - max(1, min(168, int(hours or 24))) * 3600.0
+        checks = (
+            ('generated_setups', ('created_ts','signal_created_ts','updated_ts'), 'user_id'),
+            ('executable_setups', ('executable_ts','created_ts','signal_created_ts','updated_ts'), 'user_id'),
+            ('emailed_setups', ('emailed_ts','created_ts','updated_ts'), 'user_id'),
+            ('setup_pipeline_events', ('event_ts','created_ts'), 'user_id'),
+            ('autotrade_attempts', ('when_ts',), 'uid'),
+            ('autotrade_trades', ('opened_ts','created_ts'), 'uid'),
+        )
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            for table, ts_cols, uid_col in checks:
+                try:
+                    if not _yver90_table_exists(conn, table):
+                        continue
+                    cols = set(_yver90_table_columns(conn, table) or [])
+                    use_cols = [c for c in ts_cols if c in cols]
+                    if not use_cols:
+                        continue
+                    where = []
+                    params = []
+                    if uid_col in cols and ids:
+                        where.append('%s IN (%s)' % (uid_col, ','.join(['?'] * len(ids))))
+                        params.extend(ids)
+                    # Only rows in the visible audit window matter for cache busting.
+                    any_time = 'MAX(' + ','.join([f'COALESCE({c},0)' for c in use_cols]) + ')' if len(use_cols) > 1 else f'COALESCE({use_cols[0]},0)'
+                    # SQLite MAX(a,b,c) is scalar; wrap in SELECT MAX(x) outside.
+                    if len(use_cols) > 1:
+                        expr = 'MAX(' + ','.join([f'COALESCE({c},0)' for c in use_cols]) + ')'
+                    else:
+                        expr = f'COALESCE({use_cols[0]},0)'
+                    where.append(f'({expr})>=?')
+                    params.append(float(since_ts))
+                    sql = f'SELECT MAX({expr}) AS ts FROM {table}' + ((' WHERE ' + ' AND '.join(where)) if where else '')
+                    row = conn.execute(sql, tuple(params)).fetchone()
+                    latest = max(latest, float((row['ts'] if row else 0.0) or 0.0))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return float(latest or 0.0)
+
+
+_YVER109_ORIG_SETUP_AUDIT_CMD = globals().get('setup_audit_cmd')
+
+
+async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """v109: cache-bust /setup_audit whenever newer setup/email/AT activity exists."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    limit = 0
+    hours = 24
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and args[0].lower() in {'h', 'help', '?', 'guide'}:
+            await send_long_message(update, _setup_audit_help_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        if args and args[0].lower() in {'overall', 'alltime', 'all-time'}:
+            await _send_cached_or_queue_admin_report(
+                update,
+                "/setup_audit overall",
+                f"admin:bg:v109:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}",
+                _setup_audit_overall_text,
+                args=(int(AUTOTRADE_OWNER_UID or uid),),
+                parse_mode=ParseMode.HTML,
+                fresh_ttl=120,
+                stale_ttl=12 * 3600,
+                background_timeout=900,
+            )
+            return
+        if args and args[0].lower() in {'compare', 'reconcile', 'traded', 'autotrade'}:
+            cmp_hours = 24
+            try:
+                if len(args) >= 2 and re.fullmatch(r'\d+(\.\d+)?', str(args[1])):
+                    cmp_hours = int(float(args[1]))
+            except Exception:
+                cmp_hours = 24
+            await _send_cached_or_queue_admin_report(
+                update,
+                f"/setup_audit compare {int(cmp_hours)}",
+                f"admin:bg:v109:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                _setup_audit_compare_text,
+                args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
+                parse_mode=ParseMode.HTML,
+                fresh_ttl=60,
+                stale_ttl=12 * 3600,
+                background_timeout=900,
+            )
+            return
+        if len(args) == 1:
+            if args[0].isdigit() or re.fullmatch(r'\d+(\.\d+)?', args[0]):
+                hours = int(float(args[0]))
+            elif args[0].lower() in {'all', 'unlimited', 'full'}:
+                limit = 0
+        elif len(args) >= 2:
+            if args[0].lower() in {'rows', 'row', 'limit', 'n'}:
+                limit = int(float(args[1]))
+                if len(args) >= 3:
+                    hours = int(float(args[2]))
+            else:
+                limit = 0 if args[0].lower() in {'all', 'unlimited', 'full', '0'} else int(float(args[0]))
+                hours = int(float(args[1]))
+    except Exception:
+        limit = 0
+        hours = 24
+    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+    latest_ts = _yver109_latest_setup_activity_ts(owner_uid, int(hours or 24))
+    activity_bucket = int(float(latest_ts or 0.0) // 30)  # bust within 30s of a new setup/attempt
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_audit {int(hours)}",
+        f"admin:bg:v109:setup_audit:{owner_uid}:{int(limit)}:{int(hours)}:act{activity_bucket}",
+        _setup_audit_text,
+        args=(owner_uid, int(limit), int(hours)),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=30,
+        stale_ttl=20 * 60,
+        background_timeout=600,
+    )
+
+
+_YVER109_ORIG_ENGINE_HEALTH_TEXT = globals().get('_yver90_engine_health_text')
+
+
+def _yver109_replace_count_line(text: str, label: str, n: int, latest: float = 0.0) -> str:
+    try:
+        n = int(n or 0)
+        if n <= 0:
+            return text
+        latest_txt = _yver90_melb_time(float(latest or 0.0))[5:16] if float(latest or 0.0) > 0 else 'durable'
+        repl = f"{label}: {n} | latest: {latest_txt}"
+        pat = rf'^{re.escape(label)}: .*?$'
+        return re.sub(pat, repl, str(text or ''), flags=re.MULTILINE)
+    except Exception:
+        return text
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    try:
+        out = _YVER109_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours) if callable(_YVER109_ORIG_ENGINE_HEALTH_TEXT) else ''
+    except Exception as exc:
+        out = f"🧪 Engine Health — {eng}\n━━━━━━━━━━━━━━━━━━━━\nStatus: ERROR | {type(exc).__name__}: {exc}"
+    try:
+        extra = _yver106_engine_health_extra_counts(int(uid or 0), eng, int(hours or 24)) if callable(globals().get('_yver106_engine_health_extra_counts')) else {}
+        audit_n = int((extra or {}).get('setup_audit_results', 0) or 0)
+        gen_n = int((extra or {}).get('generated_setups', 0) or 0)
+        exe_n = int((extra or {}).get('executable_setups', 0) or 0)
+        em_n = int((extra or {}).get('emailed_setups', 0) or 0)
+        pipe_n = int((extra or {}).get('setup_pipeline_events', 0) or 0)
+        pol_n = int((extra or {}).get('setup_combo_policy', 0) or 0)
+        latest = float((extra or {}).get('latest', 0.0) or 0.0)
+        active = audit_n + gen_n + exe_n + em_n + pipe_n
+        if active > 0:
+            out = re.sub(r'Status: NO_RECENT_F8_ACTIVITY|Status: OK_NO_RECENT_F9_SETUP', f'Status: OK_RECENT_{eng}_ACTIVITY', str(out))
+            out = _yver109_replace_count_line(out, 'Generated setup rows', gen_n, latest)
+            out = _yver109_replace_count_line(out, 'Executable queue rows', exe_n, latest)
+            out = _yver109_replace_count_line(out, 'Setup audit rows', audit_n, latest)
+            out = _yver109_replace_count_line(out, 'Emailed setup rows', em_n, latest)
+            out = _yver109_replace_count_line(out, 'Pipeline events', pipe_n, latest)
+            out = re.sub(rf'^Current /setup_matrix policy rows for {eng}: .*?$', f'Current /setup_matrix policy rows for {eng}: {pol_n} | statuses: durable combo-aware', str(out), flags=re.MULTILINE)
+            out += (f"\n✅ yver109 primary durable counts are active: audit={audit_n} | generated={gen_n} | "
+                    f"executable={exe_n} | emailed={em_n} | pipeline={pipe_n} | policy={pol_n}")
+        else:
+            out += f"\n✅ yver109 primary durable counts are active: no durable {eng} rows found in this window."
+    except Exception as exc:
+        try:
+            out += f"\n⚠️ yver109 durable count patch failed: {type(exc).__name__}: {exc}"
+        except Exception:
+            pass
+    return out
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v109'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v109'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver109_version', YVER109_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver109
+# =========================================================
+
+
 if __name__ == "__main__":
     main()
 
