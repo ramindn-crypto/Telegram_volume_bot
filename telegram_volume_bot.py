@@ -78754,6 +78754,531 @@ except Exception:
 # end yver110
 # =========================================================
 
+
+
+# =========================================================
+# yver111 — F9 strict-policy evidence reset/quarantine
+# =========================================================
+# Reason: /setup_matrix policy was still showing multiple F9 KEEP lanes using
+# historical/pre-strict F9 evidence.  F9 rule/implementation was only stabilised
+# in yver107-yver108, so old F9 rows must not promote live policy.  From this
+# patch onward F9 policy, /screen/email, and AutoTrade only trust post-reset
+# strict-2-day F9 evidence.  Owner risk profile is intentionally untouched.
+
+YVER111_VERSION = 'yver111_2026_06_21_f9_policy_reset_strict_evidence'
+
+
+def _yver111_f9_policy_cutoff_ts() -> float:
+    """Deployment-time cutoff for valid F9 policy evidence.
+
+    Stored F9 rows before this patch may include one-day scouts/recovery rows.
+    They remain visible for audit history, but do not promote F9 to KEEP.
+    """
+    key = 'yver111_f9_policy_strict_cutoff_ts'
+    try:
+        v = _autotrade_config_get(key, None)
+        if v is not None and float(v or 0.0) > 0:
+            return float(v)
+    except Exception:
+        pass
+    ts = float(time.time())
+    try:
+        _autotrade_config_set(key, ts)
+        _autotrade_config_set('yver111_f9_policy_reset_version', YVER111_VERSION)
+    except Exception:
+        pass
+    return ts
+
+
+def _yver111_is_f9_family(fam: str = '') -> bool:
+    try:
+        return str(fam or '').upper().strip() == 'F9'
+    except Exception:
+        return False
+
+
+def _yver111_f9_post_reset_evidence_for_lane(family: str, session: str, strategy: str = 'NOR', side: str = 'BOTH', user_id: int = 0) -> dict:
+    """Return only post-reset strict F9 decided evidence for one lane."""
+    out = {'family': str(family or '').upper().strip(), 'session': str(session or '').upper().strip(), 'strategy': _setup_strategy_suffix(value=str(strategy or 'NOR')), 'side': _setup_side_suffix(value=str(side or 'BOTH')), 'cutoff_ts': 0.0, 'setups': 0, 'decided': 0, 'tp': 0, 'sl': 0, 'wr': 0.0, 'avg_r': 0.0, 'allow_keep': False, 'reason': 'not_f9'}
+    try:
+        fam = str(family or '').upper().strip()
+        if fam != 'F9':
+            return out
+        sess = str(session or '').upper().strip()
+        strat = _setup_strategy_suffix(value=str(strategy or 'NOR'))
+        side_u = _setup_side_suffix(value=str(side or 'BOTH'))
+        if side_u not in {'BUY', 'SELL'}:
+            side_u = 'BOTH'
+        cutoff = float(_yver111_f9_policy_cutoff_ts() or 0.0)
+        out.update({'session': sess, 'strategy': strat, 'side': side_u, 'cutoff_ts': cutoff, 'reason': 'no_post_reset_evidence'})
+        if not sess or sess in {'-', 'NONE'} or strat not in {'NOR','REV'}:
+            return out
+        uid = int(user_id or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        ids = []
+        if uid > 0:
+            ids.append(uid)
+        ids.append(0)
+        ids = list(dict.fromkeys([int(x) for x in ids]))
+        qmarks = ','.join(['?'] * len(ids))
+        side_clause = ''
+        params = list(ids) + [sess, strat, cutoff]
+        if side_u in {'BUY', 'SELL'}:
+            side_clause = ' AND UPPER(side)=?'
+            params.append(side_u)
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                # setup_id carries the strategy in current F9 rows: F9-...-SYM-SIDE;
+                # older strict rows are all NOR unless explicitly REV in source/note.
+                rows = cur.execute(f"""
+                    SELECT result, net_r, setup_id, source, note
+                      FROM setup_audit_results
+                     WHERE user_id IN ({qmarks})
+                       AND UPPER(family)='F9'
+                       AND UPPER(session)=?
+                       AND created_ts>=?
+                       {side_clause}
+                    ORDER BY created_ts DESC
+                """, tuple(params)).fetchall() or []
+        except Exception:
+            rows = []
+        setups = 0; tp = 0; sl = 0; net_sum = 0.0; decided = 0
+        for r in rows:
+            try:
+                sid = str(r['setup_id'] or '').upper()
+                src = str(r['source'] or '').upper()
+                note = str(r['note'] or '').upper()
+                # If a future F9 REV row is explicitly tagged, keep it separate.
+                is_rev = ('-REV-' in sid) or ('REV' in src) or ('REV' in note)
+                row_strat = 'REV' if is_rev else 'NOR'
+                if row_strat != strat:
+                    continue
+                setups += 1
+                res = str(r['result'] or '').upper().strip()
+                if res in {'TP','WIN'}:
+                    tp += 1; decided += 1
+                    net_sum += float(r['net_r'] if r['net_r'] is not None else 1.5)
+                elif res in {'SL','LOSS'}:
+                    sl += 1; decided += 1
+                    net_sum += float(r['net_r'] if r['net_r'] is not None else -1.0)
+            except Exception:
+                continue
+        wr = (100.0 * tp / decided) if decided > 0 else 0.0
+        avg = (net_sum / decided) if decided > 0 else 0.0
+        try:
+            min_dec = max(3, int(_autotrade_strict_keep_edge_min_decided()))
+        except Exception:
+            min_dec = 3
+        try:
+            min_wr = float(_autotrade_strict_keep_edge_min_wr())
+        except Exception:
+            min_wr = float(globals().get('SETUP_COMBO_POLICY_FORCE_KEEP_WR', 49.0) or 49.0)
+        try:
+            min_avg = float(_autotrade_strict_keep_edge_min_avgr())
+        except Exception:
+            min_avg = 0.05
+        allow = decided >= min_dec and wr >= min_wr and avg >= min_avg
+        reason = 'post_reset_f9_policy_keep_ok' if allow else f'post_reset_f9_policy_wait:n{decided}/{min_dec},WR{wr:.1f}/{min_wr:.1f},AvgR{avg:+.2f}/{min_avg:+.2f}'
+        out.update({'setups': int(setups), 'decided': int(decided), 'tp': int(tp), 'sl': int(sl), 'wr': float(wr), 'avg_r': float(avg), 'allow_keep': bool(allow), 'min_decided': int(min_dec), 'min_wr': float(min_wr), 'min_avg_r': float(min_avg), 'reason': reason})
+        return out
+    except Exception as exc:
+        out['reason'] = f'f9_policy_evidence_error:{type(exc).__name__}'
+        return out
+
+
+def _yver111_f9_policy_state(family: str, session: str, strategy: str = 'NOR', side: str = 'BOTH', user_id: int = 0) -> dict:
+    ev = _yver111_f9_post_reset_evidence_for_lane(family, session, strategy, side, user_id)
+    if not _yver111_is_f9_family(family):
+        return {'applies': False, 'evidence': ev}
+    if bool(ev.get('allow_keep')):
+        return {'applies': True, 'execnow': 'KEEP', 'policy': 'KEEP', 'reco': 'KEEP', 'evidence': ev}
+    return {'applies': True, 'execnow': 'GATE', 'policy': 'WATCH', 'reco': 'WATCH', 'evidence': ev}
+
+
+try:
+    _YVER111_ORIG_FORCE_KEEP_OVERRIDE = _setup_combo_force_keep_override_for_lane
+except Exception:
+    _YVER111_ORIG_FORCE_KEEP_OVERRIDE = None
+
+
+def _setup_combo_force_keep_override_for_lane(family: str, session: str, strategy: str = 'NOR', side: str = 'BOTH', user_id: int = 0) -> dict:
+    # F9 cannot be force-kept by historical setup_combo_scores.  It needs fresh
+    # post-reset strict evidence only.
+    try:
+        if str(family or '').upper().strip() == 'F9':
+            st = _yver111_f9_policy_state(family, session, strategy, side, user_id)
+            ev = dict(st.get('evidence') or {})
+            if bool(st.get('applies')) and bool(ev.get('allow_keep')):
+                return {'combo': _setup_combo_strategy_side_key('F9', str(session or '').upper().strip(), _setup_strategy_suffix(value=str(strategy or 'NOR')), _setup_side_suffix(value=str(side or 'BOTH'))), 'decided': int(ev.get('decided') or 0), 'win_rate': float(ev.get('wr') or 0.0), 'avg_r': float(ev.get('avg_r') or 0.0), 'setups': int(ev.get('setups') or 0), 'source': 'yver111_post_reset_f9_evidence', 'reason': str(ev.get('reason') or 'post_reset_f9_keep')}
+            return {}
+    except Exception:
+        return {}
+    if callable(_YVER111_ORIG_FORCE_KEEP_OVERRIDE):
+        return _YVER111_ORIG_FORCE_KEEP_OVERRIDE(family, session, strategy, side, user_id)
+    return {}
+
+
+try:
+    _YVER111_ORIG_POLICY_STATE_FOR_LANE = _setup_matrix_policy_source_state_for_lane
+except Exception:
+    _YVER111_ORIG_POLICY_STATE_FOR_LANE = None
+
+
+def _setup_matrix_policy_source_state_for_lane(family: str, session: str, strategy: str = 'NOR', side: str = 'BOTH', user_id: int = 0) -> dict:
+    base = _YVER111_ORIG_POLICY_STATE_FOR_LANE(family, session, strategy, side, user_id) if callable(_YVER111_ORIG_POLICY_STATE_FOR_LANE) else {'execnow': 'GATE', 'policy': 'WATCH', 'reco': 'WATCH', 'combo': ''}
+    try:
+        if str(family or '').upper().strip() == 'F9':
+            st = _yver111_f9_policy_state(family, session, strategy, side, user_id)
+            ev = dict(st.get('evidence') or {})
+            base = dict(base or {})
+            base.update({
+                'execnow': st.get('execnow') or 'GATE',
+                'policy': st.get('policy') or 'WATCH',
+                'reco': st.get('reco') or 'WATCH',
+                'setups': int(ev.get('setups') or 0),
+                'decided': int(ev.get('decided') or 0),
+                'wr': float(ev.get('wr') or 0.0),
+                'avg_r': float(ev.get('avg_r') or 0.0),
+                'f9_policy_reset': True,
+                'f9_policy_reason': str(ev.get('reason') or ''),
+                'source': 'yver111_post_reset_f9_policy',
+            })
+            return base
+    except Exception:
+        pass
+    return base
+
+
+try:
+    _YVER111_ORIG_POLICY_LOOKUP_FOR_SETUP = _setup_combo_policy_lookup_for_setup
+except Exception:
+    _YVER111_ORIG_POLICY_LOOKUP_FOR_SETUP = None
+
+
+def _setup_combo_policy_lookup_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> dict:
+    try:
+        fam, sess2 = _setup_combo_family_session_from_obj(setup_or_row, session_name=session_name)
+        fam = str(fam or '').upper().strip()
+        if fam == 'F9':
+            sess = str(session_name or sess2 or _autotrade_setup_attr(setup_or_row, 'session', '') or _autotrade_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+            strat = _setup_strategy_suffix(setup_or_row)
+            side = _setup_side_suffix(setup_or_row)
+            if side not in {'BUY','SELL'}:
+                side = _setup_side_suffix(value=str(_autotrade_setup_attr(setup_or_row, 'side', '') or ''))
+            if side not in {'BUY','SELL'}:
+                side = 'BOTH'
+            st = _yver111_f9_policy_state(fam, sess, strat, side, user_id)
+            ev = dict(st.get('evidence') or {})
+            status = str(st.get('policy') or 'WATCH').upper().strip()
+            pol = {
+                'user_id': int(user_id or globals().get('AUTOTRADE_OWNER_UID', 0) or 0),
+                'family': fam, 'session': sess, 'strategy': strat, 'side': side,
+                'status': status, 'enabled': 1, 'policy_kind': 'yver111_post_reset_f9_policy',
+                'last_decided': int(ev.get('decided') or 0),
+                'last_win_rate': float(ev.get('wr') or 0.0),
+                'last_avg_r': float(ev.get('avg_r') or 0.0),
+                'last_setups': int(ev.get('setups') or 0),
+                'note': str(ev.get('reason') or 'f9 policy reset'),
+            }
+            return {'found': True, 'policy': pol, 'family': fam, 'session': sess, 'strategy': strat, 'side': side, 'status': status, 'enabled': 1, 'combo': _setup_combo_strategy_side_key(fam, sess, strat, side) if side in {'BUY','SELL'} else _setup_combo_strategy_key(fam, sess, strat), 'f9_policy_reset': True, 'f9_evidence': ev}
+    except Exception:
+        pass
+    if callable(_YVER111_ORIG_POLICY_LOOKUP_FOR_SETUP):
+        return _YVER111_ORIG_POLICY_LOOKUP_FOR_SETUP(setup_or_row, session_name=session_name, user_id=user_id)
+    return {'found': False, 'policy': None, 'family': 'F0', 'session': str(session_name or '').upper().strip() or '-', 'strategy': 'NOR', 'side': 'BOTH', 'status': 'UNKNOWN', 'enabled': 1, 'combo': ''}
+
+
+try:
+    _YVER111_ORIG_SETUP_MATRIX_POLICY_TEXT = _setup_combo_policy_text
+except Exception:
+    _YVER111_ORIG_SETUP_MATRIX_POLICY_TEXT = None
+
+
+def _yver111_rewrite_f9_rows_in_policy_text(txt: str, uid: int) -> str:
+    try:
+        s = str(txt or '')
+        m = re.search(r'(<pre>)(.*?)(</pre>)', s, flags=re.S)
+        if not m:
+            return s + f"\nF9 policy reset: old pre-strict F9 evidence is quarantined; F9 KEEP needs post-reset strict evidence since {_setup_matrix_policy_format_mel_ts(_yver111_f9_policy_cutoff_ts())} Melbourne."
+        raw_table = html.unescape(m.group(2))
+        lines = raw_table.splitlines()
+        if not lines:
+            return s
+        headers = lines[0].split()
+        rows = []
+        changed = 0
+        for line in lines[1:]:
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            combo, execnow, policy, set_v, wr_txt, avg_txt, reco = parts[:7]
+            if combo.upper().startswith('F9-'):
+                try:
+                    p = combo.upper().split('-')
+                    fam, sess, strat, side = p[0], p[1], (p[2] if len(p) > 2 else 'NOR'), (p[3] if len(p) > 3 else 'BOTH')
+                    st = _yver111_f9_policy_state(fam, sess, strat, side, uid)
+                    ev = dict(st.get('evidence') or {})
+                    execnow = str(st.get('execnow') or 'GATE')
+                    policy = str(st.get('policy') or 'WATCH')
+                    reco = str(st.get('reco') or 'WATCH')
+                    set_v = int(ev.get('setups') or 0)
+                    dec = int(ev.get('decided') or 0)
+                    wr_txt = f"{float(ev.get('wr') or 0.0):.1f}%" if dec > 0 else '-'
+                    avg_txt = f"{float(ev.get('avg_r') or 0.0):+.2f}" if dec > 0 else '-'
+                    changed += 1
+                except Exception:
+                    execnow, policy, reco = 'GATE', 'WATCH', 'WATCH'
+            rows.append([combo, execnow, policy, set_v, wr_txt, avg_txt, reco])
+        try:
+            policy_rank = {'KEEP': 0, 'WATCH': 1, 'TIGHTEN': 2, 'DISABLE': 3, 'OFF': 4, '-': 5}
+            def _rk(r):
+                try:
+                    wrn = float(str(r[4]).replace('%','').replace('-','0') or 0.0)
+                except Exception:
+                    wrn = 0.0
+                try:
+                    sn = int(r[3] or 0)
+                except Exception:
+                    sn = 0
+                return (policy_rank.get(str(r[2]).upper(), 9), -wrn, -sn, str(r[0]))
+            rows = sorted(rows, key=_rk)
+        except Exception:
+            pass
+        new_table = tabulate(rows, headers=headers or ['Combo','ExecNow','Policy','Set','WR','AvgR','Reco'], tablefmt='plain')
+        out = s[:m.start(2)] + html.escape(new_table) + s[m.end(2):]
+        cutoff_txt = _setup_matrix_policy_format_mel_ts(_yver111_f9_policy_cutoff_ts())
+        note = (f"\nF9 policy reset: pre-strict F9 evidence is quarantined. "
+                f"F9 rows in this table use only post-reset strict 2-day evidence since {html.escape(cutoff_txt)} Melbourne; "
+                "until then F9 stays WATCH/GATE even if old DB rows had KEEP.")
+        return out + note
+    except Exception as exc:
+        return str(txt or '') + f"\n⚠️ yver111 F9 policy table rewrite failed: {type(exc).__name__}: {html.escape(str(exc))}"
+
+
+def _setup_combo_policy_text(uid: int) -> str:
+    base = _YVER111_ORIG_SETUP_MATRIX_POLICY_TEXT(uid) if callable(_YVER111_ORIG_SETUP_MATRIX_POLICY_TEXT) else 'setup_matrix policy unavailable'
+    return _yver111_rewrite_f9_rows_in_policy_text(base, int(uid or 0))
+
+
+def _yver111_demote_stored_f9_keep_once() -> bool:
+    key = 'yver111_f9_stored_keep_demoted'
+    try:
+        if str(_autotrade_config_get(key, '') or '').strip() == 'true':
+            return False
+    except Exception:
+        pass
+    try:
+        _setup_combo_policy_migrate()
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE setup_combo_policy
+                   SET status='WATCH', enabled=1,
+                       policy_kind=COALESCE(policy_kind,'') || '|yver111_f9_policy_reset',
+                       note='F9 pre-strict evidence quarantined; requires post-reset strict 2-day decided evidence'
+                 WHERE UPPER(family)='F9' AND UPPER(COALESCE(status,''))='KEEP'
+            """)
+            conn.commit()
+        try:
+            _autotrade_config_set(key, 'true')
+            _autotrade_config_set('yver111_f9_policy_reset_demote_ts', str(int(time.time())))
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+try:
+    _yver111_f9_policy_cutoff_ts()
+    _yver111_demote_stored_f9_keep_once()
+except Exception:
+    pass
+try:
+    globals().setdefault('_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE', {'ts': 0.0, 'user_id': 0, 'run_id': '', 'rows': {}})['ts'] = 0.0
+    globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0, 'user_id': 0, 'data': {}})['ts'] = 0.0
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v111_f9_policy_reset'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v111'
+except Exception:
+    pass
+# =========================================================
+# end yver111
+# =========================================================
+
+
+# =========================================================
+# yver112 — F8 multi-symbol BigMove mirror + blackout validation sync
+# =========================================================
+# Purpose:
+# 1) BigMove alert emails can contain multiple candidates in one email subject/body
+#    (for example "BICO DOWN ... (+1 more)").  Older yver98 email-path mirror
+#    parsed only the first/top symbol, so the second candidate (for example SLX)
+#    could be missing from the F8 setup/audit mirror even though the BigMove alert
+#    email was sent.  This wrapper extracts every symbol/direction from the alert
+#    body and mirrors every candidate into F8.
+# 2) Auto-blackout display/config must match the current 7d /setup_open_times rule.
+#    Remove stale carried-over daily hours; preserve only current weak 7d hours +
+#    the weekend safety window.  Setup generation remains SHADOW ON.
+YVER112_VERSION = 'yver112_2026_06_21_f8_multi_bigmove_and_blackout_sync'
+
+
+def _yver112_parse_all_bigmove_subject_body(subject: str = '', body: str = '') -> list[tuple[str, str]]:
+    """Return all (symbol, UP/DOWN) pairs from a BigMove alert subject/body."""
+    pairs = []
+    seen = set()
+    try:
+        text = f"{subject or ''}\n{body or ''}"
+        # 1) Subject form: Big Move Alert • BICO DOWN • Confirm15m ... (+1 more)
+        for m in re.finditer(r'Big\s*Move\s*Alert\s*[•\-:|]*\s*([A-Z0-9]{2,20})\s+(UP|DOWN)\b', text, re.I):
+            sym = str(m.group(1)).upper().strip()
+            direc = str(m.group(2)).upper().strip()
+            key = (sym, direc)
+            if sym and key not in seen:
+                seen.add(key); pairs.append(key)
+        # 2) Body line form: 🔴 BICO: 15m confirmation ... or 🟢 SLX: ...
+        for m in re.finditer(r'(?:^|[\n\r])\s*(?:[🟢🔴🟡⚡•\-]*\s*)?([A-Z0-9]{2,20})\s*:\s*15m\s+confirmation\s*[🟢🔴🟡\s|]*\|?\s*15m\s*([+\-]\d+(?:\.\d+)?)%', text, re.I):
+            sym = str(m.group(1)).upper().strip()
+            val = float(m.group(2) or 0.0)
+            direc = 'UP' if val > 0 else 'DOWN'
+            key = (sym, direc)
+            if sym and key not in seen:
+                seen.add(key); pairs.append(key)
+        # 3) Fallback body row form with 1H/4H but no explicit "15m confirmation".
+        for m in re.finditer(r'(?:^|[\n\r])\s*(?:[🟢🔴🟡⚡•\-]*\s*)?([A-Z0-9]{2,20})\s*[:\-]\s*.*?15m\s*([+\-]\d+(?:\.\d+)?)%\s*\|\s*1H\s*([+\-]\d+(?:\.\d+)?)%\s*\|\s*4H\s*([+\-]\d+(?:\.\d+)?)%', text, re.I):
+            sym = str(m.group(1)).upper().strip()
+            vals = [float(m.group(i) or 0.0) for i in (2,3,4)]
+            if all(v > 0 for v in vals):
+                direc = 'UP'
+            elif all(v < 0 for v in vals):
+                direc = 'DOWN'
+            else:
+                continue
+            key = (sym, direc)
+            if sym and key not in seen:
+                seen.add(key); pairs.append(key)
+        # 4) TradingView link fallback for single-symbol emails.
+        if not pairs:
+            one_sym, one_dir = ('','')
+            try:
+                one_sym, one_dir = _yver98_parse_bigmove_subject_body(subject, body)
+            except Exception:
+                one_sym, one_dir = ('','')
+            if one_sym and one_dir:
+                pairs.append((str(one_sym).upper().strip(), str(one_dir).upper().strip()))
+    except Exception:
+        pass
+    return pairs
+
+try:
+    _YVER112_ORIG_SEND_EMAIL_ASYNC = _send_email_async
+except Exception:
+    _YVER112_ORIG_SEND_EMAIL_ASYNC = None
+
+async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
+    """yver112 wrapper: mirror every BigMove email candidate into F8 before SMTP."""
+    uid = 0
+    try:
+        uid = int(kwargs.get('user_id_for_debug') or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    subj = ''
+    body = ''
+    try:
+        subj = str(args[0] if len(args) >= 1 else kwargs.get('subject', '') or '')
+        body = str(args[1] if len(args) >= 2 else kwargs.get('body', '') or '')
+    except Exception:
+        pass
+    pairs = _yver112_parse_all_bigmove_subject_body(subj, body)
+    made = 0
+    if pairs:
+        for sym, direc in list(pairs or [])[:12]:
+            try:
+                made += int(_yver98_force_f8_for_bigmove(uid, sym, direc, event_ts=_yver98_ts(), source='yver112_send_email_async_bigmove_multi') or 0)
+            except Exception:
+                pass
+        try:
+            db_log_setup_pipeline_event(int(uid or 0), stage='yver112_bigmove_email_multi_mirror', status='ok', mode='engine_f8', details={'pairs': pairs, 'made': made, 'subject': str(subj or '')[:180]})
+        except Exception:
+            pass
+    if callable(_YVER112_ORIG_SEND_EMAIL_ASYNC):
+        return bool(await _YVER112_ORIG_SEND_EMAIL_ASYNC(timeout_sec, *args, **kwargs))
+    return False
+
+
+def _yver112_build_auto_blackout_recommendation_exact(uid: int = 0) -> dict:
+    """Exact 7d auto-blackout: current weak hours only + weekend safety.
+
+    This intentionally removes the previous two-review smoothing because it made
+    /autotrade_config display stale daily blackout hours that no longer matched
+    /setup_open_times 7d.
+    """
+    uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+    stats_7 = _yver65_setup_open_hour_stats(uid_i, '7d')
+    weak7 = _yver65_weak_hours_from_stats(stats_7, min_decided=5, wr_lt=45.0, avg_r_lt=0.0)
+    candidate = set(int(h) % 24 for h in (weak7 or set()))
+    details = {}
+    for h in sorted(candidate):
+        m7 = _yver65_hour_metric(stats_7, h)
+        details[str(int(h) % 24)] = {
+            'h': int(h) % 24,
+            'wr7': round(float(m7.get('wr', 0.0)), 2),
+            'avg7': round(float(m7.get('avg_r', 0.0)), 3),
+            'dec7': int(m7.get('decided', 0) or 0),
+            'set7': int(m7.get('set', 0) or 0),
+            'open7': int(m7.get('open', 0) or 0),
+            'support': ['7d_exact_no_stale_smoothing'],
+        }
+    daily_windows = _yver65_compact_daily_hours_to_windows(candidate)
+    windows_parts = list(daily_windows)
+    if YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW:
+        windows_parts.append(YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW)
+    windows = _normalise_melbourne_blackout_windows(','.join(windows_parts), default='')
+    return {
+        'ok': bool(windows),
+        'windows': windows,
+        'daily_hours': sorted(candidate),
+        'candidate_hours': sorted(candidate),
+        'weak7': sorted(weak7),
+        'weak3': [], 'weak10': [], 'weak24': [],
+        'details': details,
+        'miss': {},
+        'method': 'yver112 exact 7d /setup_open_times rule: WR<45%, AvgR<0, decided TP+SL>=5; no stale daily-hour smoothing; weekend safety preserved; setup generation SHADOW ON',
+        'version': YVER112_VERSION,
+    }
+
+# Override v66 recommendation builder with the exact/current validation builder.
+def _yver65_build_auto_blackout_recommendation(uid: int = 0) -> dict:
+    return _yver112_build_auto_blackout_recommendation_exact(uid)
+
+try:
+    # Force one startup sync so /autotrade_config no longer shows stale daily windows.
+    _yver65_auto_blackout_update_once(reason='yver112_startup_exact_blackout_validation', force=True)
+except Exception:
+    pass
+
+try:
+    _autotrade_config_set('yver112_bigmove_f8_multi_symbol_mirror', 'true')
+    _autotrade_config_set('yver112_auto_blackout_exact_7d_sync', 'true')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v112_f8_multi_blackout_sync'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v112'
+except Exception:
+    pass
+# =========================================================
+# end yver112
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
