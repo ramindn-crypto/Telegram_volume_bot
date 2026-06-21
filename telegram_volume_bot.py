@@ -75777,6 +75777,599 @@ except Exception:
 # end yver99
 # =========================================================
 
+# =========================================================
+# yver100 — F9 screen/audit/email/autotrade reconciliation repair
+# =========================================================
+# Problem fixed:
+#   /screen could show current F9 setup cards from the in-memory/cached screen lane,
+#   while generated_setups/setup_audit/email/autotrade did not yet contain the same
+#   rows.  That made F9 look alive on /screen but invisible to /setup_audit and email.
+#
+# Contract:
+#   Any F9 setup visible on /screen must be mirrored into the same durable pipeline
+#   as all other engines: generated_setups -> setup_audit -> policy -> executable
+#   -> setup email -> AutoTrade if KEEP and safety allows.
+#
+# Notes:
+#   - This does not force WATCH/disabled setups to trade.
+#   - It only reconciles F9 cards that /screen already decided are Top Trade Setups.
+#   - Emails still go through the normal duplicate/cooldown/SMTP locks.
+
+YVER100_VERSION = 'yver100_2026_06_21_f9_screen_audit_email_autotrade_reconcile'
+
+try:
+    _YVER100_ORIG_SCREEN_CMD = screen_cmd
+except Exception:
+    _YVER100_ORIG_SCREEN_CMD = None
+try:
+    _YVER100_ORIG_SETUP_AUDIT_CMD = setup_audit_cmd
+except Exception:
+    _YVER100_ORIG_SETUP_AUDIT_CMD = None
+try:
+    _YVER100_ORIG_ENGINE_HEALTH_TEXT = _yver90_engine_health_text
+except Exception:
+    _YVER100_ORIG_ENGINE_HEALTH_TEXT = None
+try:
+    _YVER100_ORIG_SCREEN_CACHE_PUT = _screen_cache_put
+except Exception:
+    _YVER100_ORIG_SCREEN_CACHE_PUT = None
+
+_YVER100_F9_RECON_MEMO = {}
+
+
+def _yver100_float_from_text(x, default=0.0):
+    try:
+        t = str(x or '').strip().replace(',', '')
+        t = re.sub(r'[^0-9eE+\-.]', '', t)
+        if t in {'', '+', '-'}:
+            return float(default)
+        return float(t)
+    except Exception:
+        return float(default)
+
+
+def _yver100_int_from_text(x, default=0):
+    try:
+        return int(float(_yver100_float_from_text(x, default)))
+    except Exception:
+        return int(default)
+
+
+def _yver100_best_for_symbol(best_fut: dict, sym: str):
+    try:
+        sym = str(sym or '').upper().strip()
+        if not sym:
+            return None
+        if isinstance(best_fut, dict):
+            return best_fut.get(sym) or best_fut.get(sym.upper())
+    except Exception:
+        pass
+    return None
+
+
+def _yver100_f9_screen_parse_cards(body: str, best_fut: dict | None = None, default_session: str = '') -> list:
+    """Parse F9 setup cards from /screen markdown body and rebuild Setup objects."""
+    out = []
+    try:
+        txt = str(body or '')
+        if 'Family: `F9`' not in txt and 'Family: F9' not in txt and 'F9-' not in txt:
+            return []
+        # Split on card headers while preserving each card body.
+        starts = list(re.finditer(r'(?m)^[\U0001F7E2\U0001F534]\s*\*?(BUY|SELL)\s*[—-]\s*([A-Z0-9]{2,20})\*?', txt))
+        if not starts:
+            return []
+        for i, m in enumerate(starts):
+            try:
+                start = m.start()
+                end = starts[i + 1].start() if i + 1 < len(starts) else len(txt)
+                block = txt[start:end]
+                side = str(m.group(1) or '').upper().strip()
+                sym = str(m.group(2) or '').upper().strip()
+                if side not in {'BUY', 'SELL'} or not sym:
+                    continue
+                if 'F9-' not in block and 'Family: `F9`' not in block and 'Family: F9' not in block:
+                    continue
+                sid = ''
+                mm = re.search(r'`(F9-[^`\s|]+)`', block)
+                if mm:
+                    sid = str(mm.group(1) or '').strip()
+                if not sid:
+                    mm = re.search(r'\b(F9-[A-Za-z0-9_\-]+)\b', block)
+                    if mm:
+                        sid = str(mm.group(1) or '').strip()
+                if not sid:
+                    continue
+                conf = 80
+                mm = re.search(r'Conf:\s*`?([0-9]+)`?', block)
+                if mm:
+                    conf = _yver100_int_from_text(mm.group(1), 80)
+                entry = sl = tp = 0.0
+                mm = re.search(r'Entry:\s*`?([0-9eE+\-.]+)`?\s*\|\s*SL:\s*`?([0-9eE+\-.]+)`?', block)
+                if mm:
+                    entry = _yver100_float_from_text(mm.group(1), 0.0)
+                    sl = _yver100_float_from_text(mm.group(2), 0.0)
+                mm = re.search(r'\bTP:\s*`?([0-9eE+\-.]+)`?', block)
+                if mm:
+                    tp = _yver100_float_from_text(mm.group(1), 0.0)
+                if not (entry > 0 and sl > 0 and tp > 0):
+                    continue
+                if side == 'BUY' and not (sl < entry < tp):
+                    continue
+                if side == 'SELL' and not (tp < entry < sl):
+                    continue
+                ch24 = ch4 = ch1 = ch15 = 0.0
+                mm = re.search(r'Moves:\s*24H\s*([+\-]?[0-9.]+)%.*?4H\s*([+\-]?[0-9.]+)%.*?1H\s*([+\-]?[0-9.]+)%.*?15m\s*([+\-]?[0-9.]+)%', block, re.S)
+                if mm:
+                    ch24 = _yver100_float_from_text(mm.group(1), 0.0)
+                    ch4 = _yver100_float_from_text(mm.group(2), 0.0)
+                    ch1 = _yver100_float_from_text(mm.group(3), 0.0)
+                    ch15 = _yver100_float_from_text(mm.group(4), 0.0)
+                vol_m = 0.0
+                mm = re.search(r'Volume:\s*~?\s*([0-9.]+)\s*M', block, re.I)
+                if mm:
+                    vol_m = _yver100_float_from_text(mm.group(1), 0.0)
+                fut_vol = float(vol_m) * 1_000_000.0
+                mv = _yver100_best_for_symbol(best_fut or {}, sym)
+                market_symbol = ''
+                try:
+                    market_symbol = str(getattr(mv, 'symbol', '') or '')
+                except Exception:
+                    market_symbol = ''
+                if not market_symbol:
+                    market_symbol = f'{sym}/USDT:USDT'
+                try:
+                    if fut_vol <= 0 and mv is not None:
+                        fut_vol = float(usd_notional(mv) or 0.0)
+                except Exception:
+                    pass
+                try:
+                    if abs(ch24) < 0.0001 and mv is not None:
+                        ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0)
+                except Exception:
+                    pass
+                created_ts = time.time()
+                mm = re.match(r'F9-(\d{9,12})-', sid)
+                if mm:
+                    try:
+                        created_ts = float(int(mm.group(1)))
+                    except Exception:
+                        pass
+                sess = str(default_session or '').upper().strip()
+                if sess not in {'ASIA', 'LON', 'NY'}:
+                    try:
+                        sess = str(scan_session_name_utc(datetime.fromtimestamp(float(created_ts), tz=timezone.utc)) or '').upper().strip()
+                    except Exception:
+                        sess = str(scan_session_name_utc() or '').upper().strip()
+                if sess not in {'ASIA', 'LON', 'NY'}:
+                    sess = str(default_session or 'ASIA').upper().strip() or 'ASIA'
+                s = Setup(
+                    setup_id=sid,
+                    symbol=sym,
+                    market_symbol=market_symbol,
+                    side=side,
+                    conf=int(conf),
+                    entry=float(entry),
+                    sl=float(sl),
+                    tp=float(tp),
+                    alt_target_a=None,
+                    alt_target_b=float(tp),
+                    fut_vol_usd=float(fut_vol or 0.0),
+                    ch24=float(ch24 or 0.0),
+                    ch4=float(ch4 or 0.0),
+                    ch1=float(ch1 or 0.0),
+                    ch15=float(ch15 or 0.0),
+                    ema_support_period=0,
+                    ema_support_dist_pct=0.0,
+                    pullback_ema_period=0,
+                    pullback_ema_dist_pct=0.0,
+                    pullback_ready=True,
+                    pullback_bypass_hot=False,
+                    leader_base_override=False,
+                    engine='F9',
+                    is_trailing_alt_target_b=False,
+                    created_ts=float(created_ts),
+                    family_id=F9_FAMILY_ID,
+                    family_name=F9_FAMILY_NAME,
+                    family_version='yver100_screen_reconcile',
+                    session=sess,
+                )
+                try:
+                    setattr(s, 'id', sid)
+                    setattr(s, 'source_kind', 'screen_f9_reconcile')
+                    setattr(s, 'source_session', sess)
+                    setattr(s, 'yver100_screen_f9_reconcile', True)
+                    setattr(s, 'entry_reason', 'F9 visible on /screen; mirrored to durable setup pipeline by yver100')
+                    setattr(s, 'why', 'F9 /screen setup reconciled into generated_setups/setup_audit/email/autotrade lane')
+                except Exception:
+                    pass
+                out.append(s)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    # dedupe
+    res = []
+    seen = set()
+    for s in out:
+        try:
+            k = str(getattr(s, 'setup_id', '') or '')
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            res.append(s)
+        except Exception:
+            continue
+    return res
+
+
+def _yver100_screen_cache_entries(uid: int = 0, session: str = '') -> list[tuple[str, dict]]:
+    rows = []
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    sess = str(session or '').upper().strip()
+    try:
+        for k, v in list((_SCREEN_CACHE or {}).items()):
+            ks = str(k or '')
+            if uid_i > 0 and not (ks.startswith(f'uid:{uid_i}::') or ks.startswith('global::')):
+                continue
+            if sess and not (ks.endswith(f'::{sess}') or ks == f'global::{sess}' or f'::{sess}' in ks):
+                # keep a loose fallback because cache keys are not always session-only
+                pass
+            if isinstance(v, dict) and str(v.get('body') or ''):
+                rows.append((ks, dict(v)))
+    except Exception:
+        pass
+    try:
+        rows.sort(key=lambda kv: float((kv[1] or {}).get('ts', 0.0) or 0.0), reverse=True)
+    except Exception:
+        pass
+    return rows[:8]
+
+
+def _yver100_persist_f9_setups_from_screen(uid: int, session: str, setups: list, source: str = 'screen_cache') -> tuple[int, list, dict]:
+    """Persist F9 screen-visible setups and return (generated_count, executable_keep_setups, stats)."""
+    generated = 0
+    executable = []
+    stats = {'seen': len(setups or []), 'generated': 0, 'gated': 0, 'reasons': {}}
+    try:
+        uid_i = int(uid or 0)
+        if uid_i <= 0:
+            uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        if uid_i <= 0 or not setups:
+            return 0, [], stats
+        sess = str(session or '').upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            try:
+                sess = str(scan_session_name_utc() or '').upper().strip()
+            except Exception:
+                sess = ''
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            sess = 'ASIA'
+        reasons_total = Counter()
+        for s in list(setups or []):
+            try:
+                if _setup_audit_family_code(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '') != 'F9':
+                    continue
+                sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '')
+                if not sid:
+                    continue
+                try:
+                    setattr(s, 'source_session', sess)
+                    setattr(s, 'session', sess)
+                except Exception:
+                    pass
+                if not _yver97_setup_db_exists(uid_i, sid):
+                    db_log_generated_setup(uid_i, 'screen_f9_reconcile', sess, s)
+                    generated += 1
+                    stats['generated'] = generated
+                try:
+                    db_insert_signal(s, user_id=uid_i)
+                except Exception:
+                    pass
+                try:
+                    db_log_setup_pipeline_event(uid_i, stage='yver100_f9_screen_to_generated', status='ok', session=sess, mode='engine_f9', setup_id=sid, symbol=str(getattr(s, 'symbol', '') or ''), side=str(getattr(s, 'side', '') or ''), details={'source': source})
+                except Exception:
+                    pass
+            except Exception as e:
+                try:
+                    reasons_total[f'persist_error:{type(e).__name__}'] += 1
+                except Exception:
+                    pass
+        try:
+            gated, reasons = _setup_email_presend_executable_filter(uid_i, sess, list(setups or []), lane='yver100_f9_screen_reconcile')
+        except Exception:
+            gated, reasons = [], Counter({'yver100_f9_gate_exception': 1})
+        try:
+            reasons_total.update(reasons or {})
+        except Exception:
+            pass
+        if gated:
+            try:
+                _persist_executable_candidates(uid_i, sess, list(gated or []), source_kind='executable_setups', mode='yver100_f9_screen_reconcile')
+            except Exception:
+                pass
+            executable = list(gated or [])
+            stats['gated'] = len(executable)
+        try:
+            stats['reasons'] = _pipeline_top_reasons(reasons_total, 8)
+        except Exception:
+            stats['reasons'] = dict(reasons_total)
+        try:
+            db_log_setup_pipeline_event(uid_i, stage='yver100_f9_screen_reconcile_summary', status='ok', session=sess, mode='engine_f9', details={'seen': len(setups or []), 'generated': generated, 'gated': len(executable), 'top_reasons': stats.get('reasons')})
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            db_log_setup_pipeline_event(int(uid or 0), stage='yver100_f9_screen_reconcile_summary', status='error', session=str(session or ''), mode='engine_f9', details={'error': f'{type(exc).__name__}: {exc}'})
+        except Exception:
+            pass
+    return int(generated or 0), list(executable or []), stats
+
+
+def _yver100_reconcile_screen_cache_f9_sync(uid: int = 0, session: str = '', max_age_min: int = 90) -> tuple[int, list, dict]:
+    """Synchronously mirror current cached F9 /screen cards into generated/executable DB."""
+    made = 0
+    all_exec = []
+    summary = {'entries': 0, 'parsed': 0, 'generated': 0, 'gated': 0}
+    try:
+        uid_i = int(uid or 0)
+        if uid_i <= 0:
+            uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        if uid_i <= 0:
+            return 0, [], summary
+        sess = str(session or '').upper().strip()
+        try:
+            best = get_cached_futures_tickers() or {}
+        except Exception:
+            best = {}
+        now = time.time()
+        max_age_sec = float(max(5, int(max_age_min or 90))) * 60.0
+        entries = _yver100_screen_cache_entries(uid_i, sess)
+        summary['entries'] = len(entries)
+        for key, ce in entries:
+            try:
+                ts = float((ce or {}).get('ts', 0.0) or 0.0)
+                if ts > 0 and now - ts > max_age_sec:
+                    continue
+                body = str((ce or {}).get('body') or '')
+                if 'F9-' not in body:
+                    continue
+                # Derive session from key if possible.
+                sess2 = sess
+                try:
+                    mm = re.search(r'::(ASIA|LON|NY)$', str(key or '').upper())
+                    if mm:
+                        sess2 = str(mm.group(1)).upper()
+                except Exception:
+                    pass
+                if sess2 not in {'ASIA', 'LON', 'NY'}:
+                    sess2 = str(scan_session_name_utc() or 'ASIA').upper()
+                setups = _yver100_f9_screen_parse_cards(body, best_fut=best, default_session=sess2)
+                if not setups:
+                    continue
+                summary['parsed'] += len(setups)
+                gen, exe, st = _yver100_persist_f9_setups_from_screen(uid_i, sess2, setups, source=f'screen_cache:{key}')
+                made += int(gen or 0)
+                summary['generated'] += int(gen or 0)
+                summary['gated'] += len(exe or [])
+                all_exec.extend(exe or [])
+            except Exception:
+                continue
+    except Exception:
+        return made, all_exec, summary
+    return int(made or 0), list(all_exec or []), summary
+
+
+async def _yver100_email_and_autotrade_f9_from_screen(uid: int, session: str = '') -> None:
+    """Send setup email and trigger AutoTrade for reconciled KEEP F9 screen rows."""
+    try:
+        uid_i = int(uid or 0)
+        if uid_i <= 0:
+            uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        if uid_i <= 0:
+            return
+        sess = str(session or '').upper().strip()
+        gen, executable, stats = await to_thread_fast(_yver100_reconcile_screen_cache_f9_sync, uid_i, sess, 90)
+        if not executable:
+            return
+        # Keep only fresh, not-yet-emailed identities.
+        actionable = []
+        seen = set()
+        for s in list(executable or []):
+            try:
+                sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '')
+                sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+                side = str(getattr(s, 'side', '') or '').upper().strip()
+                sess2 = str(getattr(s, 'source_session', '') or sess or '').upper().strip() or sess
+                if not sid or not sym or side not in {'BUY', 'SELL'}:
+                    continue
+                k = _setup_identity_from_obj(s) or sid
+                if k in seen:
+                    continue
+                seen.add(k)
+                if db_has_emailed_setup(uid_i, sid, lookback_hours=12):
+                    continue
+                if _email_setup_identity_recently_sent(uid_i, s):
+                    continue
+                # F9 screen reconciliation should not be blocked by a stale symbol cooldown
+                # if the exact setup was never emailed.  The atomic v92 SMTP lock still
+                # prevents duplicates.
+                actionable.append(s)
+            except Exception:
+                continue
+        if not actionable:
+            return
+        actionable = list(actionable[:max(1, int(EMAIL_SETUPS_N or 3))])
+        try:
+            best = get_cached_futures_tickers() or {}
+        except Exception:
+            best = {}
+        try:
+            user = get_user(uid_i) or {}
+        except Exception:
+            user = {}
+        target_session = sess
+        if target_session not in {'ASIA', 'LON', 'NY'}:
+            try:
+                target_session = str(getattr(actionable[0], 'source_session', '') or scan_session_name_utc() or 'ASIA').upper()
+            except Exception:
+                target_session = 'ASIA'
+        sent = await to_thread_heavy(send_email_alert_multi, dict(user or {}), {'name': str(target_session)}, list(actionable or []), best)
+        if sent:
+            try:
+                st = email_state_get(uid_i)
+                email_state_set(uid_i, last_email_ts=time.time(), sent_count=int(st.get('sent_count', 0) or 0) + 1)
+            except Exception:
+                pass
+            try:
+                _email_daily_inc(uid_i, local_trading_day_str())
+            except Exception:
+                pass
+            for s in actionable:
+                try:
+                    mark_symbol_emailed(uid_i, str(getattr(s, 'symbol', '') or ''), str(getattr(s, 'side', '') or ''), target_session)
+                except Exception:
+                    pass
+            try:
+                if _autotrade_ready() and (uid_i == int(AUTOTRADE_OWNER_UID or 0) or is_admin_user(uid_i)):
+                    _safe_create_task(_trigger_autotrade_after_email_async(uid_i, target_session, list(actionable or [])), 'yver100_f9_autotrade_after_screen_email')
+            except Exception:
+                pass
+            try:
+                db_log_setup_pipeline_event(uid_i, stage='yver100_f9_screen_email_autotrade', status='sent', session=target_session, mode='engine_f9', details={'sent': len(actionable), 'generated': gen, 'gated': len(executable)})
+            except Exception:
+                pass
+        else:
+            try:
+                db_log_setup_pipeline_event(uid_i, stage='yver100_f9_screen_email_autotrade', status='email_failed', session=target_session, mode='engine_f9', details={'actionable': len(actionable)})
+            except Exception:
+                pass
+    except Exception as exc:
+        try:
+            db_log_setup_pipeline_event(int(uid or 0), stage='yver100_f9_screen_email_autotrade', status='error', mode='engine_f9', details={'error': f'{type(exc).__name__}: {exc}'})
+        except Exception:
+            pass
+
+
+def _screen_cache_put(cache_key: str, body: str, kb: list | None = None, ts: float | None = None, allow_empty_overwrite: bool = False) -> bool:
+    ok = False
+    if callable(_YVER100_ORIG_SCREEN_CACHE_PUT):
+        try:
+            ok = bool(_YVER100_ORIG_SCREEN_CACHE_PUT(cache_key, body, kb, ts=ts, allow_empty_overwrite=allow_empty_overwrite))
+        except TypeError:
+            ok = bool(_YVER100_ORIG_SCREEN_CACHE_PUT(cache_key, body, kb, ts, allow_empty_overwrite))
+        except Exception:
+            ok = False
+    else:
+        try:
+            _SCREEN_CACHE[str(cache_key)] = {'body': body, 'kb': kb or [], 'ts': float(ts or time.time())}
+            ok = True
+        except Exception:
+            ok = False
+    # Immediately mirror F9 screen cards to generated/executable DB so /setup_audit
+    # and /engine_health cannot lag behind a visible /screen setup.
+    try:
+        key = str(cache_key or '')
+        if ok and 'F9-' in str(body or ''):
+            uid = 0
+            sess = ''
+            mm = re.search(r'uid:(\d+)::([A-Z]+)', key)
+            if mm:
+                uid = int(mm.group(1))
+                sess = str(mm.group(2)).upper()
+            else:
+                owner = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+                uid = owner
+                mm = re.search(r'global::([A-Z]+)', key)
+                if mm:
+                    sess = str(mm.group(1)).upper()
+            if uid > 0:
+                _yver100_reconcile_screen_cache_f9_sync(uid, sess, 90)
+    except Exception:
+        pass
+    return bool(ok)
+
+
+async def screen_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if callable(_YVER100_ORIG_SCREEN_CMD):
+        res = await _YVER100_ORIG_SCREEN_CMD(update, context)
+    else:
+        res = None
+    try:
+        uid = int(update.effective_user.id)
+        sess = str(scan_session_name_utc() or '').upper().strip()
+        # After any /screen response, sync visible F9 cards into email/autotrade lane.
+        _safe_create_task(_yver100_email_and_autotrade_f9_from_screen(uid, sess), 'yver100_f9_screen_post_sync')
+    except Exception:
+        pass
+    return res
+
+
+async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uid = int(update.effective_user.id)
+        sess = str(scan_session_name_utc() or '').upper().strip()
+        await to_thread_fast(_yver100_reconcile_screen_cache_f9_sync, uid, sess, 180)
+    except Exception:
+        pass
+    if callable(_YVER100_ORIG_SETUP_AUDIT_CMD):
+        return await _YVER100_ORIG_SETUP_AUDIT_CMD(update, context)
+    await update.message.reply_text('setup_audit unavailable')
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    f9_summary = None
+    if eng == 'F9':
+        try:
+            _, _, f9_summary = _yver100_reconcile_screen_cache_f9_sync(int(uid or 0), '', max(90, int(hours or 24) * 60))
+        except Exception:
+            f9_summary = None
+    if callable(_YVER100_ORIG_ENGINE_HEALTH_TEXT):
+        out = _YVER100_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours)
+    else:
+        out = ''
+    if eng == 'F9':
+        try:
+            st = f9_summary or {}
+            out += ("\n🧩 yver100 F9 screen reconcile: "
+                    f"cache_entries={int(st.get('entries', 0) or 0)} | "
+                    f"parsed_cards={int(st.get('parsed', 0) or 0)} | "
+                    f"generated_rows={int(st.get('generated', 0) or 0)} | "
+                    f"executable_rows={int(st.get('gated', 0) or 0)}")
+            out += "\nMeaning: every F9 card visible on /screen is now mirrored into generated_setups/setup_audit, then emailed/AutoTraded only if KEEP and safety allows."
+        except Exception:
+            pass
+    return out
+
+try:
+    ADMIN_HELP_DESCRIPTIONS.update({
+        'engine_health': 'F8/F9 engine health and pipeline proof: /engine_health F8 24 or /engine_health F9 24; v100 also reconciles F9 /screen cards into audit/email/autotrade pipeline',
+    })
+except Exception:
+    pass
+try:
+    HELP_TEXT_ADMIN = build_help_text_admin()
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver100_f9_screen_reconcile_version', YVER100_VERSION)
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v100'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v100'
+except Exception:
+    pass
+# =========================================================
+# end yver100
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
