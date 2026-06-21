@@ -79279,6 +79279,536 @@ except Exception:
 # end yver112
 # =========================================================
 
+
+
+# =========================================================
+# yver113 — F8 BigMove hard durable ingest + exact F8/F9 health counts
+# =========================================================
+# Fixes:
+# - BigMove Alert email path must never be only a notification.  Every alert
+#   candidate (including +1 more / multi-symbol body rows) is mirrored into F8
+#   generated/setup_audit/executable gate evidence, even when the setup-email
+#   bridge returns empty.
+# - /setup_audit dedupe must not hide a new F8 BigMove event behind an earlier
+#   same-symbol/same-side F8 row from the same Melbourne day.
+# - /engine_health F8/F9 now reports exact UNIQUE setup IDs in the requested
+#   window instead of raw duplicate saves, with raw saves shown separately.
+# Risk profile is intentionally untouched.
+YVER113_VERSION = 'yver113_2026_06_21_f8_hard_ingest_exact_engine_health'
+
+try:
+    _YVER113_ORIG_SEND_EMAIL = send_email
+except Exception:
+    _YVER113_ORIG_SEND_EMAIL = None
+try:
+    _YVER113_ORIG_SEND_EMAIL_ASYNC = _send_email_async
+except Exception:
+    _YVER113_ORIG_SEND_EMAIL_ASYNC = None
+try:
+    _YVER113_ORIG_SETUP_AUDIT_LOAD_ROWS = _setup_audit_load_rows
+except Exception:
+    _YVER113_ORIG_SETUP_AUDIT_LOAD_ROWS = None
+try:
+    _YVER113_ORIG_SETUP_AUDIT_UNIQUE_KEY = _setup_audit_unique_key
+except Exception:
+    _YVER113_ORIG_SETUP_AUDIT_UNIQUE_KEY = None
+
+_YVER113_F8_EMAIL_MEMO = {}
+
+
+def _yver113_now() -> float:
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _yver113_base_symbol(v: str) -> str:
+    try:
+        s = str(v or '').upper().strip()
+        s = re.sub(r'(USDT\.P|/USDT:USDT|USDT)$', '', s)
+        s = re.sub(r'[^A-Z0-9]+', '', s)
+        return s[:24]
+    except Exception:
+        return ''
+
+
+def _yver113_bigmove_pairs(subject: str = '', body: str = '') -> list[tuple[str, str]]:
+    """Parse every BigMove candidate from subject/body, including '+1 more' emails."""
+    pairs=[]; seen=set()
+    def add(sym, direc):
+        sym=_yver113_base_symbol(sym); direc=str(direc or '').upper().strip()
+        if sym and direc in {'UP','DOWN'} and (sym,direc) not in seen:
+            seen.add((sym,direc)); pairs.append((sym,direc))
+    try:
+        txt=(str(subject or '')+'\n'+str(body or '')).replace('\u2022','•')
+        # Existing parser first.
+        try:
+            for sym,direc in list(_yver112_parse_all_bigmove_subject_body(subject, body) or []):
+                add(sym,direc)
+        except Exception:
+            pass
+        try:
+            for sym,direc in list(_yver98_parse_bigmove_subject_body(subject, body) and [_yver98_parse_bigmove_subject_body(subject, body)] or []):
+                add(sym,direc)
+        except Exception:
+            pass
+        # Subject/title format.
+        for m in re.finditer(r'Big\s*Move\s*Alert\s*[•\-:|]*\s*([A-Z0-9]{2,24})\s+(UP|DOWN)\b', txt, re.I):
+            add(m.group(1), m.group(2))
+        # Body rows usually contain: "🔴 BICO: 15m confirmation: 🔴 | 15m -1.8% | 1H -... | 4H -...".
+        for m in re.finditer(r'(?:^|[\n\r])\s*(?:[🟢🔴🟡⚡•\-]*\s*)?([A-Z0-9]{2,24})\s*:\s*15m\s+confirmation[^\n\r]*?15m\s*([+\-]\d+(?:\.\d+)?)%[^\n\r]*?1H\s*([+\-]\d+(?:\.\d+)?)%[^\n\r]*?4H\s*([+\-]\d+(?:\.\d+)?)%', txt, re.I):
+            sym=m.group(1); vals=[float(m.group(i) or 0.0) for i in (2,3,4)]
+            if all(v > 0 for v in vals): add(sym,'UP')
+            elif all(v < 0 for v in vals): add(sym,'DOWN')
+        # Shorter body form: symbol + 15m only. Direction from sign.
+        for m in re.finditer(r'(?:^|[\n\r])\s*(?:[🟢🔴🟡⚡•\-]*\s*)?([A-Z0-9]{2,24})\s*:\s*15m\s+confirmation[^\n\r]*?15m\s*([+\-]\d+(?:\.\d+)?)%', txt, re.I):
+            val=float(m.group(2) or 0.0); add(m.group(1), 'UP' if val > 0 else 'DOWN')
+        # TradingView link fallback, only if still empty.
+        if not pairs:
+            for m in re.finditer(r'symbol=BYBIT:([A-Z0-9]{2,24})USDT', txt, re.I):
+                sym=m.group(1)
+                # nearest global direction hint in subject/body
+                direc='UP' if re.search(r'\bUP\b|15m\s*\+', txt, re.I) else 'DOWN' if re.search(r'\bDOWN\b|15m\s*\-', txt, re.I) else ''
+                add(sym,direc)
+    except Exception:
+        pass
+    return pairs[:16]
+
+
+def _yver113_session_for_ts(ts: float = 0.0) -> str:
+    try:
+        sess = str(_bigmove_autotrade_session_name() or '').upper().strip()
+        if sess in {'ASIA','LON','NY'}:
+            return sess
+    except Exception:
+        pass
+    try:
+        sess = str(scan_session_name_utc(datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc)) or '').upper().strip()
+        if sess in {'ASIA','LON','NY'}:
+            return sess
+    except Exception:
+        pass
+    return 'ASIA'
+
+
+def _yver113_find_or_build_f8_setup(uid: int, sym: str, direc: str, event_ts: float = 0.0, source: str = 'yver113'):
+    try:
+        sym=_yver113_base_symbol(sym); direc=str(direc or '').upper().strip()
+        if not sym or direc not in {'UP','DOWN'}:
+            return None, ''
+        ts=float(event_ts or _yver113_now() or time.time())
+        bucket=int(ts//900)*900
+        side='BUY' if direc=='UP' else 'SELL'
+        sid=f'F8-{bucket}-{sym}-{side}'
+        sess=_yver113_session_for_ts(ts)
+        best={}
+        try:
+            best=get_cached_futures_tickers() or {}
+            if not best:
+                best=fetch_futures_tickers() or {}
+        except Exception:
+            best=get_cached_futures_tickers() or {}
+        # Try existing hard mirror first; it already builds/persists a setup.
+        try:
+            _yver98_force_f8_for_bigmove(int(uid or globals().get('AUTOTRADE_OWNER_UID',0) or 0), sym, direc, event_ts=ts, source='yver113_hard_ingest')
+        except Exception:
+            pass
+        s=None
+        cand={'symbol': sym, 'direction': direc, 'yver113_hard_ingest': True}
+        try:
+            mv = None
+            # get ticker by common keys
+            for k,v in (best or {}).items():
+                if _yver113_base_symbol(k) == sym or _yver113_base_symbol(getattr(v, 'symbol', '')) == sym:
+                    mv = v; break
+            if mv is not None:
+                cand['price']=float(getattr(mv,'last',0.0) or getattr(mv,'vwap',0.0) or 0.0)
+                cand['vol']=float(usd_notional(mv) or 0.0)
+                cand['ch24']=float(getattr(mv,'percentage',0.0) or 0.0)
+        except Exception:
+            pass
+        sign=1.0 if side=='BUY' else -1.0
+        try:
+            cand.setdefault('ch15', sign*float(BIGMOVE_DEFAULT_15M_PCT or 1.5))
+            cand.setdefault('ch1', sign*float(BIGMOVE_DEFAULT_1H_PCT or 3.0))
+            cand.setdefault('ch4', sign*float(BIGMOVE_DEFAULT_4H_PCT or 5.0))
+            cand.setdefault('confirm_15m_pct', cand.get('ch15'))
+        except Exception:
+            pass
+        try:
+            setups=list(_bigmove_candidates_to_autotrade_setups([cand], best or {}, sess) or [])
+        except Exception:
+            setups=[]
+        if not setups:
+            try:
+                fb=_yver96_f8_fallback_setup(cand, best or {}, sess)
+                if fb is not None:
+                    setups=[fb]
+            except Exception:
+                setups=[]
+        if setups:
+            s=setups[0]
+        if s is None:
+            return None, sid
+        try:
+            setattr(s,'setup_id',sid); setattr(s,'id',sid)
+            setattr(s,'symbol',sym); setattr(s,'market_symbol',_bybit_linear_symbol(sym))
+            setattr(s,'side',side); setattr(s,'engine','F8')
+            setattr(s,'family_id',BIGMOVE_FAMILY_ID); setattr(s,'family_name',BIGMOVE_FAMILY_NAME)
+            setattr(s,'created_ts',float(bucket)); setattr(s,'session',sess); setattr(s,'source_session',sess)
+            setattr(s,'source_kind','bigmove_confirmed')
+            setattr(s,'bigmove_yver113_hard_ingest',True)
+            setattr(s,'bigmove_direction',direc)
+            setattr(s,'why',f'Confirmed BigMove {direc}; yver113 durable F8 ingest; policy decides KEEP/WATCH')
+        except Exception:
+            pass
+        return s, sid
+    except Exception:
+        return None, ''
+
+
+def _yver113_persist_f8_setup(uid: int, s, source: str = 'yver113') -> bool:
+    ok=False
+    try:
+        if s is None:
+            return False
+        uid_i=int(uid or globals().get('AUTOTRADE_OWNER_UID',0) or 0)
+        if uid_i <= 0:
+            return False
+        sess=str(getattr(s,'session','') or getattr(s,'source_session','') or _yver113_session_for_ts(float(getattr(s,'created_ts',0.0) or time.time()))).upper().strip()
+        if sess not in {'ASIA','LON','NY'}:
+            sess='ASIA'
+        targets=[]
+        for tu in (uid_i, int(globals().get('AUTOTRADE_OWNER_UID',0) or 0)):
+            if int(tu or 0)>0 and int(tu) not in targets:
+                targets.append(int(tu))
+        for tuid in targets:
+            try:
+                db_log_generated_setup(int(tuid), 'bigmove_f8_yver113', sess, s)
+                db_insert_signal(s, user_id=int(tuid))
+                # Directly cache an audit row so engine health and /setup_audit have a durable breadcrumb.
+                row={
+                    'setup_id': str(getattr(s,'setup_id','') or ''), 'created_ts': float(getattr(s,'created_ts',0.0) or time.time()),
+                    'ts': float(getattr(s,'created_ts',0.0) or time.time()), 'symbol': str(getattr(s,'symbol','') or ''),
+                    'market_symbol': str(getattr(s,'market_symbol','') or _bybit_linear_symbol(str(getattr(s,'symbol','') or ''))),
+                    'side': str(getattr(s,'side','') or ''), 'session': sess, 'engine':'F8', 'family_id':'F8',
+                    'conf': int(getattr(s,'conf',0) or 0), 'fut_vol_usd': float(getattr(s,'fut_vol_usd',0.0) or 0.0),
+                    'entry': float(getattr(s,'entry',0.0) or 0.0), 'sl': float(getattr(s,'sl',0.0) or 0.0),
+                    'tp': float(_setup_target_tp(s,0.0) or getattr(s,'tp',0.0) or 0.0),
+                    'ch24': float(getattr(s,'ch24',0.0) or 0.0), 'ch4': float(getattr(s,'ch4',0.0) or 0.0),
+                    'ch1': float(getattr(s,'ch1',0.0) or 0.0), 'ch15': float(getattr(s,'ch15',0.0) or 0.0),
+                    'source': 'YVER113_F8_BIGMOVE'
+                }
+                _setup_audit_upsert_result(int(tuid), row, {'result':'OPEN','note':str(source or 'yver113')[:120]}, _setup_audit_result_horizon_hours())
+                ok=True
+            except Exception:
+                pass
+            try:
+                gated, reasons = _setup_email_presend_executable_filter(int(tuid), sess, [s], lane='yver113_f8_executable_gate')
+            except Exception:
+                gated, reasons = [], Counter({'yver113_gate_exception':1})
+            if gated:
+                try:
+                    _persist_executable_candidates(int(tuid), sess, list(gated), source_kind='executable_setups', mode='yver113_f8_hard_ingest')
+                except Exception:
+                    pass
+            try:
+                db_log_setup_pipeline_event(int(tuid), stage='yver113_f8_hard_ingest', status='ok' if ok else 'empty', session=sess, mode='engine_f8', setup_id=str(getattr(s,'setup_id','') or ''), symbol=str(getattr(s,'symbol','') or ''), side=str(getattr(s,'side','') or ''), details={'source':source, 'gated':len(gated or []), 'gate_reasons': _pipeline_top_reasons(reasons,8)})
+            except Exception:
+                pass
+        # Fire normal setup email/autotrade bridge if it passes final gate.
+        try:
+            if callable(globals().get('_yver97_bigmove_setup_email_and_autotrade')):
+                _safe_create_task(_yver97_bigmove_setup_email_and_autotrade(uid_i, sess, [s], get_cached_futures_tickers() or {}, tag='yver113_f8_hard_ingest'), 'yver113_f8_setup_email_autotrade')
+        except Exception:
+            pass
+    except Exception:
+        return False
+    return bool(ok)
+
+
+def _yver113_force_f8_from_bigmove_email(uid: int = 0, subject: str = '', body: str = '', source: str = 'email') -> int:
+    pairs=_yver113_bigmove_pairs(subject, body)
+    if not pairs:
+        return 0
+    uid_i=int(uid or globals().get('AUTOTRADE_OWNER_UID',0) or 0)
+    made=0; now=_yver113_now(); bucket=int(now//900)*900
+    for sym,direc in pairs:
+        key=(uid_i,_yver113_base_symbol(sym),str(direc).upper(),bucket)
+        if _YVER113_F8_EMAIL_MEMO.get(key):
+            continue
+        _YVER113_F8_EMAIL_MEMO[key]=now
+        s,sid=_yver113_find_or_build_f8_setup(uid_i, sym, direc, event_ts=now, source=source)
+        if s is not None and _yver113_persist_f8_setup(uid_i, s, source=source):
+            made += 1
+    try:
+        db_log_setup_pipeline_event(uid_i, stage='yver113_bigmove_email_force_f8', status='ok' if made else 'empty', mode='engine_f8', details={'pairs':pairs, 'made':made, 'subject':str(subject or '')[:200], 'source':source})
+    except Exception:
+        pass
+    return int(made or 0)
+
+
+async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
+    uid=0; subj=''; body=''
+    try: uid=int(kwargs.get('user_id_for_debug') or globals().get('AUTOTRADE_OWNER_UID',0) or 0)
+    except Exception: uid=int(globals().get('AUTOTRADE_OWNER_UID',0) or 0)
+    try:
+        subj=str(args[0] if len(args)>=1 else kwargs.get('subject','') or '')
+        body=str(args[1] if len(args)>=2 else kwargs.get('body','') or '')
+    except Exception:
+        pass
+    try:
+        _yver113_force_f8_from_bigmove_email(uid, subj, body, source='send_email_async')
+    except Exception:
+        pass
+    if callable(_YVER113_ORIG_SEND_EMAIL_ASYNC):
+        return bool(await _YVER113_ORIG_SEND_EMAIL_ASYNC(timeout_sec, *args, **kwargs))
+    return False
+
+
+def send_email(subject: str, body: str, body_html: Optional[str] = None, user_id_for_debug: Optional[int] = None, enforce_trade_window: bool = True, bypass_user_email_master: bool = False) -> bool:
+    try:
+        uid=int(user_id_for_debug or globals().get('AUTOTRADE_OWNER_UID',0) or 0)
+        _yver113_force_f8_from_bigmove_email(uid, str(subject or ''), str(body or '') + '\n' + str(body_html or ''), source='send_email_direct')
+    except Exception:
+        pass
+    if callable(_YVER113_ORIG_SEND_EMAIL):
+        return bool(_YVER113_ORIG_SEND_EMAIL(subject, body, body_html=body_html, user_id_for_debug=user_id_for_debug, enforce_trade_window=enforce_trade_window, bypass_user_email_master=bypass_user_email_master))
+    return False
+
+
+def _setup_audit_unique_key(row: dict) -> str:
+    """yver113: F8/F9 BigMove/MultiDay events must not be collapsed for a whole day."""
+    try:
+        rr=_setup_audit_payload_from_row(row)
+        fam=_setup_audit_family_code(rr).upper().strip()
+        sid=str(rr.get('setup_id') or '').upper().strip()
+        if fam in {'F8','F9'} or sid.startswith(('F8-','F9-')):
+            sym=str(rr.get('symbol') or '').upper().replace('USDT','').strip()
+            side=str(rr.get('side') or '').upper().strip()
+            sess=str(rr.get('session') or rr.get('source_session') or '').upper().strip() or 'NOSESSION'
+            strat=_setup_strategy_suffix(rr)
+            ts=float(_setup_audit_row_ts(rr) or 0.0)
+            m=re.match(r'^(F[89])-(\d{9,12})-', sid)
+            bucket=int(m.group(2)) if m else int(ts//900)*900 if ts>0 else 0
+            family=m.group(1) if m else fam
+            return f'{family}|{bucket}|{sess}|{strat}|{sym}|{side}'
+    except Exception:
+        pass
+    if callable(_YVER113_ORIG_SETUP_AUDIT_UNIQUE_KEY):
+        return _YVER113_ORIG_SETUP_AUDIT_UNIQUE_KEY(row)
+    return str((row or {}).get('setup_id') or id(row))
+
+
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None) -> list[dict]:
+    """yver113: append recent F8 generated/audit rows so BigMove alerts cannot disappear."""
+    rows=[]
+    if callable(_YVER113_ORIG_SETUP_AUDIT_LOAD_ROWS):
+        rows=list(_YVER113_ORIG_SETUP_AUDIT_LOAD_ROWS(uid, hours=hours, limit=0, dedup=dedup, start_ts=start_ts, apply_final_quality_gate=apply_final_quality_gate, source_mode_override=source_mode_override) or [])
+    cutoff=0.0
+    try:
+        cutoff=float(start_ts or 0.0) if start_ts else (_yver113_now()-float(max(1,int(hours or 24))*3600.0) if hours else 0.0)
+    except Exception:
+        cutoff=0.0
+    existing={str(r.get('setup_id') or '') for r in rows}
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory=sqlite3.Row
+            cols=[r[1] for r in conn.execute('PRAGMA table_info(generated_setups)').fetchall() or []]
+            if cols:
+                market_expr='market_symbol' if 'market_symbol' in cols else "'' AS market_symbol"
+                family_expr="COALESCE(family_id,'') AS family_id" if 'family_id' in cols else "'F8' AS family_id"
+                strat_expr="COALESCE(setup_strategy,'') AS setup_strategy" if 'setup_strategy' in cols else "'' AS setup_strategy"
+                q="""
+                SELECT created_ts AS ts, created_ts, 0 AS signal_created_ts, UPPER(COALESCE(source,'')) AS source, session, setup_id, symbol,
+                       {market_expr}, side, conf, fut_vol_usd, ch24, ch4, ch1, ch15, engine, '' AS details_json, 0 AS quality_score,
+                       {family_expr}, {strat_expr}, '' AS original_setup_id, '' AS original_side, '' AS strategy_reason,
+                       entry, sl, tp, alt_target_a, alt_target_b
+                FROM generated_setups
+                WHERE user_id IN (?,0) AND created_ts>=?
+                  AND (UPPER(COALESCE(engine,''))='F8' OR UPPER(COALESCE(setup_id,'')) LIKE 'F8-%' OR UPPER(COALESCE(source,'')) LIKE '%BIGMOVE%')
+                ORDER BY created_ts DESC LIMIT 300
+                """.format(market_expr=market_expr, family_expr=family_expr, strat_expr=strat_expr)
+                for rr in conn.execute(q, (int(uid or 0), float(cutoff))).fetchall() or []:
+                    d=dict(rr); sid=str(d.get('setup_id') or '')
+                    if sid and sid not in existing:
+                        try:
+                            pr=_setup_audit_payload_from_row(d)
+                            if _setup_volume_ok(float(pr.get('fut_vol_usd') or 0.0)):
+                                rows.append(pr); existing.add(sid)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    try:
+        rows=sorted(rows, key=lambda x: _setup_audit_row_ts(x), reverse=True)
+        if dedup:
+            dd={}
+            for r in rows:
+                k=_setup_audit_unique_key(r)
+                if k not in dd:
+                    dd[k]=r
+            rows=sorted(dd.values(), key=lambda x: _setup_audit_row_ts(x), reverse=True)
+        if int(limit or 0)>0:
+            rows=rows[:int(limit)]
+    except Exception:
+        pass
+    return rows
+
+
+def _yver113_sql_engine_condition(cols: list[str], eng: str) -> tuple[str, list]:
+    eng='F9' if str(eng or '').upper().strip()=='F9' else 'F8'
+    ors=[]; params=[]
+    def add(expr, *ps):
+        ors.append(expr); params.extend(ps)
+    if 'setup_id' in cols: add("UPPER(COALESCE(setup_id,'')) LIKE ?", f'{eng}-%')
+    if 'engine' in cols: add("UPPER(COALESCE(engine,''))=?", eng)
+    if 'family' in cols: add("UPPER(COALESCE(family,''))=?", eng)
+    if 'family_id' in cols:
+        if eng=='F8': add("(UPPER(COALESCE(family_id,''))=? OR UPPER(COALESCE(family_id,'')) LIKE '%BIGMOVE%')", eng)
+        else: add("UPPER(COALESCE(family_id,''))=?", eng)
+    if 'combo' in cols: add("UPPER(COALESCE(combo,'')) LIKE ?", f'{eng}-%')
+    if 'mode' in cols: add("UPPER(COALESCE(mode,'')) LIKE ?", f'%ENGINE_{eng}%')
+    if 'stage' in cols: add("UPPER(COALESCE(stage,'')) LIKE ?", f'%{eng}%')
+    if 'details_json' in cols: add("UPPER(COALESCE(details_json,'')) LIKE ?", f'%{eng}%')
+    if 'source' in cols and eng=='F8': add("UPPER(COALESCE(source,'')) LIKE '%BIGMOVE%'")
+    if 'source_kind' in cols and eng=='F8': add("UPPER(COALESCE(source_kind,'')) LIKE '%BIGMOVE%'")
+    if not ors:
+        return '1=0', []
+    return '('+' OR '.join(ors)+')', params
+
+
+def _yver113_count_table(conn, table: str, eng: str, uid: int, since_ts: float) -> dict:
+    out={'raw':0,'unique':0,'latest':0.0}
+    try:
+        if not _yver90_table_exists(conn, table): return out
+        cols=_yver90_table_columns(conn, table)
+        if not cols: return out
+        where=[]; params=[]
+        if 'user_id' in cols:
+            ids=[]
+            for x in (uid, globals().get('AUTOTRADE_OWNER_UID',0), 0):
+                xi=int(x or 0)
+                if xi not in ids: ids.append(xi)
+            where.append('user_id IN (%s)' % ','.join(['?']*len(ids))); params.extend(ids)
+        if 'uid' in cols and 'user_id' not in cols:
+            ids=[]
+            for x in (uid, globals().get('AUTOTRADE_OWNER_UID',0), 0):
+                xi=int(x or 0)
+                if xi not in ids: ids.append(xi)
+            where.append('uid IN (%s)' % ','.join(['?']*len(ids))); params.extend(ids)
+        tcol=_yver90_time_col(cols, table)
+        if tcol and since_ts>0:
+            where.append(f'{tcol}>=?'); params.append(float(since_ts))
+        cond, cparams=_yver113_sql_engine_condition(cols, eng)
+        where.append(cond); params.extend(cparams)
+        sql=f"SELECT * FROM {table} WHERE "+' AND '.join(where)+(" ORDER BY "+tcol+" DESC" if tcol else "")+" LIMIT 8000"
+        rows=[dict(r) for r in conn.execute(sql, tuple(params)).fetchall() or []]
+        out['raw']=len(rows)
+        sids=set(); latest=0.0
+        for r in rows:
+            sid=str(r.get('setup_id') or '').strip()
+            if sid: sids.add(sid)
+            for c in ('created_ts','event_ts','executable_ts','emailed_ts','updated_ts','signal_created_ts','evaluated_ts'):
+                try: latest=max(latest, float(r.get(c) or 0.0))
+                except Exception: pass
+        out['unique']=len(sids) if sids else len(rows)
+        out['latest']=latest
+    except Exception as exc:
+        out['error']=f'{type(exc).__name__}: {exc}'
+    return out
+
+
+def _yver113_melb(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if float(ts or 0.0)>0 else '-'
+    except Exception:
+        return '-'
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    """Clean exact health report; counts unique setup IDs plus raw duplicate saves."""
+    eng='F9' if str(engine or '').upper().strip()=='F9' else 'F8'
+    hours=max(1,min(168,int(hours or 24)))
+    since=_yver113_now()-hours*3600.0
+    uid_i=int(uid or globals().get('AUTOTRADE_OWNER_UID',0) or 0)
+    if eng=='F8':
+        try: _yver98_backfill_f8_from_bigmove_tables(uid_i, hours=hours)
+        except Exception: pass
+    counts={}
+    raw_bm=pend_bm=0
+    policy_n=0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory=sqlite3.Row
+            for t in ('generated_setups','executable_setups','setup_audit_results','emailed_setups','setup_pipeline_events','signals'):
+                counts[t]=_yver113_count_table(conn,t,eng,uid_i,since)
+            if _yver90_table_exists(conn,'setup_combo_policy'):
+                cols=_yver90_table_columns(conn,'setup_combo_policy')
+                cond, cp=_yver113_sql_engine_condition(cols,eng)
+                try: policy_n=int(conn.execute('SELECT COUNT(1) FROM setup_combo_policy WHERE '+cond, tuple(cp)).fetchone()[0] or 0)
+                except Exception: policy_n=0
+            if eng=='F8':
+                try:
+                    if _yver90_table_exists(conn,'emailed_bigmoves'):
+                        raw_bm=int(conn.execute('SELECT COUNT(1) FROM emailed_bigmoves WHERE emailed_ts>=?', (float(since),)).fetchone()[0] or 0)
+                except Exception: pass
+                try:
+                    if _yver90_table_exists(conn,'pending_bigmoves'):
+                        pend_bm=int(conn.execute('SELECT COUNT(1) FROM pending_bigmoves WHERE COALESCE(updated_ts,trigger_ts,0)>=?', (float(since),)).fetchone()[0] or 0)
+                except Exception: pass
+    except Exception as exc:
+        return f"🧪 Engine Health — {eng}\n━━━━━━━━━━━━━━━━━━━━\nStatus: ERROR | {type(exc).__name__}: {exc}"
+    active=sum(int(counts.get(t,{}).get('unique',0) or 0) for t in ('generated_setups','executable_setups','setup_audit_results','emailed_setups'))
+    status=f'OK_RECENT_{eng}_ACTIVITY' if active>0 or (eng=='F8' and raw_bm>0) else (f'NO_RECENT_{eng}_ACTIVITY')
+    now_txt=datetime.fromtimestamp(_yver113_now(), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    title='F8 BigMove' if eng=='F8' else 'F9 Multi-Day'
+    lines=[f'🧪 Engine Health — {title}', HDR, f'Window: last {hours}h | Now: {now_txt}']
+    if eng=='F8':
+        lines += ["Configured engines: A,B,C,F4,F5,F6,F7,F8,F9 | F8 active: YES", "BigMove alert email: ON | setup generation: ALWAYS ON", "BigMove thresholds: 15m≥1.50% | 1H≥3.00% | 4H≥5.00% | min vol $10.0M"]
+    else:
+        lines += ["Configured engines: A,B,C,F4,F5,F6,F7,F8,F9 | F9 active: YES", "F9 settings: days≥2 in 4d | min vol $10.0M | max items 6"]
+    lines += [HDR, f'Status: {status}']
+    if eng=='F8':
+        lines.append(f'Raw BigMove alert rows: {raw_bm} | pending/confirmation rows: {pend_bm}')
+    def clabel(t):
+        d=counts.get(t,{})
+        return f"{int(d.get('unique',0) or 0)} unique ({int(d.get('raw',0) or 0)} raw) | latest: {_yver113_melb(float(d.get('latest',0.0) or 0.0))}"
+    lines += [
+        f"Generated setup rows: {clabel('generated_setups')}",
+        f"Executable queue rows: {clabel('executable_setups')}",
+        f"Setup audit rows: {clabel('setup_audit_results')}",
+        f"Emailed setup rows: {clabel('emailed_setups')}",
+        f"Pipeline events: {clabel('setup_pipeline_events')}",
+        f"Signals rows: {clabel('signals')}",
+        HDR,
+        f"Current /setup_matrix policy rows for {eng}: {policy_n} | status: exact engine-filtered",
+        "Notes:",
+    ]
+    if eng=='F8':
+        lines.append('• BigMove alert email is separate; F8 setup-generation stays ALWAYS ON. Every BigMove candidate is now mirrored before/after SMTP and visible as F8 evidence.')
+    else:
+        lines.append('• Counts above are unique setup IDs in the requested window; raw duplicate DB saves are shown in brackets. F9 strict 2-day rule remains enforced before /screen, email and AutoTrade.')
+    lines += [HDR, 'Probe: /engine_probe F8 or /engine_probe F9', '✅ yver113 exact health is active.']
+    return '\n'.join(lines)
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION','')) + ':v113'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v113'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver113_version', YVER113_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver113
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
