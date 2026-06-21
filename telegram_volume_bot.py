@@ -76923,6 +76923,197 @@ except Exception:
 # end yver102
 # =========================================================
 
+
+# =========================================================
+# yver105 fast-safe F8/F9 bridge scheduler (based on yver102)
+# =========================================================
+# Purpose:
+# - Keep the known-good yver102 baseline.
+# - Prevent F8/F9 bridge coroutines from blocking Telegram's main event loop.
+# - Prevent Render "coroutine was never awaited" warnings when bridge calls happen
+#   from synchronous cache/email paths.
+# - Avoid unbounded background threads: one bounded daemon worker runs heavy bridge
+#   coroutines sequentially off the command loop.
+# No risk/cap/TP/SL/leverage/blackout settings are changed here.
+YVER105_VERSION = 'yver105_fast_safe_f8_f9_bridge_scheduler_from_yver102'
+
+try:
+    import queue as _yver105_queue_mod
+except Exception:
+    _yver105_queue_mod = None
+
+_YVER105_BG_QUEUE = None
+_YVER105_BG_WORKER_STARTED = False
+_YVER105_BG_LOCK = threading.RLock()
+_YVER105_RECENT_LABEL_TS = {}
+_YVER105_RECENT_LABEL_LOCK = threading.RLock()
+_YVER105_BG_MAX_QUEUE = 25
+_YVER105_BG_DEDUPE_SEC = 12.0
+_YVER105_HEAVY_LABEL_PREFIXES = (
+    'yver97_', 'yver98_', 'yver100_f9', 'yver101_f9',
+    'yver103_', 'yver104_', 'yver105_',
+)
+
+
+def _yver105_close_coro_quietly(coro) -> None:
+    try:
+        close = getattr(coro, 'close', None)
+        if callable(close):
+            close()
+    except Exception:
+        pass
+
+
+def _yver105_is_heavy_bridge_label(label: str) -> bool:
+    try:
+        name = str(label or '').strip()
+        return any(name.startswith(p) for p in _YVER105_HEAVY_LABEL_PREFIXES)
+    except Exception:
+        return False
+
+
+def _yver105_bg_worker() -> None:
+    q = globals().get('_YVER105_BG_QUEUE')
+    while True:
+        item = None
+        try:
+            item = q.get() if q is not None else None
+        except Exception:
+            time.sleep(0.25)
+            continue
+        if item is None:
+            continue
+        label, coro = item
+        try:
+            asyncio.run(coro)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            try:
+                logger.warning('yver105 background bridge %s failed: %s: %s', label, type(exc).__name__, exc)
+            except Exception:
+                pass
+        finally:
+            try:
+                q.task_done()
+            except Exception:
+                pass
+
+
+def _yver105_ensure_bg_worker() -> bool:
+    global _YVER105_BG_QUEUE, _YVER105_BG_WORKER_STARTED
+    try:
+        if _yver105_queue_mod is None:
+            return False
+        with _YVER105_BG_LOCK:
+            if _YVER105_BG_QUEUE is None:
+                _YVER105_BG_QUEUE = _yver105_queue_mod.Queue(maxsize=int(_YVER105_BG_MAX_QUEUE))
+            if not _YVER105_BG_WORKER_STARTED:
+                th = threading.Thread(target=_yver105_bg_worker, name='pf-yver105-bridge-worker', daemon=True)
+                th.start()
+                _YVER105_BG_WORKER_STARTED = True
+        return True
+    except Exception:
+        return False
+
+
+def _yver105_recent_duplicate(label: str) -> bool:
+    """Throttle duplicate bridge scheduling bursts without touching normal commands."""
+    try:
+        name = str(label or '').strip()
+        if not _yver105_is_heavy_bridge_label(name):
+            return False
+        now = float(time.time())
+        with _YVER105_RECENT_LABEL_LOCK:
+            # prune occasionally
+            for k, ts in list(_YVER105_RECENT_LABEL_TS.items()):
+                try:
+                    if now - float(ts or 0.0) > 60.0:
+                        _YVER105_RECENT_LABEL_TS.pop(k, None)
+                except Exception:
+                    _YVER105_RECENT_LABEL_TS.pop(k, None)
+            last = float(_YVER105_RECENT_LABEL_TS.get(name, 0.0) or 0.0)
+            if now - last < float(_YVER105_BG_DEDUPE_SEC):
+                return True
+            _YVER105_RECENT_LABEL_TS[name] = now
+        return False
+    except Exception:
+        return False
+
+
+def _yver105_enqueue_bg_coro(coro, label: str = 'background'):
+    name = str(label or 'background')
+    if coro is None:
+        return None
+    if _yver105_recent_duplicate(name):
+        _yver105_close_coro_quietly(coro)
+        try:
+            _autotrade_config_set('yver105_last_deduped_bg_task', name[:120])
+        except Exception:
+            pass
+        return None
+    if not _yver105_ensure_bg_worker():
+        _yver105_close_coro_quietly(coro)
+        return None
+    try:
+        _YVER105_BG_QUEUE.put_nowait((name, coro))
+        return None
+    except Exception:
+        _yver105_close_coro_quietly(coro)
+        try:
+            logger.warning('yver105 bridge queue full/dropped task: %s', name)
+        except Exception:
+            pass
+        return None
+
+
+# Override yver102 _safe_create_task with a command-loop-safe scheduler.
+# Heavy F8/F9 bridge coroutines are always offloaded so SMTP/DB/AutoTrade bridge work
+# cannot freeze /start, /help_admin, or other fast commands.  All other normal async
+# work keeps the original loop scheduling behaviour when a running loop exists.
+def _safe_create_task(coro, label: str = 'background'):
+    name = str(label or 'background')
+    if coro is None:
+        return None
+    try:
+        if _yver105_is_heavy_bridge_label(name):
+            return _yver105_enqueue_bg_coro(coro, name)
+    except Exception:
+        pass
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    except Exception:
+        loop = None
+    if loop is not None and getattr(loop, 'is_running', lambda: False)():
+        try:
+            task = loop.create_task(coro, name=name)
+            task.add_done_callback(lambda t, _label=name: _safe_task_done(t, _label))
+            return task
+        except Exception:
+            _yver105_close_coro_quietly(coro)
+            return None
+    # No running event loop in this thread.  Run non-heavy background work in the
+    # same bounded worker rather than leaking an un-awaited coroutine.
+    return _yver105_enqueue_bg_coro(coro, name)
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v105'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v105'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver105_fast_safe_bridge_scheduler', YVER105_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver105
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
