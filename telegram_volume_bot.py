@@ -78538,6 +78538,222 @@ except Exception:
 # =========================================================
 
 
+
+# =========================================================
+# yver110 health-note cleanup + AutoTrade terminal retry quieting
+# =========================================================
+# Purpose:
+# - Keep the risk profile unchanged.
+# - Fix /engine_health F8/F9 contradictory text where primary durable counts are
+#   non-zero but old notes still say no rows/no policy.
+# - Stop noisy repeated AutoTrade attempts every few minutes for terminal rows
+#   such as F9_REQUIRES_2_DISTINCT_DAYS and ALREADY_TRADED, while still allowing
+#   retryable safety blocks like OPEN_CAP/DAILY_CAP to retry inside the entry window.
+YVER110_VERSION = 'yver110_2026_06_21_health_notes_terminal_retry_quiet'
+
+_YVER110_ORIG_ENGINE_HEALTH_TEXT = globals().get('_yver90_engine_health_text')
+
+
+def _yver110_engine_extra(uid: int, eng: str, hours: int = 24) -> dict:
+    try:
+        fn = globals().get('_yver106_engine_health_extra_counts')
+        if callable(fn):
+            return dict(fn(int(uid or 0), str(eng or 'F8').upper(), int(hours or 24)) or {})
+    except Exception:
+        pass
+    return {}
+
+
+def _yver110_clean_engine_health_notes(txt: str, eng: str, extra: dict) -> str:
+    """Remove legacy contradictory health notes once durable rows are confirmed."""
+    out = str(txt or '')
+    try:
+        eng = 'F9' if str(eng or '').upper().strip() == 'F9' else 'F8'
+        audit_n = int((extra or {}).get('setup_audit_results', 0) or 0)
+        gen_n = int((extra or {}).get('generated_setups', 0) or 0)
+        exe_n = int((extra or {}).get('executable_setups', 0) or 0)
+        em_n = int((extra or {}).get('emailed_setups', 0) or 0)
+        pipe_n = int((extra or {}).get('setup_pipeline_events', 0) or 0)
+        pol_n = int((extra or {}).get('setup_combo_policy', 0) or 0)
+        active = audit_n + gen_n + exe_n + em_n + pipe_n
+        if active <= 0:
+            return out
+
+        # Primary status/counts should be coherent.
+        out = re.sub(r'Status:\s*NO_RECENT_F8_ACTIVITY|Status:\s*OK_NO_RECENT_F9_SETUP',
+                     f'Status: OK_RECENT_{eng}_ACTIVITY', out)
+        out = re.sub(rf'^Current /setup_matrix policy rows for {eng}: .*?$',
+                     f'Current /setup_matrix policy rows for {eng}: {pol_n} | statuses: durable combo-aware',
+                     out, flags=re.MULTILINE)
+
+        # Remove stale contradictory bullets created by older health wrappers.
+        stale_patterns = [
+            r'\n• No F9 setup rows in this window\.[^\n]*',
+            r'\n• No current setup_matrix policy rows for F9;[^\n]*',
+            r'\n• No F8 rows/events found in this window\.[^\n]*',
+            r'\n• No current setup_matrix policy rows for F8;[^\n]*',
+            r'\n• No F9 setup rows in this window\.[\s\S]*?created\.',
+            r'\n• No current setup_matrix policy rows for F9;[\s\S]*?created\.',
+            r'\n• No F8 rows/events found in this window\.[\s\S]*?code path\.',
+            r'\n• No current setup_matrix policy rows for F8;[\s\S]*?created\.',
+        ]
+        for pat in stale_patterns:
+            out = re.sub(pat, '', out, flags=re.IGNORECASE)
+
+        # Add one clear current-state note, once.
+        marker = f"✅ yver110 coherent health: durable {eng} evidence is active"
+        if marker not in out:
+            out += (f"\n{marker}: generated={gen_n} | audit={audit_n} | executable={exe_n} | "
+                    f"emailed={em_n} | pipeline={pipe_n} | policy={pol_n}.")
+            if eng == 'F9':
+                out += " F9 strict 2-distinct-Melbourne-day gate remains enforced before /screen, email and AutoTrade."
+            else:
+                out += " F8 BigMove alert and setup-generation evidence are now shown separately but reconciled here."
+    except Exception as exc:
+        try:
+            out += f"\n⚠️ yver110 health cleanup failed: {type(exc).__name__}: {exc}"
+        except Exception:
+            pass
+    return out
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    try:
+        out = _YVER110_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours) if callable(_YVER110_ORIG_ENGINE_HEALTH_TEXT) else ''
+    except Exception as exc:
+        out = f"🧪 Engine Health — {eng}\n━━━━━━━━━━━━━━━━━━━━\nStatus: ERROR | {type(exc).__name__}: {exc}"
+    try:
+        extra = _yver110_engine_extra(int(uid or 0), eng, int(hours or 24))
+        out = _yver110_clean_engine_health_notes(out, eng, extra)
+    except Exception:
+        pass
+    return out
+
+
+_YVER110_ORIG_AUTOTRADE_PLACE_TRADE = globals().get('_autotrade_place_trade')
+_YVER110_TERMINAL_SKIP_CACHE: dict[str, float] = {}
+_YVER110_TERMINAL_SKIP_LOCK = threading.Lock()
+YVER110_TERMINAL_RETRY_QUIET_SEC = int(os.environ.get('YVER110_TERMINAL_RETRY_QUIET_SEC', '900') or 900)
+
+
+def _yver110_setup_key(s) -> str:
+    try:
+        sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+        sym = str(_bybit_linear_symbol(getattr(s, 'symbol', '') or '')).upper()
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        ent = _fmt_price(float(getattr(s, 'entry', 0.0) or 0.0)) if float(getattr(s, 'entry', 0.0) or 0.0) > 0 else ''
+        sl = _fmt_price(float(getattr(s, 'sl', 0.0) or 0.0)) if float(getattr(s, 'sl', 0.0) or 0.0) > 0 else ''
+        return '|'.join([sid, sym, side, ent, sl])
+    except Exception:
+        return str(id(s))
+
+
+def _yver110_mark_or_suppress_terminal(uid: int, s, reason: str) -> bool:
+    """Return True when this terminal skip should be suppressed as a repeat."""
+    try:
+        reason_u = re.sub(r'[^A-Z0-9_]+', '_', str(reason or '').upper()).strip('_')[:64]
+        if reason_u not in {'F9_REQUIRES_2_DISTINCT_DAYS', 'ALREADY_TRADED', 'SETUP_ALREADY_TRADED', 'ENTRY_OLD', 'TP_ALREADY_HIT', 'SL_ALREADY_HIT'}:
+            return False
+        key = f"{int(uid or 0)}|{reason_u}|{_yver110_setup_key(s)}"
+        now = float(time.time())
+        ttl = max(60, int(YVER110_TERMINAL_RETRY_QUIET_SEC or 900))
+        with _YVER110_TERMINAL_SKIP_LOCK:
+            old = float(_YVER110_TERMINAL_SKIP_CACHE.get(key) or 0.0)
+            # opportunistic cleanup
+            cutoff = now - max(float(ttl) * 2.0, 3600.0)
+            for k, v in list(_YVER110_TERMINAL_SKIP_CACHE.items())[:500]:
+                try:
+                    if float(v or 0.0) < cutoff:
+                        _YVER110_TERMINAL_SKIP_CACHE.pop(k, None)
+                except Exception:
+                    _YVER110_TERMINAL_SKIP_CACHE.pop(k, None)
+            if old and (now - old) <= ttl:
+                return True
+            _YVER110_TERMINAL_SKIP_CACHE[key] = now
+        return False
+    except Exception:
+        return False
+
+
+def _yver110_terminal_reason_for_setup(uid: int, s) -> str:
+    """Detect only genuinely terminal/non-actionable reasons; do not suppress retryable caps."""
+    try:
+        ok, why, _meta = _yver107_f9_rule_allows_setup(s) if callable(globals().get('_yver107_f9_rule_allows_setup')) else (True, '', {})
+        if not ok:
+            w = str(why or '')
+            if 'F9_REQUIRES' in w.upper():
+                return 'F9_REQUIRES_2_DISTINCT_DAYS'
+            return w or 'F9_REQUIRES_2_DISTINCT_DAYS'
+    except Exception:
+        pass
+    try:
+        fn = globals().get('_yver61_setup_terminal_for_visibility')
+        if callable(fn):
+            terminal, why = fn(s, uid=int(uid or 0))
+            if terminal:
+                lbl = _setup_audit_short_autotrade_reason(str(why or '')) if callable(globals().get('_setup_audit_short_autotrade_reason')) else str(why or '').upper()
+                if str(lbl).upper() in {'ALREADY_TRADED', 'ENTRY_OLD', 'TP_ALREADY_HIT', 'SL_ALREADY_HIT'}:
+                    return str(lbl).upper()
+    except Exception:
+        pass
+    return ''
+
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    """Quiet repeated terminal retries without changing risk/cap/TP/SL/order logic."""
+    try:
+        kept = []
+        suppressed = Counter()
+        for s in list(setups or []):
+            why = _yver110_terminal_reason_for_setup(int(uid or 0), s)
+            if why and _yver110_mark_or_suppress_terminal(int(uid or 0), s, why):
+                suppressed[str(why)] += 1
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='yver110_terminal_retry_quiet', status='skip', session=str(session_label or ''), mode='autotrade', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=str(getattr(s, 'symbol', '') or ''), side=str(getattr(s, 'side', '') or ''), details={'reason': why, 'ttl_sec': int(YVER110_TERMINAL_RETRY_QUIET_SEC)})
+                except Exception:
+                    pass
+                continue
+            kept.append(s)
+        if not kept:
+            reason = 'TERMINAL_RETRY_COOLDOWN'
+            if suppressed:
+                reason = 'TERMINAL_RETRY_COOLDOWN:' + ','.join([f'{k}={v}' for k, v in suppressed.most_common(3)])[:80]
+            try:
+                _LAST_AUTOTRADE_DECISION[int(uid or 0)] = {
+                    'status': 'SKIP',
+                    'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'reason': reason,
+                    'session': str(session_label or ''),
+                    'mode': str(_autotrade_runtime_mode()).lower(),
+                    'top_reasons': dict(suppressed.most_common(5)),
+                }
+            except Exception:
+                pass
+            return False, reason
+        if callable(_YVER110_ORIG_AUTOTRADE_PLACE_TRADE):
+            return _YVER110_ORIG_AUTOTRADE_PLACE_TRADE(uid, session_label, kept)
+    except Exception:
+        if callable(_YVER110_ORIG_AUTOTRADE_PLACE_TRADE):
+            return _YVER110_ORIG_AUTOTRADE_PLACE_TRADE(uid, session_label, setups)
+    return False, 'autotrade_place_trade_missing'
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v110'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v110'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver110_version', YVER110_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver110
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
