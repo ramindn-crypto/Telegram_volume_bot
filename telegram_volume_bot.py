@@ -77552,6 +77552,340 @@ except Exception:
 # end yver106
 # =========================================================
 
+
+# =========================================================
+# yver107 — strict F9 2-day rule + F9 symbol cooldown hardening
+# =========================================================
+# Owner rule:
+#   F9 Multi-Day continuation must NOT be "all current leaders".
+#   BUY requires the symbol appeared in Leaders on at least 2 distinct Melbourne
+#   days inside the F9 lookback window; SELL requires the same for Losers.
+#
+# This patch disables the old v96/v97 one-day scout/warmup behaviour from the live
+# screen/email/autotrade path.  It also enforces a symbol+side F9 email cooldown so
+# new 15m bucket setup_ids for the same symbol do not create repeated emails.
+# No risk, TP/SL, leverage, blackout, or Bybit order sizing settings are changed.
+
+YVER107_VERSION = 'yver107_2026_06_21_strict_f9_two_day_and_cooldown'
+
+
+def _yver107_is_f9_setup(s) -> bool:
+    try:
+        sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').upper()
+        fam = str(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '').upper()
+        combo = str(getattr(s, 'combo', '') or getattr(s, 'setup_combo', '') or '').upper()
+        if sid.startswith('F9-') or combo.startswith('F9-') or fam == 'F9' or 'F9' in fam:
+            return True
+        try:
+            return _setup_audit_family_code(fam) == 'F9'
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _yver107_f9_bucket_for_side(side: str) -> str:
+    return 'leaders' if str(side or '').upper().strip() == 'BUY' else 'losers'
+
+
+def _yver107_f9_required_days() -> int:
+    try:
+        return max(2, int(globals().get('F9_MIN_DAYS', 2) or 2))
+    except Exception:
+        return 2
+
+
+def _yver107_f9_repeat_days_for_symbol(symbol: str, side: str, created_ts: float | None = None) -> tuple[int, str]:
+    sym = str(symbol or '').upper().strip()
+    sd = str(side or '').upper().strip()
+    bucket = _yver107_f9_bucket_for_side(sd)
+    try:
+        ts = float(created_ts or 0.0)
+    except Exception:
+        ts = 0.0
+    if ts <= 0:
+        try:
+            ts = float(time.time())
+        except Exception:
+            ts = 0.0
+    try:
+        days = int(_f9_repeated_bucket_days(sym, bucket, current_ts=ts, lookback_days=int(globals().get('F9_LOOKBACK_DAYS', 4) or 4)) or 0)
+    except Exception:
+        days = 0
+    return int(days), bucket
+
+
+def _yver107_f9_rule_allows_setup(s) -> tuple[bool, str, dict]:
+    """Return whether a F9 setup satisfies the real multi-day rule."""
+    if not _yver107_is_f9_setup(s):
+        return True, 'not_f9', {}
+    try:
+        sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        if not sym or side not in {'BUY', 'SELL'}:
+            return False, 'f9_missing_symbol_side', {}
+        created_ts = float(getattr(s, 'created_ts', 0.0) or 0.0)
+        days, bucket = _yver107_f9_repeat_days_for_symbol(sym, side, created_ts=created_ts)
+        required = _yver107_f9_required_days()
+        # Keep any explicit stronger f9_days if a proper builder already stored it.
+        try:
+            explicit_days = int(getattr(s, 'f9_days', 0) or 0)
+            if explicit_days > days:
+                days = explicit_days
+        except Exception:
+            pass
+        meta = {'symbol': sym, 'side': side, 'bucket': bucket, 'days': int(days), 'required_days': int(required)}
+        if int(days) < int(required):
+            return False, f'f9_requires_{required}d_{bucket}_has_{days}d', meta
+        try:
+            setattr(s, 'f9_days', int(days))
+            setattr(s, 'f9_bucket', str(bucket))
+            setattr(s, 'f9_two_day_rule_ok', True)
+        except Exception:
+            pass
+        return True, 'f9_2day_ok', meta
+    except Exception as exc:
+        return False, f'f9_rule_error:{type(exc).__name__}', {}
+
+
+def _yver107_filter_and_dedupe_f9_setups(setups: list, uid: int = 0, session: str = '', *, enforce_cooldown: bool = False, source: str = '') -> tuple[list, dict]:
+    """Filter invalid one-day F9 rows and collapse repeated same-symbol/side buckets."""
+    kept_by_key = {}
+    skipped = Counter()
+    skipped_examples = []
+    sess = str(session or '').upper().strip()
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    for s in list(setups or []):
+        try:
+            if not _yver107_is_f9_setup(s):
+                # Non-F9 rows pass through unchanged.
+                key = ('NONF9', str(getattr(s, 'setup_id', '') or id(s)))
+                kept_by_key[key] = s
+                continue
+            sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+            side = str(getattr(s, 'side', '') or '').upper().strip()
+            ok, why, meta = _yver107_f9_rule_allows_setup(s)
+            if not ok:
+                skipped[str(why)] += 1
+                if len(skipped_examples) < 5:
+                    skipped_examples.append({'symbol': sym, 'side': side, 'reason': why, **dict(meta or {})})
+                try:
+                    db_log_setup_pipeline_event(uid_i, stage='yver107_f9_two_day_rule', status='skip', session=sess, mode='engine_f9', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=sym, side=side, details={'reason': why, 'source': source, **dict(meta or {})})
+                except Exception:
+                    pass
+                continue
+            if enforce_cooldown and uid_i > 0:
+                try:
+                    if _email_symbol_recently_sent(uid_i, sym, side, sess, setup_id=str(getattr(s, 'setup_id', '') or '')):
+                        skipped['f9_symbol_side_email_cooldown'] += 1
+                        if len(skipped_examples) < 5:
+                            skipped_examples.append({'symbol': sym, 'side': side, 'reason': 'f9_symbol_side_email_cooldown'})
+                        continue
+                except Exception:
+                    pass
+            key = (sym, side)
+            old = kept_by_key.get(key)
+            if old is None:
+                kept_by_key[key] = s
+            else:
+                # Keep newest bucket/setup.  If same timestamp, keep higher quality/conf.
+                def _rank(x):
+                    try:
+                        return (
+                            float(getattr(x, 'created_ts', 0.0) or 0.0),
+                            int(getattr(x, 'conf', 0) or 0),
+                            float(getattr(x, 'quality_score', 0.0) or 0.0),
+                            float(getattr(x, 'fut_vol_usd', 0.0) or 0.0),
+                        )
+                    except Exception:
+                        return (0.0, 0, 0.0, 0.0)
+                if _rank(s) >= _rank(old):
+                    kept_by_key[key] = s
+                skipped['f9_duplicate_symbol_side_collapsed'] += 1
+        except Exception as exc:
+            skipped[f'f9_filter_exception:{type(exc).__name__}'] += 1
+            continue
+    out = list(kept_by_key.values())
+    return out, {'kept': len(out), 'skipped': dict(skipped), 'examples': skipped_examples}
+
+
+# Strict F9 picker: use the original real 2-day F9 builder, not the yver96 one-day scout fallback.
+try:
+    _YVER107_ORIG_PICK_MULTIDAY = _YVER96_ORIG_PICK_MULTIDAY_MOVER_FAMILY_SETUPS if callable(globals().get('_YVER96_ORIG_PICK_MULTIDAY_MOVER_FAMILY_SETUPS')) else pick_multiday_mover_family_setups
+except Exception:
+    _YVER107_ORIG_PICK_MULTIDAY = None
+
+
+def pick_multiday_mover_family_setups(best_fut: Dict[str, MarketVol], leaders: list[str], losers: list[str], n: int, session_name: str, scan_profile: str = DEFAULT_SCAN_PROFILE) -> List[Setup]:
+    out = []
+    try:
+        if callable(_YVER107_ORIG_PICK_MULTIDAY):
+            out = list(_YVER107_ORIG_PICK_MULTIDAY(best_fut, leaders, losers, n, session_name, scan_profile=scan_profile) or [])
+    except Exception:
+        out = []
+    try:
+        out, stats = _yver107_filter_and_dedupe_f9_setups(out, int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), str(session_name or ''), enforce_cooldown=False, source='strict_picker')
+    except Exception:
+        pass
+    try:
+        max_n = max(0, int(n or globals().get('F9_MAX_ITEMS', 6) or 6))
+    except Exception:
+        max_n = 6
+    return list(out or [])[:max_n]
+
+
+# Disable v97 health-check scout seeding. Health checks should report truth, not create one-day F9 rows.
+def _yver97_seed_f9_scouts(uid: int, hours: int = 24, session_name: str | None = None) -> int:
+    try:
+        _autotrade_config_set('yver107_f9_health_no_scout_seed_last_ts', str(int(time.time())))
+    except Exception:
+        pass
+    return 0
+
+
+# Screen display dedupe/filter for F9 so repeated same-symbol buckets do not flood /screen.
+try:
+    _YVER107_ORIG_SCREEN_FORMAT_SETUP_CARDS = _screen_format_setup_cards
+except Exception:
+    _YVER107_ORIG_SCREEN_FORMAT_SETUP_CARDS = None
+
+
+def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
+    try:
+        setups2, stats = _yver107_filter_and_dedupe_f9_setups(list(setups or []), int(uid or 0), str(session or ''), enforce_cooldown=False, source='screen_format')
+        return _YVER107_ORIG_SCREEN_FORMAT_SETUP_CARDS(setups2, uid, session) if callable(_YVER107_ORIG_SCREEN_FORMAT_SETUP_CARDS) else ''
+    except Exception:
+        return _YVER107_ORIG_SCREEN_FORMAT_SETUP_CARDS(setups, uid, session) if callable(_YVER107_ORIG_SCREEN_FORMAT_SETUP_CARDS) else ''
+
+
+# Hard bridge wrapper: visible F9 rows are emailed/autotraded only when they satisfy the real 2-day rule and symbol cooldown.
+try:
+    _YVER107_ORIG_FORCE_VISIBLE_F9 = _yver101_force_email_autotrade_visible_f9
+except Exception:
+    _YVER107_ORIG_FORCE_VISIBLE_F9 = None
+
+
+async def _yver101_force_email_autotrade_visible_f9(uid: int, session: str = '', best_fut: dict | None = None, body: str = '', shown_setups: list | None = None, source: str = 'screen') -> dict:
+    try:
+        uid_i = int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid_i = 0
+    sess = str(session or '').upper().strip()
+    if sess not in {'ASIA', 'LON', 'NY'}:
+        try:
+            sess = str(scan_session_name_utc() or 'ASIA').upper().strip()
+        except Exception:
+            sess = 'ASIA'
+    try:
+        best = best_fut or get_cached_futures_tickers() or {}
+    except Exception:
+        best = best_fut or {}
+    try:
+        raw = _yver101_visible_f9_setups(uid_i, sess, best_fut=best or {}, body=str(body or ''), shown_setups=list(shown_setups or []))
+    except Exception:
+        raw = list(shown_setups or [])
+    filtered, stats = _yver107_filter_and_dedupe_f9_setups(raw, uid_i, sess, enforce_cooldown=True, source=str(source or 'screen'))
+    if not filtered:
+        try:
+            db_log_setup_pipeline_event(uid_i, stage='yver107_f9_visible_email_autotrade', status='skip', session=sess, mode='engine_f9', details={'reason': 'no_valid_2day_or_cooldown', 'source': source, 'stats': stats})
+        except Exception:
+            pass
+        try:
+            _LAST_EMAIL_DECISION[uid_i] = {'status': 'SKIP', 'picked': '-', 'when': datetime.now(MEL_TZ).isoformat(timespec='seconds'), 'reasons': ['yver107_f9_two_day_or_cooldown_block', str((stats or {}).get('skipped') or {})[:200]]}
+        except Exception:
+            pass
+        return {'status': 'skip', 'reason': 'no_valid_f9_after_2day_cooldown_filter', 'stats': stats}
+    if callable(_YVER107_ORIG_FORCE_VISIBLE_F9):
+        # Pass body='' so the original function cannot reparse invalid stale F9 rows from text.
+        return await _YVER107_ORIG_FORCE_VISIBLE_F9(uid_i, sess, best_fut=best or {}, body='', shown_setups=filtered, source=f'{source}:yver107_strict')
+    return {'status': 'skip', 'reason': 'orig_f9_bridge_missing'}
+
+
+# Final AutoTrade guard: old one-day F9 executable rows already in DB cannot open after deploy.
+try:
+    _YVER107_ORIG_AUTOTRADE_PLACE_TRADE = _autotrade_place_trade
+except Exception:
+    _YVER107_ORIG_AUTOTRADE_PLACE_TRADE = None
+
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    try:
+        filtered = []
+        skipped = Counter()
+        for s in list(setups or []):
+            ok, why, meta = _yver107_f9_rule_allows_setup(s)
+            if not ok:
+                skipped[str(why)] += 1
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='yver107_autotrade_f9_two_day_guard', status='skip', session=str(session_label or ''), mode='autotrade', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=str(getattr(s, 'symbol', '') or ''), side=str(getattr(s, 'side', '') or ''), details={'reason': why, **dict(meta or {})})
+                except Exception:
+                    pass
+                continue
+            filtered.append(s)
+        if not filtered:
+            try:
+                _LAST_AUTOTRADE_DECISION[int(uid or 0)] = {
+                    'status': 'SKIP',
+                    'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'reason': 'F9_REQUIRES_2_DISTINCT_DAYS' if skipped else 'NO_SETUPS_AFTER_F9_FILTER',
+                    'session': str(session_label or ''),
+                    'mode': str(_autotrade_runtime_mode()).lower(),
+                    'top_reasons': dict(skipped.most_common(5)),
+                }
+            except Exception:
+                pass
+            return False, 'F9_REQUIRES_2_DISTINCT_DAYS' if skipped else 'NO_SETUPS_AFTER_F9_FILTER'
+        if callable(_YVER107_ORIG_AUTOTRADE_PLACE_TRADE):
+            return _YVER107_ORIG_AUTOTRADE_PLACE_TRADE(uid, session_label, filtered)
+    except Exception as exc:
+        if callable(_YVER107_ORIG_AUTOTRADE_PLACE_TRADE):
+            return _YVER107_ORIG_AUTOTRADE_PLACE_TRADE(uid, session_label, setups)
+        return False, f'yver107_autotrade_guard_error:{type(exc).__name__}'
+    return False, 'autotrade_place_trade_missing'
+
+
+# Engine-health note cleanup: remove old scout promise and show v107 strict rule.
+try:
+    _YVER107_ORIG_ENGINE_HEALTH_TEXT = _yver90_engine_health_text
+except Exception:
+    _YVER107_ORIG_ENGINE_HEALTH_TEXT = None
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    out = _YVER107_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours) if callable(_YVER107_ORIG_ENGINE_HEALTH_TEXT) else ''
+    try:
+        eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+        if eng == 'F9':
+            # Remove older misleading scout wording if present.
+            out = re.sub(r"\n🧬 v97 action:.*?(?=\n🧩|\nMeaning:|$)", "", str(out), flags=re.S)
+            out += ("\n✅ yver107 F9 rule: STRICT 2-day mode is ON. "
+                    "F9 BUY requires the symbol to be in Leaders on ≥2 distinct Melbourne days; "
+                    "F9 SELL requires Losers on ≥2 distinct Melbourne days. One-day scout/warmup rows are disabled for /screen, email and AutoTrade. "
+                    "Same symbol/side F9 setup emails obey the normal setup-email cooldown.")
+    except Exception:
+        pass
+    return out
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v107'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v107'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver107_strict_f9_two_day_and_cooldown_version', YVER107_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver107
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
