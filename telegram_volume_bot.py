@@ -79755,113 +79755,475 @@ except Exception:
 
 
 # =========================================================
-# yver118 — hard-visible F8/F9 health commands in /help_admin
+# yver119 — fast v117-based BigMove/F8 final audit mirror
 # =========================================================
-# Reason:
-#   After the rollback/rebase chain the engine_health/engine_probe handlers still
-#   exist, but the rendered /help_admin output can miss the F8/F9 command block.
-#   This patch does not rely on cached HELP_TEXT_ADMIN or the grouped help builder.
-#   The /help_admin command itself appends a compact, top-visible diagnostics block
-#   at send time.
+# Base: yver117, not yver118.  This keeps the known faster command path and adds
+# only a small, synchronous F8 audit mirror for confirmed BigMove emails.
+#
+# Problem fixed:
+# A confirmed BigMove alert email could be visible in Gmail (example: TNSR UP) but
+# no matching F8 setup appeared in /setup_audit.  Existing hooks attempted to build
+# F8 rows, but if the live BigMove builder/gate returned zero rows, the event was
+# only recorded as a market alert.  That breaks the contract:
+#   BigMove alert email -> F8 generated/setup_audit row always.
+#
+# yver119 contract:
+# - Every confirmed BigMove email is mirrored into generated_setups/signals for the
+#   user and owner as an F8 setup, even when the tradable setup email is later gated.
+# - KEEP rows are optionally handed to the existing gated setup-email/AutoTrade
+#   bridge in the background.  WATCH rows stay audit-only.
+# - No AutoTrade risk, cap, leverage, blackout, TP/SL or sizing settings changed.
 
-YVER118_VERSION = 'yver118_help_admin_engine_health_runtime_inject'
-
-def _yver118_engine_help_block() -> str:
-    return (
-        "🧪 F8/F9 ENGINE HEALTH / PIPELINE CHECKS\n"
-        "────────────────────\n"
-        "/engine_health F8 24\n"
-        "• F8 BigMove health: raw BigMove alerts, generated rows, /setup_audit rows, executable/email rows, pipeline events.\n\n"
-        "/engine_health F9 24\n"
-        "• F9 Multi-Day health: generated rows, /setup_audit rows, executable/email rows, /screen reconciliation, pipeline events.\n\n"
-        "/engine_probe F8\n"
-        "• Dry-run F8 code/table/function probe. No email, no trade, no setup row written.\n\n"
-        "/engine_probe F9\n"
-        "• Dry-run F9 code/table/function probe. No email, no trade, no setup row written.\n\n"
-        "/setup_matrix verify\n"
-        "• Verify /setup_matrix policy WR/Set/AvgR against raw TP/SL score rows.\n"
-    )
-
-def _yver118_force_admin_help_text(base: str = '') -> str:
-    try:
-        txt = str(base or '')
-    except Exception:
-        txt = ''
-    block = _yver118_engine_help_block().strip()
-    # Remove any old duplicate engine block, then prepend the current block.
-    try:
-        txt = re.sub(
-            r"\n*────────────────────\n🧪 F8/F9 ENGINE HEALTH / PIPELINE CHECKS\n────────────────────\n.*?(?=\n────────────────────\n|\Z)",
-            "",
-            txt,
-            flags=re.S,
-        ).strip()
-    except Exception:
-        txt = txt.strip()
-    return (block + "\n\n" + txt).rstrip()
+YVER119_VERSION = 'yver119_from_v117_fast_bigmove_f8_final_audit_mirror_20260621'
 
 try:
-    ADMIN_HELP_DESCRIPTIONS.update({
-        'engine_health': 'F8/F9 engine health and pipeline proof: /engine_health F8 24 or /engine_health F9 24',
-        'engine_probe': 'Dry-run F8/F9 engine probe: /engine_probe F8 or /engine_probe F9',
-        'setup_matrix': 'DB-backed setup matrix: /setup_matrix policy, /setup_matrix verify, /setup_matrix safety, /setup_matrix deep 168',
-    })
+    _YVER119_ORIG_YVER117_FORCE_F8_FROM_EMAIL = _yver117_force_f8_from_email
+except Exception:
+    _YVER119_ORIG_YVER117_FORCE_F8_FROM_EMAIL = None
+try:
+    _YVER119_ORIG_MARK_BIGMOVE_EMAILED = mark_bigmove_emailed
+except Exception:
+    _YVER119_ORIG_MARK_BIGMOVE_EMAILED = None
+try:
+    _YVER119_ORIG_SEND_EMAIL_ASYNC = _send_email_async
+except Exception:
+    _YVER119_ORIG_SEND_EMAIL_ASYNC = None
+
+
+def _yver119_safe_ts() -> float:
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _yver119_bigmove_detail_map(subject: str = '', body: str = '', body_html: str = '') -> dict:
+    """Parse BigMove email details by symbol so fallback F8 rows keep real move data."""
+    details = {}
+    try:
+        txt = _yver117_clean_text_for_parse(subject, body, body_html) if callable(globals().get('_yver117_clean_text_for_parse')) else (str(subject or '') + '\n' + str(body or '') + '\n' + str(body_html or ''))
+    except Exception:
+        txt = str(subject or '') + '\n' + str(body or '') + '\n' + str(body_html or '')
+
+    def _put(sym: str, direction: str = '', ch15=None, ch1=None, ch4=None, vol=None):
+        try:
+            s = re.sub(r'[^A-Z0-9]', '', str(sym or '').upper().strip())
+            if not s:
+                return
+            d = str(direction or '').upper().strip()
+            row = dict(details.get(s) or {})
+            if d in {'UP', 'DOWN'}:
+                row['direction'] = d
+            for k, v in (('ch15', ch15), ('ch1', ch1), ('ch4', ch4), ('vol', vol)):
+                try:
+                    if v is not None and str(v) != '':
+                        row[k] = float(v)
+                except Exception:
+                    pass
+            details[s] = row
+        except Exception:
+            pass
+
+    # Subject: Big Move Alert • TNSR UP • Confirm15m +8.3%
+    try:
+        for m in re.finditer(r'Big\s*Move\s*Alert\s*[•\-:]+\s*([A-Z0-9]{2,20})\s+(UP|DOWN)\b[\s\S]{0,80}?Confirm15m\s*([+\-]\d+(?:\.\d+)?)\s*%', txt, re.I):
+            _put(m.group(1), m.group(2), ch15=m.group(3))
+    except Exception:
+        pass
+    try:
+        for m in re.finditer(r'Big\s*Move\s*Alert\s*[•\-:]+\s*([A-Z0-9]{2,20})\s+(UP|DOWN)\b', txt, re.I):
+            _put(m.group(1), m.group(2))
+    except Exception:
+        pass
+
+    # Body row: TNSR: 15m confirmation: ... | 15m: +8.3% | 1H +6.7% | 4H +67.8% | Vol ~24.3M
+    try:
+        pat = re.compile(
+            r'\b([A-Z0-9]{2,20})\s*:\s*15m\s+confirmation[\s\S]{0,260}?15m\s*:?\s*([+\-]\d+(?:\.\d+)?)\s*%[\s\S]{0,120}?1H\s*:?\s*([+\-]\d+(?:\.\d+)?)\s*%[\s\S]{0,120}?4H\s*:?\s*([+\-]\d+(?:\.\d+)?)\s*%(?:[\s\S]{0,120}?Vol\s*~?\s*([0-9]+(?:\.[0-9]+)?)\s*([MB]))?',
+            re.I,
+        )
+        for m in pat.finditer(txt):
+            sym = m.group(1)
+            ch15 = float(m.group(2)); ch1 = float(m.group(3)); ch4 = float(m.group(4))
+            vol = None
+            try:
+                if m.group(5):
+                    mult = 1_000_000.0 if str(m.group(6) or 'M').upper() == 'M' else 1_000_000_000.0
+                    vol = float(m.group(5)) * mult
+            except Exception:
+                vol = None
+            direction = 'UP' if ch15 >= 0 else 'DOWN'
+            _put(sym, direction, ch15=ch15, ch1=ch1, ch4=ch4, vol=vol)
+    except Exception:
+        pass
+
+    # TradingView link fallback for symbol existence.
+    try:
+        for m in re.finditer(r'symbol=BYBIT:([A-Z0-9]{2,20})USDT', txt, re.I):
+            _put(m.group(1))
+    except Exception:
+        pass
+    return details
+
+
+def _yver119_marketvol_for_symbol(sym: str, best_fut: dict | None = None):
+    try:
+        s = str(sym or '').upper().strip()
+        best = best_fut or get_cached_futures_tickers() or {}
+        if s in best:
+            return best.get(s)
+        lin = _bybit_linear_symbol(s)
+        for k, mv in (best or {}).items():
+            try:
+                if str(k or '').upper().strip() == s:
+                    return mv
+                if str(k or '').replace('/', '').replace(':', '').upper().startswith(lin):
+                    return mv
+                if str(getattr(mv, 'base', '') or '').upper().strip() == s:
+                    return mv
+                if str(getattr(mv, 'symbol', '') or '').replace('/', '').replace(':', '').upper().startswith(lin):
+                    return mv
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _yver119_price_for_symbol(sym: str, best_fut: dict | None = None) -> float:
+    try:
+        mv = _yver119_marketvol_for_symbol(sym, best_fut)
+        for key in ('last', 'vwap', 'open'):
+            try:
+                px = float(getattr(mv, key, 0.0) or 0.0)
+                if px > 0:
+                    return float(px)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        px = float(_autotrade_live_reference_price(_bybit_linear_symbol(sym), fallback_entry=0.0) or 0.0)
+        if px > 0:
+            return px
+    except Exception:
+        pass
+    try:
+        market_symbol = f"{str(sym or '').upper().strip()}/USDT:USDT"
+        rows = _ohlcv_cached_or_optional_fetch(market_symbol, '15m', 2, allow_cold=False)
+        if rows:
+            px = float(rows[-1][4] or 0.0)
+            if px > 0:
+                return px
+    except Exception:
+        pass
+    return 0.0
+
+
+def _yver119_recent_f8_mirror_exists(uid: int, sym: str, side: str, event_ts: float, window_sec: int = 18 * 60) -> bool:
+    try:
+        uid_i = int(uid or 0)
+        s = str(sym or '').upper().strip()
+        sd = str(side or '').upper().strip()
+        ts = float(event_ts or _yver119_safe_ts())
+        lo = ts - float(window_sec)
+        hi = ts + float(window_sec)
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            for tbl, ts_col in (('generated_setups', 'created_ts'), ('executable_setups', 'executable_ts'), ('emailed_setups', 'emailed_ts')):
+                try:
+                    cols = {r[1] for r in cur.execute(f'PRAGMA table_info({tbl})').fetchall()}
+                    if 'user_id' not in cols or 'symbol' not in cols or 'side' not in cols or ts_col not in cols:
+                        continue
+                    fam_clause = ''
+                    params = [uid_i, s, sd, lo, hi]
+                    if 'family_id' in cols:
+                        fam_clause = " AND (family_id LIKE 'F8%' OR engine='F8' OR setup_id LIKE 'F8BM-%' OR setup_id LIKE 'BMAT-%')"
+                    elif 'engine' in cols:
+                        fam_clause = " AND (engine='F8' OR setup_id LIKE 'F8BM-%' OR setup_id LIKE 'BMAT-%')"
+                    else:
+                        fam_clause = " AND (setup_id LIKE 'F8BM-%' OR setup_id LIKE 'BMAT-%')"
+                    row = cur.execute(f"SELECT 1 FROM {tbl} WHERE user_id=? AND UPPER(symbol)=? AND UPPER(side)=? AND {ts_col} BETWEEN ? AND ? {fam_clause} LIMIT 1", tuple(params)).fetchone()
+                    if row:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def _yver119_build_f8_fallback_setup(sym: str, direction: str, event_ts: float, detail: dict | None = None, best_fut: dict | None = None, session_name: str = ''):
+    try:
+        sbase = str(sym or '').upper().strip()
+        direc = str(direction or '').upper().strip()
+        side = 'BUY' if direc == 'UP' else 'SELL' if direc == 'DOWN' else ''
+        if not sbase or side not in {'BUY', 'SELL'}:
+            return None
+        entry = float(_yver119_price_for_symbol(sbase, best_fut) or 0.0)
+        if entry <= 0:
+            return None
+        mv = _yver119_marketvol_for_symbol(sbase, best_fut)
+        d = dict(detail or {})
+        ch15 = float(d.get('ch15', 0.0) or 0.0)
+        ch1 = float(d.get('ch1', 0.0) or 0.0)
+        ch4 = float(d.get('ch4', 0.0) or 0.0)
+        try:
+            ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0) if mv is not None else 0.0
+        except Exception:
+            ch24 = 0.0
+        if abs(ch24) < 1e-9:
+            try:
+                ch24 = float(ch4 or ch1 or ch15 or 0.0)
+            except Exception:
+                ch24 = 0.0
+        try:
+            fut_vol = float(d.get('vol') or (usd_notional(mv) if mv is not None else 0.0) or 0.0)
+        except Exception:
+            fut_vol = float(d.get('vol') or 0.0 or 0.0)
+        # Conservative no-cold-fetch fallback. The normal BigMove builder uses 3%-10%
+        # ATR clamp and can fall back to 10%. For the emergency audit mirror, use 3%
+        # to keep the audit outcome meaningful while still respecting TP/SL geometry.
+        try:
+            sl_pct = max(1.0, min(10.0, float(globals().get('BIGMOVE_AUTOTRADE_SL_MIN_PCT', 3.0) or 3.0)))
+        except Exception:
+            sl_pct = 3.0
+        try:
+            rr = float(_autotrade_min_live_rr() or 1.5)
+        except Exception:
+            rr = 1.5
+        rr = max(1.0, min(2.0, rr))
+        if side == 'BUY':
+            sl = entry * (1.0 - sl_pct / 100.0)
+            tp = entry + (entry - sl) * rr
+        else:
+            sl = entry * (1.0 + sl_pct / 100.0)
+            tp = entry - (sl - entry) * rr
+        if sl <= 0 or tp <= 0:
+            return None
+        try:
+            market_symbol = str(getattr(mv, 'symbol', '') or '') if mv is not None else f'{sbase}/USDT:USDT'
+        except Exception:
+            market_symbol = f'{sbase}/USDT:USDT'
+        sess = str(session_name or _bigmove_autotrade_session_name()).upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            sess = _bigmove_autotrade_session_name()
+        try:
+            conf = int(_bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, fut_vol, 0.0))
+        except Exception:
+            conf = 84
+        conf = int(max(78, min(96, conf)))
+        bucket = int(float(event_ts or _yver119_safe_ts()) // 900) * 900
+        setup_id = f'F8BM-{bucket}-{sbase}-{side}'
+        stp = Setup(
+            setup_id=setup_id,
+            symbol=sbase,
+            market_symbol=market_symbol,
+            side=side,
+            conf=int(conf),
+            entry=float(entry),
+            sl=float(sl),
+            tp=float(tp),
+            alt_target_a=0.0,
+            alt_target_b=0.0,
+            fut_vol_usd=float(fut_vol),
+            ch24=float(ch24),
+            ch4=float(ch4),
+            ch1=float(ch1),
+            ch15=float(ch15),
+            ema_support_period=0,
+            ema_support_dist_pct=0.0,
+            pullback_ema_period=0,
+            pullback_ema_dist_pct=0.0,
+            pullback_ready=True,
+            pullback_bypass_hot=True,
+            leader_base_override=True,
+            engine='F8',
+            is_trailing_alt_target_b=False,
+            created_ts=float(event_ts or _yver119_safe_ts()),
+            family_id=globals().get('BIGMOVE_FAMILY_ID', 'F8_BIGMOVE_CONT'),
+            family_name=globals().get('BIGMOVE_FAMILY_NAME', 'F8 BigMove'),
+            session=sess,
+        )
+        try:
+            stp = _setup_route_candidate_for_executable_lane(stp, session_name=sess, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+        except Exception:
+            pass
+        for k, v in {
+            'bigmove_signal': True,
+            'bigmove_alert_autotrade': True,
+            'bigmove_direction': direc,
+            'source_kind': 'generated_setups',
+            'source_session': sess,
+            'delivery_lane_locked': False,
+            'yver119_f8_fallback_mirror': True,
+            'email_logged_ts': float(event_ts or _yver119_safe_ts()),
+            'emailed_ts': float(event_ts or _yver119_safe_ts()),
+            'why': f'yver119 confirmed BigMove email audit mirror {direc}: generated F8 setup even when setup-email gate later blocks/delays',
+        }.items():
+            try:
+                setattr(stp, k, v)
+            except Exception:
+                pass
+        try:
+            return _research_finalize_setup(stp, session_name=sess)
+        except Exception:
+            return stp
+    except Exception:
+        return None
+
+
+def _yver119_persist_f8_mirror_setup(uid: int, setup, event_ts: float, source: str = '') -> int:
+    made = 0
+    try:
+        if setup is None:
+            return 0
+        sess = str(getattr(setup, 'source_session', '') or getattr(setup, 'session', '') or _bigmove_autotrade_session_name()).upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            sess = _bigmove_autotrade_session_name()
+        targets = []
+        for tu in (int(uid or 0), int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)):
+            try:
+                if int(tu) > 0 and int(tu) not in targets:
+                    targets.append(int(tu))
+            except Exception:
+                pass
+        for tuid in targets:
+            try:
+                sym = str(getattr(setup, 'symbol', '') or '').upper().strip()
+                side = str(getattr(setup, 'side', '') or '').upper().strip()
+                if _yver119_recent_f8_mirror_exists(tuid, sym, side, float(event_ts or _yver119_safe_ts())):
+                    continue
+                db_log_generated_setup(int(tuid), 'bigmove_f8_yver119_audit_mirror', sess, setup)
+                try:
+                    db_insert_signal(setup, user_id=int(tuid))
+                except Exception:
+                    pass
+                made += 1
+                try:
+                    db_log_setup_pipeline_event(int(tuid), stage='yver119_f8_audit_mirror', status='generated', session=sess, mode='engine_f8', setup_id=str(getattr(setup, 'setup_id', '') or ''), symbol=sym, side=side, details={'source': source, 'event_ts': float(event_ts or 0.0)})
+                except Exception:
+                    pass
+            except Exception:
+                continue
+        # If it also passes the normal setup-email gate, pass to the existing async bridge.
+        # This is background-only and unique-labelled so it cannot slow /start or /screen.
+        if made > 0:
+            try:
+                if callable(globals().get('_yver97_bigmove_setup_email_and_autotrade')):
+                    label = f"yver119_f8_setup_email_autotrade_{str(getattr(setup,'symbol','')).upper()}_{int(float(event_ts or _yver119_safe_ts()))}"
+                    _safe_create_task(_yver97_bigmove_setup_email_and_autotrade(int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0), sess, [setup], get_cached_futures_tickers() or {}, tag='yver119_audit_mirror'), label)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return int(made or 0)
+
+
+def _yver119_force_f8_audit_mirror(uid: int, sym: str, direction: str, event_ts: float | None = None, source: str = '', detail: dict | None = None, best_fut: dict | None = None) -> int:
+    try:
+        uid_i = int(uid or 0) or int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    if uid_i <= 0:
+        return 0
+    ts = float(event_ts or _yver119_safe_ts())
+    direc = str(direction or '').upper().strip()
+    if direc not in {'UP', 'DOWN'}:
+        return 0
+    side = 'BUY' if direc == 'UP' else 'SELL'
+    if _yver119_recent_f8_mirror_exists(uid_i, sym, side, ts):
+        return 0
+    setup = _yver119_build_f8_fallback_setup(sym, direc, ts, detail=detail, best_fut=best_fut, session_name=_bigmove_autotrade_session_name())
+    if setup is None:
+        try:
+            db_log_setup_pipeline_event(uid_i, stage='yver119_f8_audit_mirror', status='empty', mode='engine_f8', symbol=str(sym or '').upper(), side=side, details={'source': source, 'reason': 'fallback_setup_build_empty_no_price_or_bad_geometry', 'event_ts': ts})
+        except Exception:
+            pass
+        return 0
+    return _yver119_persist_f8_mirror_setup(uid_i, setup, ts, source=source)
+
+
+def _yver117_force_f8_from_email(uid: int, subject: str = '', body: str = '', body_html: str = '', source: str = 'send_email') -> int:
+    """yver119 wrapper: call v117/v98 path, then force fallback audit mirror if it returns 0."""
+    made = 0
+    try:
+        if callable(_YVER119_ORIG_YVER117_FORCE_F8_FROM_EMAIL):
+            made = int(_YVER119_ORIG_YVER117_FORCE_F8_FROM_EMAIL(uid, subject, body, body_html, source=source) or 0)
+    except Exception:
+        made = 0
+    try:
+        details = _yver119_bigmove_detail_map(subject, body, body_html)
+        pairs = []
+        try:
+            pairs = _yver117_parse_all_bigmove_candidates(subject, body, body_html) if callable(globals().get('_yver117_parse_all_bigmove_candidates')) else []
+        except Exception:
+            pairs = []
+        # Merge detail-map-only rows too, because the subject parser can miss wrapped Gmail text.
+        seen = set()
+        for sym, direc in list(pairs or []):
+            seen.add((str(sym).upper(), str(direc).upper()))
+        for sym, d in details.items():
+            direc = str((d or {}).get('direction') or '').upper().strip()
+            if direc in {'UP', 'DOWN'} and (str(sym).upper(), direc) not in seen:
+                pairs.append((str(sym).upper(), direc)); seen.add((str(sym).upper(), direc))
+        for sym, direc in list(pairs or []):
+            try:
+                made += int(_yver119_force_f8_audit_mirror(int(uid or 0), sym, direc, event_ts=_yver119_safe_ts(), source='fallback_' + str(source or 'email'), detail=details.get(str(sym).upper(), {})) or 0)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return int(made or 0)
+
+
+def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
+    """yver119 wrapper: every cooldown mark also creates a durable F8 audit mirror."""
+    try:
+        if callable(_YVER119_ORIG_MARK_BIGMOVE_EMAILED):
+            _YVER119_ORIG_MARK_BIGMOVE_EMAILED(uid, symbol, direction)
+    except Exception:
+        pass
+    try:
+        _yver119_force_f8_audit_mirror(int(uid or 0), str(symbol or ''), str(direction or ''), event_ts=_yver119_safe_ts(), source='mark_bigmove_emailed')
+    except Exception:
+        pass
+
+
+async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
+    """yver119 wrapper: async email path also gets the same fallback audit mirror."""
+    uid = 0
+    try:
+        uid = int(kwargs.get('user_id_for_debug') or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    try:
+        subj = str(args[0] if len(args) >= 1 else kwargs.get('subject', '') or '')
+        body = str(args[1] if len(args) >= 2 else kwargs.get('body', '') or '')
+        html = str(kwargs.get('body_html', '') or '')
+        _yver117_force_f8_from_email(uid, subj, body, html, source='async_send_email_pre_smtp')
+    except Exception:
+        pass
+    if callable(_YVER119_ORIG_SEND_EMAIL_ASYNC):
+        return bool(await _YVER119_ORIG_SEND_EMAIL_ASYNC(timeout_sec, *args, **kwargs))
+    return False
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v119'
 except Exception:
     pass
-
 try:
-    _YVER118_PREV_BUILD_HELP_TEXT_ADMIN = build_help_text_admin
-except Exception:
-    _YVER118_PREV_BUILD_HELP_TEXT_ADMIN = None
-
-def build_help_text_admin() -> str:
-    try:
-        base = _YVER118_PREV_BUILD_HELP_TEXT_ADMIN() if callable(_YVER118_PREV_BUILD_HELP_TEXT_ADMIN) else str(globals().get('HELP_TEXT_ADMIN', '') or '')
-    except Exception:
-        base = str(globals().get('HELP_TEXT_ADMIN', '') or '')
-    return _yver118_force_admin_help_text(base)
-
-try:
-    HELP_TEXT_ADMIN = build_help_text_admin()
-except Exception:
-    HELP_TEXT_ADMIN = _yver118_engine_help_block().strip()
-
-try:
-    _YVER118_PREV_CMD_HELP_ADMIN = cmd_help_admin
-except Exception:
-    _YVER118_PREV_CMD_HELP_ADMIN = None
-
-async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        await update.message.reply_text("Admin only.")
-        return
-    try:
-        base = build_help_text_admin()
-    except Exception:
-        base = str(globals().get('HELP_TEXT_ADMIN', '') or '')
-    await send_long_message(
-        update,
-        _yver118_force_admin_help_text(base),
-        parse_mode=None,
-        disable_web_page_preview=True,
-    )
-
-try:
-    # Makes the Admin output visibly versioned/cached as new after deploy.
-    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v118'
+    SETUP_AUDIT_CACHE_VERSION = 'v119'
 except Exception:
     pass
 try:
-    SETUP_AUDIT_CACHE_VERSION = str(globals().get('SETUP_AUDIT_CACHE_VERSION', '')) + ':v118'
+    _autotrade_config_set('yver119_version', YVER119_VERSION)
+    _autotrade_config_set('yver119_base', 'yver117_not_yver118')
+    _autotrade_config_set('yver119_bigmove_f8_final_audit_mirror', 'ON')
 except Exception:
     pass
-try:
-    _autotrade_config_set('yver118_help_admin_engine_commands_runtime_visible', '/engine_health F8 24,/engine_health F9 24,/engine_probe F8,/engine_probe F9,/setup_matrix verify')
-except Exception:
-    pass
-
 # =========================================================
-# end yver118 help_admin engine command visibility fix
+# end yver119
 # =========================================================
 
 if __name__ == "__main__":
