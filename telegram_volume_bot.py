@@ -75712,6 +75712,71 @@ except Exception:
 # end yver98
 # =========================================================
 
+
+# =========================================================
+# yver99 help_admin registry sync
+# =========================================================
+# Owner rule: whenever a new Telegram command is added, it must be listed in
+# /help_admin so it is discoverable later.  This patch adds the recent F8/F9
+# health/probe commands and the setup-matrix WR verifier to the admin guide.
+try:
+    ADMIN_HELP_DESCRIPTIONS.update({
+        "engine_health": "F8/F9 engine health and pipeline proof: /engine_health F8 24 or /engine_health F9 24; shows generated/audit/executable/email rows and recent activity",
+        "engine_probe": "Dry-run F8/F9 engine probe: /engine_probe F8 or /engine_probe F9; checks code path/tables/functions without sending email, writing setup rows, or trading",
+        "setup_matrix": "DB-backed family/session/strategy edge matrix; usage: /setup_matrix policy, /setup_matrix verify, /setup_matrix safety, /setup_matrix deep 168",
+    })
+except Exception:
+    pass
+
+try:
+    def _yver99_group_has_command(cmds, name: str) -> bool:
+        try:
+            return str(name) in [str(c) for c in (cmds or [])]
+        except Exception:
+            return False
+
+    new_groups = []
+    inserted_engine_group = False
+    for title, cmds in list(ADMIN_HELP_GROUPS or []):
+        cmd_list = list(cmds or [])
+        # Ensure setup_matrix remains in the setup/report group with the updated
+        # description that includes /setup_matrix verify.
+        if str(title).startswith("📊 SETUP AUDIT"):
+            if not _yver99_group_has_command(cmd_list, "setup_matrix"):
+                cmd_list.append("setup_matrix")
+            # Place the engine verification commands near setup diagnostics.
+            for c in ("engine_health", "engine_probe"):
+                if not _yver99_group_has_command(cmd_list, c):
+                    cmd_list.append(c)
+            inserted_engine_group = True
+        new_groups.append((title, cmd_list))
+    if not inserted_engine_group:
+        new_groups.append(("🧪 ENGINE HEALTH / PROBES", ["engine_health", "engine_probe", "setup_matrix"]))
+    ADMIN_HELP_GROUPS = new_groups
+except Exception:
+    pass
+
+try:
+    HELP_TEXT_ADMIN = build_help_text_admin()
+except Exception:
+    pass
+
+try:
+    _autotrade_config_set('yver99_help_admin_commands_added', '/engine_health,/engine_probe,/setup_matrix verify')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v99'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v99'
+except Exception:
+    pass
+# =========================================================
+# end yver99
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
