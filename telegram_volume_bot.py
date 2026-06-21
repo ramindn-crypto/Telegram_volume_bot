@@ -77532,6 +77532,97 @@ except Exception:
 # end yver103
 # =========================================================
 
+
+# =========================================================
+# yver104 async task scheduling repair
+# =========================================================
+# Render showed RuntimeWarning: coroutine ... was never awaited for F8/F9 bridge
+# calls that were fired from synchronous branches.  The old _safe_create_task used
+# asyncio.create_task(), which only works when a running event loop exists in the
+# current thread.  When called from a sync/cache/email path it returned None and
+# left the coroutine unclosed/unrun.  This version either schedules on the current
+# loop or runs the coroutine in a small daemon thread with its own event loop.
+def _safe_create_task(coro, label: str = "background"):
+    name = str(label or "background")
+    if coro is None:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    except Exception:
+        loop = None
+    if loop is not None and getattr(loop, 'is_running', lambda: False)():
+        try:
+            task = loop.create_task(coro, name=name)
+            task.add_done_callback(lambda t, _label=name: _safe_task_done(t, _label))
+            return task
+        except Exception as exc:
+            try:
+                logger.warning("safe_create_task loop scheduling failed for %s: %s: %s", name, type(exc).__name__, exc)
+            except Exception:
+                pass
+            try:
+                close = getattr(coro, 'close', None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+            return None
+
+    # No running event loop in this sync branch.  Run the coroutine off-thread so
+    # F8/F9 bridge work actually happens and Python does not emit never-awaited
+    # warnings.  The target coroutine owns its exception handling/logging through
+    # the same _safe_task_done-style logic below.
+    def _runner(_coro=coro, _label=name):
+        try:
+            asyncio.run(_coro)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            try:
+                logger.warning("background thread task %s failed: %s: %s", _label, type(exc).__name__, exc)
+            except Exception:
+                pass
+            try:
+                close = getattr(_coro, 'close', None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
+    try:
+        th = threading.Thread(target=_runner, name=f"pf-bg-{name}"[:60], daemon=True)
+        th.start()
+        return th
+    except Exception as exc:
+        try:
+            logger.warning("safe_create_task thread start failed for %s: %s: %s", name, type(exc).__name__, exc)
+        except Exception:
+            pass
+        try:
+            close = getattr(coro, 'close', None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        return None
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v104'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v104'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver104_safe_create_task_thread_fallback', 'true')
+except Exception:
+    pass
+# =========================================================
+# end yver104
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
