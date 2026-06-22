@@ -79827,6 +79827,675 @@ except Exception:
 # end yver121
 # =========================================================
 
+
+# =========================================================
+# yver130 — F8/F9 independent setup pipeline + clean health
+# =========================================================
+# Owner request:
+# - F8 BigMove alert email and F8 setup generation must be separate paths.
+#   Turning /bigmove_alert off must not stop F8 setup generation/audit learning.
+# - F9 must be coherent end-to-end: the 2-distinct-Melbourne-day rule used by
+#   generation must be the same rule used by generated_setups, setup email,
+#   executable queue and AutoTrade guards.
+# - /engine_health is the single concise F8/F9 health command.  Old probe-style
+#   explanatory appendices are no longer shown in the main health output.
+# No live risk, TP/SL, leverage, Bybit order sizing, or runtime AutoTrade caps are changed.
+
+YVER130_VERSION = 'yver130_2026_06_22_f8_f9_pipeline_sync_clean_health'
+
+# ---------- small safe helpers ----------
+def _yver130_now_ts() -> float:
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _yver130_melb_time(ts: float | None) -> str:
+    try:
+        ts_f = float(ts or 0.0)
+        if ts_f <= 0:
+            return '-'
+        return datetime.fromtimestamp(ts_f, tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M')
+    except Exception:
+        return '-'
+
+
+def _yver130_latest_ts(rows: list[dict], fields: tuple[str, ...] = ('created_ts', 'event_ts', 'executable_ts', 'emailed_ts', 'updated_ts', 'opened_ts', 'closed_ts')) -> float:
+    latest = 0.0
+    try:
+        for r in list(rows or []):
+            for f in fields:
+                try:
+                    if f in r and float(r.get(f) or 0.0) > latest:
+                        latest = float(r.get(f) or 0.0)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return latest
+
+
+def _yver130_count_latest(label: str, rows: list[dict], fields: tuple[str, ...] = ('created_ts', 'event_ts', 'executable_ts', 'emailed_ts', 'updated_ts')) -> str:
+    try:
+        return f"{label}: {len(list(rows or []))} | latest: {_yver130_melb_time(_yver130_latest_ts(rows, fields))}"
+    except Exception:
+        return f"{label}: 0 | latest: -"
+
+
+def _yver130_table_cols(conn, table: str) -> list[str]:
+    try:
+        return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall() or []]
+    except Exception:
+        return []
+
+
+def _yver130_row_engine_match(row: dict, eng: str, setup_family_map: dict | None = None) -> bool:
+    try:
+        eng_u = str(eng or '').upper().strip()
+        sid = str((row or {}).get('setup_id') or (row or {}).get('id') or '').strip()
+        if sid and setup_family_map:
+            fam = str(setup_family_map.get(sid) or '').upper()
+            if eng_u == 'F8' and ('F8' in fam or 'BIGMOVE' in fam or 'BIG_MOVE' in fam):
+                return True
+            if eng_u == 'F9' and ('F9' in fam or 'MULTIDAY' in fam or 'MULTI_DAY' in fam or 'MULTI-DAY' in fam):
+                return True
+        parts = []
+        for k in ('family', 'engine', 'family_id', 'source', 'source_kind', 'stage', 'mode', 'details_json', 'note', 'entry_reason', 'strategy_reason', 'setup_id'):
+            v = (row or {}).get(k)
+            if v is not None:
+                parts.append(str(v))
+        txt = ' '.join(parts).upper()
+        if eng_u == 'F8':
+            return ('F8' in txt) or ('BIGMOVE' in txt) or ('BIG_MOVE' in txt)
+        if eng_u == 'F9':
+            return ('F9' in txt) or ('MULTIDAY' in txt) or ('MULTI_DAY' in txt) or ('MULTI-DAY' in txt)
+    except Exception:
+        pass
+    return False
+
+
+def _yver130_fetch_engine_rows(uid: int, eng: str, hours: int = 24) -> dict:
+    out = {k: [] for k in ('signals', 'generated_setups', 'setup_audit_results', 'executable_setups', 'emailed_setups', 'setup_pipeline_events', 'autotrade_trades')}
+    try:
+        hours_i = max(1, min(168, int(hours or 24)))
+    except Exception:
+        hours_i = 24
+    since = _yver130_now_ts() - hours_i * 3600.0
+    try:
+        if callable(globals().get('_setup_audit_migrate')):
+            _setup_audit_migrate()
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows_by_table = {}
+            for t in ('signals', 'generated_setups', 'setup_audit_results', 'executable_setups', 'emailed_setups', 'setup_pipeline_events'):
+                try:
+                    rows_by_table[t] = _yver90_fetch_rows(conn, t, since_ts=since, uid=int(uid or 0), limit=5000) if callable(globals().get('_yver90_fetch_rows')) else []
+                except Exception:
+                    rows_by_table[t] = []
+            fam_map = {}
+            try:
+                fam_map = _yver90_build_family_map(rows_by_table) if callable(globals().get('_yver90_build_family_map')) else {}
+            except Exception:
+                fam_map = {}
+            for t, rows in rows_by_table.items():
+                out[t] = [dict(r) for r in list(rows or []) if _yver130_row_engine_match(dict(r), eng, fam_map)]
+            # Include AutoTrade rows by family_id/engine where available, or by setup_id
+            # matched to generated/audit/executable rows.
+            try:
+                if _yver90_table_exists(conn, 'autotrade_trades'):
+                    cols = _yver130_table_cols(conn, 'autotrade_trades')
+                    tcol = 'opened_ts' if 'opened_ts' in cols else ('created_ts' if 'created_ts' in cols else '')
+                    where = []
+                    params = []
+                    if tcol:
+                        where.append(f'COALESCE({tcol},0)>=?')
+                        params.append(float(since))
+                    if 'uid' in cols and int(uid or 0) > 0:
+                        where.append('(uid=? OR uid=0)')
+                        params.append(int(uid or 0))
+                    sql = 'SELECT * FROM autotrade_trades'
+                    if where:
+                        sql += ' WHERE ' + ' AND '.join(where)
+                    if tcol:
+                        sql += f' ORDER BY {tcol} DESC'
+                    sql += ' LIMIT 3000'
+                    at_rows = [dict(r) for r in conn.execute(sql, tuple(params)).fetchall() or []]
+                    out['autotrade_trades'] = [r for r in at_rows if _yver130_row_engine_match(r, eng, fam_map)]
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
+def _yver130_status_summary(rows: list[dict], *fields: str, max_items: int = 4) -> str:
+    c = Counter()
+    try:
+        for r in rows or []:
+            val = ''
+            for f in fields:
+                if str((r or {}).get(f) or '').strip():
+                    val = str((r or {}).get(f) or '').strip().upper()
+                    break
+            c[val or '-'] += 1
+        if not c:
+            return '-'
+        return ', '.join(f'{k}:{v}' for k, v in c.most_common(max_items))
+    except Exception:
+        return '-'
+
+
+# ---------- F8: setup-generation hook before any BigMove alert email path ----------
+try:
+    _YVER130_ORIG_BIGMOVE_CONFIRM_NEXT_15M = _bigmove_confirm_next_15m_for_user
+except Exception:
+    _YVER130_ORIG_BIGMOVE_CONFIRM_NEXT_15M = None
+
+
+def _bigmove_confirm_next_15m_for_user(uid: int, candidates: list, p15: float, p1: float, p4: float, min_vol: float) -> tuple[list, dict]:
+    """Generate durable F8 setup/audit evidence immediately after BigMove confirmation.
+
+    This hook is intentionally upstream of BigMove alert SMTP.  It means the F8 setup
+    path stays alive when /bigmove_alert is OFF; the alert email and the setup email
+    are two different delivery paths.
+    """
+    if callable(_YVER130_ORIG_BIGMOVE_CONFIRM_NEXT_15M):
+        confirmed, stats = _YVER130_ORIG_BIGMOVE_CONFIRM_NEXT_15M(uid, candidates, p15, p1, p4, min_vol)
+    else:
+        confirmed, stats = list(candidates or []), {'fallback': 'orig_confirm_missing'}
+    try:
+        if confirmed and callable(globals().get('_yver121_fast_f8_mirror')):
+            _yver121_fast_f8_mirror(int(uid or 0), list(confirmed or []), source='yver130_confirmed_bigmove_independent_setup_generation', event_ts=_yver130_now_ts())
+            try:
+                db_log_setup_pipeline_event(int(uid or 0), stage='yver130_f8_confirmed_setup_generation', status='ok', session=str(_bigmove_autotrade_session_name() or ''), mode='engine_f8', details={'confirmed': len(list(confirmed or [])), 'alert_email_dependency': 'none'})
+            except Exception:
+                pass
+    except Exception as exc:
+        try:
+            db_log_setup_pipeline_event(int(uid or 0), stage='yver130_f8_confirmed_setup_generation', status='error', session=str(_bigmove_autotrade_session_name() or ''), mode='engine_f8', details={'error': f'{type(exc).__name__}: {exc}'})
+        except Exception:
+            pass
+    return confirmed, stats
+
+
+# ---------- F9: one coherent 2-day rule for generation, email, executable and AutoTrade ----------
+def _yver130_f9_bucket_for_side(side: str) -> str:
+    return 'leaders' if str(side or '').upper().strip() == 'BUY' else 'losers'
+
+
+def _yver130_is_f9_setup(s) -> bool:
+    try:
+        if callable(globals().get('_yver108_is_f9_setup')) and _yver108_is_f9_setup(s):
+            return True
+    except Exception:
+        pass
+    try:
+        if callable(globals().get('_yver107_is_f9_setup')) and _yver107_is_f9_setup(s):
+            return True
+    except Exception:
+        pass
+    try:
+        sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').upper()
+        fam = str(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '').upper()
+        return sid.startswith('F9-') or fam == 'F9' or 'F9' in fam or 'MULTI_DAY' in fam or 'MULTIDAY' in fam
+    except Exception:
+        return False
+
+
+def _yver130_f9_created_ts(s) -> float:
+    try:
+        if callable(globals().get('_yver108_setup_created_ts')):
+            ts = float(_yver108_setup_created_ts(s) or 0.0)
+            if ts > 0:
+                return ts
+    except Exception:
+        pass
+    try:
+        return float(getattr(s, 'created_ts', 0.0) or getattr(s, 'signal_created_ts', 0.0) or _yver130_now_ts())
+    except Exception:
+        return _yver130_now_ts()
+
+
+def _yver130_f9_day_evidence(symbol: str, side: str, created_ts: float | None = None, stamped_days: int = 0) -> tuple[int, str, dict]:
+    sym = str(symbol or '').upper().strip()
+    side_u = str(side or '').upper().strip()
+    bucket = _yver130_f9_bucket_for_side(side_u)
+    ts = float(created_ts or _yver130_now_ts())
+    persisted_days = 0
+    persisted_list = []
+    rolling_days = 0
+    try:
+        if callable(globals().get('_yver108_f9_explicit_days')):
+            persisted_days, bucket2, persisted_list = _yver108_f9_explicit_days(sym, side_u, created_ts=ts)
+            if bucket2:
+                bucket = str(bucket2)
+    except Exception:
+        persisted_days, persisted_list = 0, []
+    try:
+        rolling_days = int(_f9_repeated_bucket_days(sym, bucket, current_ts=ts, lookback_days=int(globals().get('F9_LOOKBACK_DAYS', 4) or 4)) or 0)
+    except Exception:
+        rolling_days = 0
+    try:
+        stamped_days = int(stamped_days or 0)
+    except Exception:
+        stamped_days = 0
+    days = max(int(persisted_days or 0), int(rolling_days or 0), int(stamped_days or 0))
+    return int(days), bucket, {
+        'persisted_days': int(persisted_days or 0),
+        'rolling_days': int(rolling_days or 0),
+        'stamped_days': int(stamped_days or 0),
+        'day_list': list(persisted_list or []),
+    }
+
+
+def _yver130_f9_rule_allows_setup(s) -> tuple[bool, str, dict]:
+    if not _yver130_is_f9_setup(s):
+        return True, 'not_f9', {}
+    try:
+        sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        if not sym or side not in {'BUY', 'SELL'}:
+            return False, 'F9_MISSING_SYMBOL_SIDE', {'symbol': sym, 'side': side}
+        try:
+            required = max(2, int(globals().get('F9_MIN_DAYS', 2) or 2))
+        except Exception:
+            required = 2
+        ts = _yver130_f9_created_ts(s)
+        try:
+            stamped = int(getattr(s, 'f9_days', 0) or 0)
+        except Exception:
+            stamped = 0
+        days, bucket, evidence = _yver130_f9_day_evidence(sym, side, created_ts=ts, stamped_days=stamped)
+        meta = {'symbol': sym, 'side': side, 'bucket': bucket, 'days': int(days), 'required_days': int(required), 'created_day': _f9_melbourne_day(ts), **dict(evidence or {})}
+        if int(days) < int(required):
+            return False, f'F9_REQUIRES_{required}_DISTINCT_DAYS_HAS_{days}', meta
+        try:
+            setattr(s, 'f9_days', int(days))
+            setattr(s, 'f9_bucket', str(bucket))
+            setattr(s, 'f9_two_day_rule_ok', True)
+            setattr(s, 'f9_day_evidence', dict(evidence or {}))
+        except Exception:
+            pass
+        return True, 'F9_2DAY_OK', meta
+    except Exception as exc:
+        return False, f'F9_RULE_ERROR_{type(exc).__name__}', {}
+
+
+# Replace both older guards so all downstream paths agree.
+_yver108_f9_rule_allows_setup = _yver130_f9_rule_allows_setup
+_yver107_f9_rule_allows_setup = _yver130_f9_rule_allows_setup
+
+
+try:
+    _YVER130_ORIG_PICK_MULTIDAY = pick_multiday_mover_family_setups
+except Exception:
+    _YVER130_ORIG_PICK_MULTIDAY = None
+
+
+def _yver130_make_f9_fallback_if_needed(base: str, mv: Any, side: str, days: int, bucket: str, session_name: str = 'LON'):
+    """Use the existing F9 fallback only after the real 2-day rule is satisfied."""
+    try:
+        if int(days or 0) < max(2, int(globals().get('F9_MIN_DAYS', 2) or 2)):
+            return None
+    except Exception:
+        return None
+    s = None
+    try:
+        # First try the original controlled builder.
+        s = make_multiday_mover_family_setup(base, mv, side, int(days), bucket, session_name=session_name)
+    except Exception:
+        s = None
+    if s is None:
+        try:
+            # yver96 fallback is allowed here only because days>=required. This removes
+            # the old one-day scout behaviour while preventing valid 2-day F9 from going
+            # completely silent when EMA/candle hydration is too strict.
+            if callable(globals().get('_yver96_f9_fallback_setup')):
+                s = _yver96_f9_fallback_setup(base, mv, side, int(days), bucket, session_name=session_name)
+        except Exception:
+            s = None
+    if s is not None:
+        try:
+            setattr(s, 'engine', 'F9')
+            setattr(s, 'family_id', globals().get('F9_FAMILY_ID', 'F9'))
+            setattr(s, 'family_name', globals().get('F9_FAMILY_NAME', 'Multi-Day Leader/Loser'))
+            setattr(s, 'f9_days', int(days))
+            setattr(s, 'f9_bucket', str(bucket))
+            setattr(s, 'f9_two_day_rule_ok', True)
+            setattr(s, 'entry_reason', str(getattr(s, 'entry_reason', '') or f'F9 repeated {bucket} {int(days)}d'))
+        except Exception:
+            pass
+    return s
+
+
+def pick_multiday_mover_family_setups(best_fut: Dict[str, MarketVol], leaders: list[str], losers: list[str], n: int, session_name: str, scan_profile: str = DEFAULT_SCAN_PROFILE) -> List[Setup]:
+    """F9 picker with strict 2-day rule and fallback only for valid 2-day symbols."""
+    try:
+        max_n = max(0, int(n or globals().get('F9_MAX_ITEMS', 6) or 6))
+    except Exception:
+        max_n = 6
+    out = []
+    try:
+        if callable(_YVER130_ORIG_PICK_MULTIDAY):
+            out = list(_YVER130_ORIG_PICK_MULTIDAY(best_fut, leaders, losers, max_n, session_name, scan_profile=scan_profile) or [])
+    except Exception:
+        out = []
+    try:
+        seen = {(str(getattr(s, 'symbol', '') or '').upper(), str(getattr(s, 'side', '') or '').upper()) for s in list(out or [])}
+        pairs = []
+        for b in list(leaders or [])[:12]:
+            pairs.append((str(b).upper(), 'leaders', 'BUY'))
+        for b in list(losers or [])[:12]:
+            pairs.append((str(b).upper(), 'losers', 'SELL'))
+        req = max(2, int(globals().get('F9_MIN_DAYS', 2) or 2))
+        for b, bucket, side in pairs:
+            if len(out) >= max_n:
+                break
+            if not b or (b, side) in seen:
+                continue
+            mv = (best_fut or {}).get(b)
+            if mv is None:
+                continue
+            try:
+                fut_vol = float(usd_notional(mv) or 0.0)
+            except Exception:
+                fut_vol = 0.0
+            if fut_vol < float(globals().get('F9_MIN_FUT_VOL_USD', 10_000_000) or 10_000_000):
+                continue
+            try:
+                days = int(_f9_repeated_bucket_days(b, bucket, current_ts=_yver130_now_ts(), lookback_days=int(globals().get('F9_LOOKBACK_DAYS', 4) or 4)) or 0)
+            except Exception:
+                days = 0
+            if int(days) < int(req):
+                try:
+                    db_log_setup_pipeline_event(int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), stage='yver130_f9_2day_scan', status='skip', session=str(session_name or '').upper().strip(), mode='engine_f9', symbol=b, side=side, details={'bucket': bucket, 'days': int(days), 'required': int(req)})
+                except Exception:
+                    pass
+                continue
+            s = _yver130_make_f9_fallback_if_needed(b, mv, side, int(days), bucket, session_name=session_name)
+            if s is None:
+                try:
+                    db_log_setup_pipeline_event(int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), stage='yver130_f9_2day_setup_build', status='empty', session=str(session_name or '').upper().strip(), mode='engine_f9', symbol=b, side=side, details={'bucket': bucket, 'days': int(days), 'reason': 'builder_returned_none'})
+                except Exception:
+                    pass
+                continue
+            ok, why, meta = _yver130_f9_rule_allows_setup(s)
+            if not ok:
+                try:
+                    db_log_setup_pipeline_event(int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), stage='yver130_f9_2day_setup_build', status='blocked', session=str(session_name or '').upper().strip(), mode='engine_f9', setup_id=str(getattr(s, 'setup_id', '') or ''), symbol=b, side=side, details={'reason': why, **dict(meta or {})})
+                except Exception:
+                    pass
+                continue
+            out.append(s)
+            seen.add((b, side))
+    except Exception:
+        pass
+    try:
+        # Re-use the strict filter if present, now backed by the coherent yver130 rule.
+        if callable(globals().get('_yver108_filter_f9_strict')):
+            out, _stats = _yver108_filter_f9_strict(list(out or []), int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), str(session_name or ''), enforce_email_cooldown=False, source='yver130_picker')
+    except Exception:
+        pass
+    try:
+        dedup = {}
+        for s in list(out or []):
+            key = (str(getattr(s, 'symbol', '') or '').upper(), str(getattr(s, 'side', '') or '').upper())
+            if not key[0] or not key[1]:
+                continue
+            old = dedup.get(key)
+            def _rank(x):
+                try:
+                    return (int(getattr(x, 'f9_days', 0) or 0), int(getattr(x, 'conf', 0) or 0), float(getattr(x, 'quality_score', 0.0) or 0.0), float(getattr(x, 'fut_vol_usd', 0.0) or 0.0))
+                except Exception:
+                    return (0, 0, 0.0, 0.0)
+            if old is None or _rank(s) >= _rank(old):
+                dedup[key] = s
+        out = list(dedup.values())
+        out.sort(key=lambda s: (int(getattr(s, 'f9_days', 0) or 0), int(getattr(s, 'conf', 0) or 0), float(getattr(s, 'quality_score', 0.0) or 0.0), float(getattr(s, 'fut_vol_usd', 0.0) or 0.0)), reverse=True)
+    except Exception:
+        pass
+    return list(out or [])[:max_n]
+
+
+# ---------- concise single health command ----------
+def _yver130_f9_history_candidates(hours: int = 96) -> dict:
+    """Count persisted Leaders/Losers symbols that satisfy the distinct-day F9 source rule."""
+    result = {'leaders': [], 'losers': [], 'leaders_count': 0, 'losers_count': 0}
+    try:
+        lookback_days = int(globals().get('F9_LOOKBACK_DAYS', 4) or 4)
+    except Exception:
+        lookback_days = 4
+    since = _yver130_now_ts() - 86400.0 * max(2, lookback_days)
+    try:
+        if callable(globals().get('_scan_intel_migrate_tables')):
+            _scan_intel_migrate_tables()
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT UPPER(symbol), LOWER(bucket), created_ts FROM market_scan_symbols WHERE created_ts>=? AND LOWER(bucket) IN ('leaders','losers')",
+                (float(since),),
+            ).fetchall() or []
+        days = {}
+        for sym, bucket, ts in rows:
+            try:
+                key = (str(sym or '').upper().strip(), str(bucket or '').lower().strip())
+                if not key[0] or key[1] not in {'leaders', 'losers'}:
+                    continue
+                days.setdefault(key, set()).add(_f9_melbourne_day(float(ts or 0.0)))
+            except Exception:
+                continue
+        req = max(2, int(globals().get('F9_MIN_DAYS', 2) or 2))
+        leaders = [(sym, len(ds)) for (sym, bucket), ds in days.items() if bucket == 'leaders' and len(ds) >= req]
+        losers = [(sym, len(ds)) for (sym, bucket), ds in days.items() if bucket == 'losers' and len(ds) >= req]
+        leaders.sort(key=lambda x: (-x[1], x[0]))
+        losers.sort(key=lambda x: (-x[1], x[0]))
+        result.update({'leaders': leaders[:8], 'losers': losers[:8], 'leaders_count': len(leaders), 'losers_count': len(losers)})
+    except Exception as exc:
+        result['error'] = f'{type(exc).__name__}: {exc}'
+    return result
+
+
+def _yver130_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    try:
+        hours_i = max(1, min(168, int(hours or 24)))
+    except Exception:
+        hours_i = 24
+    rows = _yver130_fetch_engine_rows(int(uid or 0), eng, hours_i)
+    gen = rows.get('generated_setups', [])
+    audit = rows.get('setup_audit_results', [])
+    exe = rows.get('executable_setups', [])
+    emailed = rows.get('emailed_setups', [])
+    pipe = rows.get('setup_pipeline_events', [])
+    atr = rows.get('autotrade_trades', [])
+    sig = rows.get('signals', [])
+    raw_alerts = raw_pending = 0
+    f9_hist = {}
+    if eng == 'F8':
+        try:
+            raw_alerts, raw_pending = _yver96_raw_f8_activity_counts(int(uid or 0), hours_i) if callable(globals().get('_yver96_raw_f8_activity_counts')) else (0, 0)
+        except Exception:
+            raw_alerts, raw_pending = 0, 0
+    else:
+        f9_hist = _yver130_f9_history_candidates(hours_i)
+    try:
+        user = get_user(int(uid or 0)) or {}
+    except Exception:
+        user = {}
+    status = 'OK'
+    checks = []
+    if eng == 'F8':
+        if (raw_alerts + raw_pending) > 0 and len(gen) == 0:
+            status = 'CHECK'
+            checks.append('BigMove detected but no F8 setup rows')
+        elif len(gen) > 0 and len(audit) == 0:
+            status = 'CHECK'
+            checks.append('F8 generated rows exist but audit rows are missing')
+        elif (raw_alerts + raw_pending + len(gen) + len(audit) + len(exe) + len(emailed) + len(pipe)) == 0:
+            status = 'IDLE'
+            checks.append('No BigMove/F8 activity in this window')
+    else:
+        source_count = int((f9_hist or {}).get('leaders_count', 0) or 0) + int((f9_hist or {}).get('losers_count', 0) or 0)
+        if source_count > 0 and len(gen) == 0:
+            status = 'CHECK'
+            checks.append('2-day F9 source symbols exist but no generated setup rows')
+        elif len(gen) > 0 and len(audit) == 0:
+            status = 'CHECK'
+            checks.append('F9 generated rows exist but audit rows are missing')
+        elif source_count == 0 and len(gen) == 0 and len(audit) == 0:
+            status = 'IDLE'
+            checks.append('No 2-day Leader/Loser source symbols in this window')
+    if not checks:
+        checks.append('generation/audit/executable/email/autotrade path is coherent')
+
+    lines = []
+    lines.append(f"🧪 Engine Health — {eng} {'BigMove' if eng == 'F8' else 'Multi-Day'}")
+    lines.append('━━━━━━━━━━━━━━━━━━━━')
+    lines.append(f"Window: last {hours_i}h | Now: {_yver90_melb_time(_yver130_now_ts()) if callable(globals().get('_yver90_melb_time')) else _yver130_melb_time(_yver130_now_ts())}")
+    lines.append(f"Status: {status}")
+    if eng == 'F8':
+        try:
+            alert_on = int((user or {}).get('bigmove_alert_on', (user or {}).get('bigmove_alert', 1)) or 0) == 1
+        except Exception:
+            alert_on = True
+        try:
+            p15, p1, p4 = _user_bigmove_thresholds(user)
+            minv = _user_bigmove_min_vol_usd(user)
+            lines.append(f"F8 rule: 15m≥{float(p15):.2f}% | 1H≥{float(p1):.2f}% | 4H≥{float(p4):.2f}% | Vol≥${float(minv)/1_000_000:.1f}M")
+        except Exception:
+            pass
+        lines.append(f"Alert email: {'ON' if alert_on else 'OFF'} | setup generation: INDEPENDENT/ON")
+        lines.append(f"Raw BigMove: alerts={int(raw_alerts)} | pending={int(raw_pending)}")
+    else:
+        try:
+            lines.append(f"F9 rule: Leader→BUY / Loser→SELL | days≥{int(globals().get('F9_MIN_DAYS', 2) or 2)} in {int(globals().get('F9_LOOKBACK_DAYS', 4) or 4)}d | Vol≥${float(globals().get('F9_MIN_FUT_VOL_USD', 0) or 0)/1_000_000:.1f}M")
+        except Exception:
+            pass
+        try:
+            top_l = ', '.join([f'{s}:{d}d' for s, d in (f9_hist or {}).get('leaders', [])[:5]]) or '-'
+            top_s = ', '.join([f'{s}:{d}d' for s, d in (f9_hist or {}).get('losers', [])[:5]]) or '-'
+            lines.append(f"2-day source: leaders={int((f9_hist or {}).get('leaders_count', 0) or 0)} ({top_l}) | losers={int((f9_hist or {}).get('losers_count', 0) or 0)} ({top_s})")
+        except Exception:
+            pass
+    lines.append('────────────────────')
+    lines.append(_yver130_count_latest('Generated setups', gen))
+    lines.append(_yver130_count_latest('Setup audit', audit))
+    lines.append(_yver130_count_latest('Executable queue', exe, ('executable_ts', 'created_ts', 'signal_created_ts')))
+    lines.append(_yver130_count_latest('Setup emails', emailed, ('emailed_ts', 'created_ts')))
+    lines.append(_yver130_count_latest('AutoTrade rows', atr, ('opened_ts', 'created_ts', 'updated_ts', 'closed_ts')))
+    lines.append(f"Audit results: {_yver130_status_summary(audit, 'result', 'status')}")
+    lines.append(f"AutoTrade status: {_yver130_status_summary(atr, 'status', 'outcome')}")
+    lines.append(f"Pipeline events: {len(pipe)} | latest: {_yver130_melb_time(_yver130_latest_ts(pipe, ('event_ts', 'created_ts', 'updated_ts')))}")
+    lines.append('────────────────────')
+    lines.append('Check: ' + '; '.join(checks[:3]))
+    try:
+        recent = sorted(list(audit or gen or exe or sig), key=lambda r: _yver130_latest_ts([r]), reverse=True)[:5]
+        if recent:
+            lines.append('Recent:')
+            for r in recent:
+                lines.append(f"• {_yver130_melb_time(_yver130_latest_ts([r]))} {str(r.get('symbol') or '-').upper()} {str(r.get('side') or '-').upper()} {str(r.get('result') or r.get('status') or '-').upper()}")
+    except Exception:
+        pass
+    return '\n'.join(lines)
+
+
+# Replace noisy additive health wrappers with the single clean output.
+_yver90_engine_health_text = _yver130_engine_health_text
+
+
+async def engine_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text('❌ Admin only.')
+        return
+    try:
+        args = list(getattr(context, 'args', []) or [])
+        eng = str(args[0] if args else 'F8').upper().strip()
+        if eng not in {'F8', 'F9'}:
+            await update.message.reply_text('Usage: /engine_health F8 [hours] or /engine_health F9 [hours]')
+            return
+        hours = 24
+        if len(args) >= 2:
+            try:
+                hours = int(float(args[1]))
+            except Exception:
+                hours = 24
+        uid = _yver90_owner_uid(update) if callable(globals().get('_yver90_owner_uid')) else int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        txt = _yver130_engine_health_text(uid, eng, hours)
+        await send_long_message(update, txt, parse_mode=None)
+    except Exception as e:
+        await update.message.reply_text(f"❌ /engine_health failed: {type(e).__name__}: {e}")
+
+
+async def engine_probe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Keep old command non-breaking, but make /engine_health the single source."""
+    if not _is_admin(update):
+        await update.message.reply_text('❌ Admin only.')
+        return
+    try:
+        args = list(getattr(context, 'args', []) or [])
+        eng = str(args[0] if args else 'F8').upper().strip()
+        if eng not in {'F8', 'F9'}:
+            eng = 'F8'
+        uid = _yver90_owner_uid(update) if callable(globals().get('_yver90_owner_uid')) else int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        txt = _yver130_engine_health_text(uid, eng, 24)
+        await send_long_message(update, txt, parse_mode=None)
+    except Exception as e:
+        await update.message.reply_text(f"❌ /engine_probe failed: {type(e).__name__}: {e}")
+
+
+def _yver130_help_admin_block() -> str:
+    return (
+        "🧪 F8/F9 ENGINE HEALTH\n"
+        "────────────────────\n"
+        "/engine_health F8 24\n"
+        "/engine_health F9 24\n"
+    )
+
+
+async def cmd_help_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        await update.message.reply_text("Admin only.")
+        return
+    try:
+        base = str(HELP_TEXT_ADMIN or '')
+    except Exception:
+        base = ''
+    try:
+        # Remove old probe-heavy health blocks if they were prepended by older patches.
+        base = re.sub(r"🧪 F8/F9 ENGINE HEALTH / PIPELINE CHECKS\n.*?(?=\n\S|$)", "", base, flags=re.S)
+        base = base.replace('/engine_probe F8\n', '').replace('/engine_probe F9\n', '')
+    except Exception:
+        pass
+    txt = _yver130_help_admin_block() + "\n" + base.strip()
+    await send_long_message(update, txt, parse_mode=None, disable_web_page_preview=True)
+
+
+try:
+    HELP_TEXT_ADMIN = _yver130_help_admin_block() + "\n" + re.sub(r"🧪 F8/F9 ENGINE HEALTH / PIPELINE CHECKS\n.*?(?=\n\S|$)", "", str(HELP_TEXT_ADMIN or ''), flags=re.S).replace('/engine_probe F8\n', '').replace('/engine_probe F9\n', '').strip()
+except Exception:
+    HELP_TEXT_ADMIN = _yver130_help_admin_block()
+
+try:
+    _autotrade_config_set('yver130_version', YVER130_VERSION)
+    _autotrade_config_set('yver130_f8_setup_generation_independent', 'ON')
+    _autotrade_config_set('yver130_f9_coherent_2day_gate', 'ON')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v130'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v130'
+except Exception:
+    pass
+# =========================================================
+# end yver130
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
