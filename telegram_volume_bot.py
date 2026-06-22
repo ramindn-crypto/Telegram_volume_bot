@@ -82039,15 +82039,340 @@ except Exception:
 # =========================================================
 
 # =========================================================
-# yver128 — engine_health must prove against the exact visible /setup_audit table
+# yver128 — delivered-setup AutoTrade retry + exact visible F8/F9 health
 # =========================================================
 # Scope on top of yver127:
-# - Do NOT touch /setup_audit_keep, /setup_open_times, /screen, startup, trading, risk, TP/SL, leverage, sizing.
-# - /engine_health F8/F9 no longer reads hidden generated/open-times rows for its current/latest line.
-# - It parses the same rendered /setup_audit output that the owner uses to validate visibility.
-#   If a F8/F9 KEEP row is not visible in /setup_audit for that window, it is not counted here.
-YVER128_VERSION = 'yver128_2026_06_22_engine_health_exact_visible_setup_audit_text'
+# - Keep v127 speed/counts and all trading geometry unchanged.
+# - AutoTrade: a delivered/emailed KEEP setup remains retryable until
+#   AUTOTRADE_ENTRY_WINDOW_MIN, with every retry/skip reason recorded.
+# - Engine health F8/F9: report only rows that are actually visible in the
+#   rendered /setup_audit table for the same window and Policy=KEEP.
+# - No risk, TP/SL, leverage, sizing, blacklist, or order-geometry changes.
+YVER128_VERSION = 'yver128_2026_06_22_delivered_retry_exact_visible_health'
 
+# -----------------------------
+# AutoTrade: do not stop the queue on a same-symbol/setup duplicate skip
+# -----------------------------
+try:
+    _YVER128_ORIG_SHOULD_TRY_NEXT_AFTER_SKIP = _autotrade_should_try_next_after_skip
+except Exception:
+    _YVER128_ORIG_SHOULD_TRY_NEXT_AFTER_SKIP = None
+
+
+def _autotrade_should_try_next_after_skip(reason: str) -> bool:
+    """v128: duplicate guards are candidate-level skips, not queue hard-stops.
+
+    Before this patch, one already-open/already-consumed candidate could stop the
+    whole AutoTrade queue, leaving later delivered setups as SENT/QUEUED until
+    they expired.  This does not bypass duplicate protection; it only continues
+    to the next candidate.
+    """
+    r = str(reason or '').lower().strip()
+    if not r:
+        return False
+    if 'duplicate_guard_block:' in r:
+        return True
+    if 'setup_already_traded' in r or 'setup_execution_already_pending' in r:
+        return True
+    if 'blocked_duplicate_open_position' in r or 'blocked_manual_same_symbol_position' in r:
+        return True
+    try:
+        if callable(_YVER128_ORIG_SHOULD_TRY_NEXT_AFTER_SKIP):
+            return bool(_YVER128_ORIG_SHOULD_TRY_NEXT_AFTER_SKIP(reason))
+    except Exception:
+        pass
+    return False
+
+
+def _yver128_now_session_for_autotrade(uid: int) -> str:
+    try:
+        user = get_user(int(uid)) or {}
+    except Exception:
+        user = {}
+    try:
+        allowed = [str(s).upper().strip() for s in (_autotrade_get_sessions() or []) if str(s).strip()]
+    except Exception:
+        allowed = ['ASIA', 'LON', 'NY']
+    try:
+        sess = _current_session_for_allowed(datetime.now(timezone.utc), allowed)
+    except Exception:
+        sess = ''
+    try:
+        owner_unlimited = int((user or {}).get('sessions_unlimited', 0) or 0) == 1
+    except Exception:
+        owner_unlimited = False
+    if owner_unlimited and not sess:
+        try:
+            sess = scan_session_name_utc(datetime.now(timezone.utc))
+        except Exception:
+            sess = ''
+    sess = str(sess or '').upper().strip()
+    return sess if sess in {'ASIA', 'LON', 'NY'} else ''
+
+
+def _yver128_setup_policy_status(setup, sess: str, uid: int) -> str:
+    try:
+        pinfo = _setup_combo_policy_lookup_for_setup(setup, session_name=sess, user_id=int(uid))
+        found = bool((pinfo or {}).get('found'))
+        raw = str((pinfo or {}).get('status') or '').upper().strip()
+        return str(_setup_policy_effective_status(raw, found=found) or '').upper().strip()
+    except Exception:
+        return ''
+
+
+def _yver128_setup_age_ts(setup) -> float:
+    for k in ('email_logged_ts', 'emailed_ts', 'executable_ts', 'created_ts', 'signal_created_ts'):
+        try:
+            v = float(getattr(setup, k, 0.0) or 0.0)
+            if v > 0:
+                return v
+        except Exception:
+            continue
+    return 0.0
+
+
+def _yver128_attempt_meta(setup, sess: str, trigger: str = '') -> dict:
+    try:
+        return {
+            'setup_id': str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or ''),
+            'symbol': str(getattr(setup, 'symbol', '') or '').upper().strip(),
+            'side': str(getattr(setup, 'side', '') or '').upper().strip(),
+            'source_kind': str(getattr(setup, 'source_kind', '') or ''),
+            'source_session': str(getattr(setup, 'source_session', '') or sess or ''),
+            'created_ts': float(getattr(setup, 'created_ts', 0.0) or 0.0),
+            'executable_ts': float(getattr(setup, 'executable_ts', 0.0) or 0.0),
+            'emailed_ts': float(getattr(setup, 'email_logged_ts', 0.0) or getattr(setup, 'emailed_ts', 0.0) or 0.0),
+            'entry': float(getattr(setup, 'entry', 0.0) or 0.0),
+            'sl': float(getattr(setup, 'sl', 0.0) or 0.0),
+            'trigger': str(trigger or 'delivered_setup_retry'),
+        }
+    except Exception:
+        return {'trigger': str(trigger or 'delivered_setup_retry')}
+
+
+async def _yver128_retry_recent_delivered_keep_setups(context=None, trigger: str = 'scheduled_retry') -> dict:
+    """Try recent delivered/emailed KEEP setups until the normal entry window expires.
+
+    This uses the same _autotrade_place_trade() function as the scheduled job, so all
+    existing risk, cap, drift, TP/SL, leverage and Bybit guards remain unchanged.
+    It only repairs the missing retry/diagnostic path for SENT/QUEUED delivered rows.
+    """
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID') or 0)
+    except Exception:
+        owner_uid = 0
+    if owner_uid <= 0:
+        return {'status': 'skip', 'reason': 'missing_owner_uid'}
+    now_utc = datetime.now(timezone.utc)
+    try:
+        if not _autotrade_ready() or not _autotrade_entry_enabled():
+            return {'status': 'skip', 'reason': 'autotrade_not_ready_or_entries_off'}
+    except Exception:
+        return {'status': 'skip', 'reason': 'autotrade_readiness_error'}
+    sess_now = _yver128_now_session_for_autotrade(owner_uid)
+    if sess_now not in {'ASIA', 'LON', 'NY'}:
+        return {'status': 'skip', 'reason': 'outside_live_session_window'}
+    try:
+        if not _autotrade_allowed_session(sess_now):
+            return {'status': 'skip', 'reason': f'session_not_allowed ({sess_now})'}
+    except Exception:
+        pass
+    try:
+        user = get_user(owner_uid) or {}
+        if not trade_window_allows_now(user):
+            return {'status': 'skip', 'reason': 'trade_window_block'}
+    except Exception:
+        pass
+    if AUTOTRADE_EXEC_LOCK.locked():
+        return {'status': 'skip', 'reason': 'autotrade_exec_lock_busy'}
+
+    try:
+        win_min = max(1, int(_autotrade_entry_window_min()))
+    except Exception:
+        win_min = 60
+    win_sec = float(max(60, int(win_min) * 60))
+    # Pull exact delivered lane rows for all sessions, then use each row's own session
+    # if it is still a valid live/allowed session.  This catches RESOLV-style rows
+    # that were emailed but not kept in the broad executable selector.
+    candidates = []
+    seen = set()
+    for sess in ('ASIA', 'LON', 'NY'):
+        try:
+            rows = _recent_delivery_lane_setup_objects(owner_uid, session_name=sess, max_age_min=int(win_min), limit=40) or []
+        except Exception:
+            rows = []
+        for s in list(rows or []):
+            try:
+                sid = str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+                sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+                side = str(getattr(s, 'side', '') or '').upper().strip()
+                key = (sid, sym, side)
+                if not sid or not sym or side not in {'BUY', 'SELL'} or key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(s)
+            except Exception:
+                continue
+    candidates = sorted(candidates, key=lambda x: float(getattr(x, 'email_logged_ts', 0.0) or getattr(x, 'emailed_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
+    if not candidates:
+        return {'status': 'empty', 'reason': 'no_recent_delivered_setups'}
+
+    attempted = 0
+    placed = 0
+    attempts_meta = []
+    final_reason = 'no_tradable_delivered_setup'
+    async with AUTOTRADE_EXEC_LOCK:
+        for cand0 in list(candidates or [])[:40]:
+            cand = cand0
+            try:
+                src_sess = str(getattr(cand, 'source_session', '') or sess_now).upper().strip()
+                sess = src_sess if src_sess in {'ASIA', 'LON', 'NY'} else sess_now
+                if sess != sess_now and not _autotrade_allowed_session(sess):
+                    sess = sess_now
+                # Preserve delivered identity; route only if the existing code says it is safe.
+                try:
+                    setattr(cand, 'delivery_lane_locked', True)
+                    setattr(cand, 'source_kind', str(getattr(cand, 'source_kind', '') or 'emailed_setups'))
+                    setattr(cand, 'source_session', sess)
+                except Exception:
+                    pass
+                meta = _yver128_attempt_meta(cand, sess, trigger=trigger)
+                age_ts = _yver128_setup_age_ts(cand)
+                if age_ts <= 0 or (time.time() - float(age_ts)) > win_sec:
+                    final_reason = 'ENTRY_OLD'
+                    meta.update({'status': 'SKIP', 'reason': final_reason})
+                    _autotrade_record_attempt(owner_uid, meta, {}, 'SKIP', final_reason)
+                    attempts_meta.append(meta)
+                    continue
+                pol = _yver128_setup_policy_status(cand, sess, owner_uid)
+                if pol != 'KEEP':
+                    final_reason = f'policy_not_keep:{pol or "unknown"}'
+                    meta.update({'status': 'SKIP', 'reason': final_reason})
+                    _autotrade_record_attempt(owner_uid, meta, {}, 'SKIP', final_reason)
+                    attempts_meta.append(meta)
+                    continue
+                try:
+                    cand = _setup_route_unless_delivery_locked(cand, sess, owner_uid, source_kind=str(getattr(cand, 'source_kind', '') or 'emailed_setups'))
+                except Exception:
+                    pass
+                try:
+                    ok_exec, why_exec = is_executable_setup_eligible(cand, session_name=sess)
+                except Exception:
+                    ok_exec, why_exec = True, 'ok'
+                if not ok_exec:
+                    final_reason = str(why_exec or 'not_executable')
+                    meta.update({'status': 'SKIP', 'reason': final_reason})
+                    _autotrade_record_attempt(owner_uid, meta, {}, 'SKIP', final_reason)
+                    attempts_meta.append(meta)
+                    continue
+                attempted += 1
+                try:
+                    ok, reason = await to_thread_autotrade(_autotrade_place_trade, owner_uid, sess, [cand], timeout=min(int(globals().get('AUTOTRADE_JOB_TIMEOUT_SEC', 25) or 25), 25))
+                except asyncio.TimeoutError:
+                    reason = 'autotrade_place_trade_timeout_delivered_retry'
+                    try:
+                        ok, reason = await to_thread_autotrade(_autotrade_timeout_reconcile, owner_uid, sess, cand, reason, timeout=8)
+                    except Exception:
+                        ok = False
+                except Exception as e:
+                    ok, reason = False, f'{type(e).__name__}: {e}'
+                final_reason = '' if ok else str(reason or 'skip')
+                detail_snapshot = {}
+                try:
+                    detail_snapshot = dict(_LAST_AUTOTRADE_DETAIL.get(owner_uid) or {})
+                except Exception:
+                    detail_snapshot = {}
+                meta = _yver128_attempt_meta(cand, sess, trigger=trigger)
+                meta.update({
+                    'status': 'PLACED' if ok else 'SKIP',
+                    'reason': '' if ok else final_reason,
+                    'entry': detail_snapshot.get('entry') or getattr(cand, 'entry', ''),
+                    'sl': detail_snapshot.get('sl') or getattr(cand, 'sl', ''),
+                    'entry_drift_pct': detail_snapshot.get('entry_drift_pct', ''),
+                    'entry_drift_direction': detail_snapshot.get('entry_drift_direction', ''),
+                    'entry_drift_adverse_pct': detail_snapshot.get('entry_drift_adverse_pct', ''),
+                })
+                _autotrade_record_attempt(owner_uid, meta, detail_snapshot, 'PLACED' if ok else 'SKIP', '' if ok else final_reason)
+                attempts_meta.append(meta)
+                if ok:
+                    placed += 1
+                    # Continue to other recently delivered setup emails if risk/caps allow.
+                    continue
+                if not _autotrade_should_try_next_after_skip(final_reason):
+                    break
+            except Exception as e:
+                final_reason = f'retry_candidate_error:{type(e).__name__}'
+                continue
+    try:
+        _LAST_AUTOTRADE_DECISION[owner_uid] = {
+            'status': 'PLACED' if placed > 0 else ('SKIP' if attempted > 0 or attempts_meta else 'EMPTY'),
+            'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'reason': f'placed_{placed}_from_delivered_retry' if placed > 0 else str(final_reason or 'no_tradable_delivered_setup'),
+            'attempted': int(attempted),
+            'placed': int(placed),
+            'session': sess_now,
+            'mode': str(_autotrade_runtime_mode()).lower(),
+            'attempted_candidates': attempts_meta,
+            'latest_candidate': attempts_meta[0] if attempts_meta else {},
+            'trigger': str(trigger or 'delivered_setup_retry'),
+        }
+        db_log_setup_pipeline_event(owner_uid, stage='autotrade_delivered_retry', status='placed' if placed > 0 else ('skip' if attempted > 0 or attempts_meta else 'empty'), session=sess_now, mode='autotrade', details={'trigger': str(trigger or ''), 'attempted': int(attempted), 'placed': int(placed), 'reason': str(final_reason or ''), 'candidates': attempts_meta[:8]})
+    except Exception:
+        pass
+    return {'status': 'placed' if placed > 0 else 'skip', 'attempted': attempted, 'placed': placed, 'reason': final_reason, 'candidates': attempts_meta[:8]}
+
+# Wrap the scheduled job.  The original job remains first; v128 only adds a second
+# exact delivered-lane pass so SENT/QUEUED rows cannot stay silent for 60 minutes.
+try:
+    _YVER128_ORIG_AUTOTRADE_JOB = autotrade_job
+except Exception:
+    _YVER128_ORIG_AUTOTRADE_JOB = None
+
+async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
+    if callable(_YVER128_ORIG_AUTOTRADE_JOB):
+        await _YVER128_ORIG_AUTOTRADE_JOB(context)
+    try:
+        await _yver128_retry_recent_delivered_keep_setups(context, trigger='scheduled_delivered_retry')
+    except Exception as e:
+        try:
+            logger.warning('yver128 delivered retry failed: %s: %s', type(e).__name__, e)
+        except Exception:
+            pass
+
+# Also schedule a bounded follow-up loop after a setup email.  This loop does not
+# bypass the normal scheduled job; it just guarantees delivered rows are revisited.
+try:
+    _YVER128_ORIG_TRIGGER_AUTOTRADE_AFTER_EMAIL = _trigger_autotrade_after_email_async
+except Exception:
+    _YVER128_ORIG_TRIGGER_AUTOTRADE_AFTER_EMAIL = None
+
+async def _yver128_after_email_retry_loop(uid: int, session_name: str, started_ts: float, setup_ids: list[str] | None = None):
+    try:
+        win_min = max(1, int(_autotrade_entry_window_min()))
+    except Exception:
+        win_min = 60
+    deadline = float(started_ts or time.time()) + float(win_min) * 60.0
+    # Try now, then roughly every minute until the entry window expires.
+    while time.time() <= deadline:
+        try:
+            await _yver128_retry_recent_delivered_keep_setups(None, trigger='email_followup_retry')
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chosen_list: list):
+    started = float(time.time())
+    if callable(_YVER128_ORIG_TRIGGER_AUTOTRADE_AFTER_EMAIL):
+        await _YVER128_ORIG_TRIGGER_AUTOTRADE_AFTER_EMAIL(uid, session_name, chosen_list)
+    try:
+        ids = [str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or '') for x in list(chosen_list or [])]
+        _safe_create_task(_yver128_after_email_retry_loop(int(uid or 0), str(session_name or ''), started, ids), 'yver128_after_email_retry_loop')
+    except Exception:
+        pass
+
+# -----------------------------
+# Engine health: exact rendered /setup_audit visibility proof
+# -----------------------------
 _YVER128_AUDIT_PARSE_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _YVER128_AUDIT_PARSE_LOCK = threading.Lock()
 
@@ -82068,31 +82393,31 @@ def _yver128_strip_html_tags(text: str) -> str:
 
 
 def _yver128_parse_visible_setup_audit_rows(uid: int, hours: int) -> list[dict]:
-    """Parse the actual /setup_audit <hours> rendered table rows.
+    """Parse the exact visible /setup_audit <hours> table rows.
 
-    This is intentionally stricter than SQL row counting. It answers the owner's
-    validation question: 'does this row appear under /setup_audit?'.
+    This is intentionally a proof view: if a row is not rendered by /setup_audit,
+    it cannot appear as Latest in /engine_health F8/F9.
     """
     try:
         uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
     except Exception:
         uid_i = int(uid or 0)
     try:
-        h = max(1, int(float(hours or 24)))
+        h = max(1, min(8760, int(float(hours or 24))))
     except Exception:
         h = 24
-    # Very short cache so repeated /engine_health F8/F9 calls don't rebuild twice.
-    cache_key = f'{int(uid_i)}:{int(h)}:{int(time.time() // 20)}'
+    cache_key = f'{int(uid_i)}:{int(h)}:{int(time.time() // 25)}'
     try:
         with _YVER128_AUDIT_PARSE_LOCK:
             rec = _YVER128_AUDIT_PARSE_CACHE.get(cache_key)
-            if rec and (float(time.time()) - float(rec[0] or 0.0) <= 25.0):
+            if rec and (float(time.time()) - float(rec[0] or 0.0) <= 30.0):
                 return list(rec[1] or [])
     except Exception:
         pass
     rows: list[dict] = []
     try:
-        # limit=0 is the same normal /setup_audit behaviour: show all unique rows in that window.
+        # Use the rendered audit text, not generated/open-times rows.  This is read-only;
+        # it does not create or backfill setup rows.
         txt = _setup_audit_text(uid_i, limit=0, hours=int(h)) if callable(globals().get('_setup_audit_text')) else ''
         txt = _yver128_strip_html_tags(txt)
         for line in str(txt or '').splitlines():
@@ -82100,26 +82425,19 @@ def _yver128_parse_visible_setup_audit_rows(uid: int, hours: int) -> list[dict]:
             if not re.match(r'^\d{2}-\d{2}\s+\d{2}:\d{2}\s+', raw):
                 continue
             parts = raw.split()
-            # Expected visible row shape:
             # MM-DD HH:MM SYM SIDE COMBO POLICY WR AT ATPol ATWhy Conf VolM PnL Res
             if len(parts) < 8:
                 continue
             date_s, time_s, sym, side, combo, policy = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
-            combo_u = str(combo or '').upper().strip()
-            policy_u = str(policy or '').upper().strip()
-            if not combo_u or policy_u not in {'KEEP', 'WATCH', 'TIGHTEN'}:
-                continue
-            at_txt = str(parts[7] if len(parts) > 7 else '').upper().strip()
-            res = str(parts[-1] if parts else '').upper().strip()
             rows.append({
-                'date': date_s,
-                'time': time_s,
+                'date': str(date_s or ''),
+                'time': str(time_s or ''),
                 'symbol': str(sym or '').upper().strip(),
                 'side': str(side or '').upper().strip(),
-                'combo': combo_u,
-                'policy': policy_u,
-                'at': at_txt,
-                'result': res if res in {'TP','SL','OPEN'} else '-',
+                'combo': str(combo or '').upper().strip(),
+                'policy': str(policy or '').upper().strip(),
+                'at': str(parts[7] if len(parts) > 7 else '').upper().strip(),
+                'result': str(parts[-1] if parts else '').upper().strip(),
                 'line': raw,
             })
     except Exception:
@@ -82127,9 +82445,8 @@ def _yver128_parse_visible_setup_audit_rows(uid: int, hours: int) -> list[dict]:
     try:
         with _YVER128_AUDIT_PARSE_LOCK:
             _YVER128_AUDIT_PARSE_CACHE[cache_key] = (float(time.time()), list(rows or []))
-            # tiny opportunistic cleanup
-            if len(_YVER128_AUDIT_PARSE_CACHE) > 20:
-                for k in list(_YVER128_AUDIT_PARSE_CACHE.keys())[:10]:
+            if len(_YVER128_AUDIT_PARSE_CACHE) > 30:
+                for k in list(_YVER128_AUDIT_PARSE_CACHE.keys())[:15]:
                     _YVER128_AUDIT_PARSE_CACHE.pop(k, None)
     except Exception:
         pass
@@ -82140,7 +82457,7 @@ def _yver128_filter_visible_engine_keep(rows: list[dict], engine: str) -> list[d
     eng = str(engine or '').upper().strip()
     out = []
     seen = set()
-    for r0 in rows or []:
+    for r0 in list(rows or []):
         try:
             r = dict(r0 or {})
             combo = str(r.get('combo') or '').upper().strip()
@@ -82165,11 +82482,7 @@ def _yver128_visible_result_counts(rows: list[dict]) -> str:
         op = sum(1 for r in rows or [] if str((r or {}).get('result') or '').upper() == 'OPEN')
         if tp + sl + op <= 0:
             return '-'
-        bits = []
-        if tp: bits.append(f'TP:{tp}')
-        if sl: bits.append(f'SL:{sl}')
-        if op: bits.append(f'OPEN:{op}')
-        return ', '.join(bits) if bits else '-'
+        return ', '.join([x for x in (f'TP:{tp}' if tp else '', f'SL:{sl}' if sl else '', f'OPEN:{op}' if op else '') if x]) or '-'
     except Exception:
         return '-'
 
@@ -82209,24 +82522,26 @@ def _yver128_email_count(rows: list[dict]) -> int:
 
 
 def _yver123_engine_health_text(uid: int, engine: str) -> str:
-    """v128: Engine health mirrors exact visible /setup_audit rows; no hidden rows."""
+    """v128: Engine health mirrors exact visible /setup_audit rows only."""
     eng = str(engine or 'F8').upper().strip()
     if eng not in {'F8', 'F9'}:
-        return 'Usage: /engine_health F8 or /engine_health F9'
+        return 'Usage: /engine_health F8 or F9'
     try:
         uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
     except Exception:
         uid_i = int(uid or 0)
-
-    baseline_ts = _yver122_policy_baseline_ts() if callable(globals().get('_yver122_policy_baseline_ts')) else 0.0
-    windows = [('Last 1h', 1), ('Last 24h', 24), ('Last 7d', 168)]
+    try:
+        baseline_ts = _yver122_policy_baseline_ts() if callable(globals().get('_yver122_policy_baseline_ts')) else 0.0
+    except Exception:
+        baseline_ts = 0.0
+    windows = [('Last 2h', 2), ('Last 24h', 24), ('Last 7d', 168)]
     table_rows = []
-    total_recent = 0
-    for label, h in windows:
-        all_rows = _yver128_parse_visible_setup_audit_rows(uid_i, int(h))
-        krows = _yver128_filter_visible_engine_keep(all_rows, eng)
+    last24_n = 0
+    for label, hrs in windows:
+        parsed = _yver128_parse_visible_setup_audit_rows(uid_i, int(hrs))
+        krows = _yver128_filter_visible_engine_keep(parsed, eng)
         if label == 'Last 24h':
-            total_recent = len(krows)
+            last24_n = len(krows)
         table_rows.append([
             label,
             '-',
@@ -82238,52 +82553,30 @@ def _yver123_engine_health_text(uid: int, engine: str) -> str:
             _yver128_visible_result_counts(krows),
             _yver128_latest_visible(krows),
         ])
-    # Overall is still useful, but label it as a baseline SQL/audit basis rather than current proof.
-    try:
-        overall_rows = _yver127_audit_visible_keep_rows_for_engine(uid_i, eng, float(baseline_ts or 0.0)) if callable(globals().get('_yver127_audit_visible_keep_rows_for_engine')) else []
-        table_rows.append([
-            'Overall',
-            '-',
-            len(overall_rows),
-            len(overall_rows),
-            '-',
-            0,
-            0,
-            _yver123_result_counts_from_audit_rows(overall_rows) if callable(globals().get('_yver123_result_counts_from_audit_rows')) else '-',
-            _yver123_latest_from_rows(overall_rows) if callable(globals().get('_yver123_latest_from_rows')) else '-',
-        ])
-    except Exception:
-        table_rows.append(['Overall', '-', 0, 0, '-', 0, 0, '-', '-'])
-
+    status = 'IDLE_24H' if int(last24_n or 0) <= 0 else 'OK'
     try:
         keep_policy_rows = len(_yver125_keep_combos_for_engine(uid_i, eng)) if callable(globals().get('_yver125_keep_combos_for_engine')) else 0
     except Exception:
         keep_policy_rows = 0
-    try:
-        last1 = int(table_rows[0][2] or 0)
-        last24 = int(table_rows[1][2] or 0)
-        if last24 <= 0:
-            status = 'IDLE_24H'
-        elif last1 <= 0:
-            status = 'OK_24H_IDLE_1H'
-        else:
-            status = 'OK'
-    except Exception:
-        status = 'OK'
-
     table = tabulate(table_rows, headers=['Window','RawEvt','Gen','Audit','Exec','Email','AT','Results','Latest'], tablefmt='plain')
     title = 'F8 BigMove' if eng == 'F8' else 'F9 Multi-Day Leaders/Losers'
+    base_txt = '2026-06-01 00:00'
+    try:
+        if baseline_ts:
+            base_txt = _yver122_melb_txt(float(baseline_ts))
+    except Exception:
+        pass
     lines = [
         f"🧪 <b>Engine Health — {html.escape(title)}</b>",
         HDR,
-        f"Status: <b>{html.escape(status)}</b> | Baseline: <b>{html.escape(_yver122_melb_txt(float(baseline_ts or 0.0)) if callable(globals().get('_yver122_melb_txt')) else '2026-06-01 00:00')} Melbourne</b>",
-        "Read-only diagnostic: no backfill, no repair, no setup creation, no OHLCV scan.",
-        "Source for Last 1h/24h/7d: <b>exact rendered /setup_audit visible table, Policy=KEEP only</b>.",
-        "If a row is not visible in /setup_audit for that window, it is not counted here.",
+        f"Status: <b>{html.escape(status)}</b> | Baseline: <b>{html.escape(str(base_txt))} Melbourne</b>",
+        "Read-only diagnostic: no backfill, no repair, no setup creation.",
+        "Source: <b>exact rendered /setup_audit visible table, Policy=KEEP only</b>.",
+        "If a row is not visible in /setup_audit for that window, it is not counted or shown as Latest.",
         f"KEEP policy rows for {html.escape(eng)}: <b>{int(keep_policy_rows)}</b>",
         HDR,
         '<pre>' + html.escape(table) + '</pre>',
-        "Note: Exec is '-' here because this diagnostic is visibility-proof, not hidden executable-table proof.",
+        "Exec is '-' because this is a visibility-proof report, not a hidden executable-table report.",
     ]
     return '\n'.join(lines)
 
@@ -82293,7 +82586,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver128 loaded: engine_health F8/F9 parses exact visible setup_audit table for Last 1h/24h/7d; no trading/speed changes')
+    logger.info('yver128 loaded: delivered setup AutoTrade retry + exact visible /setup_audit F8/F9 health; no risk/TP/SL/leverage/sizing changes')
 except Exception:
     pass
 # =========================================================
