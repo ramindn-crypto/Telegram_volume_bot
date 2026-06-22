@@ -81812,3 +81812,228 @@ except Exception:
 # =========================================================
 # end yver125
 # =========================================================
+
+# =========================================================
+# yver127 — engine_health F8/F9 must match visible /setup_audit KEEP rows
+# =========================================================
+# Narrow fix on top of yver126:
+# - Do NOT touch /setup_audit_keep, /setup_open_times, /screen, startup, trading, risk, TP/SL, leverage, sizing.
+# - /engine_health F8/F9 no longer reports hidden generated/open-times rows as current engine activity.
+# - The health table is now based on rows that would be visible in /setup_audit after the final quality gate,
+#   then restricted to Policy=KEEP for the requested F8/F9 engine. This prevents misleading rows such as
+#   "06-22 20:46 F8-LON-REV-BUY UB BUY" when that setup is not visible in /setup_audit.
+YVER127_VERSION = 'yver127_2026_06_22_engine_health_visible_audit_keep_only'
+
+
+def _yver127_audit_visible_keep_rows_for_engine(uid: int, engine: str, start_ts: float = 0.0) -> list[dict]:
+    """Visible /setup_audit KEEP rows for one engine, read path only.
+
+    This intentionally matches the user's validation method: if a row is not visible under
+    /setup_audit for the same time window, it must not become the Latest row in /engine_health.
+    """
+    eng = str(engine or '').upper().strip()
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    try:
+        rows = _setup_audit_load_rows(
+            uid_i,
+            hours=None,
+            limit=0,
+            dedup=True,
+            start_ts=float(start_ts or 0.0),
+            apply_final_quality_gate=True,
+            source_mode_override=None,
+        ) or []
+    except Exception:
+        rows = []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r0 in list(rows or []):
+        try:
+            r = dict(r0 or {})
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if float(start_ts or 0.0) > 0 and ts > 0 and ts < float(start_ts or 0.0):
+                continue
+            combo_u = str(_yver123_combo_for_row(r) or _yver125_row_combo_u(r) or '').upper().strip()
+            if not combo_u.startswith(eng + '-'):
+                continue
+            sess = str(r.get('session') or r.get('source_session') or '').upper().strip()
+            side = str(r.get('side') or '').upper().strip()
+            pol = str(_setup_audit_policy_label(r, uid=uid_i, session_name=sess, side=side) or '').upper().strip()
+            if pol != 'KEEP':
+                continue
+            key = str(_setup_audit_unique_key(r) or '').upper().strip()
+            if not key:
+                key = f"{combo_u}:{int(ts//60)}:{_yver122_symbol(r)}:{_yver122_side(r)}"
+            if key in seen:
+                continue
+            seen.add(key)
+            r['_combo'] = combo_u
+            r['_policy'] = pol
+            out.append(r)
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: float(_setup_audit_row_ts(x) or 0.0), reverse=True)
+
+
+def _yver127_filter_rows_since(rows: list[dict], start_ts: float) -> list[dict]:
+    out = []
+    for r in rows or []:
+        try:
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if float(start_ts or 0.0) > 0 and ts > 0 and ts < float(start_ts or 0.0):
+                continue
+            out.append(r)
+        except Exception:
+            continue
+    return out
+
+
+def _yver127_visible_setup_ids(rows: list[dict]) -> set[str]:
+    s = set()
+    for r in rows or []:
+        try:
+            sid = str((r or {}).get('setup_id') or '').strip()
+            if sid:
+                s.add(sid)
+        except Exception:
+            pass
+    return s
+
+
+def _yver127_delivery_rows_for_visible_setups(uid: int, engine: str, setup_ids: set[str], baseline_ts: float) -> tuple[list[dict], list[dict]]:
+    """Return email/autotrade rows tied to visible setup_ids only; fail closed to empty."""
+    if not setup_ids:
+        return [], []
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    emails: list[dict] = []
+    autos: list[dict] = []
+    try:
+        with sqlite3.connect(DB_PATH, timeout=1.5) as conn:
+            raw_email = []
+            for t in ('emailed_setup_identities', 'emailed_setups', 'setup_email_log', 'setup_delivery_log'):
+                try:
+                    raw_email.extend(_yver122_fetch(conn, t, baseline_ts, uid_i, limit=8000))
+                except Exception:
+                    pass
+            for r in raw_email:
+                try:
+                    sid = str((r or {}).get('setup_id') or (r or {}).get('source_setup_id') or '').strip()
+                    if sid and sid in setup_ids:
+                        emails.append(dict(r or {}))
+                except Exception:
+                    pass
+            raw_auto = _yver122_fetch(conn, 'autotrade_trades', baseline_ts, uid_i, limit=8000)
+            for r in raw_auto:
+                try:
+                    sid = str((r or {}).get('setup_id') or (r or {}).get('source_setup_id') or '').strip()
+                    if sid and sid in setup_ids:
+                        autos.append(dict(r or {}))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return emails, autos
+
+
+def _yver127_exec_count_from_visible_rows(rows: list[dict]) -> int:
+    n = 0
+    for r in rows or []:
+        try:
+            src = str((r or {}).get('source') or '').upper().strip()
+            if src.startswith('EXEC'):
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+def _yver123_engine_health_text(uid: int, engine: str) -> str:
+    """v127: F8/F9 health follows visible /setup_audit KEEP rows only."""
+    eng = str(engine or 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        return 'Usage: /engine_health F8 or /engine_health F9'
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+
+    now_ts = float(time.time())
+    baseline_ts = _yver122_policy_baseline_ts()
+    windows = [('Last 24h', now_ts - 24*3600), ('Last 7d', now_ts - 7*86400), ('Overall', baseline_ts)]
+
+    visible_keep_all = _yver127_audit_visible_keep_rows_for_engine(uid_i, eng, baseline_ts)
+    setup_ids = _yver127_visible_setup_ids(visible_keep_all)
+    email_rows_all, auto_rows_all = _yver127_delivery_rows_for_visible_setups(uid_i, eng, setup_ids, baseline_ts)
+    raw_f8 = _yver123_raw_f8_rows(uid_i, baseline_ts) if eng == 'F8' else []
+    try:
+        keep_policy_rows = len(_yver125_keep_combos_for_engine(uid_i, eng))
+    except Exception:
+        keep_policy_rows = 0
+
+    table_rows = []
+    for label, st in windows:
+        krows = _yver127_filter_rows_since(visible_keep_all, st)
+        emrows = _yver127_filter_rows_since(email_rows_all, st)
+        arows = _yver127_filter_rows_since(auto_rows_all, st)
+        raw = _yver127_filter_rows_since(raw_f8, st) if eng == 'F8' else []
+        # Gen/Audit are intentionally the same visible KEEP setup rows. Exec is a subset of those rows.
+        table_rows.append([
+            label,
+            len(raw) if eng == 'F8' else '-',
+            len(krows),
+            len(krows),
+            _yver127_exec_count_from_visible_rows(krows),
+            len(emrows),
+            len(arows),
+            _yver123_result_counts_from_audit_rows(krows),
+            _yver123_latest_from_rows(krows),
+        ])
+
+    try:
+        total_keep = int(table_rows[2][2] or 0)
+        recent_keep = int(table_rows[0][2] or 0)
+        if total_keep <= 0:
+            status = 'IDLE'
+        elif recent_keep <= 0:
+            status = 'IDLE_24H'
+        else:
+            status = 'OK'
+    except Exception:
+        status = 'OK'
+
+    table = tabulate(table_rows, headers=['Window','RawEvt','Gen','Audit','Exec','Email','AT','Results','Latest'], tablefmt='plain')
+    title = 'F8 BigMove' if eng == 'F8' else 'F9 Multi-Day Leaders/Losers'
+    lines = [
+        f"🧪 <b>Engine Health — {html.escape(title)}</b>",
+        HDR,
+        f"Status: <b>{html.escape(status)}</b> | Baseline: <b>{html.escape(_yver122_melb_txt(baseline_ts))} Melbourne</b>",
+        "Read-only diagnostic: no backfill, no repair, no setup creation, no OHLCV scan.",
+        "Source: <b>visible /setup_audit rows only, Policy=KEEP only</b>.",
+        "Hidden generated-only rows and WATCH rows are not counted here.",
+        f"KEEP policy rows for {html.escape(eng)}: <b>{int(keep_policy_rows)}</b>",
+    ]
+    if eng == 'F8':
+        lines.append('RawEvt = BigMove source logs when present; Gen/Audit = visible KEEP F8 rows only.')
+    else:
+        lines.append('IDLE is valid when no visible KEEP F9 setup exists in the checked window.')
+    lines.extend([HDR, '<pre>' + html.escape(table) + '</pre>'])
+    return '\n'.join(lines)
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v127'
+    SETUP_AUDIT_CACHE_VERSION = 'v127'
+except Exception:
+    pass
+try:
+    logger.info('yver127 loaded: engine_health F8/F9 uses visible /setup_audit KEEP rows only; no trading/speed changes')
+except Exception:
+    pass
+# =========================================================
+# end yver127
+# =========================================================
