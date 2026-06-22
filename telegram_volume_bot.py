@@ -43744,7 +43744,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "🤖 AutoTrade Runtime Config",
             HDR,
             "Profile",
-            f"Mode: {str(summary['AUTOTRADE_MODE']).lower()} | Entries: {'ON' if bool(summary.get('AUTOTRADE_ENTRY_ENABLED', True)) else 'OFF'} | Policy: {'KEEP-only' if keep_only else 'KEEP+WATCH'} | Entry source: {'EMAIL-MATCHED' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)) else 'DIRECT KEEP QUEUE'}",
+            f"Mode: {str(summary['AUTOTRADE_MODE']).lower()} | Entries: {'ON' if bool(summary.get('AUTOTRADE_ENTRY_ENABLED', True)) else 'OFF'} | Policy: {'KEEP-only' if keep_only else 'KEEP+WATCH'} | Entry source: {str(summary.get('AUTOTRADE_ENTRY_SOURCE', 'DELIVERED SETUP ONLY' if bool(summary.get('AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)) else 'DIRECT KEEP QUEUE, no setup email required'))}",
             "",
             "Risk & caps",
             f"Base risk/trade: {risk_pct:.2f}%",
@@ -43785,7 +43785,8 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             "• /autotrade_config AUTOTRADE_DAILY_RISK_CAP_PCT 20",
             "• /autotrade_config AUTOTRADE_MAX_ENTRY_DRIFT_PCT 2.0",
             "• /autotrade_config AUTOTRADE_ENTRY_WINDOW_MIN 60",
-            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (open fresh KEEP directly)",
+            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY true    (DELIVERED SETUP ONLY)",
+            "• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (DIRECT KEEP QUEUE, no setup email required)",
             "• /autotrade_config AUTOTRADE_MAX_OPEN_TRADES 12",
             "• /autotrade_config AUTOTRADE_MAX_TRADES_PER_DAY 100",
             "• /autotrade_config FULL",
@@ -79827,6 +79828,1057 @@ except Exception:
 # end yver121
 # =========================================================
 
+
+# =========================================================
+# yver134: final canonical pipeline sync lock
+# =========================================================
+# This overlay intentionally sits immediately before main() so it overrides the
+# yver97/yver98/yver100/yver101 command-time repair/backfill hooks while leaving
+# the original yver121 trading/risk/TP/SL/leverage geometry untouched.
+YVER134_VERSION = "yver134_canonical_pipeline_sync"
+
+
+def _yver134_now_ts() -> float:
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _yver134_get(obj, key: str, default=None):
+    try:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+    except Exception:
+        return default
+
+
+def _yver134_set(obj, key: str, value):
+    try:
+        if isinstance(obj, dict):
+            obj[key] = value
+        else:
+            setattr(obj, key, value)
+    except Exception:
+        pass
+    return obj
+
+
+def _yver134_symbol(sym: str) -> str:
+    try:
+        return _symbol_base(str(sym or '').upper()).upper()
+    except Exception:
+        s = str(sym or '').replace('/', '').replace(' ', '').upper()
+        return s[:-4] if s.endswith('USDT') else s
+
+
+def _yver134_ts(obj, *names) -> float:
+    for n in names:
+        try:
+            v = _yver134_get(obj, n, None)
+            if v is None or v == '':
+                continue
+            ts = float(v)
+            if ts > 0:
+                return ts
+        except Exception:
+            continue
+    return _yver134_now_ts()
+
+
+def _yver134_bucket_15m(ts: float | None = None) -> int:
+    try:
+        t = int(float(ts or _yver134_now_ts()))
+        return int(t - (t % 900))
+    except Exception:
+        return int(_yver134_now_ts())
+
+
+def _yver134_mel_label(ts: float | None = None, include_time: bool = True) -> str:
+    try:
+        dt = datetime.fromtimestamp(float(ts or _yver134_now_ts()), MEL_TZ)
+        return dt.strftime('%Y-%m-%dT%H:%M') if include_time else dt.strftime('%Y-%m-%d')
+    except Exception:
+        return str(int(float(ts or _yver134_now_ts())))
+
+
+def _yver134_norm_side(x: str) -> str:
+    s = str(x or '').upper().strip()
+    if s in {'UP', 'LONG'}:
+        return 'BUY'
+    if s in {'DOWN', 'SHORT'}:
+        return 'SELL'
+    return s if s in {'BUY', 'SELL'} else ''
+
+
+def _yver134_side_from_direction(direction: str) -> str:
+    d = str(direction or '').upper().strip()
+    if d == 'UP':
+        return 'BUY'
+    if d == 'DOWN':
+        return 'SELL'
+    return _yver134_norm_side(direction)
+
+
+def _yver134_strategy_label(obj) -> str:
+    raw = ''
+    try:
+        if callable(globals().get('_setup_strategy_label')):
+            raw = str(_setup_strategy_label(obj) or '')
+    except Exception:
+        raw = ''
+    if not raw:
+        raw = str(_yver134_get(obj, 'setup_strategy', '') or _yver134_get(obj, 'strategy', '') or _yver134_get(obj, 'strategy_mode', '') or '')
+    u = str(raw or '').upper().strip()
+    if u in {'REVERSE', 'REV'}:
+        return 'REV'
+    if u in {'NORMAL', 'NOR'}:
+        return 'NOR'
+    return u or 'NOR'
+
+
+def _yver134_family_code(obj, hint: str = '') -> str:
+    h = str(hint or '').upper().strip()
+    if h in {'F8', 'F9'}:
+        return h
+    sid = str(_yver134_get(obj, 'setup_id', '') or _yver134_get(obj, 'id', '') or '')
+    if sid.startswith('F8:') or sid.startswith('F8-'):
+        return 'F8'
+    if sid.startswith('F9:') or sid.startswith('F9-'):
+        return 'F9'
+    vals = ' '.join(str(_yver134_get(obj, k, '') or '') for k in ('family', 'family_id', 'family_name', 'engine', 'source', 'source_table')).upper()
+    if 'F8' in vals or 'BIGMOVE' in vals or 'BIG MOVE' in vals:
+        return 'F8'
+    if 'F9' in vals or 'MULTI_DAY' in vals or 'MULTI-DAY' in vals or 'LEADER' in vals or 'LOSER' in vals:
+        return 'F9'
+    return ''
+
+
+def _yver134_combo(family: str, session: str, obj, side: str) -> str:
+    fam = str(family or '').upper().strip()
+    sess = str(session or '').upper().strip() or str(_yver134_get(obj, 'session', '') or '').upper().strip() or 'NY'
+    strat = _yver134_strategy_label(obj)
+    try:
+        return str(_setup_combo_strategy_side_key(fam, sess, obj, side) or f'{fam}-{sess}-{strat}-{side}')
+    except Exception:
+        return f'{fam}-{sess}-{strat}-{side}'
+
+
+def _yver134_canonicalize_setup_identity(obj, family_hint: str = '', event_ts: float | None = None,
+                                         raw_direction: str | None = None, raw_symbol: str | None = None,
+                                         raw_side: str | None = None, session_name: str | None = None):
+    """Attach deterministic F8/F9 identity metadata to a setup-like dict/object."""
+    if obj is None:
+        return obj
+    fam = _yver134_family_code(obj, family_hint)
+    if fam not in {'F8', 'F9'}:
+        return obj
+
+    sym = _yver134_symbol(raw_symbol or _yver134_get(obj, 'raw_symbol', '') or _yver134_get(obj, 'symbol', ''))
+    if not sym:
+        return obj
+    sess = str(session_name or _yver134_get(obj, 'session', '') or '').upper().strip()
+    if sess not in {'ASIA', 'LON', 'NY'}:
+        sess = 'NY'
+    created_ts = _yver134_ts(obj, 'created_ts', 'ts', 'setup_ts', 'generated_ts', 'signal_created_ts')
+    bucket_ts = _yver134_bucket_15m(event_ts or _yver134_get(obj, 'confirm_15m_ts', 0) or _yver134_get(obj, 'event_ts', 0) or created_ts)
+    final_side = _yver134_norm_side(_yver134_get(obj, 'side', '') or _yver134_get(obj, 'final_side', ''))
+    if fam == 'F8':
+        raw_dir = str(raw_direction or _yver134_get(obj, 'raw_direction', '') or _yver134_get(obj, 'direction', '') or '').upper().strip()
+        raw_s = _yver134_norm_side(raw_side or _yver134_get(obj, 'raw_side', '') or _yver134_side_from_direction(raw_dir))
+        if not raw_dir and raw_s in {'BUY', 'SELL'}:
+            raw_dir = 'UP' if raw_s == 'BUY' else 'DOWN'
+        if not raw_s:
+            raw_s = final_side or 'BUY'
+        if final_side not in {'BUY', 'SELL'}:
+            final_side = raw_s
+        strat = _yver134_strategy_label(obj)
+        setup_id = f'F8:{bucket_ts}:{sym}:{raw_s}:{final_side}:{sess}:{strat}'
+        event_id = f'F8:{bucket_ts}:{sym}:{raw_s}'
+        for k, v in {
+            'raw_symbol': sym, 'raw_direction': raw_dir or ('UP' if raw_s == 'BUY' else 'DOWN'),
+            'raw_side': raw_s, 'final_side': final_side, 'side': final_side,
+            'event_id': event_id, 'source_event_id': event_id,
+            'family': 'F8', 'family_code': 'F8', 'family_id': globals().get('BIGMOVE_FAMILY_ID', 'F8_BIGMOVE_CONT'),
+            'family_name': globals().get('BIGMOVE_FAMILY_NAME', 'Big Move Continuation'),
+            'engine': 'F8', 'session': sess, 'setup_strategy': 'REVERSE' if strat == 'REV' else 'NORMAL',
+            'strategy': strat, 'strategy_mode': 'REVERSE' if strat == 'REV' else 'NORMAL',
+            'combo': _yver134_combo('F8', sess, obj, final_side),
+            'setup_id': setup_id, 'id': setup_id,
+            'created_ts': created_ts or float(bucket_ts), 'confirm_15m_ts': float(bucket_ts),
+        }.items():
+            _yver134_set(obj, k, v)
+        return obj
+
+    # F9 canonical identity: only final side is tradable; current 2-day source must be real.
+    final_side = final_side or _yver134_norm_side(raw_side or '')
+    if final_side not in {'BUY', 'SELL'}:
+        return obj
+    strat = _yver134_strategy_label(obj)
+    slot = str(_yver134_get(obj, 'scan_slot', '') or _yver134_mel_label(bucket_ts, include_time=True))
+    setup_id = f'F9:{slot}:{sym}:{final_side}:{sess}:{strat}'
+    event_id = f'F9:{slot}:{sym}:{final_side}'
+    for k, v in {
+        'raw_symbol': sym, 'final_side': final_side, 'side': final_side,
+        'event_id': event_id, 'source_event_id': event_id,
+        'family': 'F9', 'family_code': 'F9', 'family_id': globals().get('F9_FAMILY_ID', 'F9_MULTI_DAY_MOVER_CONT'),
+        'family_name': globals().get('F9_FAMILY_NAME', 'Multi-Day Leader/Loser Continuation'),
+        'engine': 'F9', 'session': sess, 'setup_strategy': 'REVERSE' if strat == 'REV' else 'NORMAL',
+        'strategy': strat, 'strategy_mode': 'REVERSE' if strat == 'REV' else 'NORMAL',
+        'combo': _yver134_combo('F9', sess, obj, final_side),
+        'setup_id': setup_id, 'id': setup_id,
+        'created_ts': created_ts or float(bucket_ts), 'confirm_15m_ts': float(bucket_ts), 'scan_slot': slot,
+    }.items():
+        _yver134_set(obj, k, v)
+    return obj
+
+
+def _yver134_dedupe_setups_by_id(setups: list) -> list:
+    out, seen = [], set()
+    for s in setups or []:
+        sid = str(_yver134_get(s, 'setup_id', '') or _yver134_get(s, 'id', '') or '').strip()
+        key = sid or f"{_yver134_get(s,'symbol','')}:{_yver134_get(s,'side','')}:{round(float(_yver134_get(s,'entry',0) or 0), 10)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+# ---- Disable broken repair/backfill hooks from yver97/yver98/yver100/yver101. ----
+def _yver98_backfill_f8_from_bigmove_tables(*args, **kwargs):
+    return 0
+
+def _yver98_force_f8_for_bigmove(*args, **kwargs):
+    return 0
+
+def _yver97_mirror_bigmove_mark_to_f8(*args, **kwargs):
+    return []
+
+def _yver97_seed_f9_scouts(*args, **kwargs):
+    return 0
+
+def _yver96_f9_fallback_setup(*args, **kwargs):
+    return None
+
+def _yver100_persist_f9_setups_from_screen(*args, **kwargs):
+    return (0, [], {'disabled_by': YVER134_VERSION, 'why': 'F9 screen/cache synthesis disabled; current 2-day source required'})
+
+def _yver100_reconcile_screen_cache_f9_sync(*args, **kwargs):
+    return (0, [], {'disabled_by': YVER134_VERSION, 'why': 'read-only command path; no F9 reconciliation writes'})
+
+def _yver101_visible_f9_setups(*args, **kwargs):
+    return []
+
+async def _yver101_force_email_autotrade_visible_f9(*args, **kwargs):
+    return {'status': 'skip', 'disabled_by': YVER134_VERSION, 'why': 'F9 visible-cache force email/autotrade disabled'}
+
+
+# ---- Canonicalize F8 builders and prevent one event -> many unrelated/sided setups. ----
+try:
+    _YVER134_ORIG_YVER121_FAST_F8_SETUP_FROM_ROW = _yver121_fast_f8_setup_from_row
+except Exception:
+    _YVER134_ORIG_YVER121_FAST_F8_SETUP_FROM_ROW = None
+
+def _yver121_fast_f8_setup_from_row(row: dict, session_name: str, event_ts: float):
+    if not callable(_YVER134_ORIG_YVER121_FAST_F8_SETUP_FROM_ROW):
+        return None
+    s = _YVER134_ORIG_YVER121_FAST_F8_SETUP_FROM_ROW(row, session_name, event_ts)
+    return _yver134_canonicalize_setup_identity(
+        s, 'F8', event_ts=event_ts,
+        raw_direction=str((row or {}).get('direction') or ''),
+        raw_symbol=str((row or {}).get('symbol') or ''),
+        session_name=session_name,
+    )
+
+try:
+    _YVER134_ORIG_BIGMOVE_CAND_TO_SETUP = _bigmove_candidate_to_autotrade_setup
+except Exception:
+    _YVER134_ORIG_BIGMOVE_CAND_TO_SETUP = None
+
+def _bigmove_candidate_to_autotrade_setup(c: dict, best_fut_snapshot: dict | None = None, session_name: str = ''):
+    if not callable(_YVER134_ORIG_BIGMOVE_CAND_TO_SETUP):
+        return None
+    s = _YVER134_ORIG_BIGMOVE_CAND_TO_SETUP(c, best_fut_snapshot, session_name)
+    return _yver134_canonicalize_setup_identity(
+        s, 'F8',
+        event_ts=(c or {}).get('confirm_15m_ts') or (c or {}).get('event_ts') or _yver134_now_ts(),
+        raw_direction=(c or {}).get('direction'), raw_symbol=(c or {}).get('symbol'),
+        session_name=session_name,
+    )
+
+try:
+    _YVER134_ORIG_BIGMOVE_CANDS_TO_SETUPS = _bigmove_candidates_to_autotrade_setups
+except Exception:
+    _YVER134_ORIG_BIGMOVE_CANDS_TO_SETUPS = None
+
+def _bigmove_candidates_to_autotrade_setups(candidates, best_fut_snapshot: dict | None = None, session_name: str = '') -> list:
+    if not callable(_YVER134_ORIG_BIGMOVE_CANDS_TO_SETUPS):
+        return []
+    raw = list(_YVER134_ORIG_BIGMOVE_CANDS_TO_SETUPS(candidates or [], best_fut_snapshot, session_name) or [])
+    cand_by_symbol = {}
+    for c in candidates or []:
+        try:
+            cand_by_symbol[_yver134_symbol((c or {}).get('symbol'))] = c
+        except Exception:
+            pass
+    out = []
+    for s in raw:
+        sym = _yver134_symbol(_yver134_get(s, 'symbol', ''))
+        c = cand_by_symbol.get(sym, {})
+        s = _yver134_canonicalize_setup_identity(
+            s, 'F8',
+            event_ts=(c or {}).get('confirm_15m_ts') or (c or {}).get('event_ts') or _yver134_get(s, 'created_ts', 0) or _yver134_now_ts(),
+            raw_direction=(c or {}).get('direction') or _yver134_get(s, 'raw_direction', ''),
+            raw_symbol=(c or {}).get('symbol') or sym,
+            session_name=session_name,
+        )
+        out.append(s)
+    return _yver134_dedupe_setups_by_id(out)
+
+
+# ---- Strict F9 rule: current leaders/losers must be non-empty and repeated on 2+ Melbourne days. ----
+def _yver134_market_scan_rows_for_f9(lookback_days: int = 4):
+    rows = []
+    try:
+        since = _yver134_now_ts() - max(1, int(lookback_days or 4)) * 86400
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            try:
+                cols = {r[1] for r in cur.execute("PRAGMA table_info(market_scan_symbols)").fetchall()}
+            except Exception:
+                cols = set()
+            if not cols:
+                return []
+            ts_col = 'ts' if 'ts' in cols else ('created_ts' if 'created_ts' in cols else ('scan_ts' if 'scan_ts' in cols else ''))
+            bucket_col = 'bucket' if 'bucket' in cols else ('group_name' if 'group_name' in cols else ('side_bucket' if 'side_bucket' in cols else ''))
+            sym_col = 'symbol' if 'symbol' in cols else ('base' if 'base' in cols else '')
+            if not ts_col or not bucket_col or not sym_col:
+                return []
+            q = f"SELECT * FROM market_scan_symbols WHERE COALESCE({ts_col},0)>=?"
+            for r in cur.execute(q, (float(since),)).fetchall() or []:
+                d = dict(r)
+                d['_ts_col'] = ts_col; d['_bucket_col'] = bucket_col; d['_sym_col'] = sym_col
+                rows.append(d)
+    except Exception:
+        return []
+    return rows
+
+
+def _yver134_f9_distinct_days(symbol: str, bucket: str, current_ts: float | None = None, include_current_source: bool = False, lookback_days: int | None = None) -> tuple[int, list[str]]:
+    sym = _yver134_symbol(symbol)
+    b = str(bucket or '').lower().strip()
+    days = set()
+    for r in _yver134_market_scan_rows_for_f9(int(lookback_days or globals().get('F9_LOOKBACK_DAYS', 4) or 4)):
+        try:
+            if _yver134_symbol(r.get(r.get('_sym_col', 'symbol'))) != sym:
+                continue
+            rb = str(r.get(r.get('_bucket_col', 'bucket')) or '').lower().strip()
+            if rb != b:
+                continue
+            ts = float(r.get(r.get('_ts_col', 'ts')) or 0.0)
+            if ts > 0:
+                days.add(_yver134_mel_label(ts, include_time=False))
+        except Exception:
+            continue
+    if include_current_source:
+        days.add(_yver134_mel_label(current_ts or _yver134_now_ts(), include_time=False))
+    return len(days), sorted(days)
+
+
+def _f9_repeated_bucket_days(symbol: str, bucket: str, current_ts: float | None = None, lookback_days: int | None = None) -> tuple[int, list[str]]:
+    # DB-only helper: never invent the current day when no current F9 source exists.
+    return _yver134_f9_distinct_days(symbol, bucket, current_ts=current_ts, include_current_source=False, lookback_days=lookback_days)
+
+try:
+    _YVER134_ORIG_MAKE_F9_SETUP = make_multiday_mover_family_setup
+except Exception:
+    _YVER134_ORIG_MAKE_F9_SETUP = None
+
+def make_multiday_mover_family_setup(base: str, bucket: str, days: int, rank: int | None = None, current_ts: float | None = None, session_name: str = ''):
+    if not callable(_YVER134_ORIG_MAKE_F9_SETUP):
+        return None
+    if int(days or 0) < int(globals().get('F9_MIN_DAYS', 2) or 2):
+        return None
+    s = _YVER134_ORIG_MAKE_F9_SETUP(base, bucket, days, rank=rank, current_ts=current_ts, session_name=session_name)
+    if s is None:
+        return None
+    try:
+        _yver134_set(s, 'f9_days', int(days or 0))
+        _yver134_set(s, 'f9_bucket', str(bucket or '').lower().strip())
+    except Exception:
+        pass
+    return _yver134_canonicalize_setup_identity(s, 'F9', event_ts=current_ts or _yver134_now_ts(), raw_symbol=base, session_name=session_name)
+
+
+def pick_multiday_mover_family_setups(best_fut: dict, leaders: list, losers: list, n: int = 4, session_name: str = '') -> list:
+    leaders = leaders or []
+    losers = losers or []
+    if not leaders and not losers:
+        return []
+    current_ts = _yver134_now_ts()
+    pairs = []
+    for i, sym in enumerate(leaders):
+        pairs.append((_yver134_symbol(sym), 'leaders', i + 1))
+    for i, sym in enumerate(losers):
+        pairs.append((_yver134_symbol(sym), 'losers', i + 1))
+    out = []
+    min_days = int(globals().get('F9_MIN_DAYS', 2) or 2)
+    for base, bucket, rank in pairs:
+        if not base:
+            continue
+        days, day_list = _yver134_f9_distinct_days(base, bucket, current_ts=current_ts, include_current_source=True,
+                                                   lookback_days=int(globals().get('F9_LOOKBACK_DAYS', 4) or 4))
+        if days < min_days:
+            continue
+        s = make_multiday_mover_family_setup(base, bucket, days, rank=rank, current_ts=current_ts, session_name=session_name)
+        if s is None:
+            continue
+        _yver134_set(s, 'f9_days_list', ','.join(day_list))
+        out.append(s)
+        if n and len(out) >= int(n):
+            break
+    return _yver134_dedupe_setups_by_id(out)
+
+
+# ---- Generated/executable insert hardening: canonical ID + INSERT OR IGNORE behavior for F8/F9. ----
+def _yver134_setup_id_exists(table: str, uid: int, setup_id: str) -> bool:
+    if not setup_id:
+        return False
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
+            if not cur.fetchone():
+                return False
+            cols = {r[1] for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+            if 'setup_id' not in cols:
+                return False
+            uid_col = 'user_id' if 'user_id' in cols else ('uid' if 'uid' in cols else '')
+            if uid_col:
+                row = cur.execute(f"SELECT 1 FROM {table} WHERE {uid_col}=? AND setup_id=? LIMIT 1", (int(uid), str(setup_id))).fetchone()
+            else:
+                row = cur.execute(f"SELECT 1 FROM {table} WHERE setup_id=? LIMIT 1", (str(setup_id),)).fetchone()
+            return bool(row)
+    except Exception:
+        return False
+
+try:
+    _YVER134_ORIG_DB_LOG_GENERATED_SETUP = db_log_generated_setup
+except Exception:
+    _YVER134_ORIG_DB_LOG_GENERATED_SETUP = None
+
+def db_log_generated_setup(user_id: int, source: str, session_name: str, s: 'Setup'):
+    fam = _yver134_family_code(s, '')
+    if fam in {'F8', 'F9'}:
+        s = _yver134_canonicalize_setup_identity(s, fam, session_name=session_name)
+        sid = str(_yver134_get(s, 'setup_id', '') or '').strip()
+        if sid and _yver134_setup_id_exists('generated_setups', int(user_id), sid):
+            return None
+    if callable(_YVER134_ORIG_DB_LOG_GENERATED_SETUP):
+        return _YVER134_ORIG_DB_LOG_GENERATED_SETUP(user_id, source, session_name, s)
+    return None
+
+try:
+    _YVER134_ORIG_DB_MARK_EXECUTABLE_SETUP = db_mark_executable_setup
+except Exception:
+    _YVER134_ORIG_DB_MARK_EXECUTABLE_SETUP = None
+
+def db_mark_executable_setup(user_id: int, session_name: str, s: 'Setup'):
+    fam = _yver134_family_code(s, '')
+    if fam in {'F8', 'F9'}:
+        s = _yver134_canonicalize_setup_identity(s, fam, session_name=session_name)
+    if callable(_YVER134_ORIG_DB_MARK_EXECUTABLE_SETUP):
+        return _YVER134_ORIG_DB_MARK_EXECUTABLE_SETUP(user_id, session_name, s)
+    return None
+
+try:
+    _YVER134_ORIG_DB_INSERT_SIGNAL = db_insert_signal
+except Exception:
+    _YVER134_ORIG_DB_INSERT_SIGNAL = None
+
+def db_insert_signal(*args, **kwargs):
+    try:
+        if args:
+            obj = args[0]
+            fam = _yver134_family_code(obj, '')
+            if fam in {'F8', 'F9'}:
+                _yver134_canonicalize_setup_identity(obj, fam)
+    except Exception:
+        pass
+    if callable(_YVER134_ORIG_DB_INSERT_SIGNAL):
+        return _YVER134_ORIG_DB_INSERT_SIGNAL(*args, **kwargs)
+    return None
+
+try:
+    _YVER134_ORIG_SETUP_AUDIT_UNIQUE_KEY = _setup_audit_unique_key
+except Exception:
+    _YVER134_ORIG_SETUP_AUDIT_UNIQUE_KEY = None
+
+def _setup_audit_unique_key(row: dict) -> str:
+    sid = str((row or {}).get('setup_id') or '').strip()
+    if sid.startswith('F8:') or sid.startswith('F9:'):
+        return sid
+    if callable(_YVER134_ORIG_SETUP_AUDIT_UNIQUE_KEY):
+        return _YVER134_ORIG_SETUP_AUDIT_UNIQUE_KEY(row)
+    return sid or '|'.join(str((row or {}).get(k, '')) for k in ('symbol','side','entry','created_ts'))
+
+
+# ---- Current F9 source used by read-only health and setup-audit filtering. ----
+def _yver134_current_f9_source(hours: int = 24) -> dict:
+    now = _yver134_now_ts()
+    since_current = now - max(1, int(hours or 24)) * 3600
+    rows = _yver134_market_scan_rows_for_f9(int(globals().get('F9_LOOKBACK_DAYS', 4) or 4))
+    current_pairs = set()
+    for r in rows:
+        try:
+            ts = float(r.get(r.get('_ts_col','ts')) or 0.0)
+            if ts < since_current:
+                continue
+            b = str(r.get(r.get('_bucket_col','bucket')) or '').lower().strip()
+            if b not in {'leaders', 'losers'}:
+                continue
+            sym = _yver134_symbol(r.get(r.get('_sym_col','symbol')))
+            if sym:
+                current_pairs.add((sym, b))
+        except Exception:
+            continue
+    eligible = set()
+    min_days = int(globals().get('F9_MIN_DAYS', 2) or 2)
+    for sym, bucket in current_pairs:
+        days, day_list = _yver134_f9_distinct_days(sym, bucket, current_ts=now, include_current_source=True,
+                                                   lookback_days=int(globals().get('F9_LOOKBACK_DAYS', 4) or 4))
+        if days >= min_days:
+            eligible.add((sym, 'BUY' if bucket == 'leaders' else 'SELL'))
+    return {'current_pairs': current_pairs, 'eligible': eligible, 'count': len(eligible)}
+
+
+# ---- /setup_audit: canonical rows only, no synthetic repair flood. ----
+def _yver134_bad_synthetic_row(row: dict) -> bool:
+    src = ' '.join(str((row or {}).get(k, '') or '') for k in ('source','source_table','note','last_reason','setup_id')).upper()
+    bad = ('REPAIR', 'BACKFILL', 'SCOUT', 'SCREEN_F9_RECONCILE', 'YVER97', 'YVER98', 'SYNTHETIC')
+    return any(x in src for x in bad)
+
+
+def _yver134_valid_setup_audit_row(row: dict) -> bool:
+    if not isinstance(row, dict):
+        return False
+    sid = str(row.get('setup_id') or '').strip()
+    fam = _yver134_family_code(row, '')
+    if fam in {'F8', 'F9'}:
+        if not sid.startswith(f'{fam}:'):
+            return False
+        if _yver134_bad_synthetic_row(row):
+            return False
+    sym = _yver134_symbol(row.get('symbol'))
+    side = _yver134_norm_side(row.get('side'))
+    if not sid or not sym or side not in {'BUY', 'SELL'}:
+        return False
+    for k in ('entry', 'sl', 'tp'):
+        try:
+            if float(row.get(k) or 0.0) <= 0:
+                return False
+        except Exception:
+            return False
+    try:
+        if float(row.get('created_ts') or row.get('ts') or 0.0) <= 0:
+            return False
+    except Exception:
+        return False
+    return True
+
+try:
+    _YVER134_ORIG_SETUP_AUDIT_LOAD_ROWS = _setup_audit_load_rows
+except Exception:
+    _YVER134_ORIG_SETUP_AUDIT_LOAD_ROWS = None
+
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True,
+                           start_ts: float | None = None, apply_final_quality_gate: bool | None = None,
+                           source_mode_override: str | None = None) -> list[dict]:
+    if not callable(_YVER134_ORIG_SETUP_AUDIT_LOAD_ROWS):
+        return []
+    rows = _YVER134_ORIG_SETUP_AUDIT_LOAD_ROWS(uid, hours=hours, limit=limit, dedup=dedup, start_ts=start_ts,
+                                               apply_final_quality_gate=apply_final_quality_gate,
+                                               source_mode_override=source_mode_override)
+    out, seen = [], set()
+    f9_source = _yver134_current_f9_source(int(hours or 24)) if int(hours or 24) <= 48 else {'count': 1, 'eligible': set()}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        fam = _yver134_family_code(r, '')
+        if fam == 'F9' and not f9_source.get('count'):
+            continue
+        if fam in {'F8', 'F9'}:
+            _yver134_canonicalize_setup_identity(r, fam, event_ts=float(r.get('created_ts') or r.get('ts') or 0.0),
+                                                 raw_symbol=r.get('symbol'), session_name=r.get('session'))
+        if not _yver134_valid_setup_audit_row(r):
+            continue
+        key = str(r.get('setup_id') or _setup_audit_unique_key(r))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    if limit:
+        return out[:int(limit)]
+    return out
+
+try:
+    _YVER134_ORIG_AT_MATCH_SAFE = _yver58_setup_audit_trade_match_safe
+except Exception:
+    _YVER134_ORIG_AT_MATCH_SAFE = None
+
+def _yver58_setup_audit_trade_match_safe(setup_row: dict, trade_row: dict, uid: int = 0, allow_missing_open_ts: bool = False) -> bool:
+    base_ok = bool(_YVER134_ORIG_AT_MATCH_SAFE(setup_row, trade_row, uid=uid, allow_missing_open_ts=allow_missing_open_ts)) if callable(_YVER134_ORIG_AT_MATCH_SAFE) else False
+    if not base_ok:
+        return False
+    sid = str((setup_row or {}).get('setup_id') or '').strip()
+    tsid = str((trade_row or {}).get('setup_id') or '').strip()
+    if sid and tsid and sid == tsid:
+        return True
+    # Fallback matching is only allowed when setup_id is missing, and then must
+    # be same symbol/side, open inside the entry window, and entry-close.
+    if sid and tsid and sid != tsid:
+        return False
+    if not _symbol_match_loose((setup_row or {}).get('symbol'), (trade_row or {}).get('symbol')):
+        return False
+    if _yver134_norm_side((setup_row or {}).get('side')) != _yver134_norm_side((trade_row or {}).get('side')):
+        return False
+    try:
+        setup_ts = float((setup_row or {}).get('created_ts') or (setup_row or {}).get('ts') or 0.0)
+        open_ts = float((trade_row or {}).get('opened_ts') or (trade_row or {}).get('created_ts') or 0.0)
+        window = max(1, int(_autotrade_entry_window_min() or 60)) * 60 + 300
+        if setup_ts > 0 and open_ts > 0 and not (setup_ts - 30 <= open_ts <= setup_ts + window):
+            return False
+    except Exception:
+        return False
+    try:
+        se = float((setup_row or {}).get('entry') or 0.0)
+        te = float((trade_row or {}).get('entry') or 0.0)
+        if se > 0 and te > 0:
+            drift = abs(te - se) / se
+            max_drift = max(0.003, float(_autotrade_runtime_max_entry_drift_pct() or 0.0) / 100.0 + 0.001)
+            if drift > max_drift:
+                return False
+    except Exception:
+        return False
+    return True
+
+try:
+    _YVER134_ORIG_SETUP_AUDIT_TEXT = _setup_audit_text
+except Exception:
+    _YVER134_ORIG_SETUP_AUDIT_TEXT = None
+
+def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
+    txt = _YVER134_ORIG_SETUP_AUDIT_TEXT(uid, limit=limit, hours=hours) if callable(_YVER134_ORIG_SETUP_AUDIT_TEXT) else 'setup_audit unavailable'
+    try:
+        if 'CurrentPol' not in txt:
+            txt = txt.replace('Policy', 'CurrentPol')
+            txt = txt.replace('ATPol', 'ATPol')
+        if 'CurrentPol = current live delivery policy' not in txt:
+            txt += "\nCurrentPol = current live delivery policy; ATPol = policy captured at AutoTrade open."
+    except Exception:
+        pass
+    return txt
+
+
+# ---- /engine_health: read-only, fast, no repair/backfill/OHLCV writes. ----
+def _yver134_table_cols(cur, table: str) -> set:
+    try:
+        cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
+        if not cur.fetchone():
+            return set()
+        return {str(r[1]) for r in cur.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
+
+
+def _yver134_select_recent(cur, table: str, since_ts: float, uid: int = 0, max_rows: int = 1000) -> list[dict]:
+    cols = _yver134_table_cols(cur, table)
+    if not cols:
+        return []
+    ts_col = ''
+    for c in ('created_ts','ts','generated_ts','executable_ts','emailed_ts','opened_ts','updated_ts','signal_created_ts'):
+        if c in cols:
+            ts_col = c; break
+    uid_col = 'user_id' if 'user_id' in cols else ('uid' if 'uid' in cols else '')
+    try:
+        q = f"SELECT * FROM {table}"
+        wh, params = [], []
+        if ts_col:
+            wh.append(f"COALESCE({ts_col},0)>=?"); params.append(float(since_ts))
+        if uid and uid_col:
+            wh.append(f"{uid_col}=?"); params.append(int(uid))
+        if wh:
+            q += " WHERE " + " AND ".join(wh)
+        if ts_col:
+            q += f" ORDER BY COALESCE({ts_col},0) DESC"
+        q += f" LIMIT {int(max_rows)}"
+        cur.execute(q, params)
+        return [dict(r) for r in cur.fetchall() or []]
+    except Exception:
+        return []
+
+
+def _yver134_row_time(row: dict) -> float:
+    for k in ('created_ts','ts','generated_ts','executable_ts','emailed_ts','opened_ts','updated_ts','signal_created_ts'):
+        try:
+            v = float((row or {}).get(k) or 0.0)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return 0.0
+
+
+def _yver134_health_key(row: dict) -> str:
+    sid = str((row or {}).get('setup_id') or (row or {}).get('id') or '').strip()
+    if sid:
+        return sid
+    ev = str((row or {}).get('event_id') or (row or {}).get('source_event_id') or '').strip()
+    if ev:
+        return ev
+    return '|'.join(str((row or {}).get(k, '') or '') for k in ('symbol','side','direction','created_ts','ts','emailed_ts','opened_ts'))
+
+
+def _yver134_filter_engine_rows(rows: list[dict], engine: str, f9_source: dict | None = None) -> list[dict]:
+    eng = str(engine or '').upper().strip()
+    out, seen = [], set()
+    eligible_f9 = set((f9_source or {}).get('eligible') or set())
+    for r in rows or []:
+        fam = _yver134_family_code(r, '')
+        if fam != eng:
+            continue
+        if eng == 'F9':
+            if not eligible_f9:
+                continue
+            sym = _yver134_symbol(r.get('symbol'))
+            side = _yver134_norm_side(r.get('side'))
+            if (sym, side) not in eligible_f9:
+                continue
+        key = _yver134_health_key(r)
+        if not key or key in seen:
+            continue
+        seen.add(key); out.append(r)
+    return out
+
+
+def _yver134_f8_source_events(cur, since_ts: float, uid: int = 0) -> list[dict]:
+    events, seen = [], set()
+    for table in ('pending_bigmoves', 'emailed_bigmoves'):
+        cols = _yver134_table_cols(cur, table)
+        if not cols:
+            continue
+        rows = _yver134_select_recent(cur, table, since_ts, uid=uid, max_rows=2000)
+        for r in rows:
+            sym = _yver134_symbol(r.get('symbol') or r.get('base'))
+            direction = str(r.get('direction') or r.get('raw_direction') or '').upper().strip()
+            side = _yver134_side_from_direction(direction)
+            if not sym or side not in {'BUY','SELL'}:
+                continue
+            ts = _yver134_row_time(r) or since_ts
+            key = f"F8:{_yver134_bucket_15m(ts)}:{sym}:{side}"
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append({'event_id': key, 'symbol': sym, 'side': side, 'direction': direction, 'ts': ts, 'source_table': table})
+    return events
+
+
+def _yver134_policy_count(cur, engine: str) -> int:
+    cols = _yver134_table_cols(cur, 'setup_combo_policy')
+    if not cols:
+        return 0
+    try:
+        if 'family' in cols:
+            return int(cur.execute("SELECT COUNT(1) FROM setup_combo_policy WHERE UPPER(COALESCE(family,''))=?", (engine,)).fetchone()[0] or 0)
+        if 'combo' in cols:
+            return int(cur.execute("SELECT COUNT(1) FROM setup_combo_policy WHERE UPPER(COALESCE(combo,'')) LIKE ?", (f'{engine}-%',)).fetchone()[0] or 0)
+    except Exception:
+        return 0
+    return 0
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = str(engine or 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        eng = 'F8'
+    hours_i = max(1, int(hours or 24))
+    since = _yver134_now_ts() - hours_i * 3600
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            f9_source = _yver134_current_f9_source(hours_i) if eng == 'F9' else None
+            if eng == 'F8':
+                source_rows = _yver134_f8_source_events(cur, since, uid=uid)
+            else:
+                source_rows = [{'symbol': s, 'side': side} for (s, side) in sorted((f9_source or {}).get('eligible') or set())]
+            gen = _yver134_filter_engine_rows(_yver134_select_recent(cur, 'generated_setups', since, uid=uid), eng, f9_source)
+            audit = _yver134_filter_engine_rows(_yver134_select_recent(cur, 'setup_audit_results', since, uid=uid), eng, f9_source)
+            exe = _yver134_filter_engine_rows(_yver134_select_recent(cur, 'executable_setups', since, uid=uid), eng, f9_source)
+            emails = _yver134_filter_engine_rows(_yver134_select_recent(cur, 'emailed_setups', since, uid=uid), eng, f9_source)
+            at = _yver134_filter_engine_rows(_yver134_select_recent(cur, 'autotrade_trades', since, uid=uid), eng, f9_source)
+            policy_n = _yver134_policy_count(cur, eng)
+    except Exception as e:
+        return f"🧭 Engine Health {eng} {hours_i}h\nStatus: ERROR\nRead failed: {e}"
+
+    results = {}
+    for r in audit:
+        res = str(r.get('result') or r.get('status') or r.get('outcome') or 'UNKNOWN').upper().strip() or 'UNKNOWN'
+        results[res] = results.get(res, 0) + 1
+    status = 'OK'
+    problems = []
+    if eng == 'F9' and len(source_rows) == 0:
+        status = 'IDLE'
+    else:
+        if len(source_rows) > 0 and len(gen) == 0:
+            status = 'CHECK'; problems.append('source_without_generated')
+        if eng == 'F8' and len(source_rows) > 0 and len(gen) > len(source_rows):
+            status = 'CHECK'; problems.append('generated_gt_source_unique')
+        if len(audit) > max(len(gen), len(source_rows)) + 1:
+            status = 'CHECK'; problems.append('audit_gt_generated_unique')
+        if len(at) > 0 and len(emails) == 0 and _autotrade_require_setup_email_for_entry():
+            status = 'ERROR'; problems.append('autotrade_without_delivered_setup_email')
+
+    all_recent = []
+    for table, rows in [('GEN', gen), ('AUDIT', audit), ('EXE', exe), ('EMAIL', emails), ('AT', at)]:
+        for r in rows:
+            rr = dict(r); rr['_table'] = table; rr['_t'] = _yver134_row_time(r); all_recent.append(rr)
+    all_recent.sort(key=lambda x: float(x.get('_t') or 0.0), reverse=True)
+    latest = all_recent[0] if all_recent else {}
+    recent_lines, seen = [], set()
+    for r in all_recent:
+        key = _yver134_health_key(r)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        recent_lines.append(f"{r.get('_table','-')} { _yver134_mel_label(float(r.get('_t') or 0), True) } {str(r.get('setup_id') or key)[:42]} {str(r.get('symbol') or '-').upper()} {str(r.get('side') or '-').upper()} {str(r.get('combo') or '-')}" )
+        if len(recent_lines) >= 5:
+            break
+    source_label = 'confirmed BigMove events' if eng == 'F8' else 'current 2-day Leader/Loser sources'
+    lines = [
+        f"🧭 Engine Health {eng} {hours_i}h",
+        f"Status: {status}" + (f" | {'; '.join(problems)}" if problems else ''),
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"Source events ({source_label}): {len(source_rows)}",
+        f"Generated setups: {len(gen)}",
+        f"Setup audit: {len(audit)}",
+        f"Executable queue: {len(exe)}",
+        f"Setup emails/deliveries: {len(emails)}",
+        f"AutoTrade rows: {len(at)}",
+        f"Policy rows: {policy_n}",
+        f"Audit results: " + (', '.join(f'{k}:{v}' for k, v in sorted(results.items())) if results else '-'),
+    ]
+    if latest:
+        lines += ["━━━━━━━━━━━━━━━━━━━━", f"Latest row: {latest.get('_table','-')} {_yver134_mel_label(float(latest.get('_t') or 0), True)} {str(latest.get('setup_id') or _yver134_health_key(latest))[:54]} {str(latest.get('symbol') or '-').upper()} {str(latest.get('side') or '-').upper()}"]
+    lines += ["━━━━━━━━━━━━━━━━━━━━", "Recent unique canonical rows:"]
+    lines += recent_lines or ['-']
+    if eng == 'F9' and status == 'IDLE':
+        lines.append('Note: old historical F9 evidence is ignored here; current source is empty.')
+    lines.append('Read-only: no backfill, no repair, no setup creation, no OHLCV scan.')
+    return '\n'.join(lines)
+
+
+# ---- AutoTrade safe default: delivered setup only unless explicitly overridden. ----
+try:
+    _YVER134_ORIG_AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = _autotrade_require_setup_email_for_entry
+except Exception:
+    _YVER134_ORIG_AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY = None
+
+def _autotrade_require_setup_email_for_entry() -> bool:
+    try:
+        return _autotrade_bool_cfg(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, 'AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY', True)
+    except Exception:
+        return True
+
+
+def _yver134_apply_entry_source_default() -> None:
+    try:
+        # Owner-requested safe default for yver134: AutoTrade consumes delivered setup only.
+        # This does not alter risk, TP, SL, leverage, sizing or caps.
+        _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, '1')
+        _autotrade_config_set('yver134_entry_source_sync_version', YVER134_VERSION)
+    except Exception:
+        pass
+_yver134_apply_entry_source_default()
+
+try:
+    _YVER134_ORIG_RUNTIME_SUMMARY_DICT = _autotrade_runtime_summary_dict
+except Exception:
+    _YVER134_ORIG_RUNTIME_SUMMARY_DICT = None
+
+def _autotrade_runtime_summary_dict() -> dict:
+    d = _YVER134_ORIG_RUNTIME_SUMMARY_DICT() if callable(_YVER134_ORIG_RUNTIME_SUMMARY_DICT) else {}
+    try:
+        req = bool(_autotrade_require_setup_email_for_entry())
+        d['AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY'] = req
+        d['AUTOTRADE_ENTRY_SOURCE'] = 'DELIVERED SETUP ONLY' if req else 'DIRECT KEEP QUEUE, no setup email required'
+    except Exception:
+        pass
+    return d
+
+
+def _yver134_delivery_meta(uid: int, s, session_label: str = '') -> tuple[bool, float, str]:
+    try:
+        ok, why = _autotrade_recent_email_gate_allows_setup(int(uid), s, session_label=session_label)
+        if not ok:
+            return False, 0.0, str(why or 'missing_recent_setup_email')
+        sid = str(_yver134_get(s, 'setup_id', '') or _yver134_get(s, 'id', '') or '')
+        ts = 0.0
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cols = _yver134_table_cols(cur, 'emailed_setups')
+            if cols and 'setup_id' in cols:
+                uid_col = 'user_id' if 'user_id' in cols else ('uid' if 'uid' in cols else '')
+                ts_col = 'emailed_ts' if 'emailed_ts' in cols else ('created_ts' if 'created_ts' in cols else '')
+                if ts_col and uid_col:
+                    row = cur.execute(f"SELECT {ts_col} FROM emailed_setups WHERE {uid_col}=? AND setup_id=? ORDER BY COALESCE({ts_col},0) DESC LIMIT 1", (int(uid), sid)).fetchone()
+                    if row:
+                        ts = float(row[0] or 0.0)
+        return True, ts, 'delivered_setup_email_match'
+    except Exception as e:
+        return False, 0.0, f'setup_email_gate_exception:{e}'
+
+
+def _yver134_policy_at_open(uid: int, s, session_label: str) -> str:
+    try:
+        combo = _setup_combo_strategy_side_key(_yver134_family_code(s) or _setup_family_code(s), session_label, s, _yver134_get(s, 'side', ''))
+        row = _setup_combo_policy_lookup(combo)
+        return str((row or {}).get('policy') or (row or {}).get('decision') or '').upper() or 'UNKNOWN'
+    except Exception:
+        try:
+            keep, why = _setup_policy_allows_setup(int(uid), s, session_label)
+            return 'KEEP' if keep else str(why or 'OFF').upper()
+        except Exception:
+            return 'UNKNOWN'
+
+
+def _yver134_ensure_autotrade_source_cols() -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cols = _yver134_table_cols(cur, 'autotrade_trades')
+            if not cols:
+                return
+            wanted = {
+                'source_setup_id': 'TEXT', 'source_combo': 'TEXT', 'source_policy_at_open': 'TEXT',
+                'setup_email_delivered': 'INTEGER NOT NULL DEFAULT 0', 'setup_email_delivered_ts': 'REAL NOT NULL DEFAULT 0',
+                'autotrade_opened_ts': 'REAL NOT NULL DEFAULT 0', 'autotrade_entry_source': 'TEXT',
+            }
+            for col, ddl in wanted.items():
+                if col not in cols:
+                    cur.execute(f"ALTER TABLE autotrade_trades ADD COLUMN {col} {ddl}")
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _yver134_update_autotrade_source_metadata(uid: int, setups: list, session_label: str) -> None:
+    try:
+        _yver134_ensure_autotrade_source_cols()
+        now = _yver134_now_ts()
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            for s in setups or []:
+                sid = str(_yver134_get(s, 'setup_id', '') or _yver134_get(s, 'id', '') or '').strip()
+                if not sid:
+                    continue
+                row = cur.execute("SELECT trade_id FROM autotrade_trades WHERE uid=? AND setup_id=? ORDER BY COALESCE(opened_ts,created_ts,0) DESC LIMIT 1", (int(uid), sid)).fetchone()
+                if not row:
+                    continue
+                delivered = 1 if bool(_yver134_get(s, 'setup_email_delivered', False)) else 0
+                delivery_ts = float(_yver134_get(s, 'setup_email_delivered_ts', 0.0) or 0.0)
+                combo = str(_yver134_get(s, 'combo', '') or _yver134_combo(_yver134_family_code(s) or _setup_family_code(s), session_label, s, _yver134_get(s, 'side','')))
+                pol = str(_yver134_get(s, 'source_policy_at_open', '') or _yver134_policy_at_open(uid, s, session_label))
+                entry_src = str(_yver134_get(s, 'autotrade_entry_source', '') or ('DELIVERED SETUP ONLY' if _autotrade_require_setup_email_for_entry() else 'DIRECT KEEP QUEUE, no setup email required'))
+                cur.execute("""UPDATE autotrade_trades
+                               SET source_setup_id=?, source_combo=?, source_policy_at_open=?,
+                                   setup_email_delivered=?, setup_email_delivered_ts=?, autotrade_opened_ts=?, autotrade_entry_source=?
+                               WHERE trade_id=?""",
+                            (sid, combo, pol, delivered, delivery_ts, now, entry_src, row[0]))
+            conn.commit()
+    except Exception:
+        pass
+
+try:
+    _YVER134_ORIG_AUTOTRADE_DB_ADD_TRADE = _autotrade_db_add_trade
+except Exception:
+    _YVER134_ORIG_AUTOTRADE_DB_ADD_TRADE = None
+
+def _autotrade_db_add_trade(uid: int, session_label: str, s: 'Setup', qty: float, lifecycle_state: str = 'executed_open', lifecycle_reason: str = '', report_meta: dict | None = None) -> str:
+    # Fill source fields into the payload path without changing sizing/order logic.
+    if s is not None:
+        _yver134_canonicalize_setup_identity(s, _yver134_family_code(s), session_name=session_label)
+    tid = _YVER134_ORIG_AUTOTRADE_DB_ADD_TRADE(uid, session_label, s, qty, lifecycle_state=lifecycle_state, lifecycle_reason=lifecycle_reason, report_meta=report_meta) if callable(_YVER134_ORIG_AUTOTRADE_DB_ADD_TRADE) else ''
+    try:
+        _yver134_update_autotrade_source_metadata(int(uid), [s], session_label)
+    except Exception:
+        pass
+    return tid
+
+try:
+    _YVER134_ORIG_AUTOTRADE_PLACE_TRADE = _autotrade_place_trade
+except Exception:
+    _YVER134_ORIG_AUTOTRADE_PLACE_TRADE = None
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    if not callable(_YVER134_ORIG_AUTOTRADE_PLACE_TRADE):
+        return (False, 'autotrade_place_unavailable')
+    req = bool(_autotrade_require_setup_email_for_entry())
+    entry_src = 'DELIVERED SETUP ONLY' if req else 'DIRECT KEEP QUEUE, no setup email required'
+    kept, skipped = [], []
+    for s in setups or []:
+        fam = _yver134_family_code(s, '')
+        if fam in {'F8','F9'}:
+            s = _yver134_canonicalize_setup_identity(s, fam, session_name=session_label)
+        if req:
+            ok, delivery_ts, why = _yver134_delivery_meta(uid, s, session_label=session_label)
+            if not ok:
+                skipped.append((s, why))
+                try:
+                    _autotrade_record_attempt(int(uid), s, str(session_label or '').upper(), 'SKIP', str(why or 'missing_recent_setup_email'), extra={'entry_source': entry_src, 'setup_email_required': True})
+                except Exception:
+                    pass
+                continue
+            _yver134_set(s, 'setup_email_delivered', True)
+            _yver134_set(s, 'setup_email_delivered_ts', float(delivery_ts or 0.0))
+        else:
+            _yver134_set(s, 'setup_email_delivered', False)
+            _yver134_set(s, 'setup_email_delivered_ts', 0.0)
+        _yver134_set(s, 'autotrade_entry_source', entry_src)
+        _yver134_set(s, 'source_policy_at_open', _yver134_policy_at_open(uid, s, session_label))
+        _yver134_set(s, 'source_combo', str(_yver134_get(s, 'combo', '') or _yver134_combo(_yver134_family_code(s) or _setup_family_code(s), session_label, s, _yver134_get(s, 'side',''))))
+        kept.append(s)
+    if req and not kept:
+        _LAST_AUTOTRADE_DECISION[int(uid)] = {
+            'ts': _yver134_now_ts(), 'session': str(session_label or '').upper(), 'decision': 'SKIP',
+            'reason': 'missing_recent_delivered_setup_email', 'entry_source': entry_src,
+            'setup_email_required': True, 'skipped': len(skipped),
+        }
+        _LAST_AUTOTRADE_DETAIL[int(uid)] = {
+            'entry_source': entry_src, 'setup_email_required': True,
+            'why': 'AutoTrade requires the exact setup_id to be delivered/emailed within AUTOTRADE_ENTRY_WINDOW_MIN.',
+            'skipped_setup_ids': [str(_yver134_get(s, 'setup_id', '') or _yver134_get(s, 'id', '')) for s, _ in skipped[:10]],
+        }
+        return (False, 'missing_recent_delivered_setup_email')
+    _LAST_AUTOTRADE_DETAIL[int(uid)] = dict(_LAST_AUTOTRADE_DETAIL.get(int(uid), {}) or {}, entry_source=entry_src, setup_email_required=req)
+    ok, reason = _YVER134_ORIG_AUTOTRADE_PLACE_TRADE(uid, session_label, kept)
+    if ok:
+        _yver134_update_autotrade_source_metadata(int(uid), kept, session_label)
+    return ok, reason
+
+
+# Surface exact entry-source wording in debug/last dictionaries even when no placement runs.
+try:
+    _LAST_AUTOTRADE_DETAIL.setdefault(int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), {})['entry_source'] = 'DELIVERED SETUP ONLY'
+except Exception:
+    pass
+
+logger.info("%s loaded: canonical F8/F9 setup identity, read-only engine_health, delivered-setup AutoTrade gate", YVER134_VERSION)
+
 if __name__ == "__main__":
     main()
 
@@ -79935,7 +80987,8 @@ def _autotrade_apply_yver78_editable_owner_defaults() -> bool:
     return bool(changed)
 
 try:
-    _autotrade_apply_yver78_editable_owner_defaults()
+    # yver134: do not let dormant post-main yver78 code alter risk/cap defaults.
+    _autotrade_config_set('yver78_owner_defaults_skipped_by_yver134', 'true')
 except Exception:
     pass
 
