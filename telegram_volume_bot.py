@@ -79827,6 +79827,240 @@ except Exception:
 # end yver121
 # =========================================================
 
+
+# =========================================================
+# yver122 — fast F8 BigMove parser/pre-send mirror repair on v121
+# =========================================================
+# Purpose:
+# - keep v121 speed; no cold OHLCV/ticker/network work in the alert path
+# - make BigMove Alert parsing more tolerant (subject-only, wrapped body lines,
+#   $ volume formats, TradingView-only links)
+# - mirror before direct SMTP send as well as async/pre-SMTP and mark_bigmove_emailed
+# - keep /help_admin F8/F9 engine checks visible
+# Trading/risk/blackout/TP/SL/leverage/F9 logic intentionally untouched.
+YVER122_VERSION = 'yver122_2026_06_22_v121_fast_f8_parser_presend_mirror'
+
+_YVER122_F8_MEMO = {}
+try:
+    _YVER122_ORIG_SEND_EMAIL = send_email
+except Exception:
+    _YVER122_ORIG_SEND_EMAIL = None
+try:
+    _YVER122_ORIG_SEND_EMAIL_ASYNC = _send_email_async
+except Exception:
+    _YVER122_ORIG_SEND_EMAIL_ASYNC = None
+try:
+    _YVER122_ORIG_MARK_BIGMOVE_EMAILED = mark_bigmove_emailed
+except Exception:
+    _YVER122_ORIG_MARK_BIGMOVE_EMAILED = None
+
+
+def _yver122_ts() -> float:
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _yver122_clean_email_text(subject: str = '', body: str = '', body_html: str = '') -> str:
+    try:
+        txt = f"{subject or ''}\n{body or ''}\n{body_html or ''}"
+        txt = txt.replace('\u2022', '•').replace('\xa0', ' ')
+        txt = txt.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&#36;', '$')
+        txt = re.sub(r'<br\s*/?>', '\n', txt, flags=re.I)
+        txt = re.sub(r'</p\s*>|</div\s*>|</li\s*>|</tr\s*>', '\n', txt, flags=re.I)
+        txt = re.sub(r'<[^>]+>', ' ', txt)
+        txt = re.sub(r'[ \t]+', ' ', txt)
+        return txt
+    except Exception:
+        return str(subject or '') + '\n' + str(body or '') + '\n' + str(body_html or '')
+
+
+def _yver122_num_pct(x, default=0.0) -> float:
+    try:
+        m = re.search(r'([+\-]?\d+(?:\.\d+)?)', str(x or '').replace(',', ''))
+        return float(m.group(1)) if m else float(default)
+    except Exception:
+        return float(default)
+
+
+def _yver122_vol_to_usd(raw: str) -> float:
+    try:
+        s = str(raw or '').upper().replace(',', '').replace('$', '').strip()
+        m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*([KMB])?', s)
+        if not m:
+            return 0.0
+        val = float(m.group(1)); suf = str(m.group(2) or '')
+        if suf == 'K': val *= 1_000.0
+        elif suf == 'M': val *= 1_000_000.0
+        elif suf == 'B': val *= 1_000_000_000.0
+        return float(val)
+    except Exception:
+        return 0.0
+
+
+def _yver122_parse_bigmove_alert(subject: str = '', body: str = '', body_html: str = '') -> list[dict]:
+    """Very tolerant fast parser for BigMove alert email content."""
+    txt = _yver122_clean_email_text(subject, body, body_html)
+    if not re.search(r'Big\s*Move\s*Alert|BigMove\s*Alert|BIG\s*MOVE|15m\s+confirmation|BYBIT:[A-Z0-9]{2,20}USDT', txt, re.I):
+        return []
+    out = []
+    seen = set()
+
+    def add(sym: str, direction: str = '', ch15=0.0, ch1=0.0, ch4=0.0, vol=0.0, price=0.0):
+        try:
+            s = re.sub(r'[^A-Z0-9]', '', str(sym or '').upper().strip())
+            if len(s) < 2 or len(s) > 20:
+                return
+            d = str(direction or '').upper().strip()
+            c15 = _yver122_num_pct(ch15, 0.0)
+            if d not in {'UP', 'DOWN'}:
+                d = 'UP' if c15 > 0 else 'DOWN' if c15 < 0 else ''
+            if d not in {'UP', 'DOWN'}:
+                return
+            key = (s, d)
+            if key in seen:
+                for row in out:
+                    if row.get('symbol') == s and row.get('direction') == d:
+                        for k, v in [('ch15', c15), ('ch1', _yver122_num_pct(ch1, 0.0)), ('ch4', _yver122_num_pct(ch4, 0.0)), ('vol', float(vol or 0.0)), ('price', float(price or 0.0))]:
+                            try:
+                                if not row.get(k) and v:
+                                    row[k] = v
+                            except Exception:
+                                pass
+                        break
+                return
+            seen.add(key)
+            out.append({'symbol': s, 'direction': d, 'ch15': c15, 'ch1': _yver122_num_pct(ch1, 0.0), 'ch4': _yver122_num_pct(ch4, 0.0), 'vol': float(vol or 0.0), 'price': float(price or 0.0)})
+        except Exception:
+            pass
+
+    # Subject-only variants:
+    # Big Move Alert • TNSR UP
+    # BIGMOVE ALERT: TNSR DOWN -4.1%
+    try:
+        for m in re.finditer(r'(?:Big\s*Move\s*Alert|BigMove\s*Alert|BIG\s*MOVE\s*ALERT)[^A-Z0-9]{0,12}([A-Z0-9]{2,20})\s+(UP|DOWN)\b(?:[^\n\r]{0,80}?([+\-]?\d+(?:\.\d+)?)\s*%)?', txt, re.I):
+            add(m.group(1), m.group(2), ch15=(m.group(3) or 0.0))
+    except Exception:
+        pass
+
+    # Body rows. Supports missing colons, emojis, wrapped rows and $ volume.
+    try:
+        row_pat = re.compile(
+            r'\b([A-Z0-9]{2,20})\s*:?\s*(?:15m\s+confirmation|confirmed|confirmation)[\s\S]{0,260}?'
+            r'15m\s*:?\s*([+\-]?\d+(?:\.\d+)?)\s*%[\s\S]{0,140}?'
+            r'(?:1H|1h|60m)\s*:?\s*([+\-]?\d+(?:\.\d+)?)\s*%[\s\S]{0,140}?'
+            r'(?:4H|4h|240m)\s*:?\s*([+\-]?\d+(?:\.\d+)?)\s*%[\s\S]{0,180}?'
+            r'(?:Vol(?:ume)?\s*[:~≈]?\s*\$?\s*([0-9]+(?:\.[0-9]+)?\s*[KMB]?))?',
+            re.I,
+        )
+        for m in row_pat.finditer(txt):
+            ch15 = _yver122_num_pct(m.group(2), 0.0)
+            add(m.group(1), 'UP' if ch15 >= 0 else 'DOWN', ch15=ch15, ch1=m.group(3), ch4=m.group(4), vol=_yver122_vol_to_usd(m.group(5) or ''))
+    except Exception:
+        pass
+
+    # Simpler fallback for wrapped rows with only 15m percent.
+    try:
+        simple_pat = re.compile(r'\b([A-Z0-9]{2,20})\s*:?\s*15m\s+confirmation[\s\S]{0,180}?15m\s*:?\s*([+\-]?\d+(?:\.\d+)?)\s*%', re.I)
+        for m in simple_pat.finditer(txt):
+            ch15 = _yver122_num_pct(m.group(2), 0.0)
+            add(m.group(1), 'UP' if ch15 >= 0 else 'DOWN', ch15=ch15)
+    except Exception:
+        pass
+
+    # TradingView fallback. Direction from nearby text or subject.
+    try:
+        for m in re.finditer(r'symbol=BYBIT:([A-Z0-9]{2,20})USDT', txt, re.I):
+            sym = str(m.group(1)).upper().strip()
+            if any(r.get('symbol') == sym for r in out):
+                continue
+            window = txt[max(0, m.start()-300):m.end()+100]
+            d = ''
+            if re.search(r'\bDOWN\b|15m\s*:?\s*-\d', window, re.I): d = 'DOWN'
+            elif re.search(r'\bUP\b|15m\s*:?\s*\+\d', window, re.I): d = 'UP'
+            if not d:
+                sm = re.search(r'\b' + re.escape(sym) + r'\s+(UP|DOWN)\b', txt, re.I)
+                if sm: d = sm.group(1).upper()
+            if d:
+                add(sym, d)
+    except Exception:
+        pass
+    return out
+
+
+def _yver122_fast_mirror_from_email(uid: int, subject: str = '', body: str = '', body_html: str = '', source: str = 'email') -> int:
+    try:
+        rows = _yver122_parse_bigmove_alert(subject, body, body_html)
+        if not rows:
+            return 0
+        # Use v121 fast mirror so no cold network work is added.
+        return int(_yver121_fast_f8_mirror(int(uid or 0) or int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0), rows, source='yver122_' + str(source or 'email'), event_ts=_yver122_ts()) or 0)
+    except Exception:
+        return 0
+
+
+async def _send_email_async(timeout_sec: int, *args, **kwargs) -> bool:
+    try:
+        uid = int(kwargs.get('user_id_for_debug') or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    try:
+        subj = str(args[0] if len(args) >= 1 else kwargs.get('subject', '') or '')
+        body = str(args[1] if len(args) >= 2 else kwargs.get('body', '') or '')
+        body_html = str(kwargs.get('body_html') or '')
+        _yver122_fast_mirror_from_email(uid, subj, body, body_html, source='send_email_async_pre_smtp')
+    except Exception:
+        pass
+    if callable(_YVER122_ORIG_SEND_EMAIL_ASYNC):
+        return bool(await _YVER122_ORIG_SEND_EMAIL_ASYNC(timeout_sec, *args, **kwargs))
+    return False
+
+
+def send_email(subject: str, body: str, body_html: Optional[str] = None, user_id_for_debug: Optional[int] = None, enforce_trade_window: bool = True, bypass_user_email_master: bool = False) -> bool:
+    try:
+        uid = int(user_id_for_debug) if user_id_for_debug is not None else int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    # Mirror before SMTP too. This is fast and memo-protected, and fixes direct-send paths.
+    try:
+        _yver122_fast_mirror_from_email(uid, subject, body, body_html or '', source='direct_send_email_pre_smtp')
+    except Exception:
+        pass
+    if callable(_YVER122_ORIG_SEND_EMAIL):
+        return bool(_YVER122_ORIG_SEND_EMAIL(subject, body, body_html=body_html, user_id_for_debug=user_id_for_debug, enforce_trade_window=enforce_trade_window, bypass_user_email_master=bypass_user_email_master))
+    return False
+
+
+def mark_bigmove_emailed(uid: int, symbol: str, direction: str) -> None:
+    try:
+        if callable(_YVER122_ORIG_MARK_BIGMOVE_EMAILED):
+            _YVER122_ORIG_MARK_BIGMOVE_EMAILED(uid, symbol, direction)
+    except Exception:
+        pass
+    try:
+        _yver121_fast_f8_mirror(int(uid), [{'symbol': str(symbol or '').upper(), 'direction': str(direction or '').upper()}], source='yver122_mark_bigmove_emailed', event_ts=_yver122_ts())
+    except Exception:
+        pass
+
+try:
+    # Ensure help_admin remains discoverable without adding a slow wrapper.
+    HELP_TEXT_ADMIN = (_yver121_help_admin_block() + "\n" + str(HELP_TEXT_ADMIN or '')) if '/engine_health F8 24' not in str(HELP_TEXT_ADMIN or '') else HELP_TEXT_ADMIN
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver122_version', YVER122_VERSION)
+    _autotrade_config_set('yver122_fast_f8_parser_presend_mirror', 'ON')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v122'
+except Exception:
+    pass
+# =========================================================
+# end yver122
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
