@@ -80390,6 +80390,278 @@ except Exception:
 # end yver124
 # =========================================================
 
+
+
+# =========================================================
+# yver125 /screen delivery queue repair
+# =========================================================
+# v124 trading was correct, but /screen could still show "No emailed/executable
+# KEEP setup" immediately after setup emails + AutoTrade placements (example:
+# W and EIGEN at 15:37-15:40).  Root cause: the v115 ghost-prevention filter
+# required an exact emailed_setups match when SCREEN_REQUIRE_EMAILED_SETUP=1 and
+# ignored the matching executable/AT_OPEN row.  If the email identity and the
+# executable setup_id differ even slightly, /screen hides a real delivered setup.
+#
+# Contract from v125:
+#   generated-only candidates remain hidden;
+#   a recent real setup is visible when it has EITHER a recent setup-email record
+#   OR a recent executable/AutoTrade queue row.
+# This keeps the NEAR ghost fixed while making /screen match setup_audit,
+# email_decision and autotrade_last for real W/EIGEN-style deliveries.
+
+YVER125_VERSION = 'yver125_2026_06_22_screen_show_recent_executable_or_emailed_keep'
+
+try:
+    _YVER125_ORIG_YVER115_FILTER = _yver115_filter_to_synced_screen_setups
+except Exception:
+    _YVER125_ORIG_YVER115_FILTER = None
+try:
+    _YVER125_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = _screen_recent_db_body_and_kb
+except Exception:
+    _YVER125_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = None
+try:
+    _YVER125_ORIG_BUILD_SCREEN_BODY_AND_KB = _build_screen_body_and_kb
+except Exception:
+    _YVER125_ORIG_BUILD_SCREEN_BODY_AND_KB = None
+
+
+def _yver125_recent_executable_ok_for_screen(user_id: int, setup, session_name: str = '', lookback_hours: float | None = None) -> bool:
+    """True if this setup is in the real executable/AutoTrade lane.
+
+    Uses setup_id first and then symbol+side+session as a safe fallback, so a
+    delivered setup is not hidden when email/setup ids differ between DB tables.
+    """
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0 or setup is None:
+        return False
+    try:
+        hours = float(lookback_hours if lookback_hours is not None else max(1.0, float(_screen_actionable_fallback_max_age_min()) / 60.0))
+    except Exception:
+        hours = 1.0
+    cutoff = float(time.time()) - max(0.25, hours) * 3600.0
+    sid = str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip()
+    sym = str(getattr(setup, 'symbol', '') or '').upper().strip()
+    side = str(getattr(setup, 'side', '') or '').upper().strip()
+    sess = str(session_name or getattr(setup, 'source_session', '') or getattr(setup, 'session', '') or '').upper().strip()
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            row = None
+            if sid:
+                if sess:
+                    row = cur.execute(
+                        """
+                        SELECT executable_ts FROM executable_setups
+                        WHERE setup_id=? AND user_id IN (?,0) AND executable_ts>=?
+                          AND (UPPER(COALESCE(session,''))=? OR COALESCE(session,'')='')
+                        ORDER BY executable_ts DESC LIMIT 1
+                        """,
+                        (sid, uid, float(cutoff), sess),
+                    ).fetchone()
+                else:
+                    row = cur.execute(
+                        """
+                        SELECT executable_ts FROM executable_setups
+                        WHERE setup_id=? AND user_id IN (?,0) AND executable_ts>=?
+                        ORDER BY executable_ts DESC LIMIT 1
+                        """,
+                        (sid, uid, float(cutoff)),
+                    ).fetchone()
+            if (not row) and sym and side:
+                if sess:
+                    row = cur.execute(
+                        """
+                        SELECT executable_ts FROM executable_setups
+                        WHERE UPPER(symbol)=? AND UPPER(side)=? AND user_id IN (?,0) AND executable_ts>=?
+                          AND (UPPER(COALESCE(session,''))=? OR COALESCE(session,'')='')
+                        ORDER BY executable_ts DESC LIMIT 1
+                        """,
+                        (sym, side, uid, float(cutoff), sess),
+                    ).fetchone()
+                else:
+                    row = cur.execute(
+                        """
+                        SELECT executable_ts FROM executable_setups
+                        WHERE UPPER(symbol)=? AND UPPER(side)=? AND user_id IN (?,0) AND executable_ts>=?
+                        ORDER BY executable_ts DESC LIMIT 1
+                        """,
+                        (sym, side, uid, float(cutoff)),
+                    ).fetchone()
+            if row and row[0] is not None:
+                try:
+                    setattr(setup, 'executable_ts', float(row[0] or 0.0))
+                    if not str(getattr(setup, 'source_kind', '') or '').strip():
+                        setattr(setup, 'source_kind', 'executable_setups')
+                except Exception:
+                    pass
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _yver115_filter_to_synced_screen_setups(setups: list, uid: int, session_name: str = '', require_email: bool | None = None) -> list:
+    """v125: /screen shows real emailed OR executable KEEP setups.
+
+    The older v115 filter solved the NEAR screen-only ghost by requiring a setup
+    email match.  That was too strict after an AutoTrade placement: exact email
+    ids can differ, while executable_setups/autotrade_last/setup_audit are already
+    real.  Generated-only candidates still fail because neither email nor
+    executable evidence exists.
+    """
+    out = []
+    seen = set()
+    sess = str(session_name or '').upper().strip()
+    try:
+        hours = max(1.0, float(_screen_actionable_fallback_max_age_min()) / 60.0)
+    except Exception:
+        hours = 1.0
+    for s in list(setups or []):
+        try:
+            sid = _yver115_setup_id(s)
+            ident = str(_setup_identity_from_obj(s) or sid).strip()
+            if not sid or (ident and ident in seen):
+                continue
+            ok, why = _yver115_basic_visible_keep(s, int(uid or 0), sess)
+            if not ok:
+                try:
+                    setattr(s, 'yver125_screen_hidden_reason', why)
+                except Exception:
+                    pass
+                continue
+            emailed_ok = False
+            exec_ok = False
+            try:
+                emailed_ok = bool(_yver115_recent_email_ok(int(uid or 0), s, lookback_hours=hours))
+            except Exception:
+                emailed_ok = False
+            try:
+                exec_ok = bool(_yver125_recent_executable_ok_for_screen(int(uid or 0), s, sess, lookback_hours=hours))
+            except Exception:
+                exec_ok = False
+            if not (emailed_ok or exec_ok):
+                try:
+                    setattr(s, 'yver125_screen_hidden_reason', 'not_recently_emailed_or_executable')
+                except Exception:
+                    pass
+                continue
+            try:
+                if emailed_ok:
+                    setattr(s, 'source_kind', 'emailed_setups')
+                elif exec_ok and not str(getattr(s, 'source_kind', '') or '').strip():
+                    setattr(s, 'source_kind', 'executable_setups')
+            except Exception:
+                pass
+            if ident:
+                seen.add(ident)
+            out.append(s)
+        except Exception:
+            continue
+    return list(out)
+
+
+def _yver125_screen_recent_queue(uid: int, session: str, max_age_min: int | None = None, limit: int | None = None) -> list:
+    """Build the /screen real-delivery queue directly from email + executable DB."""
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    if uid_i <= 0:
+        return []
+    sess = str(session or '').upper().strip()
+    try:
+        max_age_min_i = int(max_age_min or max(YVER82_KEEP_DELIVERY_WINDOW_MIN, int(_autotrade_entry_window_min())))
+    except Exception:
+        max_age_min_i = 60
+    try:
+        lim = int(limit or _screen_display_limit() or 4)
+    except Exception:
+        lim = 4
+    candidates = []
+    # Keep both sources. Email cache may have the exact email body; executable rows
+    # are the durable proof used by setup_audit/autotrade_last.
+    try:
+        candidates.extend(_recent_delivery_lane_setup_objects(uid_i, session_name=sess, max_age_min=max_age_min_i, limit=max(lim * 3, 12)) or [])
+    except Exception:
+        pass
+    try:
+        cutoff = float(time.time()) - float(max(5, max_age_min_i)) * 60.0
+        rows = db_list_executable_setups(uid_i, session_name=sess, ts_from=float(cutoff), limit=max(lim * 5, 20)) or []
+        candidates.extend(_executable_rows_to_setup_objects(rows, session_name=sess) or [])
+    except Exception:
+        pass
+    synced = _yver115_filter_to_synced_screen_setups(candidates, uid_i, sess, require_email=False)
+    try:
+        # Sort by email/executable/created time so the latest W/EIGEN-style batch wins.
+        synced.sort(key=lambda x: float(getattr(x, 'email_logged_ts', 0.0) or getattr(x, 'emailed_ts', 0.0) or getattr(x, 'executable_ts', 0.0) or getattr(x, 'created_ts', 0.0) or 0.0), reverse=True)
+    except Exception:
+        pass
+    try:
+        db_log_setup_pipeline_event(uid_i, stage='yver125_screen_real_queue', status='ok' if synced else 'empty', session=sess, mode='screen', details={'input': len(candidates), 'shown': len(synced), 'rule': 'email_or_executable_not_generated_only'})
+    except Exception:
+        pass
+    return list(synced or [])[:lim]
+
+
+def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int | None = None, include_email_source: bool = True):
+    """v125: first show real emailed/executable KEEP setups, then clean no-setup context."""
+    try:
+        if not _yver82_delivery_blackout_now()[0]:
+            setups = _yver125_screen_recent_queue(int(uid or 0), str(session or ''), max_age_min=max_age_min, limit=_screen_display_limit())
+            if setups:
+                return _yver82_screen_body_for_setups(int(uid or 0), str(session or ''), best_fut or {}, setups, "_Showing recent emailed/executable KEEP setup queue while the live scan refreshes._")
+    except Exception:
+        pass
+    # Do not call older generated-only fallbacks.  They can reintroduce ghosts.
+    return _yver115_no_setup_screen_body(int(uid or 0), str(session or ''), best_fut or {})
+
+
+def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
+    """v125 final guard: prefer real queue; otherwise keep v115 ghost block."""
+    try:
+        setups = _yver125_screen_recent_queue(int(uid or 0), str(session or ''), max_age_min=None, limit=_screen_display_limit())
+        if setups:
+            return _yver82_screen_body_for_setups(int(uid or 0), str(session or ''), best_fut or {}, setups, "_Showing recent emailed/executable KEEP setup queue while the live scan refreshes._")
+    except Exception:
+        pass
+    try:
+        if callable(_YVER125_ORIG_BUILD_SCREEN_BODY_AND_KB):
+            body, kb, setups0 = _YVER125_ORIG_BUILD_SCREEN_BODY_AND_KB(best_fut, session, uid)
+        else:
+            body, kb, setups0 = ('', [], [])
+        synced = _yver115_filter_to_synced_screen_setups(list(setups0 or []), int(uid or 0), str(session or ''), require_email=False)
+        if synced:
+            return _yver82_screen_body_for_setups(int(uid or 0), str(session or ''), best_fut or {}, synced[:_screen_display_limit()], "_Showing recent emailed/executable KEEP setup queue while the live scan refreshes._")
+        if list(setups0 or []) or _yver115_body_contains_setup_card(body):
+            return _yver115_no_setup_screen_body(int(uid or 0), str(session or ''), best_fut or {})
+        return body, kb, setups0
+    except Exception:
+        return _yver115_no_setup_screen_body(int(uid or 0), str(session or ''), best_fut or {})
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v125'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v125'
+except Exception:
+    pass
+try:
+    _screen_cache_put('yver125:deploy:screen_delivery_queue_repair', 'v125 deployed', [], ts=float(time.time()), allow_empty_overwrite=True)
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver125_version', YVER125_VERSION)
+    _autotrade_config_set('yver125_screen_rule', 'show recent emailed OR executable KEEP; hide generated-only')
+except Exception:
+    pass
+# =========================================================
+# end yver125
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
