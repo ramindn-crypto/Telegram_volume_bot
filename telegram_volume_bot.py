@@ -81010,6 +81010,231 @@ except Exception:
 # end yver127
 # =========================================================
 
+
+# =========================================================
+# yver128 WATCH+ near-KEEP visibility lane
+# =========================================================
+# Owner request after policy discussion:
+# - Treat lanes with WR >45% and positive AvgR as a visible near-KEEP category.
+# - Do NOT loosen live AutoTrade. KEEP remains the only live-entry policy.
+# - This is visibility/diagnostic only: /setup_matrix policy and /setup_audit can show
+#   WATCH+ so near-KEEP lanes are easy to review, while email/AutoTrade remain locked
+#   to current KEEP + real setup-email proof from yver127.
+YVER128_VERSION = 'yver128_2026_06_22_watch_plus_near_keep_visibility_only'
+
+WATCH_PLUS_POLICY_LABEL = 'WATCH+'
+WATCH_PLUS_MIN_WR = float(os.environ.get('SETUP_COMBO_WATCH_PLUS_MIN_WR', '45.0') or 45.0)
+WATCH_PLUS_MIN_AVGR = float(os.environ.get('SETUP_COMBO_WATCH_PLUS_MIN_AVGR', '0.0') or 0.0)
+
+try:
+    _YVER128_ORIG_SETUP_MATRIX_POLICY_TEXT = _setup_combo_policy_text
+except Exception:
+    _YVER128_ORIG_SETUP_MATRIX_POLICY_TEXT = None
+try:
+    _YVER128_ORIG_SETUP_AUDIT_POLICY_LABEL = _setup_audit_policy_label
+except Exception:
+    _YVER128_ORIG_SETUP_AUDIT_POLICY_LABEL = None
+try:
+    _YVER128_ORIG_SETUP_MATRIX_STATE_FOR_SETUP = _setup_matrix_policy_source_state_for_setup
+except Exception:
+    _YVER128_ORIG_SETUP_MATRIX_STATE_FOR_SETUP = None
+
+
+def _yver128_force_keep_wr_floor() -> float:
+    try:
+        return float(globals().get('SETUP_COMBO_POLICY_FORCE_KEEP_WR', 49.0) or 49.0)
+    except Exception:
+        return 49.0
+
+
+def _yver128_is_watch_plus(decided: int, wr: float, avg_r: float, policy: str = '', reco: str = '') -> bool:
+    """Near-KEEP visibility rule only.
+
+    WATCH+ must never be treated as KEEP by AutoTrade. It is a labelled WATCH row:
+    WR >45%, WR <= current KEEP floor, AvgR positive, and at least one decided result.
+    """
+    try:
+        pol = str(policy or '').upper().strip()
+        rec = str(reco or '').upper().strip()
+        if pol in {'KEEP', 'DISABLE', 'OFF', 'TIGHTEN'} or rec == 'KEEP':
+            return False
+        d = int(float(decided or 0))
+        w = float(wr or 0.0)
+        a = float(avg_r or 0.0)
+        keep_floor = _yver128_force_keep_wr_floor()
+        return d > 0 and w > float(WATCH_PLUS_MIN_WR) and w <= keep_floor and a > float(WATCH_PLUS_MIN_AVGR)
+    except Exception:
+        return False
+
+
+def _yver128_state_is_watch_plus(state: dict) -> bool:
+    try:
+        st = dict(state or {})
+        return _yver128_is_watch_plus(
+            int(float(st.get('decided') or 0)),
+            float(st.get('wr') or 0.0),
+            float(st.get('avg_r') or 0.0),
+            str(st.get('policy') or ''),
+            str(st.get('reco') or ''),
+        )
+    except Exception:
+        return False
+
+
+def _yver128_mark_state_watch_plus(state: dict) -> dict:
+    st = dict(state or {})
+    try:
+        if _yver128_state_is_watch_plus(st):
+            # Keep the enforceable policy as WATCH, but provide an explicit display label.
+            st['watch_plus'] = True
+            st['display_policy'] = WATCH_PLUS_POLICY_LABEL
+            st['display_execnow'] = 'GATE+'
+            st['display_reco'] = WATCH_PLUS_POLICY_LABEL
+            st['near_keep_rule'] = f'WR>{WATCH_PLUS_MIN_WR:.1f}% and AvgR>{WATCH_PLUS_MIN_AVGR:+.2f}; live AutoTrade still requires KEEP'
+    except Exception:
+        pass
+    return st
+
+
+def _setup_matrix_policy_source_state_for_setup(setup_or_row, session_name: str = '', user_id: int = 0) -> dict:
+    try:
+        if callable(_YVER128_ORIG_SETUP_MATRIX_STATE_FOR_SETUP):
+            return _yver128_mark_state_watch_plus(_YVER128_ORIG_SETUP_MATRIX_STATE_FOR_SETUP(setup_or_row, session_name=session_name, user_id=user_id) or {})
+    except Exception:
+        pass
+    return {'execnow': 'OFF', 'policy': 'DISABLE', 'reco': 'DISABLE', 'combo': '', 'source': 'setup_matrix_policy'}
+
+
+def _setup_audit_policy_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
+    """Display WATCH+ for near-KEEP lanes, while preserving live gate as WATCH."""
+    try:
+        base = 'WATCH'
+        if callable(_YVER128_ORIG_SETUP_AUDIT_POLICY_LABEL):
+            base = str(_YVER128_ORIG_SETUP_AUDIT_POLICY_LABEL(row, uid=uid, session_name=session_name, side=side) or 'WATCH').upper().strip()
+        if base == 'WATCH':
+            rr = dict(row or {})
+            sess = str(session_name or rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
+            side_u = str(side or rr.get('side') or '').upper().strip()
+            if side_u in {'BUY', 'SELL'}:
+                rr['side'] = side_u
+            policy_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+            state = _setup_matrix_policy_source_state_for_setup(rr, session_name=sess, user_id=policy_uid) or {}
+            if bool(state.get('watch_plus')):
+                return WATCH_PLUS_POLICY_LABEL
+        return base if base in {'KEEP', 'WATCH', WATCH_PLUS_POLICY_LABEL, 'TIGHTEN', 'DISABLE', 'OFF'} else 'WATCH'
+    except Exception:
+        return 'DISABLE'
+
+
+def _yver128_watch_plus_table_text(table_txt: str) -> str:
+    """Post-process /setup_matrix policy plain table so near-KEEP rows show WATCH+.
+
+    The underlying live policy remains WATCH; this is a display label only.
+    """
+    try:
+        lines = str(table_txt or '').splitlines()
+        if not lines:
+            return str(table_txt or '')
+        parsed = []
+        header_seen = False
+        changed = False
+        for line in lines:
+            raw = str(line or '')
+            parts = raw.split()
+            if len(parts) >= 7 and parts[0].upper().startswith('F') and '-' in parts[0]:
+                combo, execnow, policy, set_v, wr_s, avg_s, reco = parts[:7]
+                try:
+                    wr = float(str(wr_s).replace('%','').replace('-', '0') or 0.0)
+                    avg = float(str(avg_s).replace('+','') or 0.0)
+                    decided = int(float(str(set_v).replace('-', '0') or 0))
+                except Exception:
+                    parsed.append(parts[:7]); continue
+                if _yver128_is_watch_plus(decided, wr, avg, policy, reco):
+                    policy = WATCH_PLUS_POLICY_LABEL
+                    if str(execnow).upper().strip() == 'GATE':
+                        execnow = 'GATE+'
+                    if str(reco).upper().strip() == 'WATCH':
+                        reco = WATCH_PLUS_POLICY_LABEL
+                    changed = True
+                parsed.append([combo, execnow, policy, set_v, wr_s, avg_s, reco])
+            else:
+                # Header or non-row lines.
+                if parts and parts[0] == 'Combo':
+                    header_seen = True
+                parsed.append(raw)
+        if not changed:
+            return str(table_txt or '')
+        # Rebuild only contiguous table-like rows; leave header/non-row text alone.
+        rows = [p for p in parsed if isinstance(p, list)]
+        if not rows:
+            return str(table_txt or '')
+        try:
+            # Sort same as policy table: KEEP first, then WATCH+, then WATCH, then weaker.
+            rank = {'KEEP': 0, WATCH_PLUS_POLICY_LABEL: 1, 'WATCH': 2, 'TIGHTEN': 3, 'DISABLE': 4, 'OFF': 5, '-': 6}
+            def key(r):
+                try: wrn = float(str(r[4]).replace('%','').replace('-', '0') or 0.0)
+                except Exception: wrn = 0.0
+                try: sn = int(float(str(r[3]).replace('-', '0') or 0))
+                except Exception: sn = 0
+                return (rank.get(str(r[2]).upper().strip(), 9), -wrn, -sn, str(r[0]))
+            rows = sorted(rows, key=key)
+            return tabulate(rows, headers=['Combo','ExecNow','Policy','Set','WR','AvgR','Reco'], tablefmt='plain')
+        except Exception:
+            # Conservative fallback: fixed-width lines from parsed rows only.
+            return '\n'.join(' '.join(p) for p in rows)
+    except Exception:
+        return str(table_txt or '')
+
+
+def _setup_combo_policy_text(owner_uid: int) -> str:
+    try:
+        txt = _YVER128_ORIG_SETUP_MATRIX_POLICY_TEXT(owner_uid) if callable(_YVER128_ORIG_SETUP_MATRIX_POLICY_TEXT) else ''
+        s = str(txt or '')
+        # Only modify the <pre> policy table, leaving metadata intact.
+        m = re.search(r'<pre>([\s\S]*?)</pre>', s, flags=re.I)
+        if not m:
+            return s
+        table_escaped = m.group(1)
+        try:
+            table_plain = html.unescape(table_escaped)
+        except Exception:
+            table_plain = table_escaped
+        table_new = _yver128_watch_plus_table_text(table_plain)
+        note = (
+            "\nWATCH+ = WR > 45% and positive AvgR, but not KEEP. "
+            "It is visibility only; setup email/AutoTrade still require KEEP."
+        )
+        try:
+            repl = '<pre>' + html.escape(table_new) + '</pre>' + html.escape(note)
+        except Exception:
+            repl = '<pre>' + table_new + '</pre>' + note
+        return s[:m.start()] + repl + s[m.end():]
+    except Exception as exc:
+        try:
+            if callable(_YVER128_ORIG_SETUP_MATRIX_POLICY_TEXT):
+                return _YVER128_ORIG_SETUP_MATRIX_POLICY_TEXT(owner_uid)
+        except Exception:
+            pass
+        return f"❌ setup_combo_policy failed: {type(exc).__name__}: {html.escape(str(exc))}"
+
+# Make cache keys version-aware so WATCH+ labels appear after deploy.
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v128'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v128'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver128_version', YVER128_VERSION)
+    _autotrade_config_set('yver128_watch_plus_rule', f'WR>{WATCH_PLUS_MIN_WR:.1f}, AvgR>{WATCH_PLUS_MIN_AVGR:+.2f}, visibility_only')
+except Exception:
+    pass
+# =========================================================
+# end yver128
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
