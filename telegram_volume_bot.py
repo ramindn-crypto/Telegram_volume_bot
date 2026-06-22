@@ -81006,6 +81006,303 @@ except Exception:
 # end yver131
 # =========================================================
 
+
+# =========================================================
+# yver132 — F8/F9 generated setup -> audit visibility finalization
+# =========================================================
+# Reason:
+# - v131 correctly made F8 BigMove detection generate durable generated_setups rows.
+# - Live validation then showed a confirmed BigMove email at 18:00 and generated rows
+#   latest=18:00, but setup_audit latest was still 16:35 because the normal audit
+#   loader is executable-first and can ignore generated-only F8/F9 learning rows.
+# Fix:
+# - F8/F9 generated rows are now included in /setup_audit even when the default
+#   source mode is EXECUTABLE.
+# - F8/F9 generated rows are upserted into setup_audit_results as soon as they are
+#   created/repaired, so /engine_health cannot show generated rows without matching
+#   audit visibility.
+# - Setup emails and AutoTrade are NOT loosened: they still require the existing
+#   policy/executable/blackout/entry-window gates. This only fixes generation/audit
+#   visibility and evidence sync.
+
+YVER132_VERSION = 'yver132_2026_06_22_f8_f9_generated_to_audit_visibility_sync'
+
+try:
+    _YVER132_ORIG_SETUP_AUDIT_LOAD_ROWS = _setup_audit_load_rows
+except Exception:
+    _YVER132_ORIG_SETUP_AUDIT_LOAD_ROWS = None
+try:
+    _YVER132_ORIG_FORCE_F8_EVENT = _yver131_force_f8_event
+except Exception:
+    _YVER132_ORIG_FORCE_F8_EVENT = None
+try:
+    _YVER132_ORIG_ENGINE_HEALTH_TEXT = _yver131_engine_health_text
+except Exception:
+    _YVER132_ORIG_ENGINE_HEALTH_TEXT = None
+
+
+def _yver132_row_text(row: dict) -> str:
+    try:
+        parts = []
+        for k, v in dict(row or {}).items():
+            if v is not None:
+                parts.append(str(v))
+        return ' '.join(parts).upper()
+    except Exception:
+        return ''
+
+
+def _yver132_engine_for_row(row: dict) -> str:
+    try:
+        if callable(globals().get('_yver131_engine_match')):
+            if _yver131_engine_match(dict(row or {}), 'F8', {}):
+                return 'F8'
+            if _yver131_engine_match(dict(row or {}), 'F9', {}):
+                return 'F9'
+    except Exception:
+        pass
+    txt = _yver132_row_text(row)
+    if 'F8' in txt or 'BIGMOVE' in txt or 'BIG_MOVE' in txt:
+        return 'F8'
+    if 'F9' in txt or 'MULTIDAY' in txt or 'MULTI_DAY' in txt or 'MULTI-DAY' in txt:
+        return 'F9'
+    return ''
+
+
+def _yver132_prepare_engine_row_for_audit(row: dict, engine: str = '') -> dict:
+    rr = {}
+    try:
+        rr = dict(row or {})
+        eng = str(engine or _yver132_engine_for_row(rr) or '').upper().strip()
+        if callable(globals().get('_setup_audit_payload_from_row')):
+            rr = _setup_audit_payload_from_row(rr)
+        if eng == 'F8':
+            rr.setdefault('engine', 'F8')
+            if not str(rr.get('engine') or '').strip():
+                rr['engine'] = 'F8'
+            if not str(rr.get('family_id') or '').strip():
+                rr['family_id'] = str(globals().get('BIGMOVE_FAMILY_ID', 'F8') or 'F8')
+            if not str(rr.get('source') or '').strip():
+                rr['source'] = 'BIGMOVE_GENERATED'
+        elif eng == 'F9':
+            rr.setdefault('engine', 'F9')
+            if not str(rr.get('engine') or '').strip():
+                rr['engine'] = 'F9'
+            if not str(rr.get('family_id') or '').strip():
+                rr['family_id'] = str(globals().get('MULTIDAY_MOVER_FAMILY_ID', 'F9') or 'F9')
+            if not str(rr.get('source') or '').strip():
+                rr['source'] = 'MULTIDAY_GENERATED'
+        if not str(rr.get('setup_id') or '').strip() and callable(globals().get('_setup_audit_unique_key')):
+            rr['setup_id'] = _setup_audit_unique_key(rr)
+    except Exception:
+        rr = dict(row or {})
+    return rr
+
+
+def _yver132_audit_existing_ids(uid: int, hours: int) -> set[str]:
+    out: set[str] = set()
+    try:
+        since = float(time.time()) - float(max(1, int(hours or 24)) * 3600)
+        if callable(globals().get('_setup_audit_migrate')):
+            _setup_audit_migrate()
+        with sqlite3.connect(DB_PATH) as conn:
+            for r in conn.execute('SELECT setup_id FROM setup_audit_results WHERE user_id=? AND created_ts>=?', (int(uid or 0), float(since))).fetchall() or []:
+                sid = str(r[0] or '').strip()
+                if sid:
+                    out.add(sid)
+    except Exception:
+        pass
+    return out
+
+
+def _yver132_repair_generated_to_audit(uid: int, engine: str = 'F8', hours: int = 24, max_rows: int = 80) -> int:
+    """Make generated F8/F9 rows visible in setup_audit_results.
+
+    This does not make the setup executable and does not send setup email. It only
+    records/evaluates the setup price-path evidence so health/audit cannot diverge.
+    """
+    made = 0
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    try:
+        uid_i = int(uid or 0) or int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    if uid_i <= 0:
+        return 0
+    try:
+        h = max(1, min(168, int(hours or 24)))
+    except Exception:
+        h = 24
+    try:
+        rows_pack = _yver131_fetch_engine_rows(uid_i, eng, h) if callable(globals().get('_yver131_fetch_engine_rows')) else {}
+        candidates = list((rows_pack or {}).get('generated_setups') or []) + list((rows_pack or {}).get('executable_setups') or [])
+    except Exception:
+        candidates = []
+    if not candidates:
+        return 0
+    try:
+        existing = _yver132_audit_existing_ids(uid_i, h)
+    except Exception:
+        existing = set()
+    seen: set[str] = set()
+    horizon = 0
+    try:
+        horizon = int(_setup_audit_result_horizon_hours()) if callable(globals().get('_setup_audit_result_horizon_hours')) else 0
+    except Exception:
+        horizon = 0
+    try:
+        candidates = sorted(candidates, key=lambda r: float((r or {}).get('created_ts') or (r or {}).get('executable_ts') or (r or {}).get('ts') or 0.0), reverse=True)
+    except Exception:
+        pass
+    for raw in list(candidates or [])[:max(1, int(max_rows or 80))]:
+        try:
+            rr = _yver132_prepare_engine_row_for_audit(dict(raw or {}), eng)
+            sid = str(rr.get('setup_id') or '').strip()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            if sid in existing:
+                continue
+            try:
+                vol = float(rr.get('fut_vol_usd') or 0.0)
+                if callable(globals().get('_setup_volume_ok')) and not _setup_volume_ok(vol):
+                    continue
+            except Exception:
+                pass
+            ev = {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'yver132_generated_engine_audit_seed'}
+            try:
+                if callable(globals().get('_setup_audit_resolve_result')):
+                    # No heavy/network requirement here.  With no grouped candles supplied,
+                    # resolver still upserts OPEN/current-price evidence and later
+                    # /setup_audit can refresh exact TP/SL using its normal preload.
+                    ev = _setup_audit_resolve_result(rr, horizon_hours=horizon, user_id=uid_i, candles_by_symbol={}, audit_timeframe='5m', actual_pnl_usdt=0.0)
+                elif callable(globals().get('_setup_audit_upsert_result')):
+                    _setup_audit_upsert_result(uid_i, rr, ev, horizon, actual_pnl_usdt=0.0)
+            except Exception:
+                try:
+                    if callable(globals().get('_setup_audit_upsert_result')):
+                        _setup_audit_upsert_result(uid_i, rr, ev, horizon, actual_pnl_usdt=0.0)
+                except Exception:
+                    pass
+            made += 1
+        except Exception:
+            continue
+    if made:
+        try:
+            db_log_setup_pipeline_event(uid_i, stage='yver132_generated_to_audit_sync', status='ok', session='', mode=f'engine_{eng.lower()}', details={'engine': eng, 'made': int(made), 'hours': int(h)})
+        except Exception:
+            pass
+    return int(made or 0)
+
+
+# Wrap F8 independent generation so a confirmed BigMove creates audit visibility too.
+def _yver131_force_f8_event(uid: int, symbol: str, direction: str, event_ts: float | None = None, source: str = 'yver132') -> int:
+    made = 0
+    try:
+        if callable(_YVER132_ORIG_FORCE_F8_EVENT):
+            made = int(_YVER132_ORIG_FORCE_F8_EVENT(uid, symbol, direction, event_ts=event_ts, source=source) or 0)
+    except Exception:
+        made = 0
+    try:
+        _yver132_repair_generated_to_audit(int(uid or 0), 'F8', hours=6, max_rows=40)
+    except Exception:
+        pass
+    return int(made or 0)
+
+
+# Make /setup_audit include generated-only F8/F9 learning rows, while keeping the
+# normal executable-first audit behaviour for all other families.
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None) -> list[dict]:
+    if not callable(_YVER132_ORIG_SETUP_AUDIT_LOAD_ROWS):
+        return []
+    base = []
+    try:
+        base = list(_YVER132_ORIG_SETUP_AUDIT_LOAD_ROWS(uid, hours=hours, limit=limit, dedup=dedup, start_ts=start_ts, apply_final_quality_gate=apply_final_quality_gate, source_mode_override=source_mode_override) or [])
+    except Exception:
+        base = []
+    # If the caller explicitly requested generated/all rows, do not double-append.
+    try:
+        if source_mode_override is not None and str(source_mode_override or '').strip().upper() in {'GEN', 'GENERATED', 'RAW', 'RAW_GENERATED', 'ALL'}:
+            return base
+    except Exception:
+        pass
+    try:
+        extra = list(_YVER132_ORIG_SETUP_AUDIT_LOAD_ROWS(uid, hours=hours, limit=0, dedup=False, start_ts=start_ts, apply_final_quality_gate=False, source_mode_override='ALL') or [])
+        extra = [_yver132_prepare_engine_row_for_audit(r, _yver132_engine_for_row(r)) for r in extra if _yver132_engine_for_row(r) in {'F8', 'F9'}]
+        seen_sid = {str((r or {}).get('setup_id') or '').strip() for r in base if str((r or {}).get('setup_id') or '').strip()}
+        combined = list(base)
+        for r in extra:
+            sid = str((r or {}).get('setup_id') or '').strip()
+            if sid and sid in seen_sid:
+                continue
+            if sid:
+                seen_sid.add(sid)
+            combined.append(r)
+        try:
+            combined = sorted(combined, key=lambda x: _setup_audit_row_ts(x) if callable(globals().get('_setup_audit_row_ts')) else float((x or {}).get('created_ts') or (x or {}).get('ts') or 0.0), reverse=True)
+        except Exception:
+            pass
+        if dedup and callable(globals().get('_setup_audit_unique_key')):
+            by_key = {}
+            # Preserve the same practical de-dup logic: earliest row per practical setup.
+            for r in sorted(combined, key=lambda x: _setup_audit_row_ts(x) if callable(globals().get('_setup_audit_row_ts')) else float((x or {}).get('created_ts') or (x or {}).get('ts') or 0.0)):
+                try:
+                    k = _setup_audit_unique_key(r)
+                    if k not in by_key:
+                        by_key[k] = r
+                except Exception:
+                    sid = str((r or {}).get('setup_id') or id(r))
+                    by_key.setdefault(sid, r)
+            combined = sorted(list(by_key.values()), key=lambda x: _setup_audit_row_ts(x) if callable(globals().get('_setup_audit_row_ts')) else float((x or {}).get('created_ts') or (x or {}).get('ts') or 0.0), reverse=True)
+        if int(limit or 0) > 0:
+            combined = combined[:int(limit)]
+        return combined
+    except Exception:
+        return base
+
+
+# Health now repairs generated->audit before rendering, so latest generated F8/F9
+# rows cannot remain invisible in audit counts.
+def _yver132_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    try:
+        # v131 raw BigMove backfill first, then v132 audit repair.
+        if eng == 'F8' and callable(globals().get('_yver131_backfill_f8_from_raw')):
+            _yver131_backfill_f8_from_raw(int(uid or 0), int(hours or 24))
+    except Exception:
+        pass
+    try:
+        _yver132_repair_generated_to_audit(int(uid or 0), eng, hours=int(hours or 24), max_rows=100)
+    except Exception:
+        pass
+    if callable(_YVER132_ORIG_ENGINE_HEALTH_TEXT):
+        return _YVER132_ORIG_ENGINE_HEALTH_TEXT(uid, eng, hours)
+    if callable(globals().get('_yver131_engine_health_text')):
+        return _yver131_engine_health_text(uid, eng, hours)
+    return f'Engine Health {eng}: unavailable'
+
+
+_yver131_engine_health_text = _yver132_engine_health_text
+_yver130_engine_health_text = _yver132_engine_health_text
+_yver90_engine_health_text = _yver132_engine_health_text
+
+try:
+    _autotrade_config_set('yver132_version', YVER132_VERSION)
+    _autotrade_config_set('yver132_f8_f9_generated_audit_sync', 'ON')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v132'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v132'
+except Exception:
+    pass
+# =========================================================
+# end yver132
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
