@@ -79827,6 +79827,554 @@ except Exception:
 # end yver121
 # =========================================================
 
+
+# =========================================================
+# yver122: stable v121 command-only diagnostics fix
+# =========================================================
+# Scope: fix misleading/noisy /engine_health F8/F9 and align
+# /setup_audit_keep Overall with /setup_open_times baseline (01 Jun 2026).
+# No setup generation, email loop, AutoTrade, TP/SL, leverage, risk sizing, or
+# startup behaviour is changed.
+
+YVER122_VERSION = 'yver122_v121_engine_health_setup_audit_keep_baseline'
+
+
+def _yver122_melb_txt(ts: float | None, short: bool = False) -> str:
+    try:
+        ts_f = float(ts or 0.0)
+        if ts_f <= 0:
+            return '-'
+        fmt = '%m-%d %H:%M' if bool(short) else '%Y-%m-%d %H:%M'
+        return datetime.fromtimestamp(ts_f, tz=timezone.utc).astimezone(MEL_TZ).strftime(fmt)
+    except Exception:
+        return '-'
+
+
+def _yver122_policy_baseline_ts() -> float:
+    try:
+        v = float(_overall_report_start_ts() or 0.0)
+        if v > 0:
+            return v
+    except Exception:
+        pass
+    try:
+        return datetime(2026, 6, 1, 0, 0, tzinfo=MEL_TZ).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _yver122_table_exists(conn, table: str) -> bool:
+    try:
+        return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (str(table),)).fetchone())
+    except Exception:
+        return False
+
+
+def _yver122_cols(conn, table: str) -> list[str]:
+    try:
+        return [str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall() or []]
+    except Exception:
+        return []
+
+
+def _yver122_ts_col(cols: list[str]) -> str:
+    for c in ('created_ts', 'event_ts', 'executable_ts', 'emailed_ts', 'opened_ts', 'ts', 'updated_ts', 'signal_created_ts'):
+        if c in cols:
+            return c
+    return ''
+
+
+def _yver122_row_ts(row: dict) -> float:
+    for c in ('created_ts', 'event_ts', 'executable_ts', 'emailed_ts', 'opened_ts', 'ts', 'updated_ts', 'signal_created_ts'):
+        try:
+            v = float((row or {}).get(c) or 0.0)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+    return 0.0
+
+
+def _yver122_fetch(conn, table: str, start_ts: float = 0.0, uid: int = 0, limit: int = 12000) -> list[dict]:
+    try:
+        if not _yver122_table_exists(conn, table):
+            return []
+        cols = _yver122_cols(conn, table)
+        if not cols:
+            return []
+        where, params = [], []
+        if int(uid or 0) > 0:
+            if 'user_id' in cols:
+                where.append('user_id IN (?,0)')
+                params.extend([int(uid), 0])
+            elif 'uid' in cols:
+                where.append('uid IN (?,0)')
+                params.extend([int(uid), 0])
+        tcol = _yver122_ts_col(cols)
+        if tcol and float(start_ts or 0.0) > 0:
+            where.append(f'{tcol} >= ?')
+            params.append(float(start_ts))
+        sql = f"SELECT * FROM {table}"
+        if where:
+            sql += ' WHERE ' + ' AND '.join(where)
+        if tcol:
+            sql += f' ORDER BY {tcol} DESC'
+        sql += f' LIMIT {int(limit or 12000)}'
+        conn.row_factory = sqlite3.Row
+        return [dict(r) for r in conn.execute(sql, tuple(params)).fetchall() or []]
+    except Exception:
+        return []
+
+
+def _yver122_engine_match(row: dict, engine: str) -> bool:
+    try:
+        eng = str(engine or '').upper().strip()
+        txt = ' '.join(str((row or {}).get(k) or '') for k in (
+            'setup_id', 'combo', 'family', 'engine', 'family_id', 'source', 'source_kind',
+            'strategy_reason', 'entry_reason', 'note', 'details_json', 'reason'
+        )).upper()
+        if eng == 'F8':
+            return bool(re.search(r'(^|[^A-Z0-9])F8([^A-Z0-9]|$)', txt) or 'BIGMOVE' in txt or 'BIG_MOVE' in txt)
+        if eng == 'F9':
+            return bool(re.search(r'(^|[^A-Z0-9])F9([^A-Z0-9]|$)', txt) or 'MULTIDAY' in txt or 'MULTI_DAY' in txt or 'MULTI-DAY' in txt)
+    except Exception:
+        pass
+    return False
+
+
+def _yver122_symbol(row: dict) -> str:
+    try:
+        return str((row or {}).get('symbol') or (row or {}).get('sym') or '').upper().replace('USDT', '').strip()
+    except Exception:
+        return ''
+
+
+def _yver122_side(row: dict) -> str:
+    try:
+        s = str((row or {}).get('side') or (row or {}).get('raw_side') or (row or {}).get('direction') or '').upper().strip()
+        if s in {'UP', 'LONG'}:
+            return 'BUY'
+        if s in {'DOWN', 'SHORT'}:
+            return 'SELL'
+        return s
+    except Exception:
+        return ''
+
+
+def _yver122_dedupe_key(row: dict, engine: str) -> str:
+    try:
+        eng = str(engine or '').upper().strip()
+        sid = str((row or {}).get('setup_id') or '').upper().strip()
+        sym = _yver122_symbol(row)
+        side = _yver122_side(row)
+        ts = _yver122_row_ts(row)
+        bucket = int(ts // 900 * 900) if ts > 0 else 0
+        if eng == 'F8':
+            # Old F8 mirrors created duplicate IDs such as F8-<ts>-TNSR-SELL and
+            # F8-<ts>-TNSR-SELL-RV.  Health must count the BigMove event once.
+            m = re.match(r'^F8[-:]([0-9]{8,}|[0-9T:\-]+)[-:]+([A-Z0-9]+)[-:]+(BUY|SELL|UP|DOWN)', sid)
+            if m:
+                raw_side = {'UP': 'BUY', 'DOWN': 'SELL'}.get(m.group(3), m.group(3))
+                return f'F8:{m.group(1)}:{m.group(2).replace("USDT", "")}:{raw_side}'
+            if sid.startswith('F8:'):
+                parts = [p for p in sid.split(':') if p]
+                if len(parts) >= 4:
+                    raw_side = {'UP': 'BUY', 'DOWN': 'SELL'}.get(parts[3], parts[3])
+                    return f'F8:{parts[1]}:{parts[2].replace("USDT", "")}:{raw_side}'
+            return f'F8:{bucket}:{sym}:{side}'
+        if eng == 'F9':
+            try:
+                day = datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d') if ts > 0 else '0'
+            except Exception:
+                day = '0'
+            if sid.startswith('F9'):
+                return sid
+            return f'F9:{day}:{sym}:{side}'
+        return sid or f'{eng}:{bucket}:{sym}:{side}'
+    except Exception:
+        return str((row or {}).get('setup_id') or id(row))
+
+
+def _yver122_filter_engine_rows(rows: list[dict], engine: str, start_ts: float = 0.0) -> list[dict]:
+    out = []
+    seen = set()
+    for r in rows or []:
+        try:
+            ts = _yver122_row_ts(r)
+            if float(start_ts or 0.0) > 0 and ts > 0 and ts < float(start_ts):
+                continue
+            if not _yver122_engine_match(r, engine):
+                continue
+            k = _yver122_dedupe_key(r, engine)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(r)
+        except Exception:
+            continue
+    return out
+
+
+def _yver122_result_counts(rows: list[dict]) -> str:
+    d = {}
+    for r in rows or []:
+        val = ''
+        for k in ('result', 'res', 'outcome', 'status'):
+            if str((r or {}).get(k) or '').strip():
+                val = str((r or {}).get(k) or '').upper().strip()
+                break
+        if not val or val in {'-', 'NONE'}:
+            val = 'OPEN'
+        if 'TP' in val:
+            val = 'TP'
+        elif 'SL' in val or 'LOSS' in val:
+            val = 'SL'
+        elif 'OPEN' in val:
+            val = 'OPEN'
+        d[val] = d.get(val, 0) + 1
+    if not d:
+        return '-'
+    return ', '.join(f'{k}:{v}' for k, v in sorted(d.items()))
+
+
+def _yver122_latest(rows: list[dict]) -> str:
+    try:
+        if not rows:
+            return '-'
+        r = max(rows, key=lambda x: _yver122_row_ts(x))
+        ts = _yver122_row_ts(r)
+        combo = str(r.get('combo') or r.get('setup_id') or '-').upper().strip()[:22]
+        sym = _yver122_symbol(r) or '-'
+        side = _yver122_side(r) or '-'
+        return f"{_yver122_melb_txt(ts, short=True)} {combo} {sym} {side}"
+    except Exception:
+        return '-'
+
+
+def _yver122_policy_count(conn, engine: str, uid: int = 0) -> int:
+    try:
+        if not _yver122_table_exists(conn, 'setup_combo_policy'):
+            return 0
+        cols = _yver122_cols(conn, 'setup_combo_policy')
+        combo_col = 'combo' if 'combo' in cols else ('key' if 'key' in cols else '')
+        if not combo_col:
+            return 0
+        params = [f'{engine.upper()}-%']
+        where = [f'UPPER({combo_col}) LIKE ?']
+        if int(uid or 0) > 0 and 'user_id' in cols:
+            where.append('user_id IN (?,0)')
+            params.extend([int(uid), 0])
+        return int(conn.execute('SELECT COUNT(*) FROM setup_combo_policy WHERE ' + ' AND '.join(where), tuple(params)).fetchone()[0] or 0)
+    except Exception:
+        return 0
+
+
+def _yver122_engine_health_text(uid: int, engine: str) -> str:
+    eng = str(engine or 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        return 'Usage: /engine_health F8 or /engine_health F9'
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    now_ts = float(time.time())
+    baseline_ts = _yver122_policy_baseline_ts()
+    windows = [
+        ('Last 24h', now_ts - 24.0 * 3600.0),
+        ('Last 7d', now_ts - 7.0 * 86400.0),
+        ('Overall', baseline_ts),
+    ]
+    try:
+        with sqlite3.connect(DB_PATH, timeout=3) as conn:
+            all_gen = _yver122_fetch(conn, 'generated_setups', baseline_ts, uid_i)
+            all_audit = _yver122_fetch(conn, 'setup_audit_results', baseline_ts, uid_i)
+            all_exec = _yver122_fetch(conn, 'executable_setups', baseline_ts, uid_i)
+            all_auto = _yver122_fetch(conn, 'autotrade_trades', baseline_ts, uid_i)
+            # Delivery/email tables vary by build. Count whichever exists; all are read-only.
+            email_tables = ['emailed_setup_identities', 'emailed_setups', 'setup_email_log', 'setup_delivery_log']
+            all_emails = []
+            for t in email_tables:
+                all_emails.extend(_yver122_fetch(conn, t, baseline_ts, uid_i, limit=6000))
+            policy_n = _yver122_policy_count(conn, eng, uid_i)
+            # Raw F8 source is useful but not required for F9. It is deliberately
+            # shown separately from setup/audit so BigMove alert email cannot pollute setup counts.
+            raw_f8 = []
+            if eng == 'F8':
+                for t in ('emailed_bigmoves', 'bigmove_events', 'bigmove_confirmations'):
+                    raw_f8.extend(_yver122_fetch(conn, t, baseline_ts, uid_i, limit=6000))
+    except Exception as e:
+        return f"🧪 Engine Health — {eng}\n━━━━━━━━━━━━━━━━━━━━\nStatus: ERROR | {type(e).__name__}: {html.escape(str(e))}"
+
+    table_rows = []
+    overall_health_rows = []
+    for label, st in windows:
+        gen = _yver122_filter_engine_rows(all_gen, eng, st)
+        aud = _yver122_filter_engine_rows(all_audit, eng, st)
+        exe = _yver122_filter_engine_rows(all_exec, eng, st)
+        eml = _yver122_filter_engine_rows(all_emails, eng, st)
+        aut = _yver122_filter_engine_rows(all_auto, eng, st)
+        raw = _yver122_filter_engine_rows(raw_f8, eng, st) if eng == 'F8' else []
+        if label == 'Overall':
+            overall_health_rows = gen + aud + exe + eml + aut
+        table_rows.append([
+            label,
+            len(raw) if eng == 'F8' else '-',
+            len(gen),
+            len(aud),
+            len(exe),
+            len(eml),
+            len(aut),
+            _yver122_result_counts(aud),
+            _yver122_latest(aud or gen or exe),
+        ])
+
+    try:
+        if not overall_health_rows:
+            status = 'IDLE'
+        else:
+            last_24 = table_rows[0]
+            if int(last_24[2] or 0) == 0 and int(last_24[3] or 0) == 0 and int(last_24[4] or 0) == 0:
+                status = 'IDLE_24H'
+            else:
+                status = 'OK'
+            if eng == 'F8':
+                # CHECK only if audit has more canonical rows than generated in 24h/7d;
+                # this catches pollution without using noisy pipeline_events counts.
+                if int(table_rows[0][3] or 0) > int(table_rows[0][2] or 0) + 2 or int(table_rows[1][3] or 0) > int(table_rows[1][2] or 0) + 2:
+                    status = 'CHECK_AUDIT_GT_GENERATED'
+    except Exception:
+        status = 'OK'
+
+    headers = ['Window', 'RawEvt', 'Gen', 'Audit', 'Exec', 'Email', 'AT', 'Results', 'Latest']
+    try:
+        table = tabulate(table_rows, headers=headers, tablefmt='plain')
+    except Exception:
+        table = str(table_rows)
+    title = 'F8 BigMove' if eng == 'F8' else 'F9 Multi-Day Leaders/Losers'
+    lines = [
+        f"🧪 <b>Engine Health — {html.escape(title)}</b>",
+        HDR,
+        f"Status: <b>{html.escape(status)}</b> | Baseline: <b>{html.escape(_yver122_melb_txt(baseline_ts))} Melbourne</b>",
+        "Read-only: no backfill, no repair, no setup creation, no OHLCV scan.",
+        f"Policy rows: <b>{int(policy_n)}</b>",
+    ]
+    if eng == 'F8':
+        lines.append('RawEvt = confirmed/emailed BigMove source rows only; setup rows are counted separately.')
+    else:
+        lines.append('IDLE is valid when no strict 2-day Leader/Loser source created current F9 setups.')
+    lines.extend([HDR, '<pre>' + html.escape(table) + '</pre>'])
+    return '\n'.join(lines)
+
+
+async def engine_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uid = int(update.effective_user.id)
+    except Exception:
+        uid = 0
+    try:
+        if not is_admin_user(uid):
+            await update.message.reply_text('⛔ Admin only.')
+            return
+    except Exception:
+        pass
+    try:
+        args = [str(a).strip().upper() for a in (context.args or []) if str(a).strip()]
+        eng = args[0] if args else 'F8'
+        if eng not in {'F8', 'F9'}:
+            await update.message.reply_text('Usage: /engine_health F8 or /engine_health F9')
+            return
+        await send_long_message(update, _yver122_engine_health_text(uid, eng), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as e:
+        try:
+            await update.message.reply_text(f'Engine health error: {type(e).__name__}: {e}')
+        except Exception:
+            pass
+
+
+def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
+    """KEEP-only summary using the same source/baseline basis as /setup_open_times."""
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(owner_uid or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+
+    baseline_ts = _yver122_policy_baseline_ts()
+    now_ts = float(time.time())
+    try:
+        cache_bucket = int(now_ts // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))
+        cache_key = f"keep_only_summary:v122::{uid_i}::{int(baseline_ts)}::{cache_bucket}"
+        cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
+        cached = cache.get(cache_key) if isinstance(cache, dict) else None
+        if cached and (now_ts - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
+            return str(cached.get('text') or '')
+    except Exception:
+        cache_key = ''
+
+    try:
+        lane_sets = _setup_matrix_policy_current_lane_sets(uid_i) or {}
+        keep_combos = set(lane_sets.get('keep') or set())
+    except Exception:
+        keep_combos = set()
+
+    try:
+        rows = _setup_audit_load_rows(
+            int(uid_i),
+            hours=None,
+            limit=0,
+            dedup=True,
+            start_ts=float(baseline_ts or 0.0),
+            apply_final_quality_gate=False,
+            source_mode_override='ALL',
+        )
+        source_label = 'EXECUTABLE+GENERATED'
+    except Exception:
+        rows, source_label = [], 'EXECUTABLE+GENERATED'
+
+    result_horizon = _setup_audit_result_horizon_hours()
+    audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
+
+    def _row_combo_u(r: dict) -> str:
+        try:
+            fam = _setup_audit_family_code(r)
+            sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+            strat = _setup_strategy_short_label(r)
+            side_row = _setup_side_suffix(value=str(r.get('side') or ''))
+            return str(_setup_combo_strategy_side_key(fam, sess_row, strat, side_row) or '').upper().strip()
+        except Exception:
+            return ''
+
+    enriched_rows: list[tuple[float, str, str]] = []
+    matched_rows: list[dict] = []
+    for r in list(rows or []):
+        try:
+            combo_u = _row_combo_u(r)
+            if combo_u not in keep_combos:
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if ts <= 0 or ts < float(baseline_ts or 0.0):
+                continue
+            res = _setup_audit_result_label(_setup_audit_keep_watch_fast_result_label(r, result_horizon))
+            enriched_rows.append((ts, combo_u, res))
+            matched_rows.append(r)
+        except Exception:
+            continue
+
+    def _stats_for_window(start_ts: float | None = None) -> dict:
+        keep_hit: set[str] = set()
+        set_n = tp = sl = op = 0
+        for ts, combo_u, res in enriched_rows:
+            try:
+                if start_ts is not None and float(ts or 0.0) < float(start_ts):
+                    continue
+                keep_hit.add(combo_u)
+                set_n += 1
+                if res == 'TP':
+                    tp += 1
+                elif res == 'SL':
+                    sl += 1
+                else:
+                    op += 1
+            except Exception:
+                continue
+        dec = tp + sl
+        wr = (tp / dec * 100.0) if dec > 0 else 0.0
+        return {'keep': len(keep_combos), 'watch': 0, 'used_keep': len(keep_hit), 'used_watch': 0,
+                'set': set_n, 'tp': tp, 'sl': sl, 'open': op, 'wr': wr}
+
+    windows = [
+        ('Last 24h', now_ts - 24 * 3600),
+        ('Last 7d', now_ts - 7 * 86400),
+        ('Last 14d', now_ts - 14 * 86400),
+        ('Overall', baseline_ts),
+    ]
+    table_rows = []
+    for label, st_ts in windows:
+        st = _stats_for_window(st_ts)
+        table_rows.append([label, st['keep'], st['watch'], st['used_keep'], st['used_watch'], st['set'], st['tp'], st['sl'], st['open'], f"{st['wr']:.1f}%"])
+
+    try:
+        win = _setup_audit_window_summary(matched_rows)
+        data_start_txt = str(win.get('start_txt') or _yver122_melb_txt(baseline_ts))
+        data_end_txt = str(win.get('end_txt') or '-')
+    except Exception:
+        data_start_txt = _yver122_melb_txt(baseline_ts)
+        data_end_txt = '-'
+
+    table = tabulate(
+        table_rows,
+        headers=['Window', 'Keep', 'Watch', 'UsedK', 'UsedW', 'Set', 'TP', 'SL', 'Open', 'WR'],
+        tablefmt='plain',
+        colalign=('left', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right', 'right'),
+    )
+    lines = [
+        "📊 <b>Setup KEEP Summary</b>",
+        HDR,
+        "Policy source: <b>/setup_matrix policy KEEP lanes only</b>",
+        f"Current policy combos: <b>{len(keep_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>0</b>)",
+        f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
+        f"Baseline: <b>{html.escape(_yver122_melb_txt(baseline_ts))} Melbourne</b> — same source window as <code>/setup_open_times all</code>",
+        f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE+GENERATED'))}</b> | Evaluation: <b>{_setup_audit_result_horizon_label(result_horizon)}</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        "Keep/Watch columns = <b>current policy lane totals</b>; UsedK/UsedW = policy lanes that actually had setup rows in that window.",
+        "WR basis: <b>TP/(TP+SL)</b>; OPEN means not hit yet and is excluded from WR. Setups have <b>no due date</b>.",
+        "Overall row: <b>from 2026-06-01 policy baseline</b>, matching <code>/setup_open_times all</code>.",
+        HDR,
+        "<pre>" + html.escape(table) + "</pre>",
+    ]
+    if not keep_combos:
+        lines.append("No active KEEP policy lanes found. Run <code>/setup_matrix policy</code> to refresh policy first.")
+    elif not enriched_rows:
+        lines.append("No setup rows matched the current KEEP lanes from the 2026-06-01 baseline.")
+    txt = "\n".join(lines)
+    try:
+        if cache_key:
+            _SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE[cache_key] = {'ts': now_ts, 'text': txt}
+    except Exception:
+        pass
+    return txt
+
+
+async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    hours = 24
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and re.fullmatch(r'\d+(\.\d+)?', args[0]):
+            hours = int(float(args[0]))
+    except Exception:
+        hours = 24
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_audit_keep {int(hours)}",
+        f"admin:bg:v122:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}:{int(_yver122_policy_baseline_ts())}",
+        _setup_audit_keep_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=90,
+        stale_ttl=12 * 3600,
+        background_timeout=120,
+    )
+
+try:
+    HELP_TEXT_ADMIN = str(HELP_TEXT_ADMIN or '').replace('/engine_probe F8\n/engine_probe F9\n', '')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v122'
+    SETUP_AUDIT_CACHE_VERSION = 'v122'
+except Exception:
+    pass
+try:
+    logger.info('yver122 loaded: fixed read-only /engine_health F8/F9 and /setup_audit_keep baseline alignment')
+except Exception:
+    pass
+# =========================================================
+# end yver122
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
