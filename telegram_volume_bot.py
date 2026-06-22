@@ -81163,6 +81163,200 @@ except Exception:
 # end yver124
 # =========================================================
 
+
+
+# =========================================================
+# yver126 auto-blackout active sync + manual BLACKOUT_WINDOWS setter fix
+# =========================================================
+YVER126_VERSION = 'yver126_2026_06_22_auto_blackout_active_sync_7d_exact'
+YVER126_AUTO_BLACKOUT_METHOD_TEXT = '7d-only exact auto-blackout: WR<45%, AvgR<0, decided TP+SL>=5; active windows overwritten daily; weekend safety preserved; setup generation stays SHADOW ON'
+
+# v125 kept the right speed and reporting, but two blackout problems remained:
+# 1) v79 generic config setter persisted BLACKOUT_WINDOWS into a display key instead
+#    of the live entry/setup-delivery blackout keys, so manual BLACKOUT_WINDOWS did
+#    not change the active windows.
+# 2) the auto-blackout recommender could retain old daily windows through smoothing.
+#    The owner now wants the active blackout to be auto-updated directly from the
+#    last-7-day /setup_open_times rule.  This block keeps it lightweight/read-only
+#    except for writing the two runtime blackout config keys.
+
+try:
+    _YVER126_ORIG_YVER79_SET_RUNTIME_KEY_ANY = _yver79_set_runtime_key_any
+except Exception:
+    _YVER126_ORIG_YVER79_SET_RUNTIME_KEY_ANY = None
+
+
+def _yver126_set_blackout_window_keys(key: str, raw: str):
+    """Set active blackout window keys correctly.
+
+    BLACKOUT_WINDOWS means both AutoTrade entry blackout and setup-delivery
+    blackout.  SETUP_GENERATION_BLACKOUT_* is kept as a legacy alias for setup
+    delivery blackout; setup generation itself remains SHADOW ON elsewhere.
+    """
+    k = str(key or '').strip().upper()
+    value = str(raw or '').strip()
+    val = _normalise_melbourne_blackout_windows(value, default='')
+    if not val:
+        raise ValueError('invalid blackout window format. Example: 12:00-13:00,SUN 22:00-MON 10:00')
+    if k == 'BLACKOUT_WINDOWS':
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, val)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, val)
+        return val
+    if k == 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS':
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, val)
+        return val
+    if k in {'SETUP_DELIVERY_BLACKOUT_WINDOWS', 'SETUP_GENERATION_BLACKOUT_WINDOWS'}:
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, val)
+        return val
+    raise KeyError('not a blackout window key')
+
+
+def _yver79_set_runtime_key_any(key: str, raw: str):
+    k = str(key or '').strip().upper()
+    if k in {'BLACKOUT_WINDOWS', 'AUTOTRADE_ENTRY_BLACKOUT_WINDOWS', 'SETUP_DELIVERY_BLACKOUT_WINDOWS', 'SETUP_GENERATION_BLACKOUT_WINDOWS'}:
+        return _yver126_set_blackout_window_keys(k, raw)
+    if _YVER126_ORIG_YVER79_SET_RUNTIME_KEY_ANY is not None:
+        return _YVER126_ORIG_YVER79_SET_RUNTIME_KEY_ANY(key, raw)
+    raise KeyError('original')
+
+
+def _yver126_build_auto_blackout_recommendation(uid: int = 0) -> dict:
+    """Build exact active blackout windows from last-7-day KEEP setup evidence.
+
+    This intentionally matches the rule printed by /setup_open_times 7d:
+    WR<45%, AvgR<0, decided TP+SL>=5.  Old daily windows are not retained here;
+    the next scheduled/manual auto-blackout run overwrites the active runtime
+    windows with the current 7d result plus the fixed weekend safety window.
+    """
+    uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+    stats_7 = _yver65_setup_open_hour_stats(uid_i, '7d')
+    weak7 = _yver65_weak_hours_from_stats(stats_7, min_decided=5, wr_lt=45.0, avg_r_lt=0.0)
+    final_hours = {int(h) % 24 for h in (weak7 or set())}
+    daily_windows = _yver65_compact_daily_hours_to_windows(final_hours)
+    windows_parts = list(daily_windows)
+    try:
+        weekend = str(YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW or '').strip()
+    except Exception:
+        weekend = 'SUN 22:00-MON 10:00'
+    if weekend:
+        windows_parts.append(weekend)
+    windows = _normalise_melbourne_blackout_windows(','.join(windows_parts), default='')
+
+    details = {}
+    try:
+        for h in sorted(final_hours):
+            m7 = _yver65_hour_metric(stats_7, h)
+            details[str(int(h) % 24)] = {
+                'h': int(h) % 24,
+                'wr7': round(float(m7.get('wr', 0.0)), 2),
+                'avg7': round(float(m7.get('avg_r', 0.0)), 3),
+                'dec7': int(m7.get('decided', 0) or 0),
+                'set7': int(m7.get('set', 0) or 0),
+                'open7': int(m7.get('open', 0) or 0),
+                'support': ['7d_exact'],
+            }
+    except Exception:
+        details = {}
+
+    return {
+        'ok': bool(windows),
+        'windows': windows,
+        'daily_hours': sorted(final_hours),
+        'candidate_hours': sorted(final_hours),
+        'weak7': sorted(final_hours),
+        'weak3': [],
+        'weak10': [],
+        'weak24': [],
+        'details': details,
+        'miss': {},
+        'method': YVER126_AUTO_BLACKOUT_METHOD_TEXT,
+        'version': YVER126_VERSION,
+    }
+
+
+# Override the older v65/v66 builder. _yver65_auto_blackout_update_once() calls this
+# global by name, so manual AUTO_BLACKOUT_NOW and the scheduler now use v126 logic.
+def _yver65_build_auto_blackout_recommendation(uid: int = 0) -> dict:
+    return _yver126_build_auto_blackout_recommendation(uid)
+
+
+def _yver65_auto_blackout_status_text() -> str:
+    try:
+        state = _yver65_json_load(_autotrade_config_get(YVER65_AUTO_BLACKOUT_STATE_KEY, '{}'), default={})
+        last_ts = float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, 0) or 0)
+        last_txt = '-'
+        if last_ts > 0:
+            last_txt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        h, m = _yver65_auto_blackout_review_time()
+        return (
+            '🤖 Auto Blackout\n' + HDR + '\n'
+            f"Enabled: {'YES' if _yver65_auto_blackout_enabled() else 'NO'}\n"
+            f"Review time: {h:02d}:{m:02d} Melbourne daily\n"
+            f"Last run: {last_txt}\n"
+            f"Windows: {str(_autotrade_entry_blackout_windows() or '-')}\n"
+            f"Method: {YVER126_AUTO_BLACKOUT_METHOD_TEXT}\n"
+            f"7d candidate hours: {','.join(str(x).zfill(2) for x in (state or {}).get('candidate_hours', [])) or '-'}\n"
+            f"Applied daily hours: {','.join(str(x).zfill(2) for x in (state or {}).get('hours', [])) or '-'}"
+        )
+    except Exception as e:
+        return f'Auto blackout status unavailable: {type(e).__name__}: {e}'
+
+
+def _yver126_auto_blackout_startup_sync_loop():
+    """Delayed background sync so Render startup/Telegram speed is not affected."""
+    try:
+        time.sleep(float(os.environ.get('PULSE_AUTO_BLACKOUT_STARTUP_SYNC_DELAY_SEC', '25') or 25))
+    except Exception:
+        try:
+            time.sleep(25)
+        except Exception:
+            pass
+    try:
+        if _yver65_auto_blackout_enabled():
+            res = _yver65_auto_blackout_update_once(reason='startup_sync_v126', force=True)
+            try:
+                logger.info('yver126 auto blackout startup sync: %s', res)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            logger.warning('yver126 auto blackout startup sync failed: %s: %s', type(e).__name__, e)
+        except Exception:
+            pass
+
+
+_YVER126_STARTUP_SYNC_STARTED = False
+try:
+    _YVER126_ORIG_MAIN = main
+except Exception:
+    _YVER126_ORIG_MAIN = None
+
+
+def main():
+    global _YVER126_STARTUP_SYNC_STARTED
+    try:
+        if not _YVER126_STARTUP_SYNC_STARTED:
+            _YVER126_STARTUP_SYNC_STARTED = True
+            threading.Thread(target=_yver126_auto_blackout_startup_sync_loop, name='yver126_auto_blackout_startup_sync', daemon=True).start()
+    except Exception:
+        pass
+    if _YVER126_ORIG_MAIN is not None:
+        return _YVER126_ORIG_MAIN()
+    return None
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v126'
+    SETUP_AUDIT_CACHE_VERSION = 'v126'
+except Exception:
+    pass
+try:
+    logger.info('yver126 loaded: auto-blackout overwrites active windows from exact 7d setup_open_times rule; manual BLACKOUT_WINDOWS setter fixed')
+except Exception:
+    pass
+# =========================================================
+# end yver126
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
