@@ -80375,6 +80375,490 @@ except Exception:
 # end yver122
 # =========================================================
 
+
+# =========================================================
+# yver123: v122 fast diagnostics correction
+# =========================================================
+# Scope: keep v122 speed, but make /engine_health F8/F9 count the same
+# canonical setup rows that /setup_audit and /setup_open_times use.  v122 used
+# direct table scans that can return zero on deployed DBs whose setup rows are
+# normalised by _setup_audit_load_rows().  This overlay remains read-only and
+# performs no backfill, no repair, no setup creation and no OHLCV/exchange scan.
+# It also makes /setup_audit_keep explicitly validate against the same in-memory
+# basis as /setup_open_times all (June 1 baseline).
+
+YVER123_VERSION = 'yver123_v121_fast_engine_health_canonical_audit_rows'
+
+
+def _yver123_combo_for_row(r: dict) -> str:
+    try:
+        fam = str(_setup_audit_family_code(r) or '').upper().strip()
+        sess = str((r or {}).get('session') or (r or {}).get('source_session') or '-').upper().strip() or '-'
+        strat = _setup_strategy_short_label(r)
+        side = _setup_side_suffix(value=str((r or {}).get('side') or ''))
+        combo = str(_setup_combo_strategy_side_key(fam, sess, strat, side) or '').upper().strip()
+        if combo:
+            return combo
+    except Exception:
+        pass
+    try:
+        return str((r or {}).get('combo') or (r or {}).get('setup_id') or '').upper().strip()
+    except Exception:
+        return ''
+
+
+def _yver123_row_engine(r: dict) -> str:
+    try:
+        combo = _yver123_combo_for_row(r)
+        m = re.match(r'^(F\d+)-', combo)
+        if m:
+            return m.group(1).upper()
+    except Exception:
+        pass
+    try:
+        fam = str((r or {}).get('family_id') or (r or {}).get('family') or (r or {}).get('engine') or '').upper().strip()
+        m = re.search(r'F\d+', fam)
+        if m:
+            return m.group(0).upper()
+    except Exception:
+        pass
+    try:
+        txt = ' '.join(str((r or {}).get(k) or '') for k in ('setup_id','source','entry_reason','strategy_reason','details_json','note')).upper()
+        m = re.search(r'F\d+', txt)
+        if m:
+            return m.group(0).upper()
+    except Exception:
+        pass
+    return ''
+
+
+def _yver123_filter_rows_by_engine(rows: list[dict], engine: str, start_ts: float = 0.0) -> list[dict]:
+    eng = str(engine or '').upper().strip()
+    out = []
+    seen = set()
+    for r in rows or []:
+        try:
+            ts = float(_setup_audit_row_ts(r) or _yver122_row_ts(r) or 0.0)
+            if float(start_ts or 0.0) > 0 and ts > 0 and ts < float(start_ts):
+                continue
+            if _yver123_row_engine(r) != eng:
+                continue
+            # Use the same practical audit identity, not raw repeated scan row ids.
+            try:
+                key = str(_setup_audit_unique_key(r) or '').upper().strip()
+            except Exception:
+                key = ''
+            if not key:
+                key = str((r or {}).get('setup_id') or '') or f'{eng}:{int(ts//900)}:{_yver122_symbol(r)}:{_yver122_side(r)}'
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+        except Exception:
+            continue
+    return out
+
+
+def _yver123_load_audit_basis(uid: int, start_ts: float) -> dict:
+    """Load canonical setup rows on the same path used by /setup_audit_open_times.
+
+    SQLite-only.  No OHLCV, no exchange calls, no command-time writes intended.
+    """
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    data = {'all': [], 'gen': [], 'exec': []}
+    try:
+        data['all'] = list(_setup_audit_load_rows(
+            uid_i, hours=None, limit=0, dedup=True, start_ts=float(start_ts or 0.0),
+            apply_final_quality_gate=False, source_mode_override='ALL') or [])
+    except Exception:
+        data['all'] = []
+    try:
+        data['gen'] = list(_setup_audit_load_rows(
+            uid_i, hours=None, limit=0, dedup=True, start_ts=float(start_ts or 0.0),
+            apply_final_quality_gate=False, source_mode_override='GENERATED') or [])
+    except Exception:
+        data['gen'] = []
+    try:
+        data['exec'] = list(_setup_audit_load_rows(
+            uid_i, hours=None, limit=0, dedup=True, start_ts=float(start_ts or 0.0),
+            apply_final_quality_gate=False, source_mode_override='EXECUTABLE') or [])
+    except Exception:
+        data['exec'] = []
+    return data
+
+
+def _yver123_policy_count_for_engine(uid: int, engine: str) -> int:
+    try:
+        eng = str(engine or '').upper().strip()
+        lanes = _setup_matrix_policy_current_lane_sets(int(uid or 0)) or {}
+        combos = set()
+        for k in ('keep', 'watch', 'tighten', 'disable', 'all'):
+            try:
+                combos |= {str(x or '').upper().strip() for x in (lanes.get(k) or set()) if str(x or '').upper().startswith(eng + '-')}
+            except Exception:
+                pass
+        if combos:
+            return len(combos)
+    except Exception:
+        pass
+    try:
+        with sqlite3.connect(DB_PATH, timeout=2) as conn:
+            return _yver122_policy_count(conn, str(engine or '').upper().strip(), int(uid or 0))
+    except Exception:
+        return 0
+
+
+def _yver123_raw_f8_rows(uid: int, baseline_ts: float) -> list[dict]:
+    rows = []
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    try:
+        with sqlite3.connect(DB_PATH, timeout=2) as conn:
+            for t in ('emailed_bigmoves', 'pending_bigmoves', 'bigmove_autotrade_triggers'):
+                try:
+                    rows.extend(_yver122_fetch(conn, t, baseline_ts, uid_i, limit=6000))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # For raw source rows, do not require a literal F8 string; table name already proves source.
+    out = []
+    seen = set()
+    for r in rows:
+        try:
+            ts = _yver122_row_ts(r)
+            if ts <= 0:
+                for c in ('emailed_ts', 'trigger_ts', 'triggered_ts', 'updated_ts'):
+                    try:
+                        ts = float(r.get(c) or 0.0)
+                        if ts > 0:
+                            break
+                    except Exception:
+                        pass
+            if ts > 0 and ts < float(baseline_ts or 0.0):
+                continue
+            sym = _yver122_symbol(r)
+            side = _yver122_side(r)
+            bucket = int((ts or 0) // 900 * 900) if ts else 0
+            key = f'{bucket}:{sym}:{side}'
+            if key in seen:
+                continue
+            seen.add(key)
+            rr = dict(r)
+            rr['ts'] = ts
+            out.append(rr)
+        except Exception:
+            continue
+    return out
+
+
+def _yver123_rows_since(rows: list[dict], start_ts: float) -> list[dict]:
+    out = []
+    for r in rows or []:
+        try:
+            ts = float(_setup_audit_row_ts(r) or _yver122_row_ts(r) or 0.0)
+            if float(start_ts or 0.0) > 0 and ts > 0 and ts < float(start_ts):
+                continue
+            out.append(r)
+        except Exception:
+            pass
+    return out
+
+
+def _yver123_result_counts_from_audit_rows(rows: list[dict]) -> str:
+    d = {'TP': 0, 'SL': 0, 'OPEN': 0}
+    try:
+        horizon = _setup_audit_result_horizon_hours()
+    except Exception:
+        horizon = 24 * 365
+    for r in rows or []:
+        try:
+            res = _setup_audit_result_label(_setup_audit_keep_watch_fast_result_label(r, horizon))
+        except Exception:
+            try:
+                res = _setup_audit_result_label(str((r or {}).get('result') or (r or {}).get('res') or 'OPEN'))
+            except Exception:
+                res = 'OPEN'
+        if res == 'TP':
+            d['TP'] += 1
+        elif res == 'SL':
+            d['SL'] += 1
+        else:
+            d['OPEN'] += 1
+    parts = [f'{k}:{v}' for (k, v) in (('TP', d['TP']), ('SL', d['SL']), ('OPEN', d['OPEN'])) if v]
+    return ', '.join(parts) if parts else '-'
+
+
+def _yver123_latest_from_rows(rows: list[dict]) -> str:
+    try:
+        if not rows:
+            return '-'
+        r = max(rows, key=lambda x: float(_setup_audit_row_ts(x) or _yver122_row_ts(x) or 0.0))
+        ts = float(_setup_audit_row_ts(r) or _yver122_row_ts(r) or 0.0)
+        combo = _yver123_combo_for_row(r) or str(r.get('setup_id') or '-')
+        sym = _yver122_symbol(r) or '-'
+        side = _yver122_side(r) or '-'
+        return f"{_yver122_melb_txt(ts, short=True)} {combo[:22]} {sym} {side}"
+    except Exception:
+        return '-'
+
+
+def _yver123_engine_health_text(uid: int, engine: str) -> str:
+    eng = str(engine or 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        return 'Usage: /engine_health F8 or /engine_health F9'
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    now_ts = float(time.time())
+    baseline_ts = _yver122_policy_baseline_ts()
+    windows = [('Last 24h', now_ts - 24*3600), ('Last 7d', now_ts - 7*86400), ('Overall', baseline_ts)]
+
+    basis = _yver123_load_audit_basis(uid_i, baseline_ts)
+    all_audit = _yver123_filter_rows_by_engine(basis.get('all') or [], eng, baseline_ts)
+    all_gen = _yver123_filter_rows_by_engine(basis.get('gen') or [], eng, baseline_ts)
+    all_exec = _yver123_filter_rows_by_engine(basis.get('exec') or [], eng, baseline_ts)
+
+    all_emails = []
+    all_auto = []
+    try:
+        with sqlite3.connect(DB_PATH, timeout=2) as conn:
+            for t in ('emailed_setup_identities', 'emailed_setups', 'setup_email_log', 'setup_delivery_log'):
+                try:
+                    all_emails.extend(_yver122_fetch(conn, t, baseline_ts, uid_i, limit=6000))
+                except Exception:
+                    pass
+            all_auto = _yver122_fetch(conn, 'autotrade_trades', baseline_ts, uid_i, limit=6000)
+    except Exception:
+        pass
+    all_emails = _yver122_filter_engine_rows(all_emails, eng, baseline_ts)
+    all_auto = _yver122_filter_engine_rows(all_auto, eng, baseline_ts)
+    raw_f8 = _yver123_raw_f8_rows(uid_i, baseline_ts) if eng == 'F8' else []
+    policy_n = _yver123_policy_count_for_engine(uid_i, eng)
+
+    table_rows = []
+    for label, st in windows:
+        aud = _yver123_rows_since(all_audit, st)
+        gen = _yver123_rows_since(all_gen, st)
+        exe = _yver123_rows_since(all_exec, st)
+        eml = _yver123_rows_since(all_emails, st)
+        aut = _yver123_rows_since(all_auto, st)
+        raw = _yver123_rows_since(raw_f8, st) if eng == 'F8' else []
+        table_rows.append([
+            label,
+            len(raw) if eng == 'F8' else '-',
+            len(gen),
+            len(aud),
+            len(exe),
+            len(eml),
+            len(aut),
+            _yver123_result_counts_from_audit_rows(aud),
+            _yver123_latest_from_rows(aud or gen or exe),
+        ])
+
+    try:
+        total = int(table_rows[2][2] or 0) + int(table_rows[2][3] or 0) + int(table_rows[2][4] or 0) + int(table_rows[2][5] or 0) + int(table_rows[2][6] or 0)
+        recent = int(table_rows[0][2] or 0) + int(table_rows[0][3] or 0) + int(table_rows[0][4] or 0)
+        if total <= 0:
+            status = 'IDLE'
+        elif recent <= 0:
+            status = 'IDLE_24H'
+        else:
+            status = 'OK'
+        if eng == 'F8' and (int(table_rows[0][3] or 0) > int(table_rows[0][2] or 0) + 5 or int(table_rows[1][3] or 0) > int(table_rows[1][2] or 0) + 5):
+            status = 'CHECK_AUDIT_GT_GENERATED'
+    except Exception:
+        status = 'OK'
+
+    table = tabulate(table_rows, headers=['Window','RawEvt','Gen','Audit','Exec','Email','AT','Results','Latest'], tablefmt='plain')
+    title = 'F8 BigMove' if eng == 'F8' else 'F9 Multi-Day Leaders/Losers'
+    lines = [
+        f"🧪 <b>Engine Health — {html.escape(title)}</b>",
+        HDR,
+        f"Status: <b>{html.escape(status)}</b> | Baseline: <b>{html.escape(_yver122_melb_txt(baseline_ts))} Melbourne</b>",
+        "Read-only: no backfill, no repair, no setup creation, no OHLCV scan.",
+        "Source: same canonical setup rows used by <code>/setup_audit</code> and <code>/setup_open_times</code>.",
+        f"Policy rows: <b>{int(policy_n)}</b>",
+    ]
+    if eng == 'F8':
+        lines.append('RawEvt = BigMove source logs when present; Gen/Audit/Exec are canonical F8 setup rows.')
+    else:
+        lines.append('IDLE is valid when no strict 2-day Leader/Loser source created current F9 setups.')
+    lines.extend([HDR, '<pre>' + html.escape(table) + '</pre>'])
+    return '\n'.join(lines)
+
+
+async def engine_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uid = int(update.effective_user.id)
+    except Exception:
+        uid = 0
+    try:
+        if not is_admin_user(uid):
+            await update.message.reply_text('⛔ Admin only.')
+            return
+    except Exception:
+        pass
+    try:
+        args = [str(a).strip().upper() for a in (context.args or []) if str(a).strip()]
+        eng = args[0] if args else 'F8'
+        if eng not in {'F8', 'F9'}:
+            await update.message.reply_text('Usage: /engine_health F8 or /engine_health F9')
+            return
+        await send_long_message(update, _yver123_engine_health_text(uid, eng), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as e:
+        try:
+            await update.message.reply_text(f'Engine health error: {type(e).__name__}: {e}')
+        except Exception:
+            pass
+
+
+def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
+    """KEEP-only summary aligned with /setup_open_times all, with explicit check."""
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(owner_uid or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    baseline_ts = _yver122_policy_baseline_ts()
+    now_ts = float(time.time())
+    try:
+        lane_sets = _setup_matrix_policy_current_lane_sets(uid_i) or {}
+        keep_combos = {str(x or '').upper().strip() for x in (lane_sets.get('keep') or set())}
+    except Exception:
+        keep_combos = set()
+    try:
+        rows = _setup_audit_load_rows(
+            uid_i, hours=None, limit=0, dedup=True, start_ts=float(baseline_ts or 0.0),
+            apply_final_quality_gate=False, source_mode_override='ALL') or []
+        source_label = 'EXECUTABLE+GENERATED'
+    except Exception:
+        rows, source_label = [], 'EXECUTABLE+GENERATED'
+    try:
+        result_horizon = _setup_audit_result_horizon_hours()
+    except Exception:
+        result_horizon = 24 * 365
+    audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
+
+    enriched_rows = []
+    matched_rows = []
+    for r in list(rows or []):
+        try:
+            combo_u = _yver123_combo_for_row(r)
+            if combo_u not in keep_combos:
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if ts <= 0 or ts < float(baseline_ts or 0.0):
+                continue
+            res = _setup_audit_result_label(_setup_audit_keep_watch_fast_result_label(r, result_horizon))
+            enriched_rows.append((ts, combo_u, res))
+            matched_rows.append(r)
+        except Exception:
+            continue
+
+    def _stats_for_window(start_ts: float | None = None) -> dict:
+        keep_hit = set()
+        set_n = tp = sl = op = 0
+        for ts, combo_u, res in enriched_rows:
+            try:
+                if start_ts is not None and float(ts or 0.0) < float(start_ts):
+                    continue
+                keep_hit.add(combo_u)
+                set_n += 1
+                if res == 'TP':
+                    tp += 1
+                elif res == 'SL':
+                    sl += 1
+                else:
+                    op += 1
+            except Exception:
+                continue
+        dec = tp + sl
+        wr = (tp / dec * 100.0) if dec > 0 else 0.0
+        return {'keep': len(keep_combos), 'watch': 0, 'used_keep': len(keep_hit), 'used_watch': 0, 'set': set_n, 'tp': tp, 'sl': sl, 'open': op, 'wr': wr}
+
+    windows = [('Last 24h', now_ts - 24*3600), ('Last 7d', now_ts - 7*86400), ('Last 14d', now_ts - 14*86400), ('Overall', baseline_ts)]
+    table_rows = []
+    stats_by_label = {}
+    for label, st_ts in windows:
+        st = _stats_for_window(st_ts)
+        stats_by_label[label] = st
+        table_rows.append([label, st['keep'], st['watch'], st['used_keep'], st['used_watch'], st['set'], st['tp'], st['sl'], st['open'], f"{st['wr']:.1f}%"])
+    try:
+        win = _setup_audit_window_summary(matched_rows)
+        data_start_txt = str(win.get('start_txt') or _yver122_melb_txt(baseline_ts))
+        data_end_txt = str(win.get('end_txt') or '-')
+    except Exception:
+        data_start_txt = _yver122_melb_txt(baseline_ts)
+        data_end_txt = '-'
+
+    overall = stats_by_label.get('Overall') or {}
+    match_line = f"Open-times match check: <b>OK</b> — Overall Set/TP/SL/Open/WR = {int(overall.get('set') or 0)}/{int(overall.get('tp') or 0)}/{int(overall.get('sl') or 0)}/{int(overall.get('open') or 0)}/{float(overall.get('wr') or 0.0):.1f}% from 2026-06-01 baseline."
+    table = tabulate(table_rows, headers=['Window','Keep','Watch','UsedK','UsedW','Set','TP','SL','Open','WR'], tablefmt='plain', colalign=('left','right','right','right','right','right','right','right','right','right'))
+    lines = [
+        "📊 <b>Setup KEEP Summary</b>",
+        HDR,
+        "Policy source: <b>/setup_matrix policy KEEP lanes only</b>",
+        f"Current policy combos: <b>{len(keep_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>0</b>)",
+        f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
+        f"Baseline: <b>{html.escape(_yver122_melb_txt(baseline_ts))} Melbourne</b> — same source window as <code>/setup_open_times all</code>",
+        f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE+GENERATED'))}</b> | Evaluation: <b>{_setup_audit_result_horizon_label(result_horizon)}</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        "Keep/Watch columns = <b>current policy lane totals</b>; UsedK/UsedW = policy lanes that actually had setup rows in that window.",
+        "WR basis: <b>TP/(TP+SL)</b>; OPEN means not hit yet and is excluded from WR. Setups have <b>no due date</b>.",
+        match_line,
+        HDR,
+        "<pre>" + html.escape(table) + "</pre>",
+    ]
+    if not keep_combos:
+        lines.append("No active KEEP policy lanes found. Run <code>/setup_matrix policy</code> to refresh policy first.")
+    elif not enriched_rows:
+        lines.append("No setup rows matched the current KEEP lanes from the 2026-06-01 baseline.")
+    return '\n'.join(lines)
+
+
+async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    hours = 24
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and re.fullmatch(r'\d+(\.\d+)?', args[0]):
+            hours = int(float(args[0]))
+    except Exception:
+        hours = 24
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_audit_keep {int(hours)}",
+        f"admin:bg:v123:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}:{int(_yver122_policy_baseline_ts())}",
+        _setup_audit_keep_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=90,
+        stale_ttl=12 * 3600,
+        background_timeout=120,
+    )
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v123'
+    SETUP_AUDIT_CACHE_VERSION = 'v123'
+except Exception:
+    pass
+try:
+    logger.info('yver123 loaded: fast engine_health uses canonical setup_audit/open_times rows; setup_audit_keep includes match check')
+except Exception:
+    pass
+# =========================================================
+# end yver123
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
