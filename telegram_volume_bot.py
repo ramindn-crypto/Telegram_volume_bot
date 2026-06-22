@@ -81303,6 +81303,581 @@ except Exception:
 # end yver132
 # =========================================================
 
+
+# =========================================================
+# yver133 — F8/F9 health speed + duplicate cleanup
+# =========================================================
+# Reason:
+# - v132 fixed generated->audit visibility, but /engine_health still performed
+#   repair/backfill work while rendering and could feel laggy on Render.
+# - Health Recent rows could show repeated symbol/side entries from several
+#   durable mirrors for the same BigMove event.
+# - /setup_audit could append too many generated-only F8/F9 rows by calling the
+#   heavy ALL-source loader.  Keep audit visibility, but make it bounded/direct.
+# Fix:
+# - /engine_health is read-only and fast: direct bounded SQL counts, no repair,
+#   no candle resolving, no generated->audit sync while the command is running.
+# - Recent rows are deduped by practical 15m event bucket + symbol + side + result.
+# - generated->audit repair is kept for live BigMove hooks, but rewritten as a
+#   small direct/unique OPEN seed only.  /setup_audit later refreshes exact TP/SL.
+# - /setup_audit appends only bounded direct generated-only F8/F9 rows and dedupes
+#   them against the base executable/audit rows.
+
+YVER133_VERSION = 'yver133_2026_06_22_fast_health_dedupe_bounded_f8_f9_audit'
+
+try:
+    _YVER133_BASE_SETUP_AUDIT_LOAD_ROWS = _YVER132_ORIG_SETUP_AUDIT_LOAD_ROWS if callable(globals().get('_YVER132_ORIG_SETUP_AUDIT_LOAD_ROWS')) else _setup_audit_load_rows
+except Exception:
+    _YVER133_BASE_SETUP_AUDIT_LOAD_ROWS = None
+
+
+def _yver133_safe_int(v, default=0):
+    try:
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _yver133_safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _yver133_owner_ids(uid: int = 0) -> list[int]:
+    ids: list[int] = []
+    for x in (uid, globals().get('AUTOTRADE_OWNER_UID', 0), 0):
+        try:
+            xi = int(x or 0)
+            if xi not in ids:
+                ids.append(xi)
+        except Exception:
+            pass
+    return ids or [0]
+
+
+def _yver133_table_cols(conn, table: str) -> list[str]:
+    try:
+        return [str(r[1]) for r in conn.execute(f'PRAGMA table_info({table})').fetchall() or []]
+    except Exception:
+        return []
+
+
+def _yver133_time_cols(table: str, cols: list[str]) -> list[str]:
+    preferred = {
+        'setup_audit_results': ['created_ts', 'evaluated_ts'],
+        'generated_setups': ['created_ts', 'signal_created_ts', 'updated_ts'],
+        'executable_setups': ['executable_ts', 'signal_created_ts', 'created_ts'],
+        'emailed_setups': ['emailed_ts', 'created_ts', 'signal_created_ts'],
+        'setup_pipeline_events': ['event_ts', 'created_ts', 'updated_ts'],
+        'autotrade_trades': ['opened_ts', 'created_ts', 'updated_ts', 'closed_ts'],
+        'signals': ['created_ts', 'ts', 'signal_created_ts'],
+        'setup_combo_policy': ['updated_ts', 'created_ts'],
+    }.get(str(table or ''), [])
+    out = [c for c in preferred if c in cols]
+    for c in ('created_ts', 'event_ts', 'updated_ts', 'ts', 'opened_ts', 'executable_ts', 'emailed_ts', 'signal_created_ts', 'closed_ts'):
+        if c in cols and c not in out:
+            out.append(c)
+    return out
+
+
+def _yver133_latest_ts(row: dict) -> float:
+    try:
+        for c in ('created_ts', 'event_ts', 'updated_ts', 'evaluated_ts', 'executable_ts', 'emailed_ts', 'opened_ts', 'closed_ts', 'signal_created_ts', 'ts'):
+            try:
+                v = float((row or {}).get(c) or 0.0)
+                if v > 0:
+                    return v
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return 0.0
+
+
+def _yver133_sql_match_expr(cols: list[str], eng: str) -> str:
+    eng_u = 'F9' if str(eng or '').upper().strip() == 'F9' else 'F8'
+    ors: list[str] = []
+    if 'setup_id' in cols:
+        ors.append(f"UPPER(COALESCE(setup_id,'')) LIKE '{eng_u}-%'")
+    if 'family' in cols:
+        ors.append(f"UPPER(COALESCE(family,'')) LIKE '{eng_u}%'")
+    if 'family_id' in cols:
+        ors.append(f"UPPER(COALESCE(family_id,'')) LIKE '{eng_u}%'")
+    if 'engine' in cols:
+        ors.append(f"UPPER(COALESCE(engine,''))='{eng_u}'")
+    if 'mode' in cols:
+        ors.append(f"UPPER(COALESCE(mode,'')) LIKE '%ENGINE_{eng_u.lower().upper()}%'")
+        ors.append(f"UPPER(COALESCE(mode,''))='{eng_u}'")
+    if 'combo' in cols:
+        ors.append(f"UPPER(COALESCE(combo,'')) LIKE '{eng_u}-%'")
+    if 'details_json' in cols:
+        ors.append(f"UPPER(COALESCE(details_json,'')) LIKE '%{eng_u}-%'")
+        ors.append(f"UPPER(COALESCE(details_json,'')) LIKE '%ENGINE_{eng_u}%'")
+    if eng_u == 'F8':
+        if 'source' in cols:
+            ors.append("UPPER(COALESCE(source,'')) LIKE '%BIGMOVE%'")
+            ors.append("UPPER(COALESCE(source,'')) LIKE '%BIG_MOVE%'")
+        if 'entry_reason' in cols:
+            ors.append("UPPER(COALESCE(entry_reason,'')) LIKE '%BIGMOVE%'")
+    else:
+        if 'source' in cols:
+            ors.append("UPPER(COALESCE(source,'')) LIKE '%MULTIDAY%'")
+            ors.append("UPPER(COALESCE(source,'')) LIKE '%MULTI_DAY%'")
+    return '(' + ' OR '.join(ors or ['0']) + ')'
+
+
+def _yver133_table_count_latest(uid: int, table: str, eng: str, hours: int = 24) -> tuple[int, float, list[dict]]:
+    rows: list[dict] = []
+    try:
+        since = float(time.time()) - float(max(1, int(hours or 24)) * 3600)
+    except Exception:
+        since = float(time.time()) - 86400.0
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cols = _yver133_table_cols(conn, table)
+            if not cols:
+                return 0, 0.0, []
+            where_parts = [_yver133_sql_match_expr(cols, eng)]
+            params: list = []
+            if 'user_id' in cols:
+                ids = _yver133_owner_ids(uid)
+                q = ','.join(['?'] * len(ids))
+                where_parts.append(f'user_id IN ({q})')
+                params.extend(ids)
+            elif 'uid' in cols:
+                ids = _yver133_owner_ids(uid)
+                q = ','.join(['?'] * len(ids))
+                where_parts.append(f'uid IN ({q})')
+                params.extend(ids)
+            tcols = _yver133_time_cols(table, cols)
+            texpr = '0'
+            if tcols:
+                texpr = 'MAX(' + ','.join([f'COALESCE({c},0)' for c in tcols]) + ')' if len(tcols) > 1 else f'COALESCE({tcols[0]},0)'
+                if table != 'setup_combo_policy':
+                    where_parts.append(f'{texpr}>=?')
+                    params.append(float(since))
+            where = ' AND '.join(where_parts)
+            try:
+                cnt = int(conn.execute(f'SELECT COUNT(1) FROM {table} WHERE {where}', tuple(params)).fetchone()[0] or 0)
+            except Exception:
+                cnt = 0
+            latest = 0.0
+            try:
+                latest = float(conn.execute(f'SELECT MAX({texpr}) FROM {table} WHERE {where}', tuple(params)).fetchone()[0] or 0.0)
+            except Exception:
+                latest = 0.0
+            try:
+                order_expr = texpr if texpr != '0' else 'rowid'
+                rows = [dict(r) for r in conn.execute(f'SELECT * FROM {table} WHERE {where} ORDER BY {order_expr} DESC LIMIT 80', tuple(params)).fetchall() or []]
+            except Exception:
+                rows = []
+            return cnt, latest, rows
+    except Exception:
+        return 0, 0.0, []
+
+
+def _yver133_melb_time(ts) -> str:
+    try:
+        if float(ts or 0.0) <= 0:
+            return '-'
+        if callable(globals().get('_yver130_melb_time')):
+            return _yver130_melb_time(float(ts))
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M')
+    except Exception:
+        return '-'
+
+
+def _yver133_count_latest_line(label: str, cnt: int, latest: float) -> str:
+    return f"{label}: {int(cnt or 0)} | latest: {_yver133_melb_time(latest)}"
+
+
+def _yver133_summary(rows: list[dict], *keys: str) -> str:
+    try:
+        c = Counter()
+        for r in list(rows or []):
+            val = ''
+            for k in keys:
+                val = str((r or {}).get(k) or '').upper().strip()
+                if val:
+                    break
+            if val:
+                c[val] += 1
+        return ', '.join([f'{k}:{v}' for k, v in c.most_common(6)]) or '-'
+    except Exception:
+        return '-'
+
+
+def _yver133_symbol_base(sym: str) -> str:
+    try:
+        s = str(sym or '').upper().replace('/USDT:USDT', '').replace('USDT.P', '').replace('USDT', '')
+        return re.sub(r'[^A-Z0-9]+', '', s) or '-'
+    except Exception:
+        return '-'
+
+
+def _yver133_event_key(row: dict) -> str:
+    try:
+        ts = _yver133_latest_ts(row)
+        bucket = int(ts // 900) * 900 if ts > 0 else 0
+        sym = _yver133_symbol_base(str((row or {}).get('symbol') or (row or {}).get('market_symbol') or ''))
+        side = str((row or {}).get('side') or '').upper().strip() or '-'
+        res = str((row or {}).get('result') or (row or {}).get('status') or (row or {}).get('source') or '-').upper().strip()
+        fam = str((row or {}).get('family') or (row or {}).get('family_id') or (row or {}).get('engine') or '').upper().strip()
+        if fam.startswith('F8'):
+            fam = 'F8'
+        elif fam.startswith('F9'):
+            fam = 'F9'
+        return f'{bucket}|{fam}|{sym}|{side}|{res}'
+    except Exception:
+        return str(id(row))
+
+
+def _yver133_recent_unique(rows: list[dict], limit: int = 5) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    try:
+        ordered = sorted(list(rows or []), key=_yver133_latest_ts, reverse=True)
+    except Exception:
+        ordered = list(rows or [])
+    for r in ordered:
+        try:
+            k = _yver133_event_key(dict(r or {}))
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(dict(r or {}))
+            if len(out) >= int(limit or 5):
+                break
+        except Exception:
+            continue
+    return out
+
+
+def _yver133_fast_generated_rows(uid: int, eng: str, hours: int = 24, max_rows: int = 40) -> list[dict]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cols = _yver133_table_cols(conn, 'generated_setups')
+            if not cols:
+                return []
+            since = float(time.time()) - float(max(1, int(hours or 24)) * 3600)
+            where = [_yver133_sql_match_expr(cols, eng)]
+            params: list = []
+            ids = _yver133_owner_ids(uid)
+            if 'user_id' in cols:
+                q = ','.join(['?'] * len(ids))
+                where.append(f'user_id IN ({q})')
+                params.extend(ids)
+            if 'created_ts' in cols:
+                where.append('created_ts>=?')
+                params.append(float(since))
+            order = 'created_ts DESC' if 'created_ts' in cols else 'rowid DESC'
+            raw = [dict(r) for r in conn.execute(f"SELECT * FROM generated_setups WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?", tuple(params + [max(10, int(max_rows or 40) * 3)] )).fetchall() or []]
+    except Exception:
+        return []
+    cleaned: list[dict] = []
+    seen: set[str] = set()
+    for r in raw:
+        try:
+            rr = _setup_audit_payload_from_row(r) if callable(globals().get('_setup_audit_payload_from_row')) else dict(r or {})
+            rr = _yver132_prepare_engine_row_for_audit(rr, eng) if callable(globals().get('_yver132_prepare_engine_row_for_audit')) else rr
+            if not str(rr.get('setup_id') or '').strip():
+                rr['setup_id'] = _setup_audit_unique_key(rr) if callable(globals().get('_setup_audit_unique_key')) else _yver133_event_key(rr)
+            try:
+                if callable(globals().get('_setup_volume_ok')) and not _setup_volume_ok(float(rr.get('fut_vol_usd') or 0.0)):
+                    continue
+            except Exception:
+                pass
+            if callable(globals().get('_setup_audit_unique_key')):
+                k = _setup_audit_unique_key(rr)
+            else:
+                k = _yver133_event_key(rr)
+            if k in seen:
+                continue
+            seen.add(k)
+            cleaned.append(rr)
+            if len(cleaned) >= int(max_rows or 40):
+                break
+        except Exception:
+            continue
+    return cleaned
+
+
+def _yver133_existing_audit_practical_keys(uid: int, eng: str, hours: int = 24) -> set[str]:
+    keys: set[str] = set()
+    try:
+        _setup_audit_migrate()
+        rows = _yver133_table_count_latest(uid, 'setup_audit_results', eng, hours)[2]
+        for r in rows:
+            try:
+                rr = _setup_audit_payload_from_row(r) if callable(globals().get('_setup_audit_payload_from_row')) else dict(r or {})
+                keys.add(_setup_audit_unique_key(rr) if callable(globals().get('_setup_audit_unique_key')) else _yver133_event_key(rr))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return keys
+
+
+def _yver133_repair_generated_to_audit(uid: int, engine: str = 'F8', hours: int = 24, max_rows: int = 12) -> int:
+    """Fast bounded audit seed for live F8/F9 generation.
+
+    No broad fetch, no candle/path resolving, no command-time work.  It only seeds
+    missing practical generated rows as OPEN; /setup_audit refreshes TP/SL later.
+    """
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    try:
+        uid_i = int(uid or 0) or int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    if uid_i <= 0:
+        return 0
+    made = 0
+    try:
+        existing = _yver133_existing_audit_practical_keys(uid_i, eng, max(1, int(hours or 24)))
+        candidates = _yver133_fast_generated_rows(uid_i, eng, max(1, int(hours or 24)), max_rows=max(4, int(max_rows or 12)))
+        horizon = int(_setup_audit_result_horizon_hours()) if callable(globals().get('_setup_audit_result_horizon_hours')) else 0
+        for rr in candidates:
+            try:
+                k = _setup_audit_unique_key(rr) if callable(globals().get('_setup_audit_unique_key')) else _yver133_event_key(rr)
+                if k in existing:
+                    continue
+                existing.add(k)
+                ev = {'result': 'OPEN', 'hit_level': '', 'hit_ts': None, 'note': 'yver133_fast_generated_engine_audit_seed'}
+                if callable(globals().get('_setup_audit_upsert_result')):
+                    _setup_audit_upsert_result(uid_i, rr, ev, horizon, actual_pnl_usdt=0.0)
+                    made += 1
+            except Exception:
+                continue
+        if made:
+            try:
+                db_log_setup_pipeline_event(uid_i, stage='yver133_fast_generated_to_audit_seed', status='ok', session='', mode=f'engine_{eng.lower()}', details={'engine': eng, 'made': int(made), 'hours': int(hours or 24)})
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return int(made or 0)
+
+
+# Replace v132's broad repair with the bounded direct seed.  The v132 F8 hook
+# calls this global by name, so this also speeds up BigMove alert handling.
+_yver132_repair_generated_to_audit = _yver133_repair_generated_to_audit
+
+
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None) -> list[dict]:
+    """Bounded v133 audit loader.
+
+    Keep the original executable-first audit.  Add only a small, direct set of
+    generated-only F8/F9 rows for learning visibility; do not call the heavy ALL
+    loader and do not duplicate practical events.
+    """
+    if not callable(_YVER133_BASE_SETUP_AUDIT_LOAD_ROWS):
+        return []
+    try:
+        base = list(_YVER133_BASE_SETUP_AUDIT_LOAD_ROWS(uid, hours=hours, limit=limit, dedup=dedup, start_ts=start_ts, apply_final_quality_gate=apply_final_quality_gate, source_mode_override=source_mode_override) or [])
+    except Exception:
+        base = []
+    try:
+        mode = str(source_mode_override or '').strip().upper()
+        if mode in {'GEN', 'GENERATED', 'RAW', 'RAW_GENERATED', 'ALL'}:
+            return base
+    except Exception:
+        pass
+    try:
+        h = max(1, min(168, int(hours or 24))) if hours is not None else 24
+    except Exception:
+        h = 24
+    # Add F8/F9 generated-only rows, bounded.  F8 gets slightly more because a
+    # single confirmed BigMove can produce a routed NOR/REV learning pair.
+    extra: list[dict] = []
+    try:
+        extra.extend(_yver133_fast_generated_rows(int(uid or 0), 'F8', h, max_rows=30))
+        extra.extend(_yver133_fast_generated_rows(int(uid or 0), 'F9', h, max_rows=20))
+    except Exception:
+        extra = []
+    if not extra:
+        return base
+    try:
+        combined = list(base)
+        seen: set[str] = set()
+        for r in combined:
+            try:
+                seen.add(_setup_audit_unique_key(r) if callable(globals().get('_setup_audit_unique_key')) else _yver133_event_key(r))
+            except Exception:
+                sid = str((r or {}).get('setup_id') or '')
+                if sid:
+                    seen.add(sid)
+        for r in sorted(extra, key=_yver133_latest_ts, reverse=True):
+            try:
+                k = _setup_audit_unique_key(r) if callable(globals().get('_setup_audit_unique_key')) else _yver133_event_key(r)
+                if k in seen:
+                    continue
+                seen.add(k)
+                combined.append(r)
+            except Exception:
+                continue
+        try:
+            combined = sorted(combined, key=lambda x: _setup_audit_row_ts(x) if callable(globals().get('_setup_audit_row_ts')) else _yver133_latest_ts(x), reverse=True)
+        except Exception:
+            combined = sorted(combined, key=_yver133_latest_ts, reverse=True)
+        if int(limit or 0) > 0:
+            combined = combined[:int(limit)]
+        return combined
+    except Exception:
+        return base
+
+
+def _yver133_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    """Read-only concise engine health; no repair/backfill during command render."""
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    try:
+        hours_i = max(1, min(168, int(hours or 24)))
+    except Exception:
+        hours_i = 24
+    raw_alerts = raw_pending = 0
+    if eng == 'F8':
+        try:
+            raw_alerts, raw_pending = _yver96_raw_f8_activity_counts(int(uid or 0), hours_i) if callable(globals().get('_yver96_raw_f8_activity_counts')) else (0, 0)
+        except Exception:
+            raw_alerts, raw_pending = 0, 0
+    f9_hist = {}
+    if eng == 'F9':
+        try:
+            f9_hist = _yver130_f9_history_candidates(hours_i) if callable(globals().get('_yver130_f9_history_candidates')) else {}
+        except Exception:
+            f9_hist = {}
+    tables = {
+        'gen': _yver133_table_count_latest(uid, 'generated_setups', eng, hours_i),
+        'audit': _yver133_table_count_latest(uid, 'setup_audit_results', eng, hours_i),
+        'exe': _yver133_table_count_latest(uid, 'executable_setups', eng, hours_i),
+        'email': _yver133_table_count_latest(uid, 'emailed_setups', eng, hours_i),
+        'atr': _yver133_table_count_latest(uid, 'autotrade_trades', eng, hours_i),
+        'pipe': _yver133_table_count_latest(uid, 'setup_pipeline_events', eng, hours_i),
+        'policy': _yver133_table_count_latest(uid, 'setup_combo_policy', eng, 99999),
+    }
+    gen_n, gen_latest, gen_rows = tables['gen']
+    audit_n, audit_latest, audit_rows = tables['audit']
+    exe_n, exe_latest, exe_rows = tables['exe']
+    email_n, email_latest, email_rows = tables['email']
+    atr_n, atr_latest, atr_rows = tables['atr']
+    pipe_n, pipe_latest, pipe_rows = tables['pipe']
+    policy_n, _policy_latest, _policy_rows = tables['policy']
+    status = 'OK'
+    checks: list[str] = []
+    if eng == 'F8':
+        if (int(raw_alerts or 0) + int(raw_pending or 0)) > 0 and int(gen_n or 0) == 0:
+            status = 'CHECK'
+            checks.append('BigMove detected but no F8 generated rows')
+        elif int(gen_n or 0) > 0 and int(audit_n or 0) == 0:
+            status = 'CHECK'
+            checks.append('F8 generated rows exist but audit rows are missing')
+        elif (int(raw_alerts or 0) + int(raw_pending or 0) + int(gen_n or 0) + int(audit_n or 0) + int(pipe_n or 0)) == 0:
+            status = 'IDLE'
+            checks.append('No BigMove/F8 activity in this window')
+        else:
+            checks.append('F8 BigMove detection and setup-generation rows are visible')
+    else:
+        source_count = int((f9_hist or {}).get('leaders_count', 0) or 0) + int((f9_hist or {}).get('losers_count', 0) or 0)
+        if source_count > 0 and int(gen_n or 0) == 0:
+            status = 'CHECK'
+            checks.append('2-day F9 source symbols exist but no generated rows')
+        elif int(gen_n or 0) > 0 and int(audit_n or 0) == 0:
+            status = 'CHECK'
+            checks.append('F9 generated rows exist but audit rows are missing')
+        elif source_count == 0 and int(gen_n or 0) == 0 and int(audit_n or 0) == 0:
+            status = 'IDLE'
+            checks.append('No current 2-day Leader/Loser source symbols')
+        else:
+            checks.append('F9 2-day source/generation/audit rows are coherent')
+    lines: list[str] = []
+    lines.append(f"🧪 Engine Health — {eng} {'BigMove' if eng == 'F8' else 'Multi-Day'}")
+    lines.append('━━━━━━━━━━━━━━━━━━━━')
+    lines.append(f"Window: last {hours_i}h | Now: {_yver133_melb_time(time.time())}")
+    lines.append(f"Status: {status}")
+    if eng == 'F8':
+        try:
+            user = get_user(int(uid or 0)) or {}
+        except Exception:
+            user = {}
+        try:
+            p15, p1, p4 = _user_bigmove_thresholds(user)
+            minv = _user_bigmove_min_vol_usd(user)
+            lines.append(f"F8 rule: 15m≥{float(p15):.2f}% | 1H≥{float(p1):.2f}% | 4H≥{float(p4):.2f}% | Vol≥${float(minv)/1_000_000:.1f}M")
+        except Exception:
+            pass
+        try:
+            alert_on = int((user or {}).get('bigmove_alert_on', 1) or 0) == 1
+        except Exception:
+            alert_on = True
+        lines.append(f"Alert email: {'ON' if alert_on else 'OFF'} | setup generation: INDEPENDENT/ON")
+        lines.append(f"Raw BigMove: alerts={int(raw_alerts or 0)} | pending={int(raw_pending or 0)} | backfilled_now=0")
+    else:
+        try:
+            lines.append(f"F9 rule: Leader→BUY / Loser→SELL | days≥{int(globals().get('F9_MIN_DAYS', 2) or 2)} in {int(globals().get('F9_LOOKBACK_DAYS', 4) or 4)}d | Vol≥${float(globals().get('F9_MIN_FUT_VOL_USD', 0) or 0)/1_000_000:.1f}M")
+        except Exception:
+            pass
+        try:
+            top_l = ', '.join([f'{s}:{d}d' for s, d in (f9_hist or {}).get('leaders', [])[:5]]) or '-'
+            top_s = ', '.join([f'{s}:{d}d' for s, d in (f9_hist or {}).get('losers', [])[:5]]) or '-'
+            lines.append(f"2-day source: leaders={int((f9_hist or {}).get('leaders_count', 0) or 0)} ({top_l}) | losers={int((f9_hist or {}).get('losers_count', 0) or 0)} ({top_s})")
+        except Exception:
+            pass
+    lines.append('────────────────────')
+    lines.append(_yver133_count_latest_line('Generated setups', gen_n, gen_latest))
+    lines.append(_yver133_count_latest_line('Setup audit', audit_n, audit_latest))
+    lines.append(_yver133_count_latest_line('Executable queue', exe_n, exe_latest))
+    lines.append(_yver133_count_latest_line('Setup emails', email_n, email_latest))
+    lines.append(_yver133_count_latest_line('AutoTrade rows', atr_n, atr_latest))
+    lines.append(f"Policy rows: {int(policy_n or 0)}")
+    lines.append(f"Audit results: {_yver133_summary(audit_rows, 'result', 'status')}")
+    lines.append(f"AutoTrade status: {_yver133_summary(atr_rows, 'status', 'outcome')}")
+    lines.append(f"Pipeline events: {int(pipe_n or 0)} | latest: {_yver133_melb_time(pipe_latest)}")
+    lines.append('────────────────────')
+    lines.append('Check: ' + '; '.join(checks[:3]))
+    recent_source = audit_rows or gen_rows or exe_rows
+    recent = _yver133_recent_unique(recent_source, 5)
+    if recent:
+        lines.append('Recent:')
+        for r in recent:
+            try:
+                sym = str((r or {}).get('symbol') or '-').upper()
+                side = str((r or {}).get('side') or '-').upper()
+                res = str((r or {}).get('result') or (r or {}).get('status') or (r or {}).get('source') or '-').upper()
+                lines.append(f"• {_yver133_melb_time(_yver133_latest_ts(r))} {sym} {side} {res}")
+            except Exception:
+                continue
+    return '\n'.join(lines)
+
+
+# Make every health alias use v133's read-only renderer.
+_yver133_engine_health_text.__name__ = '_yver133_engine_health_text'
+_yver132_engine_health_text = _yver133_engine_health_text
+_yver131_engine_health_text = _yver133_engine_health_text
+_yver130_engine_health_text = _yver133_engine_health_text
+_yver90_engine_health_text = _yver133_engine_health_text
+
+try:
+    _autotrade_config_set('yver133_version', YVER133_VERSION)
+    _autotrade_config_set('yver133_engine_health_read_only_fast', 'ON')
+    _autotrade_config_set('yver133_health_recent_dedupe', 'ON')
+    _autotrade_config_set('yver133_bounded_generated_audit_loader', 'ON')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v133'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v133'
+except Exception:
+    pass
+# =========================================================
+# end yver133
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
