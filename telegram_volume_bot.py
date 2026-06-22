@@ -82037,3 +82037,265 @@ except Exception:
 # =========================================================
 # end yver127
 # =========================================================
+
+# =========================================================
+# yver128 — engine_health must prove against the exact visible /setup_audit table
+# =========================================================
+# Scope on top of yver127:
+# - Do NOT touch /setup_audit_keep, /setup_open_times, /screen, startup, trading, risk, TP/SL, leverage, sizing.
+# - /engine_health F8/F9 no longer reads hidden generated/open-times rows for its current/latest line.
+# - It parses the same rendered /setup_audit output that the owner uses to validate visibility.
+#   If a F8/F9 KEEP row is not visible in /setup_audit for that window, it is not counted here.
+YVER128_VERSION = 'yver128_2026_06_22_engine_health_exact_visible_setup_audit_text'
+
+_YVER128_AUDIT_PARSE_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_YVER128_AUDIT_PARSE_LOCK = threading.Lock()
+
+
+def _yver128_strip_html_tags(text: str) -> str:
+    try:
+        s = str(text or '')
+        s = re.sub(r'<br\s*/?>', '\n', s, flags=re.IGNORECASE)
+        s = re.sub(r'</p\s*>', '\n', s, flags=re.IGNORECASE)
+        s = re.sub(r'<[^>]+>', '', s)
+        try:
+            s = html.unescape(s)
+        except Exception:
+            pass
+        return s
+    except Exception:
+        return str(text or '')
+
+
+def _yver128_parse_visible_setup_audit_rows(uid: int, hours: int) -> list[dict]:
+    """Parse the actual /setup_audit <hours> rendered table rows.
+
+    This is intentionally stricter than SQL row counting. It answers the owner's
+    validation question: 'does this row appear under /setup_audit?'.
+    """
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    try:
+        h = max(1, int(float(hours or 24)))
+    except Exception:
+        h = 24
+    # Very short cache so repeated /engine_health F8/F9 calls don't rebuild twice.
+    cache_key = f'{int(uid_i)}:{int(h)}:{int(time.time() // 20)}'
+    try:
+        with _YVER128_AUDIT_PARSE_LOCK:
+            rec = _YVER128_AUDIT_PARSE_CACHE.get(cache_key)
+            if rec and (float(time.time()) - float(rec[0] or 0.0) <= 25.0):
+                return list(rec[1] or [])
+    except Exception:
+        pass
+    rows: list[dict] = []
+    try:
+        # limit=0 is the same normal /setup_audit behaviour: show all unique rows in that window.
+        txt = _setup_audit_text(uid_i, limit=0, hours=int(h)) if callable(globals().get('_setup_audit_text')) else ''
+        txt = _yver128_strip_html_tags(txt)
+        for line in str(txt or '').splitlines():
+            raw = str(line or '').strip()
+            if not re.match(r'^\d{2}-\d{2}\s+\d{2}:\d{2}\s+', raw):
+                continue
+            parts = raw.split()
+            # Expected visible row shape:
+            # MM-DD HH:MM SYM SIDE COMBO POLICY WR AT ATPol ATWhy Conf VolM PnL Res
+            if len(parts) < 8:
+                continue
+            date_s, time_s, sym, side, combo, policy = parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]
+            combo_u = str(combo or '').upper().strip()
+            policy_u = str(policy or '').upper().strip()
+            if not combo_u or policy_u not in {'KEEP', 'WATCH', 'TIGHTEN'}:
+                continue
+            at_txt = str(parts[7] if len(parts) > 7 else '').upper().strip()
+            res = str(parts[-1] if parts else '').upper().strip()
+            rows.append({
+                'date': date_s,
+                'time': time_s,
+                'symbol': str(sym or '').upper().strip(),
+                'side': str(side or '').upper().strip(),
+                'combo': combo_u,
+                'policy': policy_u,
+                'at': at_txt,
+                'result': res if res in {'TP','SL','OPEN'} else '-',
+                'line': raw,
+            })
+    except Exception:
+        rows = []
+    try:
+        with _YVER128_AUDIT_PARSE_LOCK:
+            _YVER128_AUDIT_PARSE_CACHE[cache_key] = (float(time.time()), list(rows or []))
+            # tiny opportunistic cleanup
+            if len(_YVER128_AUDIT_PARSE_CACHE) > 20:
+                for k in list(_YVER128_AUDIT_PARSE_CACHE.keys())[:10]:
+                    _YVER128_AUDIT_PARSE_CACHE.pop(k, None)
+    except Exception:
+        pass
+    return rows
+
+
+def _yver128_filter_visible_engine_keep(rows: list[dict], engine: str) -> list[dict]:
+    eng = str(engine or '').upper().strip()
+    out = []
+    seen = set()
+    for r0 in rows or []:
+        try:
+            r = dict(r0 or {})
+            combo = str(r.get('combo') or '').upper().strip()
+            if not combo.startswith(eng + '-'):
+                continue
+            if str(r.get('policy') or '').upper().strip() != 'KEEP':
+                continue
+            key = (str(r.get('date')), str(r.get('time')), str(r.get('symbol')), str(r.get('side')), combo)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+        except Exception:
+            continue
+    return out
+
+
+def _yver128_visible_result_counts(rows: list[dict]) -> str:
+    try:
+        tp = sum(1 for r in rows or [] if str((r or {}).get('result') or '').upper() == 'TP')
+        sl = sum(1 for r in rows or [] if str((r or {}).get('result') or '').upper() == 'SL')
+        op = sum(1 for r in rows or [] if str((r or {}).get('result') or '').upper() == 'OPEN')
+        if tp + sl + op <= 0:
+            return '-'
+        bits = []
+        if tp: bits.append(f'TP:{tp}')
+        if sl: bits.append(f'SL:{sl}')
+        if op: bits.append(f'OPEN:{op}')
+        return ', '.join(bits) if bits else '-'
+    except Exception:
+        return '-'
+
+
+def _yver128_latest_visible(rows: list[dict]) -> str:
+    try:
+        if not rows:
+            return '-'
+        r = dict(rows[0] or {})
+        return f"{r.get('date','')} {r.get('time','')} {r.get('combo','')} {r.get('symbol','')} {r.get('side','')}".strip() or '-'
+    except Exception:
+        return '-'
+
+
+def _yver128_at_count(rows: list[dict]) -> int:
+    n = 0
+    for r in rows or []:
+        try:
+            at = str((r or {}).get('at') or '').upper().strip()
+            if at.startswith('AT_'):
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+def _yver128_email_count(rows: list[dict]) -> int:
+    n = 0
+    for r in rows or []:
+        try:
+            at = str((r or {}).get('at') or '').upper().strip()
+            if at in {'SENT', 'SENT_OLD', 'EMAILED', 'DELIVERED'}:
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+def _yver123_engine_health_text(uid: int, engine: str) -> str:
+    """v128: Engine health mirrors exact visible /setup_audit rows; no hidden rows."""
+    eng = str(engine or 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        return 'Usage: /engine_health F8 or /engine_health F9'
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+
+    baseline_ts = _yver122_policy_baseline_ts() if callable(globals().get('_yver122_policy_baseline_ts')) else 0.0
+    windows = [('Last 1h', 1), ('Last 24h', 24), ('Last 7d', 168)]
+    table_rows = []
+    total_recent = 0
+    for label, h in windows:
+        all_rows = _yver128_parse_visible_setup_audit_rows(uid_i, int(h))
+        krows = _yver128_filter_visible_engine_keep(all_rows, eng)
+        if label == 'Last 24h':
+            total_recent = len(krows)
+        table_rows.append([
+            label,
+            '-',
+            len(krows),
+            len(krows),
+            '-',
+            _yver128_email_count(krows),
+            _yver128_at_count(krows),
+            _yver128_visible_result_counts(krows),
+            _yver128_latest_visible(krows),
+        ])
+    # Overall is still useful, but label it as a baseline SQL/audit basis rather than current proof.
+    try:
+        overall_rows = _yver127_audit_visible_keep_rows_for_engine(uid_i, eng, float(baseline_ts or 0.0)) if callable(globals().get('_yver127_audit_visible_keep_rows_for_engine')) else []
+        table_rows.append([
+            'Overall',
+            '-',
+            len(overall_rows),
+            len(overall_rows),
+            '-',
+            0,
+            0,
+            _yver123_result_counts_from_audit_rows(overall_rows) if callable(globals().get('_yver123_result_counts_from_audit_rows')) else '-',
+            _yver123_latest_from_rows(overall_rows) if callable(globals().get('_yver123_latest_from_rows')) else '-',
+        ])
+    except Exception:
+        table_rows.append(['Overall', '-', 0, 0, '-', 0, 0, '-', '-'])
+
+    try:
+        keep_policy_rows = len(_yver125_keep_combos_for_engine(uid_i, eng)) if callable(globals().get('_yver125_keep_combos_for_engine')) else 0
+    except Exception:
+        keep_policy_rows = 0
+    try:
+        last1 = int(table_rows[0][2] or 0)
+        last24 = int(table_rows[1][2] or 0)
+        if last24 <= 0:
+            status = 'IDLE_24H'
+        elif last1 <= 0:
+            status = 'OK_24H_IDLE_1H'
+        else:
+            status = 'OK'
+    except Exception:
+        status = 'OK'
+
+    table = tabulate(table_rows, headers=['Window','RawEvt','Gen','Audit','Exec','Email','AT','Results','Latest'], tablefmt='plain')
+    title = 'F8 BigMove' if eng == 'F8' else 'F9 Multi-Day Leaders/Losers'
+    lines = [
+        f"🧪 <b>Engine Health — {html.escape(title)}</b>",
+        HDR,
+        f"Status: <b>{html.escape(status)}</b> | Baseline: <b>{html.escape(_yver122_melb_txt(float(baseline_ts or 0.0)) if callable(globals().get('_yver122_melb_txt')) else '2026-06-01 00:00')} Melbourne</b>",
+        "Read-only diagnostic: no backfill, no repair, no setup creation, no OHLCV scan.",
+        "Source for Last 1h/24h/7d: <b>exact rendered /setup_audit visible table, Policy=KEEP only</b>.",
+        "If a row is not visible in /setup_audit for that window, it is not counted here.",
+        f"KEEP policy rows for {html.escape(eng)}: <b>{int(keep_policy_rows)}</b>",
+        HDR,
+        '<pre>' + html.escape(table) + '</pre>',
+        "Note: Exec is '-' here because this diagnostic is visibility-proof, not hidden executable-table proof.",
+    ]
+    return '\n'.join(lines)
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v128'
+    SETUP_AUDIT_CACHE_VERSION = 'v128'
+except Exception:
+    pass
+try:
+    logger.info('yver128 loaded: engine_health F8/F9 parses exact visible setup_audit table for Last 1h/24h/7d; no trading/speed changes')
+except Exception:
+    pass
+# =========================================================
+# end yver128
+# =========================================================
