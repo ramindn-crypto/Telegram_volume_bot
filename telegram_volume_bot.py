@@ -80061,6 +80061,167 @@ except Exception:
 # end yver122
 # =========================================================
 
+
+# =========================================================
+# yver123 — blackout-window sync + clean F8/F9 health text
+# =========================================================
+# Based on yver122.  No risk, TP/SL, leverage, sizing, F8/F9 detector, or
+# AutoTrade order logic is changed.
+# Fixes from the 3PM review:
+#   1) If Render DB still has an old blackout set (00:00-01:00,02:00-05:00...)
+#      migrate both AutoTrade entry blackout and setup delivery blackout to the
+#      selected owner window:
+#         23:00-01:00,03:00-04:00,19:00-20:00,SUN 22:00-MON 10:00
+#      Setup generation remains SHADOW ON for learning/audit.
+#   2) Keep /engine_health F8/F9 fast but remove stale old v96/v97/yver98/yver106
+#      explanatory lines that made the health output look contradictory.
+#   3) Ensure F8/F9 health/probe commands remain visible in /help_admin.
+
+YVER123_VERSION = 'yver123_2026_06_22_blackout_sync_clean_engine_health'
+YVER123_SELECTED_BLACKOUT_WINDOWS = '23:00-01:00,03:00-04:00,19:00-20:00,SUN 22:00-MON 10:00'
+YVER123_STALE_BLACKOUT_WINDOWS = {
+    '00:00-01:00,02:00-05:00,19:00-20:00,SUN 22:00-MON 10:00',
+    '00:00-01:00,02:00-05:00,19:00-20:00,SUN22:00-MON10:00',
+    '03:00-04:00,10:00-12:00,15:00-16:00,18:00-20:00,21:00-22:00,SUN 22:00-MON 10:00',
+    '23:00-01:00,04:00-05:00,SUN 22:00-MON 10:00',
+    '23:00-01:00,04:00-05:00,SUN22:00-MON10:00',
+}
+
+try:
+    AUTOTRADE_DEFAULT_BLACKOUT_WINDOWS = YVER123_SELECTED_BLACKOUT_WINDOWS
+except Exception:
+    pass
+
+
+def _yver123_norm_blackout_windows(s: str) -> str:
+    try:
+        return re.sub(r'\s+', '', str(s or '').upper().strip())
+    except Exception:
+        return str(s or '').upper().replace(' ', '').strip()
+
+
+def _yver123_sync_selected_blackout_windows() -> bool:
+    """Migrate known stale blackout values to the selected owner window.
+
+    Conservative by design: only changes empty/known-stale values or matching but
+    differently-spaced values. It does not touch risk or order logic.
+    """
+    changed = False
+    try:
+        desired = str(YVER123_SELECTED_BLACKOUT_WINDOWS)
+        desired_n = _yver123_norm_blackout_windows(desired)
+        stale_n = {_yver123_norm_blackout_windows(x) for x in YVER123_STALE_BLACKOUT_WINDOWS}
+        keys = [
+            globals().get('AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY', 'entry_blackout_windows'),
+            globals().get('SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY', 'setup_generation_blackout_windows'),
+        ]
+        for k in keys:
+            try:
+                cur = _autotrade_config_get(k, '')
+                cur_s = str(cur or '').strip()
+                cur_n = _yver123_norm_blackout_windows(cur_s)
+                if (not cur_s) or cur_n in stale_n or cur_n == desired_n:
+                    if cur_s != desired:
+                        _autotrade_config_set(k, desired)
+                        changed = True
+            except Exception:
+                try:
+                    _autotrade_config_set(k, desired)
+                    changed = True
+                except Exception:
+                    pass
+        try:
+            _autotrade_config_set('yver123_selected_blackout_windows', desired)
+            _autotrade_config_set('yver123_blackout_sync_last_ts', str(int(time.time())))
+            _autotrade_config_set('yver123_blackout_sync_changed', 'true' if changed else 'false')
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return bool(changed)
+
+
+try:
+    _yver123_sync_selected_blackout_windows()
+except Exception:
+    pass
+
+
+_YVER123_ORIG_ENGINE_HEALTH_TEXT = globals().get('_yver90_engine_health_text')
+
+
+def _yver123_clean_engine_health_text(txt: str, eng: str = 'F8') -> str:
+    out = str(txt or '')
+    try:
+        eng = 'F9' if str(eng or '').upper().strip() == 'F9' else 'F8'
+        # Remove old historical action/warning appendices that are no longer useful
+        # once the durable row counts are displayed above.
+        drop_prefixes = (
+            '⚠️ v96 check:',
+            '🚨 v97 action:',
+            '🛠️ yver98:',
+            '🧷 yver106 durable engine check:',
+            'Meaning: F8 setup rows are visible',
+            'Meaning: F9 setup rows are visible',
+            '✅ yver109 primary durable counts are active:',
+            '✅ yver110 coherent health:',
+        )
+        kept = []
+        for line in out.splitlines():
+            ls = line.strip()
+            if any(ls.startswith(p) for p in drop_prefixes):
+                continue
+            kept.append(line)
+        out = '\n'.join(kept).rstrip()
+        marker = f'✅ yver123 clean health: {eng} durable counts above are the source of truth.'
+        if marker not in out:
+            out += '\n' + marker
+    except Exception:
+        return str(txt or '')
+    return out
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    try:
+        out = _YVER123_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours) if callable(_YVER123_ORIG_ENGINE_HEALTH_TEXT) else ''
+    except Exception as exc:
+        out = f"🧪 Engine Health — {eng}\n━━━━━━━━━━━━━━━━━━━━\nStatus: ERROR | {type(exc).__name__}: {exc}"
+    try:
+        return _yver123_clean_engine_health_text(out, eng)
+    except Exception:
+        return out
+
+
+try:
+    # Keep the engine diagnostics discoverable.  This is text-only and does not
+    # wrap /help_admin, so it stays fast.
+    if callable(globals().get('_yver121_help_admin_block')):
+        block = _yver121_help_admin_block()
+    else:
+        block = "🧪 F8/F9 ENGINE HEALTH / PIPELINE CHECKS\n/engine_health F8 24\n/engine_health F9 24\n/engine_probe F8\n/engine_probe F9\n/setup_matrix verify"
+    if '/engine_health F8 24' not in str(globals().get('HELP_TEXT_ADMIN', '') or ''):
+        HELP_TEXT_ADMIN = str(block) + "\n" + str(globals().get('HELP_TEXT_ADMIN', '') or '')
+except Exception:
+    pass
+
+try:
+    _autotrade_config_set('yver123_version', YVER123_VERSION)
+    _autotrade_config_set('yver123_health_cleanup', 'ON')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v123'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v123'
+except Exception:
+    pass
+# =========================================================
+# end yver123
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
