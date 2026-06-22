@@ -62822,11 +62822,19 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
+                try:
+                    _f8_setup_email_reason = (
+                        f"f8_setup_email_sent:{len(setup_email_setups or [])}"
+                        if setup_email_sent
+                        else _yver124_f8_setup_email_empty_reason(int(uid), str(bm_sess or ''), list(filtered or []))
+                    )
+                except Exception:
+                    _f8_setup_email_reason = f"f8_setup_email_sent:{len(setup_email_setups or [])}" if setup_email_sent else "f8_setup_email_empty:diagnostic_unavailable"
                 reasons = [
                     f"candidates={len(filtered)}",
                     f"top={top_sym}:{top_dir}:{top_tf}{top_move:+.2f}%",
                     f"sent_{tag}" if alert_sent else ("alert_email_off" if not alert_email_enabled else f"alert_email_failed:{str(alert_error)[:120]}"),
-                    f"f8_setup_email_sent:{len(setup_email_setups or [])}" if setup_email_sent else "f8_setup_email_failed_or_empty",
+                    str(_f8_setup_email_reason),
                 ]
                 _LAST_BIGMOVE_DECISION[int(uid)] = {
                     "status": "SENT" if alert_sent else ("SETUP_ONLY" if not alert_email_enabled else "ERROR"),
@@ -80220,6 +80228,166 @@ except Exception:
     pass
 # =========================================================
 # end yver123
+# =========================================================
+
+
+# =========================================================
+# yver124 BigMove/F8 setup-email diagnostics
+# =========================================================
+# v123 trading behaviour was correct, but /email_decision printed the vague
+# reason "f8_setup_email_failed_or_empty" after a valid BigMove alert.  That
+# made normal policy/final-gate blocks look like an F8 failure.  v124 keeps the
+# fast v121/v122/v123 F8 path unchanged and only makes the diagnosis explicit.
+
+YVER124_VERSION = 'yver124_2026_06_22_f8_setup_email_exact_empty_reason'
+
+
+def _yver124_parse_details_json(row: dict) -> dict:
+    try:
+        if not row:
+            return {}
+        dj = row.get('details_json') if isinstance(row, dict) else None
+        if not dj:
+            return {}
+        if isinstance(dj, dict):
+            return dict(dj)
+        return json.loads(str(dj or '{}')) if str(dj or '').strip() else {}
+    except Exception:
+        return {}
+
+
+def _yver124_recent_enough(row: dict, max_age_sec: int = 420) -> bool:
+    try:
+        evt = float((row or {}).get('event_ts') or 0.0)
+        if evt <= 0:
+            return True
+        return (float(time.time()) - evt) <= float(max_age_sec)
+    except Exception:
+        return True
+
+
+def _yver124_format_top_reasons(top) -> str:
+    try:
+        if not top:
+            return ''
+        if isinstance(top, dict):
+            items = sorted(top.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
+            return ','.join([f"{str(k)}={int(v or 0)}" for k, v in items[:5]])
+        if isinstance(top, (list, tuple)):
+            return ','.join([str(x) for x in list(top)[:5]])
+        return str(top)[:180]
+    except Exception:
+        return str(top)[:180]
+
+
+def _yver124_candidate_symbols(filtered: list) -> str:
+    try:
+        out = []
+        for c in list(filtered or [])[:8]:
+            if isinstance(c, dict):
+                sym = str(c.get('symbol') or '').upper().strip()
+                direc = str(c.get('direction') or '').upper().strip()
+                if sym:
+                    out.append(f"{sym}:{direc}" if direc else sym)
+            else:
+                sym = str(getattr(c, 'symbol', '') or '').upper().strip()
+                direc = str(getattr(c, 'direction', '') or '').upper().strip()
+                if sym:
+                    out.append(f"{sym}:{direc}" if direc else sym)
+        return ','.join(out)
+    except Exception:
+        return ''
+
+
+def _yver124_latest_bm_event(uid: int, stage: str, session: str = '') -> tuple[dict, dict]:
+    row = {}
+    try:
+        row = _latest_setup_pipeline_event(int(uid or 0), stage=stage, session=str(session or ''), mode='bigmove_setup_email') or {}
+        if not row:
+            row = _latest_setup_pipeline_event(int(uid or 0), stage=stage, mode='bigmove_setup_email') or {}
+    except Exception:
+        row = {}
+    return row, _yver124_parse_details_json(row)
+
+
+def _yver124_f8_setup_email_empty_reason(uid: int, session: str = '', filtered: list | None = None) -> str:
+    """Return exact reason for BigMove alert -> no F8 setup email.
+
+    This is diagnostic only.  It does not change the KEEP/WATCH policy,
+    executable gate, alert email, AutoTrade, or any trade sizing.
+    """
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    sess = str(session or '').upper().strip()
+    cand_txt = _yver124_candidate_symbols(list(filtered or []))
+
+    # 1) Most common: F8 setup objects were built and stored for audit, but the
+    # setup-email presend gate removed them because policy was WATCH/NOT_KEEP or
+    # a final gate failed.
+    try:
+        row, det = _yver124_latest_bm_event(uid_i, 'bigmove_setup_email_presend_gate', sess)
+        if row and _yver124_recent_enough(row):
+            top = _yver124_format_top_reasons(det.get('top_reasons') or det.get('reasons'))
+            if top:
+                return 'f8_setup_email_empty:presend_gate:' + top
+            return 'f8_setup_email_empty:presend_gate_empty'
+    except Exception:
+        pass
+
+    # 2) Candidate could not be converted into an F8 setup object at all.
+    try:
+        row, det = _yver124_latest_bm_event(uid_i, 'bigmove_setup_email_build', sess)
+        if row and _yver124_recent_enough(row):
+            status = str(row.get('status') or '').lower().strip()
+            if status == 'empty':
+                n = det.get('candidates')
+                suffix = f':candidates={n}' if n is not None else ''
+                return 'f8_setup_email_empty:builder_empty' + suffix
+            if status == 'error':
+                err = str(det.get('error') or '').strip()[:160]
+                return 'f8_setup_email_empty:builder_error' + (':' + err if err else '')
+    except Exception:
+        pass
+
+    # 3) Built/generated rows exist, but delivery was not attempted/sent.  Show
+    # how many raw F8 rows were created so this is not mistaken for dead F8.
+    try:
+        row, det = _yver124_latest_bm_event(uid_i, 'bigmove_f8_raw_generation_logged', sess)
+        if row and _yver124_recent_enough(row):
+            setups = det.get('setups')
+            if setups is not None:
+                if int(setups or 0) > 0:
+                    return f'f8_setup_email_empty:raw_f8_created={int(setups or 0)}:not_email_eligible'
+                return 'f8_setup_email_empty:raw_f8_created=0'
+    except Exception:
+        pass
+
+    # 4) Last fallback keeps the previous meaning but adds context.
+    try:
+        if cand_txt:
+            return 'f8_setup_email_empty:no_recent_gate_event:' + cand_txt
+    except Exception:
+        pass
+    return 'f8_setup_email_empty:reason_unknown'
+
+
+try:
+    _autotrade_config_set('yver124_version', YVER124_VERSION)
+    _autotrade_config_set('yver124_f8_setup_email_diagnostics', 'ON')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v124'
+except Exception:
+    pass
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v124'
+except Exception:
+    pass
+# =========================================================
+# end yver124
 # =========================================================
 
 if __name__ == "__main__":
