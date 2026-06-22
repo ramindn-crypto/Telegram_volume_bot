@@ -80859,6 +80859,310 @@ except Exception:
 # end yver123
 # =========================================================
 
+
+# =========================================================
+# yver124 — /screen must show the exact recently emailed/executable setup
+# =========================================================
+# Scope is intentionally narrow:
+# - Do not touch /engine_health counts or /setup_audit_keep numbers.
+# - Do not touch startup, scans, AutoTrade risk, TP/SL, leverage, sizing, or order logic.
+# - Fix only /screen's recent delivery fallback so a setup that was emailed and/or
+#   AutoTraded (example: ENA) appears in Top Trade Setups immediately.
+YVER124_VERSION = 'yver124_2026_06_22_screen_recent_email_exec_visibility_fix'
+
+try:
+    _YVER124_ORIG_RECENT_DELIVERY_LANE = _recent_delivery_lane_setup_objects
+except Exception:
+    _YVER124_ORIG_RECENT_DELIVERY_LANE = None
+try:
+    _YVER124_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = _screen_recent_db_body_and_kb
+except Exception:
+    _YVER124_ORIG_SCREEN_RECENT_DB_BODY_AND_KB = None
+try:
+    _YVER124_ORIG_BUILD_SCREEN_BODY_AND_KB = _build_screen_body_and_kb
+except Exception:
+    _YVER124_ORIG_BUILD_SCREEN_BODY_AND_KB = None
+
+
+def _yver124_recent_emailed_exec_setup_objects(user_id: int, session_name: str = '', max_age_min: int | None = None, limit: int = 3) -> list:
+    """Read-only fast source for /screen: emailed_setups joined to executable_setups.
+
+    v123 could miss the visible setup because the older DB reader preferred the
+    `signals` table payload. Some setup emails are stored as delivery rows plus
+    executable rows, while `signals` may not contain the full payload anymore.
+    This reader treats `emailed_setups + executable_setups` as the authoritative
+    delivery lane for /screen, matching what email + AutoTrade just consumed.
+    """
+    from types import SimpleNamespace
+    try:
+        uid = int(user_id or 0)
+    except Exception:
+        uid = 0
+    if uid <= 0:
+        return []
+    try:
+        if max_age_min is None:
+            max_age_min = _screen_actionable_fallback_max_age_min()
+        max_age_min = max(1, int(max_age_min or _screen_actionable_fallback_max_age_min()))
+    except Exception:
+        max_age_min = 60
+    try:
+        limit_i = max(1, int(limit or 3))
+    except Exception:
+        limit_i = 3
+    sess = str(session_name or '').upper().strip()
+    cutoff = float(time.time()) - float(max_age_min) * 60.0
+    rows = []
+    try:
+        with sqlite3.connect(DB_PATH, timeout=5.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            try:
+                names = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            except Exception:
+                names = set()
+            if 'emailed_setups' not in names or 'executable_setups' not in names:
+                return []
+            # Use executable payload first. It is the same durable row used by
+            # AutoTrade, so /screen cannot diverge from email/autotrade here.
+            sql = """
+                SELECT
+                    e.setup_id AS setup_id,
+                    COALESCE(NULLIF(e.session,''), NULLIF(x.session,''), '') AS session,
+                    e.emailed_ts AS emailed_ts,
+                    COALESCE(x.executable_ts, e.emailed_ts) AS executable_ts,
+                    COALESCE(x.signal_created_ts, x.executable_ts, e.emailed_ts) AS signal_created_ts,
+                    COALESCE(x.symbol, '') AS symbol,
+                    COALESCE(x.market_symbol, '') AS market_symbol,
+                    COALESCE(x.side, '') AS side,
+                    COALESCE(x.conf, 0) AS conf,
+                    COALESCE(x.entry, 0) AS entry,
+                    COALESCE(x.sl, 0) AS sl,
+                    COALESCE(x.tp, 0) AS tp,
+                    COALESCE(x.alt_target_a, 0) AS alt_target_a,
+                    COALESCE(x.alt_target_b, 0) AS alt_target_b,
+                    COALESCE(x.fut_vol_usd, 0) AS fut_vol_usd,
+                    COALESCE(x.ch24, 0) AS ch24,
+                    COALESCE(x.ch4, 0) AS ch4,
+                    COALESCE(x.ch1, 0) AS ch1,
+                    COALESCE(x.ch15, 0) AS ch15,
+                    COALESCE(x.quality_score, 0) AS quality_score,
+                    COALESCE(x.atr_pct, 0) AS atr_pct,
+                    COALESCE(x.engine, '') AS engine,
+                    COALESCE(x.pullback_ready, 0) AS pullback_ready,
+                    COALESCE(x.pullback_bypass_hot, 0) AS pullback_bypass_hot,
+                    COALESCE(x.pullback_ema_dist_pct, 0) AS pullback_ema_dist_pct,
+                    COALESCE(x.ema_support_period, 0) AS ema_support_period,
+                    COALESCE(x.ema_support_dist_pct, 0) AS ema_support_dist_pct,
+                    COALESCE(x.family_id, '') AS family_id,
+                    COALESCE(NULLIF(x.source_kind,''), 'emailed_setups') AS source_kind,
+                    COALESCE(NULLIF(x.setup_strategy,''), 'NORMAL') AS setup_strategy,
+                    COALESCE(x.original_setup_id, '') AS original_setup_id,
+                    COALESCE(x.original_side, '') AS original_side,
+                    COALESCE(x.strategy_reason, '') AS strategy_reason,
+                    COALESCE(o.outcome, 'OPEN') AS outcome
+                FROM emailed_setups e
+                JOIN executable_setups x
+                  ON x.setup_id = e.setup_id
+                 AND x.user_id IN (?, 0)
+                LEFT JOIN signal_outcomes o ON o.setup_id = e.setup_id
+                WHERE e.user_id=?
+                  AND e.emailed_ts>=?
+                  AND (?='' OR UPPER(COALESCE(e.session,''))=? OR COALESCE(e.session,'')='')
+                  AND COALESCE(o.outcome, 'OPEN')='OPEN'
+                ORDER BY e.emailed_ts DESC, x.executable_ts DESC, e.setup_id DESC
+                LIMIT ?
+            """
+            rows = cur.execute(sql, (uid, uid, float(cutoff), sess, sess, max(limit_i * 4, 12))).fetchall() or []
+    except Exception as e:
+        rows = []
+        try:
+            logger.debug('yver124 recent emailed executable read failed: %s', e)
+        except Exception:
+            pass
+
+    out = []
+    seen = set()
+    for r in list(rows or []):
+        try:
+            row = dict(r)
+            sid = str(row.get('setup_id') or '').strip()
+            sym = str(row.get('symbol') or '').upper().strip()
+            side = str(row.get('side') or '').upper().strip()
+            if not sid or not sym or side not in {'BUY','SELL'}:
+                continue
+            entry = float(row.get('entry') or 0.0)
+            sl = float(row.get('sl') or 0.0)
+            tp = float(_resolve_single_tp(entry, sl, row.get('tp'), row.get('alt_target_a'), row.get('alt_target_b'), side) or 0.0)
+            if entry <= 0 or sl <= 0 or tp <= 0:
+                continue
+            key = (sid, sym, side)
+            if key in seen:
+                continue
+            seen.add(key)
+            item = SimpleNamespace(
+                setup_id=sid,
+                id=sid,
+                symbol=sym,
+                market_symbol=str(row.get('market_symbol') or ''),
+                side=side,
+                conf=int(row.get('conf') or 0),
+                entry=entry,
+                sl=sl,
+                tp=tp,
+                alt_target_a=0.0,
+                alt_target_b=0.0,
+                fut_vol_usd=float(row.get('fut_vol_usd') or 0.0),
+                ch24=float(row.get('ch24') or 0.0),
+                ch4=float(row.get('ch4') or 0.0),
+                ch1=float(row.get('ch1') or 0.0),
+                ch15=float(row.get('ch15') or 0.0),
+                quality_score=float(row.get('quality_score') or 0.0),
+                atr_pct=float(row.get('atr_pct') or 0.0),
+                engine=str(row.get('engine') or ''),
+                pullback_ready=bool(int(row.get('pullback_ready') or 0)),
+                pullback_bypass_hot=bool(int(row.get('pullback_bypass_hot') or 0)),
+                pullback_ema_dist_pct=float(row.get('pullback_ema_dist_pct') or 0.0),
+                ema_support_period=int(row.get('ema_support_period') or 0),
+                ema_support_dist_pct=float(row.get('ema_support_dist_pct') or 0.0),
+                is_trailing_alt_target_b=False,
+                created_ts=float(row.get('signal_created_ts') or row.get('emailed_ts') or 0.0),
+                signal_created_ts=float(row.get('signal_created_ts') or 0.0),
+                executable_ts=float(row.get('executable_ts') or row.get('emailed_ts') or 0.0),
+                email_logged_ts=float(row.get('emailed_ts') or 0.0),
+                emailed_ts=float(row.get('emailed_ts') or 0.0),
+                generated_logged_ts=float(row.get('signal_created_ts') or 0.0),
+                source_kind='emailed_setups',
+                source_session=str(row.get('session') or sess),
+                session=str(row.get('session') or sess),
+                family_id=str(row.get('family_id') or ''),
+                family_version=str(globals().get('RESEARCH_FAMILY_VERSION', '') or ''),
+                setup_strategy=str(row.get('setup_strategy') or 'NORMAL'),
+                strategy=str(row.get('setup_strategy') or 'NORMAL'),
+                strategy_mode=str(row.get('setup_strategy') or 'NORMAL'),
+                strategy_reason=str(row.get('strategy_reason') or ''),
+                original_setup_id=str(row.get('original_setup_id') or ''),
+                original_side=str(row.get('original_side') or ''),
+                delivery_lane_locked=True,
+            )
+            out.append(item)
+            if len(out) >= limit_i:
+                break
+        except Exception:
+            continue
+    return out[:limit_i]
+
+
+def _recent_delivery_lane_setup_objects(user_id: int, session_name: str = '', max_age_min: int | None = None, limit: int = 3) -> list:
+    """v124: prefer exact emailed+executable rows, then fall back to older cache readers."""
+    try:
+        limit_i = max(1, int(limit or 3))
+    except Exception:
+        limit_i = 3
+    out = []
+    seen = set()
+    for getter in (
+        lambda: _yver124_recent_emailed_exec_setup_objects(user_id, session_name=session_name, max_age_min=max_age_min, limit=max(limit_i * 2, 6)),
+        lambda: _YVER124_ORIG_RECENT_DELIVERY_LANE(user_id, session_name=session_name, max_age_min=max_age_min, limit=max(limit_i * 2, 6)) if callable(_YVER124_ORIG_RECENT_DELIVERY_LANE) else [],
+    ):
+        try:
+            rows = getter() or []
+        except Exception:
+            rows = []
+        for item in list(rows or []):
+            try:
+                sid = str(getattr(item, 'setup_id', '') or getattr(item, 'id', '') or '').strip()
+                sym = str(getattr(item, 'symbol', '') or '').upper().strip()
+                side = str(getattr(item, 'side', '') or '').upper().strip()
+                key = (sid, sym, side)
+                if not sid or not sym or key in seen:
+                    continue
+                seen.add(key)
+                out.append(item)
+                if len(out) >= limit_i:
+                    return out[:limit_i]
+            except Exception:
+                continue
+    return out[:limit_i]
+
+
+def _yver124_screen_body_from_recent_delivery(uid: int, session: str, best_fut: dict, max_age_min: int | None = None):
+    """Build /screen body from the same delivery lane consumed by email/autotrade."""
+    try:
+        sess = str(session or '').upper().strip()
+        recent = _recent_delivery_lane_setup_objects(int(uid or 0), session_name=sess, max_age_min=max_age_min or _screen_actionable_fallback_max_age_min(), limit=_screen_display_limit()) or []
+        if not recent:
+            return '', [], []
+        try:
+            # Keep the v115 ghost protection, but give it authoritative delivery rows.
+            recent = _yver115_filter_to_synced_screen_setups(list(recent or []), int(uid or 0), sess, require_email=True)
+        except Exception:
+            recent = list(recent or [])
+        if not recent:
+            return '', [], []
+        # Filter strict policy/volume exactly like screen cards, but don't run OHLCV.
+        try:
+            recent = [s for s in list(recent or []) if _setup_volume_ok(s)]
+            recent = _filter_user_visible_keep_setups(recent, session_name=sess, user_id=int(uid or 0), lane='screen')
+        except Exception:
+            recent = list(recent or [])
+        if not recent:
+            return '', [], []
+        try:
+            up_list, dn_list = compute_directional_lists(best_fut or {})
+            market_txt = _screen_market_context_table(best_fut or {}, leaders=up_list, losers=dn_list)
+        except Exception:
+            market_txt = ''
+        body = "\n".join([
+            "", "*Top Trade Setups*", SEP,
+            "_Showing recent setup-email / executable lane. This is the same lane used by setup email and AutoTrade._",
+            _screen_format_setup_cards(list(recent or []), int(uid or 0), sess),
+            "", market_txt or "",
+        ]).strip()
+        kb = [(str(getattr(x, 'symbol', '') or '').upper(), str(getattr(x, 'setup_id', '') or getattr(x, 'id', '') or '')) for x in list(recent or [])]
+        return body, kb, list(recent or [])
+    except Exception:
+        return '', [], []
+
+
+def _screen_recent_db_body_and_kb(uid: int, session: str, best_fut: dict, max_age_min: int | None = None, include_email_source: bool = True):
+    """v124: /screen fallback must show latest emailed+AutoTrade setup before empty market context."""
+    try:
+        body, kb, setups = _yver124_screen_body_from_recent_delivery(int(uid or 0), str(session or ''), best_fut or {}, max_age_min=max_age_min)
+        if body and setups:
+            return body, kb, setups
+    except Exception:
+        pass
+    if callable(_YVER124_ORIG_SCREEN_RECENT_DB_BODY_AND_KB):
+        return _YVER124_ORIG_SCREEN_RECENT_DB_BODY_AND_KB(uid, session, best_fut, max_age_min=max_age_min, include_email_source=include_email_source)
+    return '', [], []
+
+
+def _build_screen_body_and_kb(best_fut: dict, session: str, uid: int):
+    """v124: if the normal fast screen body is empty, recover from latest email/autotrade lane."""
+    try:
+        body, kb, setups = _yver124_screen_body_from_recent_delivery(int(uid or 0), str(session or ''), best_fut or {}, max_age_min=_screen_actionable_fallback_max_age_min())
+        if body and setups:
+            return body, kb, setups
+    except Exception:
+        pass
+    if callable(_YVER124_ORIG_BUILD_SCREEN_BODY_AND_KB):
+        return _YVER124_ORIG_BUILD_SCREEN_BODY_AND_KB(best_fut, session, uid)
+    return ('', [], [])
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v124'
+    SCREEN_CACHE_VERSION = str(globals().get('SCREEN_CACHE_VERSION', '')) + ':v124'
+except Exception:
+    pass
+try:
+    logger.info('yver124 loaded: /screen reads recent emailed+executable lane before showing empty setup queue')
+except Exception:
+    pass
+# =========================================================
+# end yver124
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
