@@ -80662,6 +80662,105 @@ except Exception:
 # end yver125
 # =========================================================
 
+
+# =========================================================
+# yver126 — compact F8/F9 engine health notes
+# =========================================================
+# Based on yver125.  Display/diagnostic cleanup only.
+# No risk, TP/SL, leverage, blackout, detector, setup routing, email, or
+# AutoTrade execution logic is changed.
+# Goal: keep the useful gap-finder under /engine_health and remove old version
+# explanations that made F8/F9 health hard to read.
+
+YVER126_VERSION = 'yver126_2026_06_22_compact_engine_health_gap_finder'
+
+_YVER126_ORIG_ENGINE_HEALTH_TEXT = globals().get('_yver90_engine_health_text')
+
+
+def _yver126_compact_engine_health_text(txt: str, eng: str = 'F8') -> str:
+    out = str(txt or '')
+    eng = 'F9' if str(eng or '').upper().strip() == 'F9' else 'F8'
+    try:
+        lines = out.splitlines()
+        # Keep the real durable-count section and replace everything from Notes:/Probe:
+        # downward with one compact gap-finder block.
+        cut = None
+        for i, line in enumerate(lines):
+            ls = str(line or '').strip()
+            if ls.startswith('Notes:') or ls.startswith('Probe:'):
+                cut = i
+                break
+        if cut is None:
+            # Fall back: remove known historical note appendices if older wrappers
+            # return without a Notes block.
+            drop_starts = (
+                '⚠️ v96', '🚨 v97', '🛠️ yver98', '🧷 yver106',
+                '✅ yver109', '✅ yver110', '🧩 yver100', '✅ yver107',
+                '🧷 yver108', '✅ yver123', 'Meaning:',
+            )
+            clean = []
+            skip_cont = False
+            for line in lines:
+                ls = str(line or '').strip()
+                if any(ls.startswith(p) for p in drop_starts):
+                    skip_cont = True
+                    continue
+                if skip_cont:
+                    # Continuation lines from old long paragraphs usually do not
+                    # contain counters.  Resume at separators or real count rows.
+                    if ls.startswith('─') or re.search(r'rows:|Status:|Window:|Configured|Current /setup_matrix', ls):
+                        skip_cont = False
+                    else:
+                        continue
+                clean.append(line)
+            lines = clean
+            cut = len(lines)
+        base = '\n'.join(lines[:cut]).rstrip()
+        sep = '────────────────────'
+        if base and not base.endswith(sep):
+            base += '\n' + sep
+        if eng == 'F8':
+            extra = (
+                "\nChecks:\n"
+                "• OK when Raw BigMove + generated/audit rows update after alerts.\n"
+                "• Gap if Raw>0 but generated/audit=0 after a trigger.\n"
+                "• Emailed setup rows can be 0 when F8 is WATCH/not KEEP.\n"
+                "Probe: /engine_probe F8"
+            )
+        else:
+            extra = (
+                "\nChecks:\n"
+                "• OK if F9 rows are 0 when no symbol passes the ≥2-day rule.\n"
+                "• Gap if /screen shows F9 but generated/audit=0.\n"
+                "• Rule: F9 needs ≥2 distinct Melbourne days.\n"
+                "Probe: /engine_probe F9"
+            )
+        return (base + extra).rstrip()
+    except Exception:
+        return str(txt or '')
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+    try:
+        out = _YVER126_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours) if callable(_YVER126_ORIG_ENGINE_HEALTH_TEXT) else ''
+    except Exception as exc:
+        out = f"🧪 Engine Health — {eng}\n━━━━━━━━━━━━━━━━━━━━\nStatus: ERROR | {type(exc).__name__}: {exc}"
+    return _yver126_compact_engine_health_text(out, eng)
+
+try:
+    _autotrade_config_set('yver126_version', YVER126_VERSION)
+    _autotrade_config_set('yver126_engine_health_compact_notes', 'ON')
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v126'
+except Exception:
+    pass
+# =========================================================
+# end yver126
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
