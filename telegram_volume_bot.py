@@ -81357,6 +81357,304 @@ except Exception:
 # end yver126
 # =========================================================
 
+
+
+# =========================================================
+# yver130 active patch (MUST be before __main__)
+# - /engine_health F8/F9 active command path now splits KEEP/WATCH/Other
+#   using the same visible setup-audit rows; no hidden row can look tradable.
+# - /setup_audit ATWhy no longer shows NOT_KEEP for rows whose visible Policy is KEEP.
+# =========================================================
+
+def _yver130_row_ts(r: dict) -> float:
+    try:
+        return float(_setup_audit_row_ts(r) or 0.0)
+    except Exception:
+        try:
+            return float((r or {}).get('created_ts') or (r or {}).get('ts') or 0.0)
+        except Exception:
+            return 0.0
+
+
+def _yver130_sym(r: dict) -> str:
+    try:
+        return str(_symbol_base(str((r or {}).get('symbol') or (r or {}).get('market_symbol') or '')) or '').upper().strip()
+    except Exception:
+        return str((r or {}).get('symbol') or '').upper().strip()
+
+
+def _yver130_side(r: dict) -> str:
+    return str((r or {}).get('side') or '').upper().strip()
+
+
+def _yver130_combo(r: dict, fam: str = '') -> str:
+    try:
+        rr = dict(r or {})
+        f = str(fam or _setup_audit_family_code(rr) or '').upper().strip()
+        sess = str(rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
+        side = _yver130_side(rr) or '-'
+        combo = _setup_combo_strategy_side_key(f, sess, rr, side).upper().strip()
+        if combo and not combo.startswith(f + '--'):
+            return combo
+    except Exception:
+        pass
+    return str((r or {}).get('combo') or '').upper().strip()
+
+
+def _yver130_policy_for_visible_row(r: dict, uid: int = 0) -> str:
+    try:
+        rr = dict(r or {})
+        sess = str(rr.get('session') or rr.get('source_session') or '').upper().strip()
+        side = _yver130_side(rr)
+        pol = str(_setup_audit_policy_label(rr, uid=int(uid or 0), session_name=sess, side=side) or '').upper().strip()
+        if pol == 'DISABLE':
+            pol = 'OTHER'
+        if pol in {'KEEP','WATCH','TIGHTEN'}:
+            return pol
+        raw = str(rr.get('policy') or rr.get('policy_status') or '').upper().strip()
+        if raw in {'KEEP','WATCH','TIGHTEN'}:
+            return raw
+    except Exception:
+        pass
+    return 'OTHER'
+
+
+def _yver130_visible_engine_rows(uid: int, engine: str, start_ts: float = 0.0) -> list[dict]:
+    """Rows used by /engine_health. Read-only and based on the visible audit source.
+
+    This deliberately does NOT read hidden generated-only repair rows. The command is
+    a health/report view, not a generator/backfill path.
+    """
+    eng = str(engine or '').upper().strip()
+    uid_i = int(uid or 0)
+    try:
+        rows = _setup_audit_load_rows(
+            uid_i,
+            hours=None,
+            limit=0,
+            dedup=True,
+            start_ts=float(start_ts or 0.0),
+            apply_final_quality_gate=True,
+            source_mode_override='ALL',
+        ) or []
+    except Exception:
+        rows = []
+    out=[]; seen=set()
+    for r0 in rows:
+        try:
+            r=dict(r0 or {})
+            fam=str(_setup_audit_family_code(r) or '').upper().strip()
+            if fam != eng:
+                continue
+            ts=_yver130_row_ts(r)
+            if start_ts and ts and ts < float(start_ts):
+                continue
+            sym=_yver130_sym(r); side=_yver130_side(r); combo=_yver130_combo(r, fam)
+            pol=_yver130_policy_for_visible_row(r, uid_i)
+            key=''
+            try:
+                key=str(_setup_audit_unique_key(r) or '')
+            except Exception:
+                key=''
+            if not key:
+                key=f'{int(ts//60)}:{sym}:{side}:{combo}'
+            if key in seen:
+                continue
+            seen.add(key)
+            r['_v130_ts']=ts; r['_v130_sym']=sym; r['_v130_side']=side; r['_v130_combo']=combo; r['_v130_policy']=pol
+            out.append(r)
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: float(x.get('_v130_ts') or 0.0), reverse=True)
+
+
+def _yver130_result_counts(rows: list[dict]) -> str:
+    tp=sl=op=0
+    try:
+        horizon=int(_setup_audit_result_horizon_hours())
+    except Exception:
+        horizon=0
+    for r in rows or []:
+        try:
+            res=str(_setup_audit_result_label(_setup_audit_keep_watch_fast_result_label(r, horizon)) or '').upper().strip()
+        except Exception:
+            res=str((r or {}).get('result') or (r or {}).get('res') or 'OPEN').upper().strip()
+        if res == 'TP': tp+=1
+        elif res == 'SL': sl+=1
+        else: op+=1
+    return '-' if (tp+sl+op)==0 else f'TP:{tp}, SL:{sl}, OPEN:{op}'
+
+
+def _yver130_latest(rows: list[dict], keep_only: bool = False) -> str:
+    try:
+        rr=[r for r in (rows or []) if (not keep_only or str(r.get('_v130_policy') or '').upper()=='KEEP')]
+        if not rr:
+            return '-'
+        r=rr[0]
+        ts=float(r.get('_v130_ts') or 0.0)
+        when='-'
+        if ts>0:
+            try:
+                when=datetime.fromtimestamp(ts, tz=MELBOURNE_TZ).strftime('%m-%d %H:%M')
+            except Exception:
+                when=datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%m-%d %H:%M')
+        return f"{when} {r.get('_v130_combo','')} {r.get('_v130_sym','')} {r.get('_v130_side','')} {r.get('_v130_policy','')}".strip()
+    except Exception:
+        return '-'
+
+
+def _yver130_exec_email_at_counts(uid: int, engine: str, start_ts: float) -> tuple[int,int,int]:
+    """Best-effort durable counts for executable/delivered/autotrade, read-only.
+    These are secondary counts; KEEP/WATCH split is from visible audit rows.
+    """
+    uid_i=int(uid or 0); eng=str(engine or '').upper().strip()
+    exec_n=email_n=at_n=0
+    since=float(start_ts or 0.0)
+    fam_like=f'{eng}-%'
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory=sqlite3.Row
+            cur=conn.cursor()
+            # executable_setups schemas vary; try combo/family filters defensively.
+            try:
+                exec_n=int((cur.execute("SELECT COUNT(*) FROM executable_setups WHERE user_id=? AND COALESCE(created_ts,ts,0)>=? AND (UPPER(COALESCE(combo,'')) LIKE ? OR UPPER(COALESCE(family,''))=?)", (uid_i, since, fam_like, eng)).fetchone() or [0])[0] or 0)
+            except Exception:
+                try:
+                    exec_n=int((cur.execute("SELECT COUNT(*) FROM executable_setups WHERE COALESCE(created_ts,ts,0)>=? AND UPPER(COALESCE(combo,'')) LIKE ?", (since, fam_like)).fetchone() or [0])[0] or 0)
+                except Exception:
+                    exec_n=0
+            try:
+                email_n=int((cur.execute("SELECT COUNT(*) FROM emailed_setups WHERE user_id=? AND COALESCE(emailed_ts,created_ts,ts,0)>=? AND UPPER(COALESCE(combo,'')) LIKE ?", (uid_i, since, fam_like)).fetchone() or [0])[0] or 0)
+            except Exception:
+                email_n=0
+            try:
+                at_n=int((cur.execute("SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND COALESCE(opened_ts,created_ts,0)>=? AND UPPER(COALESCE(combo,'')) LIKE ?", (uid_i, since, fam_like)).fetchone() or [0])[0] or 0)
+            except Exception:
+                at_n=0
+    except Exception:
+        pass
+    return exec_n,email_n,at_n
+
+
+def _yver130_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng=str(engine or 'F8').upper().strip()
+    if eng not in {'F8','F9'}:
+        return 'Usage: /engine_health F8 or /engine_health F9'
+    try:
+        uid_i=int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i=int(uid or 0)
+    now_ts=float(time.time())
+    try:
+        baseline_ts=float(_yver122_policy_baseline_ts())
+    except Exception:
+        baseline_ts=datetime(2026,6,1,tzinfo=MELBOURNE_TZ).timestamp()
+    windows=[('Last 24h', now_ts-86400), ('Last 7d', now_ts-7*86400), ('Overall', baseline_ts)]
+    all_rows=_yver130_visible_engine_rows(uid_i, eng, baseline_ts)
+    table=[]; keep24=0
+    for label, start in windows:
+        wrs=[r for r in all_rows if float(r.get('_v130_ts') or 0.0) >= float(start)]
+        keep=[r for r in wrs if str(r.get('_v130_policy') or '').upper()=='KEEP']
+        watch=[r for r in wrs if str(r.get('_v130_policy') or '').upper() in {'WATCH','TIGHTEN'}]
+        other=[r for r in wrs if r not in keep and r not in watch]
+        if label=='Last 24h': keep24=len(keep)
+        exec_n,email_n,at_n=_yver130_exec_email_at_counts(uid_i, eng, start)
+        table.append([label, len(keep), len(watch), len(other), exec_n, email_n, at_n, _yver130_result_counts(keep), _yver130_latest(keep, keep_only=True)])
+    try:
+        policy_rows=len(_yver125_keep_combos_for_engine(uid_i, eng)) if callable(globals().get('_yver125_keep_combos_for_engine')) else 0
+    except Exception:
+        policy_rows=0
+    title='F8 BigMove' if eng=='F8' else 'F9 Multi-Day Leaders/Losers'
+    status='OK_KEEP_24H' if keep24 else 'IDLE_KEEP_24H'
+    try:
+        base_txt=datetime.fromtimestamp(baseline_ts, tz=MELBOURNE_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        base_txt='2026-06-01 00:00'
+    try:
+        tbl=tabulate(table, headers=['Window','KEEP','WATCH','Other','Exec','Email','AT','KEEP Results','Latest KEEP row'], tablefmt='plain')
+    except Exception:
+        tbl='\n'.join([' '.join(map(str,x)) for x in table])
+    lines=[
+        f'🧪 Engine Health — {title}',
+        '━━━━━━━━━━━━━━━━━━━━',
+        f'Status: {status} | Baseline: {base_txt} Melbourne',
+        'Read-only: no backfill, no repair, no setup creation, no OHLCV scan.',
+        'Source: visible /setup_audit rows split by current Policy; hidden generated-only rows are excluded.',
+        f'KEEP policy rows for {eng}: {policy_rows}',
+        'KEEP = setup-email/AutoTrade eligible evidence. WATCH/Other are diagnostic only.',
+        '━━━━━━━━━━━━━━━━━━━━',
+        tbl,
+    ]
+    if eng=='F9':
+        lines.insert(7, 'IDLE_KEEP_24H is valid when no strict 2-day Leader/Loser setup is currently KEEP.')
+    return '\n'.join(lines)
+
+
+# Override the command function BEFORE main() registers handlers.
+async def engine_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uid = update.effective_user.id if update and update.effective_user else 0
+        args = list(getattr(context, 'args', []) or [])
+        eng = str(args[0] if args else 'F8').upper().strip()
+        if eng in {'F89','F8/F9','BOTH','ALL'}:
+            txt = _yver130_engine_health_text(uid, 'F8') + '\n\n' + _yver130_engine_health_text(uid, 'F9')
+        else:
+            if eng not in {'F8','F9'}:
+                eng='F8'
+            txt = _yver130_engine_health_text(uid, eng)
+        await send_long_message(update, txt, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as e:
+        try:
+            await update.message.reply_text(f'Engine health error: {type(e).__name__}: {e}')
+        except Exception:
+            pass
+
+
+# Also override text helper names for any internal calls.
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    return _yver130_engine_health_text(uid, engine, hours)
+
+def _yver123_engine_health_text(uid: int, engine: str) -> str:
+    return _yver130_engine_health_text(uid, engine, 24)
+
+
+# Patch the diagnostic ATWhy mismatch without changing AutoTrade entry logic.
+try:
+    _YVER130_ORIG_SETUP_AUDIT_SKIP_REASON = _setup_audit_autotrade_skip_reason
+except Exception:
+    _YVER130_ORIG_SETUP_AUDIT_SKIP_REASON = None
+
+def _setup_audit_autotrade_skip_reason(row: dict, uid: int = 0, policy_label: str = '', at_state: str = '', session_name: str = '') -> str:
+    try:
+        pol=str(policy_label or '').upper().strip()
+        out = _YVER130_ORIG_SETUP_AUDIT_SKIP_REASON(row, uid=uid, policy_label=policy_label, at_state=at_state, session_name=session_name) if callable(_YVER130_ORIG_SETUP_AUDIT_SKIP_REASON) else '-'
+        out_u=str(out or '').upper().strip()
+        if pol == 'KEEP' and out_u in {'NOT_KEEP','WATCH','TIGHTEN','DISABLE','OFF','AUTOTRADE_POLICY_NOT_ALLOWED'}:
+            # The visible row is currently KEEP, so ATWhy must not contradict it.
+            try:
+                setup_ts=float(_setup_audit_row_ts(dict(row or {})) or 0.0)
+                if setup_ts and (float(time.time()) - setup_ts) > float(max(60, int(_autotrade_entry_window_min())*60)):
+                    return 'ENTRY_OLD'
+            except Exception:
+                pass
+            return 'PENDING'
+        return out
+    except Exception:
+        return '-'
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v130'
+    SETUP_AUDIT_CACHE_VERSION = 'v130'
+except Exception:
+    pass
+try:
+    logger.info('yver130 active patch loaded before main: engine_health KEEP/WATCH split + ATWhy policy mismatch guard')
+except Exception:
+    pass
+# =========================================================
+# end yver130 active patch
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
