@@ -81358,301 +81358,88 @@ except Exception:
 # =========================================================
 
 
-
 # =========================================================
-# yver130 active patch (MUST be before __main__)
-# - /engine_health F8/F9 active command path now splits KEEP/WATCH/Other
-#   using the same visible setup-audit rows; no hidden row can look tradable.
-# - /setup_audit ATWhy no longer shows NOT_KEEP for rows whose visible Policy is KEEP.
+# yver129 strict KEEP-edge runtime guard startup fix
 # =========================================================
+# Purpose:
+#   Keep the runtime sync guard ON automatically. The live output on 2026-06-24
+#   showed "Runtime sync guard: OFF" even though the matrix KEEP rule remains the
+#   source-of-truth (decided>=3, WR>=49%, AvgR>=+0.05). This patch only repairs
+#   that runtime config mismatch. It does not change TP/SL, risk, leverage,
+#   sizing, setup generation, F8/F9 logic, or order geometry.
 
-def _yver130_row_ts(r: dict) -> float:
-    try:
-        return float(_setup_audit_row_ts(r) or 0.0)
-    except Exception:
-        try:
-            return float((r or {}).get('created_ts') or (r or {}).get('ts') or 0.0)
-        except Exception:
-            return 0.0
-
-
-def _yver130_sym(r: dict) -> str:
-    try:
-        return str(_symbol_base(str((r or {}).get('symbol') or (r or {}).get('market_symbol') or '')) or '').upper().strip()
-    except Exception:
-        return str((r or {}).get('symbol') or '').upper().strip()
+YVER129_VERSION = 'yver129_2026_06_24_strict_keep_edge_runtime_guard_on'
 
 
-def _yver130_side(r: dict) -> str:
-    return str((r or {}).get('side') or '').upper().strip()
+def _yver129_force_strict_keep_edge_guard(reason: str = 'startup') -> bool:
+    """Set the owner-approved runtime policy sync guard to ON.
 
-
-def _yver130_combo(r: dict, fam: str = '') -> str:
-    try:
-        rr = dict(r or {})
-        f = str(fam or _setup_audit_family_code(rr) or '').upper().strip()
-        sess = str(rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
-        side = _yver130_side(rr) or '-'
-        combo = _setup_combo_strategy_side_key(f, sess, rr, side).upper().strip()
-        if combo and not combo.startswith(f + '--'):
-            return combo
-    except Exception:
-        pass
-    return str((r or {}).get('combo') or '').upper().strip()
-
-
-def _yver130_policy_for_visible_row(r: dict, uid: int = 0) -> str:
-    try:
-        rr = dict(r or {})
-        sess = str(rr.get('session') or rr.get('source_session') or '').upper().strip()
-        side = _yver130_side(rr)
-        pol = str(_setup_audit_policy_label(rr, uid=int(uid or 0), session_name=sess, side=side) or '').upper().strip()
-        if pol == 'DISABLE':
-            pol = 'OTHER'
-        if pol in {'KEEP','WATCH','TIGHTEN'}:
-            return pol
-        raw = str(rr.get('policy') or rr.get('policy_status') or '').upper().strip()
-        if raw in {'KEEP','WATCH','TIGHTEN'}:
-            return raw
-    except Exception:
-        pass
-    return 'OTHER'
-
-
-def _yver130_visible_engine_rows(uid: int, engine: str, start_ts: float = 0.0) -> list[dict]:
-    """Rows used by /engine_health. Read-only and based on the visible audit source.
-
-    This deliberately does NOT read hidden generated-only repair rows. The command is
-    a health/report view, not a generator/backfill path.
+    This is intentionally small and idempotent. It updates only the strict KEEP
+    edge gate and its thresholds, so AutoTrade remains aligned with
+    /setup_matrix policy. Values are the same thresholds already displayed in
+    /autotrade_config.
     """
-    eng = str(engine or '').upper().strip()
-    uid_i = int(uid or 0)
+    changed = False
     try:
-        rows = _setup_audit_load_rows(
-            uid_i,
-            hours=None,
-            limit=0,
-            dedup=True,
-            start_ts=float(start_ts or 0.0),
-            apply_final_quality_gate=True,
-            source_mode_override='ALL',
-        ) or []
-    except Exception:
-        rows = []
-    out=[]; seen=set()
-    for r0 in rows:
-        try:
-            r=dict(r0 or {})
-            fam=str(_setup_audit_family_code(r) or '').upper().strip()
-            if fam != eng:
-                continue
-            ts=_yver130_row_ts(r)
-            if start_ts and ts and ts < float(start_ts):
-                continue
-            sym=_yver130_sym(r); side=_yver130_side(r); combo=_yver130_combo(r, fam)
-            pol=_yver130_policy_for_visible_row(r, uid_i)
-            key=''
+        def _set_if_diff(k, v):
+            nonlocal changed
             try:
-                key=str(_setup_audit_unique_key(r) or '')
-            except Exception:
-                key=''
-            if not key:
-                key=f'{int(ts//60)}:{sym}:{side}:{combo}'
-            if key in seen:
-                continue
-            seen.add(key)
-            r['_v130_ts']=ts; r['_v130_sym']=sym; r['_v130_side']=side; r['_v130_combo']=combo; r['_v130_policy']=pol
-            out.append(r)
-        except Exception:
-            continue
-    return sorted(out, key=lambda x: float(x.get('_v130_ts') or 0.0), reverse=True)
-
-
-def _yver130_result_counts(rows: list[dict]) -> str:
-    tp=sl=op=0
-    try:
-        horizon=int(_setup_audit_result_horizon_hours())
-    except Exception:
-        horizon=0
-    for r in rows or []:
-        try:
-            res=str(_setup_audit_result_label(_setup_audit_keep_watch_fast_result_label(r, horizon)) or '').upper().strip()
-        except Exception:
-            res=str((r or {}).get('result') or (r or {}).get('res') or 'OPEN').upper().strip()
-        if res == 'TP': tp+=1
-        elif res == 'SL': sl+=1
-        else: op+=1
-    return '-' if (tp+sl+op)==0 else f'TP:{tp}, SL:{sl}, OPEN:{op}'
-
-
-def _yver130_latest(rows: list[dict], keep_only: bool = False) -> str:
-    try:
-        rr=[r for r in (rows or []) if (not keep_only or str(r.get('_v130_policy') or '').upper()=='KEEP')]
-        if not rr:
-            return '-'
-        r=rr[0]
-        ts=float(r.get('_v130_ts') or 0.0)
-        when='-'
-        if ts>0:
-            try:
-                when=datetime.fromtimestamp(ts, tz=MELBOURNE_TZ).strftime('%m-%d %H:%M')
-            except Exception:
-                when=datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%m-%d %H:%M')
-        return f"{when} {r.get('_v130_combo','')} {r.get('_v130_sym','')} {r.get('_v130_side','')} {r.get('_v130_policy','')}".strip()
-    except Exception:
-        return '-'
-
-
-def _yver130_exec_email_at_counts(uid: int, engine: str, start_ts: float) -> tuple[int,int,int]:
-    """Best-effort durable counts for executable/delivered/autotrade, read-only.
-    These are secondary counts; KEEP/WATCH split is from visible audit rows.
-    """
-    uid_i=int(uid or 0); eng=str(engine or '').upper().strip()
-    exec_n=email_n=at_n=0
-    since=float(start_ts or 0.0)
-    fam_like=f'{eng}-%'
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory=sqlite3.Row
-            cur=conn.cursor()
-            # executable_setups schemas vary; try combo/family filters defensively.
-            try:
-                exec_n=int((cur.execute("SELECT COUNT(*) FROM executable_setups WHERE user_id=? AND COALESCE(created_ts,ts,0)>=? AND (UPPER(COALESCE(combo,'')) LIKE ? OR UPPER(COALESCE(family,''))=?)", (uid_i, since, fam_like, eng)).fetchone() or [0])[0] or 0)
+                cur = _autotrade_config_get(k, None)
+                if str(cur).strip() != str(v).strip():
+                    _autotrade_config_set(k, v)
+                    changed = True
             except Exception:
                 try:
-                    exec_n=int((cur.execute("SELECT COUNT(*) FROM executable_setups WHERE COALESCE(created_ts,ts,0)>=? AND UPPER(COALESCE(combo,'')) LIKE ?", (since, fam_like)).fetchone() or [0])[0] or 0)
+                    _autotrade_config_set(k, v)
+                    changed = True
                 except Exception:
-                    exec_n=0
-            try:
-                email_n=int((cur.execute("SELECT COUNT(*) FROM emailed_setups WHERE user_id=? AND COALESCE(emailed_ts,created_ts,ts,0)>=? AND UPPER(COALESCE(combo,'')) LIKE ?", (uid_i, since, fam_like)).fetchone() or [0])[0] or 0)
-            except Exception:
-                email_n=0
-            try:
-                at_n=int((cur.execute("SELECT COUNT(*) FROM autotrade_trades WHERE uid=? AND COALESCE(opened_ts,created_ts,0)>=? AND UPPER(COALESCE(combo,'')) LIKE ?", (uid_i, since, fam_like)).fetchone() or [0])[0] or 0)
-            except Exception:
-                at_n=0
-    except Exception:
-        pass
-    return exec_n,email_n,at_n
+                    pass
 
-
-def _yver130_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
-    eng=str(engine or 'F8').upper().strip()
-    if eng not in {'F8','F9'}:
-        return 'Usage: /engine_health F8 or /engine_health F9'
-    try:
-        uid_i=int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
-    except Exception:
-        uid_i=int(uid or 0)
-    now_ts=float(time.time())
-    try:
-        baseline_ts=float(_yver122_policy_baseline_ts())
-    except Exception:
-        baseline_ts=datetime(2026,6,1,tzinfo=MELBOURNE_TZ).timestamp()
-    windows=[('Last 24h', now_ts-86400), ('Last 7d', now_ts-7*86400), ('Overall', baseline_ts)]
-    all_rows=_yver130_visible_engine_rows(uid_i, eng, baseline_ts)
-    table=[]; keep24=0
-    for label, start in windows:
-        wrs=[r for r in all_rows if float(r.get('_v130_ts') or 0.0) >= float(start)]
-        keep=[r for r in wrs if str(r.get('_v130_policy') or '').upper()=='KEEP']
-        watch=[r for r in wrs if str(r.get('_v130_policy') or '').upper() in {'WATCH','TIGHTEN'}]
-        other=[r for r in wrs if r not in keep and r not in watch]
-        if label=='Last 24h': keep24=len(keep)
-        exec_n,email_n,at_n=_yver130_exec_email_at_counts(uid_i, eng, start)
-        table.append([label, len(keep), len(watch), len(other), exec_n, email_n, at_n, _yver130_result_counts(keep), _yver130_latest(keep, keep_only=True)])
-    try:
-        policy_rows=len(_yver125_keep_combos_for_engine(uid_i, eng)) if callable(globals().get('_yver125_keep_combos_for_engine')) else 0
-    except Exception:
-        policy_rows=0
-    title='F8 BigMove' if eng=='F8' else 'F9 Multi-Day Leaders/Losers'
-    status='OK_KEEP_24H' if keep24 else 'IDLE_KEEP_24H'
-    try:
-        base_txt=datetime.fromtimestamp(baseline_ts, tz=MELBOURNE_TZ).strftime('%Y-%m-%d %H:%M')
-    except Exception:
-        base_txt='2026-06-01 00:00'
-    try:
-        tbl=tabulate(table, headers=['Window','KEEP','WATCH','Other','Exec','Email','AT','KEEP Results','Latest KEEP row'], tablefmt='plain')
-    except Exception:
-        tbl='\n'.join([' '.join(map(str,x)) for x in table])
-    lines=[
-        f'🧪 Engine Health — {title}',
-        '━━━━━━━━━━━━━━━━━━━━',
-        f'Status: {status} | Baseline: {base_txt} Melbourne',
-        'Read-only: no backfill, no repair, no setup creation, no OHLCV scan.',
-        'Source: visible /setup_audit rows split by current Policy; hidden generated-only rows are excluded.',
-        f'KEEP policy rows for {eng}: {policy_rows}',
-        'KEEP = setup-email/AutoTrade eligible evidence. WATCH/Other are diagnostic only.',
-        '━━━━━━━━━━━━━━━━━━━━',
-        tbl,
-    ]
-    if eng=='F9':
-        lines.insert(7, 'IDLE_KEEP_24H is valid when no strict 2-day Leader/Loser setup is currently KEEP.')
-    return '\n'.join(lines)
-
-
-# Override the command function BEFORE main() registers handlers.
-async def engine_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        uid = update.effective_user.id if update and update.effective_user else 0
-        args = list(getattr(context, 'args', []) or [])
-        eng = str(args[0] if args else 'F8').upper().strip()
-        if eng in {'F89','F8/F9','BOTH','ALL'}:
-            txt = _yver130_engine_health_text(uid, 'F8') + '\n\n' + _yver130_engine_health_text(uid, 'F9')
-        else:
-            if eng not in {'F8','F9'}:
-                eng='F8'
-            txt = _yver130_engine_health_text(uid, eng)
-        await send_long_message(update, txt, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    except Exception as e:
+        _set_if_diff(AUTOTRADE_CFG_STRICT_KEEP_EDGE_ENABLED_KEY, 1)
+        _set_if_diff(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_DECIDED_KEY, 3)
+        _set_if_diff(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_WR_KEY, 49.0)
+        _set_if_diff(AUTOTRADE_CFG_STRICT_KEEP_EDGE_MIN_AVGR_KEY, 0.05)
         try:
-            await update.message.reply_text(f'Engine health error: {type(e).__name__}: {e}')
+            _autotrade_config_set('yver129_strict_keep_edge_guard_version', YVER129_VERSION)
+            _autotrade_config_set('yver129_strict_keep_edge_guard_reason', str(reason or 'startup')[:120])
+            _autotrade_config_set('yver129_strict_keep_edge_guard_ts', str(int(time.time())))
         except Exception:
             pass
-
-
-# Also override text helper names for any internal calls.
-def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
-    return _yver130_engine_health_text(uid, engine, hours)
-
-def _yver123_engine_health_text(uid: int, engine: str) -> str:
-    return _yver130_engine_health_text(uid, engine, 24)
-
-
-# Patch the diagnostic ATWhy mismatch without changing AutoTrade entry logic.
-try:
-    _YVER130_ORIG_SETUP_AUDIT_SKIP_REASON = _setup_audit_autotrade_skip_reason
-except Exception:
-    _YVER130_ORIG_SETUP_AUDIT_SKIP_REASON = None
-
-def _setup_audit_autotrade_skip_reason(row: dict, uid: int = 0, policy_label: str = '', at_state: str = '', session_name: str = '') -> str:
-    try:
-        pol=str(policy_label or '').upper().strip()
-        out = _YVER130_ORIG_SETUP_AUDIT_SKIP_REASON(row, uid=uid, policy_label=policy_label, at_state=at_state, session_name=session_name) if callable(_YVER130_ORIG_SETUP_AUDIT_SKIP_REASON) else '-'
-        out_u=str(out or '').upper().strip()
-        if pol == 'KEEP' and out_u in {'NOT_KEEP','WATCH','TIGHTEN','DISABLE','OFF','AUTOTRADE_POLICY_NOT_ALLOWED'}:
-            # The visible row is currently KEEP, so ATWhy must not contradict it.
-            try:
-                setup_ts=float(_setup_audit_row_ts(dict(row or {})) or 0.0)
-                if setup_ts and (float(time.time()) - setup_ts) > float(max(60, int(_autotrade_entry_window_min())*60)):
-                    return 'ENTRY_OLD'
-            except Exception:
-                pass
-            return 'PENDING'
-        return out
     except Exception:
-        return '-'
+        pass
+    return bool(changed)
 
 try:
-    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v130'
-    SETUP_AUDIT_CACHE_VERSION = 'v130'
+    _yver129_force_strict_keep_edge_guard('module_load_before_main')
+except Exception:
+    pass
+
+try:
+    _YVER129_ORIG_MAIN = main
+except Exception:
+    _YVER129_ORIG_MAIN = None
+
+
+def main():
+    try:
+        _yver129_force_strict_keep_edge_guard('main_start')
+    except Exception:
+        pass
+    if _YVER129_ORIG_MAIN is not None:
+        return _YVER129_ORIG_MAIN()
+    return None
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v129'
+    SETUP_AUDIT_CACHE_VERSION = 'v129'
 except Exception:
     pass
 try:
-    logger.info('yver130 active patch loaded before main: engine_health KEEP/WATCH split + ATWhy policy mismatch guard')
+    logger.info('yver129 loaded: strict KEEP-edge runtime sync guard forced ON; no risk/TP/SL/leverage/sizing/F8/F9/order changes')
 except Exception:
     pass
 # =========================================================
-# end yver130 active patch
+# end yver129
 # =========================================================
 
 if __name__ == "__main__":
@@ -82889,517 +82676,4 @@ except Exception:
     pass
 # =========================================================
 # end yver128
-# =========================================================
-
-# =========================================================
-# yver129 — final delivered setup outcome + transparent F8/F9 health split
-# =========================================================
-# Scope on top of yver128:
-# - AutoTrade: a delivered/emailed setup must not end as silent QUEUED after the
-#   entry window.  After the normal entry window, record a final diagnostic
-#   attempt (SL_ALREADY_HIT / TP_ALREADY_HIT / DRIFT_EXPIRED / ENTRY_OLD /
-#   ALREADY_TRADED) without placing any order and without changing risk/order
-#   geometry.
-# - Engine health: the handler registered earlier calls _yver90_engine_health_text,
-#   so override that real call path.  F8/F9 health now splits visible audit rows by
-#   KEEP / WATCH / OTHER and prints the latest row policy explicitly.  KEEP is the
-#   setup-email/AutoTrade eligible evidence; WATCH is shown only so it cannot be
-#   mistaken for KEEP.
-# - No TP/SL, leverage, sizing, live order geometry, risk caps, setup_audit_keep,
-#   setup_open_times, /screen, or startup-speed changes.
-YVER129_VERSION = 'yver129_2026_06_23_autotrade_final_reason_engine_health_policy_split'
-
-# -----------------------------
-# AutoTrade final outcome for expired delivered setups
-# -----------------------------
-_YVER129_EXPIRED_FINALIZED: dict[str, float] = {}
-_YVER129_EXPIRED_FINALIZED_LOCK = threading.Lock()
-
-
-def _yver129_setup_identity(setup) -> tuple[str, str, str]:
-    try:
-        sid = str(getattr(setup, 'setup_id', '') or getattr(setup, 'id', '') or '').strip()
-    except Exception:
-        sid = ''
-    try:
-        sym = str(getattr(setup, 'symbol', '') or '').upper().strip()
-    except Exception:
-        sym = ''
-    try:
-        side = str(getattr(setup, 'side', '') or '').upper().strip()
-    except Exception:
-        side = ''
-    return sid, sym, side
-
-
-def _yver129_setup_to_audit_row(setup) -> dict:
-    row = {}
-    for k in ('setup_id', 'id', 'symbol', 'side', 'combo', 'family', 'session', 'source_session', 'strategy', 'entry', 'sl', 'tp', 'created_ts', 'executable_ts', 'email_logged_ts', 'emailed_ts', 'signal_created_ts'):
-        try:
-            v = getattr(setup, k, None)
-            if v not in (None, ''):
-                row[k] = v
-        except Exception:
-            pass
-    try:
-        if row.get('id') and not row.get('setup_id'):
-            row['setup_id'] = row.get('id')
-    except Exception:
-        pass
-    return row
-
-
-def _yver129_terminal_reason_from_audit_cache(setup) -> str:
-    """Return TP/SL_ALREADY_HIT if cached setup-audit evidence is terminal."""
-    try:
-        row = _yver129_setup_to_audit_row(setup)
-        if not row:
-            return ''
-        horizon = int(_setup_audit_result_horizon_hours()) if callable(globals().get('_setup_audit_result_horizon_hours')) else 0
-        res = str(_setup_audit_keep_watch_fast_result_label(row, horizon) if callable(globals().get('_setup_audit_keep_watch_fast_result_label')) else '').upper().strip()
-        if res == 'SL':
-            return 'SL_ALREADY_HIT'
-        if res == 'TP':
-            return 'TP_ALREADY_HIT'
-    except Exception:
-        pass
-    return ''
-
-
-def _yver129_drift_expired_reason(setup) -> tuple[str, dict]:
-    """Diagnostic-only drift check; never places or modifies an order."""
-    detail = {}
-    try:
-        sid, sym, side = _yver129_setup_identity(setup)
-        entry = float(getattr(setup, 'entry', 0.0) or 0.0)
-        sl = float(getattr(setup, 'sl', 0.0) or 0.0)
-        if not sym or side not in {'BUY', 'SELL'} or entry <= 0:
-            return 'ENTRY_OLD', detail
-        live_ref = 0.0
-        try:
-            live_ref = float(_autotrade_live_reference_price(sym, fallback_entry=entry) or 0.0)
-        except Exception:
-            live_ref = 0.0
-        if live_ref <= 0:
-            live_ref = entry
-        delta_pct = ((float(live_ref) - float(entry)) / float(entry)) * 100.0 if entry > 0 else 0.0
-        if side == 'BUY':
-            adverse = max(0.0, float(delta_pct))
-            favourable = max(0.0, -float(delta_pct))
-        else:
-            adverse = max(0.0, -float(delta_pct))
-            favourable = max(0.0, float(delta_pct))
-        try:
-            max_drift = float(_autotrade_runtime_max_entry_drift_pct())
-        except Exception:
-            max_drift = 0.0
-        drift_dir = 'adverse' if adverse > 0 else ('favourable' if favourable > 0 else 'flat')
-        detail = {
-            'setup_id': sid,
-            'symbol': sym,
-            'side': side,
-            'setup_entry': float(entry),
-            'entry': float(live_ref),
-            'sl': float(sl or 0.0),
-            'entry_delta_pct': float(delta_pct),
-            'entry_drift_pct': abs(float(delta_pct)),
-            'entry_drift_adverse_pct': float(adverse),
-            'entry_drift_direction': drift_dir,
-            'max_adverse_entry_drift_pct': float(max_drift),
-        }
-        if max_drift > 0 and adverse > max_drift:
-            return 'DRIFT_EXPIRED', detail
-    except Exception:
-        pass
-    return 'ENTRY_OLD', detail
-
-
-def _yver129_final_expiry_reason(setup, uid: int) -> tuple[str, dict]:
-    try:
-        consumed, why = _yver61_setup_consumed_by_autotrade(setup, uid=uid) if callable(globals().get('_yver61_setup_consumed_by_autotrade')) else (False, '')
-        if consumed:
-            return str(why or 'ALREADY_TRADED').upper(), {}
-    except Exception:
-        pass
-    term = _yver129_terminal_reason_from_audit_cache(setup)
-    if term:
-        return term, {}
-    return _yver129_drift_expired_reason(setup)
-
-
-def _yver129_record_expired_final_attempt(uid: int, setup, sess: str, trigger: str = 'delivered_expiry_final') -> dict:
-    try:
-        uid_i = int(uid or globals().get('AUTOTRADE_OWNER_UID') or 0)
-    except Exception:
-        uid_i = 0
-    sid, sym, side = _yver129_setup_identity(setup)
-    if uid_i <= 0 or not sid or not sym or side not in {'BUY', 'SELL'}:
-        return {'status': 'skip', 'reason': 'bad_identity'}
-    key = f'{uid_i}:{sid}:{sym}:{side}'
-    now = float(time.time())
-    with _YVER129_EXPIRED_FINALIZED_LOCK:
-        # Avoid repeated spam; one final diagnostic per setup is enough.
-        old = float(_YVER129_EXPIRED_FINALIZED.get(key) or 0.0)
-        if old and (now - old) < 18 * 3600:
-            return {'status': 'skip', 'reason': 'already_finalized'}
-        _YVER129_EXPIRED_FINALIZED[key] = now
-        if len(_YVER129_EXPIRED_FINALIZED) > 500:
-            cutoff = now - 24 * 3600
-            for k, v in list(_YVER129_EXPIRED_FINALIZED.items()):
-                try:
-                    if float(v or 0.0) < cutoff:
-                        _YVER129_EXPIRED_FINALIZED.pop(k, None)
-                except Exception:
-                    _YVER129_EXPIRED_FINALIZED.pop(k, None)
-    reason, diag = _yver129_final_expiry_reason(setup, uid_i)
-    reason = str(reason or 'ENTRY_OLD').upper().strip()
-    if reason == 'SETUP_ALREADY_TRADED':
-        reason = 'ALREADY_TRADED'
-    try:
-        meta = _yver128_attempt_meta(setup, sess, trigger=trigger) if callable(globals().get('_yver128_attempt_meta')) else {}
-    except Exception:
-        meta = {}
-    meta.update({
-        'status': 'SKIP',
-        'reason': reason,
-        'expired_final': True,
-        'trigger': str(trigger or 'delivered_expiry_final'),
-        'symbol': sym,
-        'side': side,
-        'setup_id': sid,
-    })
-    try:
-        if isinstance(diag, dict):
-            for k, v in diag.items():
-                if v not in (None, ''):
-                    meta.setdefault(k, v)
-    except Exception:
-        pass
-    try:
-        _autotrade_record_attempt(uid_i, meta, diag if isinstance(diag, dict) else {}, 'SKIP', reason)
-    except Exception:
-        pass
-    try:
-        if sid and callable(globals().get('_admin_setup_lifecycle_merge')):
-            _admin_setup_lifecycle_merge(uid_i, sid, state=_admin_setup_state_from_reason(reason), last_reason=reason)
-    except Exception:
-        pass
-    return {'status': 'finalized', 'reason': reason, 'setup_id': sid, 'symbol': sym, 'side': side}
-
-
-async def _yver129_finalize_recent_expired_delivered_setups(context=None, trigger: str = 'scheduled_expiry_finalizer') -> dict:
-    try:
-        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID') or 0)
-    except Exception:
-        owner_uid = 0
-    if owner_uid <= 0:
-        return {'status': 'skip', 'reason': 'missing_owner_uid'}
-    try:
-        win_min = max(1, int(_autotrade_entry_window_min()))
-    except Exception:
-        win_min = 60
-    # A small grace window catches setups just after expiry without scanning old history.
-    grace_min = max(10, min(45, int(win_min)))
-    now = float(time.time())
-    finalized = []
-    seen = set()
-    for sess in ('ASIA', 'LON', 'NY'):
-        try:
-            rows = _recent_delivery_lane_setup_objects(owner_uid, session_name=sess, max_age_min=int(win_min + grace_min), limit=80) or []
-        except Exception:
-            rows = []
-        for s in list(rows or []):
-            try:
-                sid, sym, side = _yver129_setup_identity(s)
-                key = (sid, sym, side)
-                if not sid or not sym or side not in {'BUY', 'SELL'} or key in seen:
-                    continue
-                seen.add(key)
-                age_ts = _yver128_setup_age_ts(s) if callable(globals().get('_yver128_setup_age_ts')) else 0.0
-                if age_ts <= 0:
-                    continue
-                age_sec = now - float(age_ts)
-                if age_sec < float(win_min) * 60.0:
-                    continue
-                if age_sec > float(win_min + grace_min) * 60.0:
-                    continue
-                src_sess = str(getattr(s, 'source_session', '') or sess or '').upper().strip()
-                final = _yver129_record_expired_final_attempt(owner_uid, s, src_sess if src_sess in {'ASIA','LON','NY'} else sess, trigger=trigger)
-                if str(final.get('status') or '') == 'finalized':
-                    finalized.append(final)
-            except Exception:
-                continue
-    try:
-        if finalized:
-            _LAST_AUTOTRADE_DECISION[owner_uid] = {
-                'status': 'SKIP',
-                'when': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                'reason': f'expired_finalized_{len(finalized)}',
-                'attempted': len(finalized),
-                'placed': 0,
-                'session': _yver128_now_session_for_autotrade(owner_uid) if callable(globals().get('_yver128_now_session_for_autotrade')) else '',
-                'mode': str(_autotrade_runtime_mode()).lower() if callable(globals().get('_autotrade_runtime_mode')) else '',
-                'attempted_candidates': finalized[:12],
-                'latest_candidate': finalized[0] if finalized else {},
-                'trigger': str(trigger or 'scheduled_expiry_finalizer'),
-            }
-    except Exception:
-        pass
-    return {'status': 'ok', 'finalized': len(finalized), 'items': finalized[:8]}
-
-
-# Extend the v128 retry pass: scan slightly beyond the entry window, so a setup
-# can receive a final ENTRY_OLD/SL_ALREADY_HIT/DRIFT_EXPIRED diagnostic instead
-# of disappearing from the recent-delivery selector.
-try:
-    _YVER129_ORIG_RETRY_RECENT_DELIVERED = _yver128_retry_recent_delivered_keep_setups
-except Exception:
-    _YVER129_ORIG_RETRY_RECENT_DELIVERED = None
-
-async def _yver128_retry_recent_delivered_keep_setups(context=None, trigger: str = 'scheduled_retry') -> dict:
-    out = {'status': 'skip', 'reason': 'retry_function_missing'}
-    if callable(_YVER129_ORIG_RETRY_RECENT_DELIVERED):
-        try:
-            out = await _YVER129_ORIG_RETRY_RECENT_DELIVERED(context, trigger=trigger)
-        except Exception as e:
-            out = {'status': 'error', 'reason': f'{type(e).__name__}: {e}'}
-    try:
-        # This is diagnostic only; it never places orders and it also runs outside
-        # live sessions, so an expired emailed setup gets a final reason even if the
-        # session has moved to NONE.
-        await _yver129_finalize_recent_expired_delivered_setups(context, trigger=f'{trigger}_expiry_finalizer')
-    except Exception:
-        pass
-    return out
-
-try:
-    _YVER129_ORIG_AUTOTRADE_JOB = autotrade_job
-except Exception:
-    _YVER129_ORIG_AUTOTRADE_JOB = None
-
-async def autotrade_job(context: ContextTypes.DEFAULT_TYPE):
-    if callable(_YVER129_ORIG_AUTOTRADE_JOB):
-        await _YVER129_ORIG_AUTOTRADE_JOB(context)
-    try:
-        await _yver129_finalize_recent_expired_delivered_setups(context, trigger='scheduled_autotrade_expiry_finalizer')
-    except Exception:
-        pass
-
-try:
-    _YVER129_ORIG_TRIGGER_AUTOTRADE_AFTER_EMAIL = _trigger_autotrade_after_email_async
-except Exception:
-    _YVER129_ORIG_TRIGGER_AUTOTRADE_AFTER_EMAIL = None
-
-async def _yver129_expiry_finalizer_after_email(uid: int, session_name: str, started_ts: float):
-    try:
-        win_min = max(1, int(_autotrade_entry_window_min()))
-    except Exception:
-        win_min = 60
-    # Sleep just beyond expiry, then record one final reason if it never placed.
-    delay = max(65.0, float(win_min) * 60.0 + 15.0 - max(0.0, time.time() - float(started_ts or time.time())))
-    try:
-        await asyncio.sleep(delay)
-        await _yver129_finalize_recent_expired_delivered_setups(None, trigger='email_window_expiry_finalizer')
-    except Exception:
-        pass
-
-async def _trigger_autotrade_after_email_async(uid: int, session_name: str, chosen_list: list):
-    started = float(time.time())
-    if callable(_YVER129_ORIG_TRIGGER_AUTOTRADE_AFTER_EMAIL):
-        await _YVER129_ORIG_TRIGGER_AUTOTRADE_AFTER_EMAIL(uid, session_name, chosen_list)
-    try:
-        _safe_create_task(_yver129_expiry_finalizer_after_email(int(uid or 0), str(session_name or ''), started), 'yver129_expiry_finalizer_after_email')
-    except Exception:
-        pass
-
-# -----------------------------
-# Engine health: override the actual registered command path (_yver90_engine_health_text)
-# -----------------------------
-
-def _yver129_row_ts(r: dict) -> float:
-    try:
-        return float(_setup_audit_row_ts(r) or 0.0)
-    except Exception:
-        try:
-            return float((r or {}).get('created_ts') or (r or {}).get('ts') or 0.0)
-        except Exception:
-            return 0.0
-
-
-def _yver129_engine_rows(uid: int, eng: str, start_ts: float = 0.0) -> list[dict]:
-    try:
-        rows = _setup_audit_load_rows(
-            int(uid or 0),
-            hours=None,
-            limit=0,
-            dedup=True,
-            start_ts=float(start_ts or 0.0),
-            apply_final_quality_gate=True,
-            source_mode_override='ALL',
-        ) or []
-    except Exception:
-        rows = []
-    out = []
-    seen = set()
-    eng = str(eng or '').upper().strip()
-    for r0 in rows:
-        try:
-            r = dict(r0 or {})
-            fam = str(_setup_audit_family_code(r) or '').upper().strip()
-            if fam != eng:
-                continue
-            ts = _yver129_row_ts(r)
-            if start_ts and ts and ts < float(start_ts):
-                continue
-            sess = str(r.get('session') or r.get('source_session') or '').upper().strip()
-            side = str(_yver122_side(r) if callable(globals().get('_yver122_side')) else (r.get('side') or '')).upper().strip()
-            pol = str(_setup_audit_policy_label(r, uid=int(uid or 0), session_name=sess, side=side) if callable(globals().get('_setup_audit_policy_label')) else (r.get('policy') or '')).upper().strip()
-            if pol not in {'KEEP', 'WATCH', 'TIGHTEN'}:
-                pol = str(r.get('policy') or pol or 'OTHER').upper().strip()
-            combo = ''
-            try:
-                combo = f"{fam}-{sess or '-'}-{_setup_strategy_short_label(r)}-{side or '-'}".upper()
-            except Exception:
-                combo = str(r.get('combo') or '').upper().strip()
-            if not combo or combo.startswith(fam + '--'):
-                combo = str(r.get('combo') or combo or '').upper().strip()
-            sym = str(_yver122_symbol(r) if callable(globals().get('_yver122_symbol')) else (r.get('symbol') or '')).upper().strip()
-            key = str(_setup_audit_unique_key(r) if callable(globals().get('_setup_audit_unique_key')) else '') or f"{int(ts//60)}:{sym}:{side}:{combo}"
-            if key in seen:
-                continue
-            seen.add(key)
-            r['_y129_ts'] = ts
-            r['_y129_policy'] = pol
-            r['_y129_combo'] = combo
-            r['_y129_symbol'] = sym
-            r['_y129_side'] = side
-            out.append(r)
-        except Exception:
-            continue
-    return sorted(out, key=lambda x: float(x.get('_y129_ts') or 0.0), reverse=True)
-
-
-def _yver129_count_result(rows: list[dict]) -> str:
-    try:
-        horizon = int(_setup_audit_result_horizon_hours()) if callable(globals().get('_setup_audit_result_horizon_hours')) else 0
-    except Exception:
-        horizon = 0
-    tp = sl = op = 0
-    for r in rows or []:
-        try:
-            res = str(_setup_audit_result_label(_setup_audit_keep_watch_fast_result_label(r, horizon)) if callable(globals().get('_setup_audit_keep_watch_fast_result_label')) else (r.get('result') or 'OPEN')).upper().strip()
-            if res == 'TP':
-                tp += 1
-            elif res == 'SL':
-                sl += 1
-            else:
-                op += 1
-        except Exception:
-            op += 1
-    if tp + sl + op <= 0:
-        return '-'
-    return f"TP:{tp}, SL:{sl}, OPEN:{op}"
-
-
-def _yver129_latest_policy_row(rows: list[dict]) -> str:
-    try:
-        if not rows:
-            return '-'
-        r = rows[0]
-        ts = float(r.get('_y129_ts') or 0.0)
-        when = '-'
-        if ts > 0:
-            try:
-                when = datetime.fromtimestamp(ts, tz=MELBOURNE_TZ).strftime('%m-%d %H:%M')
-            except Exception:
-                when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%m-%d %H:%M')
-        return f"{when} {r.get('_y129_combo','')} {r.get('_y129_symbol','')} {r.get('_y129_side','')} {r.get('_y129_policy','')}".strip()
-    except Exception:
-        return '-'
-
-
-def _yver129_engine_health_plain(uid: int, engine: str = 'F8', hours: int = 24) -> str:
-    eng = str(engine or 'F8').upper().strip()
-    if eng not in {'F8', 'F9'}:
-        return 'Usage: /engine_health F8 or /engine_health F9'
-    try:
-        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
-    except Exception:
-        uid_i = int(uid or 0)
-    now_ts = float(time.time())
-    try:
-        baseline_ts = float(_yver122_policy_baseline_ts()) if callable(globals().get('_yver122_policy_baseline_ts')) else 0.0
-    except Exception:
-        baseline_ts = 0.0
-    if baseline_ts <= 0:
-        baseline_ts = 0.0
-    windows = [
-        ('Last 24h', now_ts - 24 * 3600),
-        ('Last 7d', now_ts - 7 * 24 * 3600),
-        ('Overall', baseline_ts),
-    ]
-    all_rows = _yver129_engine_rows(uid_i, eng, baseline_ts or 0.0)
-    table_rows = []
-    keep24 = 0
-    for label, st in windows:
-        wrs = [r for r in all_rows if float(r.get('_y129_ts') or 0.0) >= float(st or 0.0)] if st else list(all_rows)
-        keep = [r for r in wrs if str(r.get('_y129_policy') or '').upper() == 'KEEP']
-        watch = [r for r in wrs if str(r.get('_y129_policy') or '').upper() in {'WATCH', 'TIGHTEN'}]
-        other = [r for r in wrs if r not in keep and r not in watch]
-        if label == 'Last 24h':
-            keep24 = len(keep)
-        table_rows.append([
-            label,
-            len(keep),
-            len(watch),
-            len(other),
-            _yver129_count_result(keep),
-            _yver129_latest_policy_row(wrs),
-        ])
-    try:
-        keep_policy_rows = len(_yver125_keep_combos_for_engine(uid_i, eng)) if callable(globals().get('_yver125_keep_combos_for_engine')) else 0
-    except Exception:
-        keep_policy_rows = 0
-    title = 'F8 BigMove' if eng == 'F8' else 'F9 Multi-Day Leaders/Losers'
-    status = 'OK_KEEP_24H' if keep24 > 0 else 'IDLE_KEEP_24H'
-    try:
-        base_txt = _yver122_melb_txt(baseline_ts) if baseline_ts else '2026-06-01 00:00'
-    except Exception:
-        base_txt = '2026-06-01 00:00'
-    table = tabulate(table_rows, headers=['Window', 'KEEP', 'WATCH', 'Other', 'KEEP Results', 'Latest visible row'], tablefmt='plain')
-    lines = [
-        f"🧪 Engine Health — {title}",
-        '━━━━━━━━━━━━━━━━━━━━',
-        f"Status: {status} | Baseline: {base_txt} Melbourne",
-        'Read-only: no backfill, no repair, no setup creation, no OHLCV scan.',
-        'Source: final setup-audit source rows split by current visible policy.',
-        f"KEEP policy rows for {eng}: {int(keep_policy_rows)}",
-        'KEEP = setup-email/AutoTrade eligible evidence. WATCH/Other are shown only for transparency and are NOT counted as KEEP.',
-        'Latest row includes policy at the end, so a WATCH row cannot look like KEEP.',
-        '━━━━━━━━━━━━━━━━━━━━',
-        table,
-    ]
-    if eng == 'F9':
-        lines.insert(7, 'IDLE_KEEP_24H is valid when no strict 2-day Leader/Loser setup is currently KEEP.')
-    return '\n'.join(lines)
-
-# The registered /engine_health command (from yver90) calls this function by name.
-def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
-    return _yver129_engine_health_plain(uid, engine, hours)
-
-# Also override the newer helper name for any direct internal calls.
-def _yver123_engine_health_text(uid: int, engine: str) -> str:
-    return _yver129_engine_health_plain(uid, engine, 24)
-
-try:
-    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v129'
-    SETUP_AUDIT_CACHE_VERSION = 'v129'
-except Exception:
-    pass
-try:
-    logger.info('yver129 loaded: AutoTrade expired delivered setups get final reason; /engine_health F8/F9 splits KEEP/WATCH/Other via registered command path')
-except Exception:
-    pass
-# =========================================================
-# end yver129
 # =========================================================
