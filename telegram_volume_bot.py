@@ -1,3 +1,4 @@
+# yver144: sync hardening for current setup delivery/reporting; BigMove/F8 and F9 reports align with visible audit rows; Render startup noise reduced; no TP/SL/risk/leverage/order changes.
 # yver143: F8/BigMove AutoTrade sync fix; confirmed emailed F8 KEEP setups no longer get blocked by the secondary strict-edge sample-count guard (AUTOTRADE_STRICT) after setup email/audit visibility. Downstream risk, blackout, direction, duplicate, leverage, drift and order safety gates unchanged.
 # yver142: repairs BigMove/F8 setup generation reliability so every confirmed BigMove alert can create a durable F8 generated/setup-audit row; failed cache-price attempts no longer memo-block later hooks. No order/risk/TP/SL/leverage changes.
 # yver141: repairs WR/O display conflict so a row shown under current/entry KEEP cannot display a stale sub-threshold historical WR/O; WR/O now falls back to the KEEP policy WR snapshot when the selected open-time matrix row is below the runtime KEEP floor. Display-only; no setup/email/autotrade/risk/TP/SL/order changes.
@@ -69408,7 +69409,7 @@ def _yver65_auto_blackout_update_once(reason: str = 'scheduled', force: bool = F
         }
         _autotrade_config_set(YVER65_AUTO_BLACKOUT_STATE_KEY, _yver65_json_dump(state))
         try:
-            logger.info('yver65 auto blackout updated: %s -> %s', old_entry, windows)
+            logger.debug('yver65 auto blackout updated: %s -> %s', old_entry, windows)
         except Exception:
             pass
         return {'ok': True, 'windows': windows, 'old_entry': old_entry, 'old_setup': old_setup, 'recommendation': rec}
@@ -80447,7 +80448,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver122 loaded: fixed read-only /engine_health F8/F9 and /setup_audit_keep baseline alignment')
+    logger.debug('yver122 loaded: fixed read-only /engine_health F8/F9 and /setup_audit_keep baseline alignment')
 except Exception:
     pass
 # =========================================================
@@ -80931,7 +80932,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver123 loaded: fast engine_health uses canonical setup_audit/open_times rows; setup_audit_keep includes match check')
+    logger.debug('yver123 loaded: fast engine_health uses canonical setup_audit/open_times rows; setup_audit_keep includes match check')
 except Exception:
     pass
 # =========================================================
@@ -81235,7 +81236,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver124 loaded: /screen reads recent emailed+executable lane before showing empty setup queue')
+    logger.debug('yver124 loaded: /screen reads recent emailed+executable lane before showing empty setup queue')
 except Exception:
     pass
 # =========================================================
@@ -81394,7 +81395,7 @@ def _yver126_auto_blackout_startup_sync_loop():
         if _yver65_auto_blackout_enabled():
             res = _yver65_auto_blackout_update_once(reason='startup_sync_v126', force=True)
             try:
-                logger.info('yver126 auto blackout startup sync: %s', res)
+                logger.debug('yver126 auto blackout startup sync: windows=%s method=%s', (res or {}).get('windows'), (res or {}).get('method'))
             except Exception:
                 pass
     except Exception as e:
@@ -81429,7 +81430,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver126 loaded: auto-blackout overwrites active windows from exact 7d setup_open_times rule; manual BLACKOUT_WINDOWS setter fixed')
+    logger.debug('yver126 loaded: auto-blackout overwrites active windows from exact 7d setup_open_times rule; manual BLACKOUT_WINDOWS setter fixed')
 except Exception:
     pass
 # =========================================================
@@ -81514,7 +81515,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver129 loaded: strict KEEP-edge runtime sync guard forced ON; no risk/TP/SL/leverage/sizing/F8/F9/order changes')
+    logger.debug('yver129 loaded: strict KEEP-edge runtime sync guard forced ON; no risk/TP/SL/leverage/sizing/F8/F9/order changes')
 except Exception:
     pass
 # =========================================================
@@ -81800,7 +81801,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver130 loaded before main: active /engine_health F8/F9 visible-audit override; ENTRY_OLD unchanged by design')
+    logger.debug('yver130 loaded before main: active /engine_health F8/F9 visible-audit override; ENTRY_OLD unchanged by design')
 except Exception:
     pass
 # =========================================================
@@ -82320,7 +82321,7 @@ async def setup_open_times_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     await _send_cached_or_queue_admin_report(
         update,
         f"/setup_open_times {html.escape(str(scope or 'all'))}",
-        f"admin:bg:v131:setup_open_times:{int(AUTOTRADE_OWNER_UID or uid)}:{cache_scope}:{int(rows_limit)}:{int(start_ts or 0)}:{int(scope_hours or 0)}",
+        f"admin:bg:v144:setup_open_times:{int(AUTOTRADE_OWNER_UID or uid)}:{cache_scope}:{int(rows_limit)}:{int(start_ts or 0)}:{int(scope_hours or 0)}",
         _setup_open_times_text,
         args=(int(AUTOTRADE_OWNER_UID or uid), str(scope or ''), int(rows_limit)),
         parse_mode=ParseMode.HTML,
@@ -82361,7 +82362,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver131 loaded before main: WR/O + WR/C columns for setup_audit, setup_open_times, autotrade_report')
+    logger.debug('yver131 loaded before main: WR/O + WR/C columns for setup_audit, setup_open_times, autotrade_report')
 except Exception:
     pass
 # =========================================================
@@ -82511,7 +82512,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver132 loaded before main: WR/O uses nearest around-generation matrix snapshot for setup_audit/setup_open_times/autotrade_report')
+    logger.debug('yver132 loaded before main: WR/O uses nearest around-generation matrix snapshot for setup_audit/setup_open_times/autotrade_report')
 except Exception:
     pass
 # =========================================================
@@ -82859,7 +82860,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver133 loaded before main: AutoTrade pre-entry setup email + /screen delivery sync; no risk/TP/SL/leverage/order logic changes')
+    logger.debug('yver133 loaded before main: AutoTrade pre-entry setup email + /screen delivery sync; no risk/TP/SL/leverage/order logic changes')
 except Exception:
     pass
 # =========================================================
@@ -83232,7 +83233,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver134 loaded before main: /screen 60m max4, WR/O causal at generation, AutoTrade pre-entry email obeys user config; no risk/TP/SL/leverage/order geometry changes')
+    logger.debug('yver134 loaded before main: /screen 60m max4, WR/O causal at generation, AutoTrade pre-entry email obeys user config; no risk/TP/SL/leverage/order geometry changes')
 except Exception:
     pass
 # =========================================================
@@ -83436,7 +83437,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver135 loaded before main: WR/O stable per Melbourne setup hour; shadow audit/executable persistence runs before email caps/gaps; no order/risk/TP/SL changes')
+    logger.debug('yver135 loaded before main: WR/O stable per Melbourne setup hour; shadow audit/executable persistence runs before email caps/gaps; no order/risk/TP/SL changes')
 except Exception:
     pass
 # =========================================================
@@ -83832,7 +83833,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver136 loaded before main: fresh WR/C direct from latest matrix scores; Bybit 110126 required-agreement errors trigger permission hold/email and stop repeated live-open retries')
+    logger.debug('yver136 loaded before main: fresh WR/C direct from latest matrix scores; Bybit 110126 required-agreement errors trigger permission hold/email and stop repeated live-open retries')
 except Exception:
     pass
 # =========================================================
@@ -84178,8 +84179,8 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver137 loaded before main: every emailed/delivered setup_id is audit-unique and backfilled from emailed_setups so /setup_audit cannot hide later same-symbol email setups')
-    logger.info('yver138 loaded before main: scheduler-noise hardening for Render max_instances/misfire warnings; no trading/setup policy changes')
+    logger.debug('yver137 loaded before main: every emailed/delivered setup_id is audit-unique and backfilled from emailed_setups so /setup_audit cannot hide later same-symbol email setups')
+    logger.debug('yver138 loaded before main: scheduler-noise hardening for Render max_instances/misfire warnings; no trading/setup policy changes')
 except Exception:
     pass
 # =========================================================
@@ -84555,7 +84556,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver139 loaded before main: replaced heavy v137 emailed audit backfill with bounded in-memory emailed setup-id dedup/backfill; v138 extra scheduler instances reverted for Render memory safety')
+    logger.debug('yver139 loaded before main: replaced heavy v137 emailed audit backfill with bounded in-memory emailed setup-id dedup/backfill; v138 extra scheduler instances reverted for Render memory safety')
 except Exception:
     pass
 # =========================================================
@@ -85131,7 +85132,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver140 loaded before main: hard duplicate setup-email lock across normal/preentry paths and current Leaders/Losers direction guard before email/screen; no order/risk/TP/SL changes')
+    logger.debug('yver140 loaded before main: hard duplicate setup-email lock across normal/preentry paths and current Leaders/Losers direction guard before email/screen; no order/risk/TP/SL changes')
 except Exception:
     pass
 # =========================================================
@@ -85332,7 +85333,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver141 loaded before main: WR/O KEEP-threshold consistency repair only; no setup/email/autotrade/risk/TP/SL/order changes')
+    logger.debug('yver141 loaded before main: WR/O KEEP-threshold consistency repair only; no setup/email/autotrade/risk/TP/SL/order changes')
 except Exception:
     pass
 # =========================================================
@@ -85708,15 +85709,15 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver142 loaded before main: BigMove alert now always mirrors to durable F8 generated/audit row before memo; no order/risk/TP/SL changes')
+    logger.debug('yver142 loaded before main: BigMove alert now always mirrors to durable F8 generated/audit row before memo; no order/risk/TP/SL changes')
 except Exception:
     pass
 # =========================================================
 # end yver142
 # =========================================================
 
-if __name__ == "__main__":
-    main()
+if False and __name__ == "__main__":
+    main()  # yver144: moved to EOF so all sync/report patches load before polling starts
 
 
 # =========================================================
@@ -86164,7 +86165,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver125 loaded: engine_health F8/F9 now uses KEEP-only /setup_open_times basis; no speed/trading changes')
+    logger.debug('yver125 loaded: engine_health F8/F9 now uses KEEP-only /setup_open_times basis; no speed/trading changes')
 except Exception:
     pass
 # =========================================================
@@ -86389,7 +86390,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver127 loaded: engine_health F8/F9 uses visible /setup_audit KEEP rows only; no trading/speed changes')
+    logger.debug('yver127 loaded: engine_health F8/F9 uses visible /setup_audit KEEP rows only; no trading/speed changes')
 except Exception:
     pass
 # =========================================================
@@ -86944,7 +86945,7 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver128 loaded: delivered setup AutoTrade retry + exact visible /setup_audit F8/F9 health; no risk/TP/SL/leverage/sizing changes')
+    logger.debug('yver128 loaded: delivered setup AutoTrade retry + exact visible /setup_audit F8/F9 health; no risk/TP/SL/leverage/sizing changes')
 except Exception:
     pass
 # =========================================================
@@ -87089,9 +87090,503 @@ try:
 except Exception:
     pass
 try:
-    logger.info('yver143 loaded: F8/BigMove KEEP setup email/audit/autotrade sync; strict sample-count guard no longer blocks confirmed F8 KEEP, downstream safety unchanged')
+    logger.debug('yver143 loaded: F8/BigMove KEEP setup email/audit/autotrade sync; strict sample-count guard no longer blocks confirmed F8 KEEP, downstream safety unchanged')
 except Exception:
     pass
 # =========================================================
 # end yver143
 # =========================================================
+
+
+# =========================================================
+# yver144 — sync/reporting hardening + Render log quieting
+# =========================================================
+# Review at 09:00 showed the core bot alive and profitable, but a few operator-facing
+# sync gaps remained:
+# - F8 BigMove setup rows could be emailed/visible while the current /setup_audit row
+#   had already become WATCH, making /engine_health F8 show Email=0 even though setup
+#   emails existed.
+# - /setup_open_times used a lane-set snapshot and could disagree with the same row's
+#   /setup_audit Policy label.
+# - AutoTrade/final delivery needed one last current-matrix KEEP check after all older
+#   compatibility overrides.
+# - Render was printing a long stack of historical "yver...loaded" startup messages.
+#
+# This patch does NOT change TP/SL, leverage, sizing, risk, drift, Bybit order placement,
+# setup geometry, BigMove trigger thresholds, or F9 generation rules.
+YVER144_VERSION = 'yver144_2026_06_25_sync_report_render_quiet'
+
+
+def _yver144_owner_uid(user_id: int = 0) -> int:
+    try:
+        owner = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        return int(owner or user_id or 0)
+    except Exception:
+        try:
+            return int(user_id or 0)
+        except Exception:
+            return 0
+
+
+def _yver144_session_for_item(item, session_name: str = '') -> str:
+    try:
+        sess = str(session_name or _autotrade_setup_attr(item, 'session', '') or _autotrade_setup_attr(item, 'source_session', '') or getattr(item, 'session', '') or getattr(item, 'source_session', '') or '').upper().strip()
+    except Exception:
+        sess = str(session_name or '').upper().strip()
+    return sess if sess in {'ASIA', 'LON', 'NY'} else sess
+
+
+def _yver144_current_matrix_state(item, session_name: str = '', user_id: int = 0) -> dict:
+    """Fresh current /setup_matrix policy state for a setup/row.
+
+    This is deliberately used only at delivery/report gates. Generated/audit rows
+    still persist for learning even when current policy is WATCH/DISABLE.
+    """
+    try:
+        uid_i = _yver144_owner_uid(int(user_id or 0))
+        sess = _yver144_session_for_item(item, session_name=session_name)
+        st = dict(_setup_matrix_policy_source_state_for_setup(item, session_name=sess, user_id=uid_i) or {})
+        if st:
+            return st
+    except Exception as exc:
+        return {'policy': 'DISABLE', 'combo': '', 'error': f'{type(exc).__name__}: {exc}', 'source': 'yver144_matrix_state'}
+    return {'policy': 'DISABLE', 'combo': '', 'source': 'yver144_matrix_state_empty'}
+
+
+def _yver144_current_matrix_keep(item, session_name: str = '', user_id: int = 0) -> tuple[bool, str, dict]:
+    try:
+        st = _yver144_current_matrix_state(item, session_name=session_name, user_id=user_id)
+        pol = str(st.get('policy') or st.get('status') or '').upper().strip()
+        combo = str(st.get('combo') or '').upper().strip()
+        if pol == 'KEEP':
+            return True, f'yver144_current_matrix_keep:{combo or "-"}', st
+        return False, f'yver144_current_matrix_not_keep:{pol or "UNKNOWN"}:{combo or "-"}', st
+    except Exception as exc:
+        return False, f'yver144_matrix_keep_error:{type(exc).__name__}', {}
+
+
+try:
+    _YVER144_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS = _setup_user_visible_keep_policy_allows
+except Exception:
+    _YVER144_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS = None
+
+
+def _setup_user_visible_keep_policy_allows(setup_or_row, session_name: str = '', user_id: int = 0, lane: str = 'screen') -> tuple[bool, str, dict]:
+    """Final user-facing delivery policy gate.
+
+    Older compatibility patches could restore a setup from stored KEEP rows.  v144
+    makes the final visible/email decision use the current /setup_matrix policy row.
+    """
+    l = str(lane or 'screen').lower().strip()
+    # Background audit/learning is not user-facing delivery.
+    delivery_lane = (l in {'screen', '/screen', 'email', 'setup_email', 'screen_sync', 'bigmove', 'bigmove_setup_email', 'f8', 'delivery', 'autotrade_preentry_setup_email'} or 'email' in l or 'screen' in l)
+    if delivery_lane:
+        keep_ok, keep_why, keep_meta = _yver144_current_matrix_keep(setup_or_row, session_name=session_name, user_id=user_id)
+        if not keep_ok:
+            return False, keep_why, keep_meta
+    if callable(_YVER144_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS):
+        try:
+            ok, why, meta = _YVER144_ORIG_SETUP_USER_VISIBLE_KEEP_POLICY_ALLOWS(setup_or_row, session_name=session_name, user_id=user_id, lane=lane)
+            if ok:
+                try:
+                    if isinstance(meta, dict):
+                        meta.update({'yver144_current_policy': (keep_meta if delivery_lane else {})})
+                except Exception:
+                    pass
+                return True, why, meta
+            # If old logic rejects but current matrix is KEEP, keep the rejection for
+            # non-policy safety reasons (symbol block, direction, basic invalid, etc.).
+            return False, why, meta
+        except Exception as exc:
+            return False, f'yver144_visible_orig_error:{type(exc).__name__}', {}
+    return _yver144_current_matrix_keep(setup_or_row, session_name=session_name, user_id=user_id)
+
+
+try:
+    _YVER144_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = is_executable_setup_eligible
+except Exception:
+    _YVER144_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE = None
+
+
+def is_executable_setup_eligible(setup, session_name: str = ''):
+    """Executable/email queue final sync: current matrix policy must still be KEEP."""
+    if callable(_YVER144_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE):
+        try:
+            ok, why = _YVER144_ORIG_IS_EXECUTABLE_SETUP_ELIGIBLE(setup, session_name=session_name)
+        except Exception as exc:
+            return False, f'yver144_exec_orig_error:{type(exc).__name__}'
+        if not ok:
+            return bool(ok), str(why or 'not_executable')
+    keep_ok, keep_why, _keep_meta = _yver144_current_matrix_keep(setup, session_name=session_name, user_id=_yver144_owner_uid(0))
+    if not keep_ok:
+        return False, keep_why
+    return True, 'yver144_current_matrix_keep_executable'
+
+
+try:
+    _YVER144_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS = _autotrade_policy_context_execution_allows
+except Exception:
+    _YVER144_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS = None
+
+
+def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
+    """AutoTrade final policy sync: do not open current WATCH/DISABLE lanes."""
+    keep_ok, keep_why, _meta = _yver144_current_matrix_keep(setup_or_row, session_name=session_name, user_id=user_id)
+    if not keep_ok:
+        return False, keep_why
+    if callable(_YVER144_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS):
+        try:
+            return _YVER144_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS(setup_or_row, session_name=session_name, user_id=user_id)
+        except Exception as exc:
+            return False, f'yver144_autotrade_policy_orig_error:{type(exc).__name__}'
+    return True, keep_why
+
+
+try:
+    _YVER144_ORIG_SETUP_EMAIL_PRESEND_FILTER = _setup_email_presend_executable_filter
+except Exception:
+    _YVER144_ORIG_SETUP_EMAIL_PRESEND_FILTER = None
+
+
+def _yver144_setup_delivery_blackout_now_for_lane(lane: str = '') -> tuple[bool, str]:
+    l = str(lane or '').lower().strip()
+    if not (('email' in l) or ('screen' in l) or l in {'delivery', 'bigmove', 'f8'}):
+        return False, ''
+    try:
+        blk, why = _setup_generation_blackout_now()
+        if blk:
+            return True, str(why or 'setup_delivery_blackout')
+    except Exception:
+        pass
+    return False, ''
+
+
+def _setup_email_presend_executable_filter(user_id: int, session_name: str, setups: list, lane: str = 'email') -> tuple[list, Counter]:
+    """Final pre-send gate used by normal setup emails, F8 setup emails and pre-entry mail."""
+    if callable(_YVER144_ORIG_SETUP_EMAIL_PRESEND_FILTER):
+        base, reasons = _YVER144_ORIG_SETUP_EMAIL_PRESEND_FILTER(user_id, session_name, setups, lane=lane)
+    else:
+        base, reasons = list(setups or []), Counter()
+    reasons = Counter(reasons or {})
+    sess = str(session_name or '').upper().strip()
+    blk, blk_why = _yver144_setup_delivery_blackout_now_for_lane(lane)
+    if blk:
+        reasons[str(blk_why or 'setup_delivery_blackout')] += len(list(base or setups or [])) or 1
+        try:
+            db_log_setup_pipeline_event(int(user_id or 0), stage='yver144_presend_delivery_blackout', status='empty', session=sess, mode=str(lane or 'email'), details={'reason': str(blk_why or ''), 'input': len(list(base or setups or []))})
+        except Exception:
+            pass
+        return [], reasons
+    out = []
+    for s in list(base or []):
+        try:
+            keep_ok, keep_why, keep_meta = _yver144_current_matrix_keep(s, session_name=sess, user_id=int(user_id or 0))
+            if not keep_ok:
+                reasons[str(keep_why or 'current_matrix_not_keep')] += 1
+                try:
+                    db_log_setup_pipeline_event(int(user_id or 0), stage='yver144_presend_current_policy_gate', status='skip', session=sess, mode=str(lane or 'email'), setup_id=str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''), symbol=str(getattr(s, 'symbol', '') or ''), side=str(getattr(s, 'side', '') or ''), details={'reason': str(keep_why or ''), 'policy': keep_meta})
+                except Exception:
+                    pass
+                continue
+            out.append(s)
+        except Exception as exc:
+            reasons[f'yver144_presend_policy_exception:{type(exc).__name__}'] += 1
+            continue
+    return out, reasons
+
+
+try:
+    _YVER144_ORIG_SCREEN_FORMAT_SETUP_CARDS = _screen_format_setup_cards
+except Exception:
+    _YVER144_ORIG_SCREEN_FORMAT_SETUP_CARDS = None
+
+
+def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
+    """Hide current non-KEEP cards from /screen even if an old delivery row exists."""
+    filtered = []
+    sess = str(session or '').upper().strip()
+    for s in list(setups or []):
+        try:
+            keep_ok, keep_why, keep_meta = _yver144_current_matrix_keep(s, session_name=sess, user_id=int(uid or 0))
+            if keep_ok:
+                filtered.append(s)
+            else:
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='yver144_screen_current_policy_gate', status='skip', session=sess, mode='screen', setup_id=str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or ''), symbol=str(getattr(s, 'symbol', '') or ''), side=str(getattr(s, 'side', '') or ''), details={'reason': str(keep_why or ''), 'policy': keep_meta})
+                except Exception:
+                    pass
+        except Exception:
+            # If the policy check itself fails, keep the old behaviour rather than blanking
+            # a valid setup due to a display-only exception.
+            filtered.append(s)
+    if callable(_YVER144_ORIG_SCREEN_FORMAT_SETUP_CARDS):
+        return _YVER144_ORIG_SCREEN_FORMAT_SETUP_CARDS(list(filtered or []), uid, session)
+    return '_No high-quality setups right now._'
+
+
+def _yver144_row_combo_u(r: dict) -> str:
+    try:
+        fam = _setup_audit_family_code(r)
+        sess_row = str((r or {}).get('session') or (r or {}).get('source_session') or '-').upper().strip() or '-'
+        strat = _setup_strategy_short_label(r)
+        side_row = _setup_side_suffix(value=str((r or {}).get('side') or ''))
+        return str(_setup_combo_strategy_side_key(fam, sess_row, strat, side_row) or '').upper().strip()
+    except Exception:
+        return ''
+
+
+def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> str:
+    """v144: KEEP opening-time analysis filtered by the same Policy label as /setup_audit."""
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(owner_uid or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    scope_label, start_ts, scope_hours = _setup_open_times_parse_scope(scope)
+    try:
+        row_limit = max(20, min(600, int(rows_limit or 220)))
+    except Exception:
+        row_limit = 220
+    try:
+        rows = _setup_audit_load_rows(int(uid_i), hours=None, limit=0, dedup=True, start_ts=float(start_ts or 0.0), apply_final_quality_gate=False, source_mode_override='ALL') or []
+        source_label = 'EXECUTABLE+GENERATED'
+    except Exception:
+        rows, source_label = [], 'EXECUTABLE+GENERATED'
+    result_horizon = _setup_audit_result_horizon_hours()
+    try:
+        historical_wr = _yver131_wr_open_lookup(int(uid_i), float(start_ts or 0.0))
+    except Exception:
+        historical_wr = lambda _c, _t: '-'
+    matched: list[dict] = []
+    hour_stats: dict[int, dict] = defaultdict(lambda: {'set': 0, 'tp': 0, 'sl': 0, 'nh': 0, 'open': 0, 'r_sum': 0.0})
+    for r in list(rows or []):
+        try:
+            combo_u = _yver144_row_combo_u(r)
+            if not combo_u:
+                continue
+            sess_row = str((r or {}).get('session') or (r or {}).get('source_session') or '').upper().strip()
+            side_row = str((r or {}).get('side') or '').upper().strip()
+            pol = _setup_audit_policy_label(r, uid=int(uid_i), session_name=sess_row, side=side_row)
+            if str(pol or '').upper().strip() != 'KEEP':
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if ts <= 0:
+                continue
+            res = _setup_audit_keep_watch_fast_result_label(r, result_horizon)
+            res = _setup_audit_result_label(res)
+            local_dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+            h = int(local_dt.hour)
+            st = hour_stats[h]
+            st['set'] += 1
+            if res == 'TP':
+                st['tp'] += 1; st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or 0.0)
+            elif res == 'SL':
+                st['sl'] += 1; st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or -1.0)
+            elif res == 'NOHIT':
+                st['nh'] += 1
+            else:
+                st['open'] += 1
+            try:
+                wr_at_gen = historical_wr(combo_u, ts) if callable(historical_wr) else '-'
+            except Exception:
+                wr_at_gen = '-'
+            wr_current = _setup_audit_policy_wr_label(r, uid=int(uid_i), session_name=sess_row, side=side_row)
+            matched.append({**dict(r or {}), '_combo': combo_u, '_wr_at_gen': wr_at_gen, '_wr_current': wr_current, '_res': res, '_time_txt': local_dt.strftime('%m-%d %H:%M')})
+        except Exception:
+            continue
+    matched = sorted(matched, key=lambda x: float(_setup_audit_row_ts(x) or 0.0), reverse=True)
+    proposals = _setup_open_times_proposals(hour_stats, scope_hours=int(scope_hours or 0))
+    top_lines = []
+    if proposals:
+        for p in proposals:
+            top_lines.append(f"• <b>{html.escape(str(p.get('label') or '-'))}</b> — WR {float(p.get('wr', 0.0)):.1f}% | AvgR {float(p.get('avg_r', 0.0)):+.2f} | TP/SL {int(p.get('tp',0) or 0)}/{int(p.get('sl',0) or 0)} | Set {int(p.get('set',0) or 0)}")
+    else:
+        top_lines.append("• <b>No blackout suggested</b> — no KEEP setup-time hour had enough weak decided evidence in this window.")
+    detail_rows = []
+    for r in matched[:row_limit]:
+        try:
+            sym = str(r.get('symbol') or '').upper().strip()
+            if sym.endswith('USDT'):
+                sym = sym[:-4]
+            detail_rows.append([str(r.get('_time_txt') or '-'), sym or '-', str(r.get('side') or '').upper().strip() or '-', str(r.get('_combo') or '-'), 'KEEP', str(r.get('_wr_at_gen') or '-'), str(r.get('_wr_current') or '-'), str(r.get('_res') or '-')])
+        except Exception:
+            continue
+    table = tabulate(detail_rows, headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'WR/O', 'WR/C', 'Res'], tablefmt='plain', colalign=('left', 'left', 'center', 'left', 'center', 'right', 'right', 'center')) if detail_rows else 'No KEEP setup rows matched this window.'
+    try:
+        win = _setup_audit_window_summary(matched)
+        start_txt = str(win.get('start_txt') or '-')
+        end_txt = str(win.get('end_txt') or '-')
+    except Exception:
+        start_txt = end_txt = '-'
+    decided = sum(int((st or {}).get('tp', 0) or 0) + int((st or {}).get('sl', 0) or 0) for st in hour_stats.values())
+    tp_n = sum(int((st or {}).get('tp', 0) or 0) for st in hour_stats.values())
+    sl_n = sum(int((st or {}).get('sl', 0) or 0) for st in hour_stats.values())
+    wr = (tp_n / decided * 100.0) if decided else 0.0
+    try:
+        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        now_txt = ''
+    lines = [
+        "⏱️ <b>KEEP Setup Opening-Time Analysis</b>", HDR,
+        "<b>Suggested blackout windows only:</b>",
+        html.escape('Auto-blackout rule sync: suggestions above use the same 7d-only AUTO_BLACKOUT candidate rule: WR<45%, AvgR<0, decided TP+SL>=5. Applied windows may also retain a previous weak hour for one review for smoothing.'),
+        *top_lines, HDR,
+        f"Window: <b>{html.escape(scope_label)}</b>" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
+        f"Rows: <b>{len(matched)}</b> KEEP setups | Decided: <b>{decided}</b> | TP/SL: <b>{tp_n}/{sl_n}</b> | WR: <b>{wr:.1f}%</b>",
+        f"Data start: <b>{html.escape(start_txt)}</b> | Data end: <b>{html.escape(end_txt)}</b> | Source: <b>{html.escape(source_label)}</b>",
+        "WR/O = open-time / generated-time /setup_matrix WR snapshot. WR/C = current /setup_matrix lane WR after latest TP/SL evidence.",
+        "Detailed rows below are KEEP-only setup opening times using the same current Policy label as <code>/setup_audit</code>.",
+        "<pre>" + html.escape(table) + "</pre>",
+    ]
+    if len(matched) > row_limit:
+        lines.append(f"Rows shown: <b>{row_limit}</b> / <b>{len(matched)}</b>. Increase the second argument to show more rows, e.g. <code>/setup_open_times all 400</code>.")
+    return "\n".join(lines)
+
+
+def _yver144_engine_rows(uid: int, engine: str, start_ts: float = 0.0) -> list[dict]:
+    try:
+        uid_i = _yver144_owner_uid(uid)
+        rows = _setup_audit_load_rows(uid_i, hours=None, limit=0, dedup=True, start_ts=float(start_ts or 0.0), apply_final_quality_gate=True, source_mode_override=None) or []
+    except Exception:
+        rows = []
+    eng = str(engine or '').upper().strip()
+    out = []
+    seen = set()
+    for r in list(rows or []):
+        try:
+            combo = _yver144_row_combo_u(r)
+            if not combo.startswith(eng + '-'):
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if float(start_ts or 0.0) > 0 and ts > 0 and ts < float(start_ts or 0.0):
+                continue
+            key = str(_setup_audit_unique_key(r) or f'{combo}:{int(ts//60)}:{str((r or {}).get("symbol") or "").upper()}:{str((r or {}).get("side") or "").upper()}')
+            if key in seen:
+                continue
+            seen.add(key)
+            rr = dict(r or {})
+            rr['_combo'] = combo
+            out.append(rr)
+        except Exception:
+            continue
+    return out
+
+
+def _yver144_at_state_for_row(r: dict, uid: int) -> str:
+    try:
+        sess = str((r or {}).get('session') or (r or {}).get('source_session') or '').upper().strip()
+        return str(_setup_audit_autotrade_state_label(r, uid=int(uid or 0), session_name=sess) or '').upper().strip()
+    except Exception:
+        return ''
+
+
+def _yver144_result_counts(rows: list[dict]) -> str:
+    cnt = Counter()
+    for r in rows or []:
+        try:
+            res = _setup_audit_result_label(_setup_audit_keep_watch_fast_result_label(r, _setup_audit_result_horizon_hours()))
+            if res in {'TP','SL','OPEN','NOHIT'}:
+                cnt[res] += 1
+        except Exception:
+            pass
+    bits = []
+    for k in ('TP','SL','OPEN','NOHIT'):
+        if cnt.get(k, 0):
+            bits.append(f'{k}:{int(cnt[k])}')
+    return ' '.join(bits) if bits else '-'
+
+
+def _yver144_latest_keep_row(rows: list[dict]) -> str:
+    try:
+        if not rows:
+            return '-'
+        r = max(rows, key=lambda x: float(_setup_audit_row_ts(x) or 0.0))
+        ts = float(_setup_audit_row_ts(r) or 0.0)
+        ttxt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if ts > 0 else '-'
+        return f"{ttxt} {str(r.get('_combo') or _yver144_row_combo_u(r) or '-')} {str((r or {}).get('symbol') or '-').upper()} {str((r or {}).get('side') or '-').upper()}"
+    except Exception:
+        return '-'
+
+
+def _yver123_engine_health_text(uid: int, engine: str) -> str:
+    """v144: engine health reconciles visible audit rows, email and AT counts."""
+    eng = str(engine or 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        return 'Usage: /engine_health F8 or F9'
+    uid_i = _yver144_owner_uid(uid)
+    now_ts = float(time.time())
+    try:
+        baseline_ts = _yver122_policy_baseline_ts()
+    except Exception:
+        baseline_ts = now_ts - 7*86400
+    all_rows = _yver144_engine_rows(uid_i, eng, baseline_ts)
+    windows = [('Last 2h', now_ts - 2*3600), ('Last 24h', now_ts - 24*3600), ('Last 7d', now_ts - 7*86400)]
+    table_rows = []
+    keep_24 = 0
+    for label, st in windows:
+        rows = [r for r in all_rows if float(_setup_audit_row_ts(r) or 0.0) >= float(st or 0.0)]
+        keep_rows, watch_rows, other_rows = [], [], []
+        email_n = at_n = 0
+        for r in rows:
+            sess = str((r or {}).get('session') or (r or {}).get('source_session') or '').upper().strip()
+            side = str((r or {}).get('side') or '').upper().strip()
+            pol = str(_setup_audit_policy_label(r, uid=int(uid_i), session_name=sess, side=side) or '').upper().strip()
+            if pol == 'KEEP':
+                keep_rows.append(r)
+            elif pol in {'WATCH','TIGHTEN','DISABLE','OFF','GATE'}:
+                watch_rows.append(r)
+            else:
+                other_rows.append(r)
+            at_state = _yver144_at_state_for_row(r, uid_i)
+            if at_state in {'SENT','SENT_OLD','EMAILED','DELIVERED'}:
+                email_n += 1
+            if at_state.startswith('AT_') or at_state in {'AT','OPEN','CLOSED'}:
+                at_n += 1
+        if label == 'Last 24h':
+            keep_24 = len(keep_rows)
+        table_rows.append([label, len(keep_rows), len(watch_rows), len(other_rows), email_n, at_n, _yver144_result_counts(keep_rows), _yver144_latest_keep_row(keep_rows)])
+    try:
+        keep_policy_rows = len(_yver125_keep_combos_for_engine(uid_i, eng)) if callable(globals().get('_yver125_keep_combos_for_engine')) else 0
+    except Exception:
+        keep_policy_rows = 0
+    status = 'OK' if int(keep_24 or 0) > 0 else 'IDLE_KEEP_24H'
+    try:
+        base_txt = _yver122_melb_txt(baseline_ts)
+    except Exception:
+        base_txt = '2026-06-01 00:00'
+    table = tabulate(table_rows, headers=['Window','KEEP','WATCH','Other','Email','AT','KEEP Results','Latest KEEP row'], tablefmt='plain')
+    title = 'F8 BigMove' if eng == 'F8' else 'F9 Multi-Day Leaders/Losers'
+    lines = [
+        f"🧪 <b>Engine Health — {html.escape(title)}</b>", HDR,
+        f"Status: <b>{html.escape(status)}</b> | Baseline: <b>{html.escape(str(base_txt))} Melbourne</b>",
+        "Read-only: no backfill, no repair, no setup creation, no OHLCV scan.",
+        "Source: <b>visible /setup_audit rows only</b>, split by current Policy.",
+        "Email/AT count visible engine rows even if their current Policy later moved to WATCH; Latest remains KEEP-only.",
+        f"KEEP policy combos for {html.escape(eng)}: <b>{int(keep_policy_rows or 0)}</b>",
+        "KEEP = current setup-email/AutoTrade eligible evidence. WATCH/Other are diagnostic/history.",
+        HDR, '<pre>' + html.escape(table) + '</pre>',
+    ]
+    return '\n'.join(lines)
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v144_sync_reports'
+    SETUP_AUDIT_CACHE_VERSION = 'v144'
+    SCREEN_CACHE_VERSION = str(globals().get('SCREEN_CACHE_VERSION', '')) + ':v144_current_policy'
+    globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0, 'user_id': 0, 'data': {}})['ts'] = 0.0
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver144_version', YVER144_VERSION)
+except Exception:
+    pass
+try:
+    logger.debug('yver144 loaded: final current-matrix delivery/autotrade sync; setup_open_times and engine_health align with visible audit; startup logs quieted')
+except Exception:
+    pass
+# =========================================================
+# end yver144
+# =========================================================
+
+if __name__ == "__main__":
+    main()
