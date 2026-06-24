@@ -1,3 +1,4 @@
+# yver143: F8/BigMove AutoTrade sync fix; confirmed emailed F8 KEEP setups no longer get blocked by the secondary strict-edge sample-count guard (AUTOTRADE_STRICT) after setup email/audit visibility. Downstream risk, blackout, direction, duplicate, leverage, drift and order safety gates unchanged.
 # yver142: repairs BigMove/F8 setup generation reliability so every confirmed BigMove alert can create a durable F8 generated/setup-audit row; failed cache-price attempts no longer memo-block later hooks. No order/risk/TP/SL/leverage changes.
 # yver141: repairs WR/O display conflict so a row shown under current/entry KEEP cannot display a stale sub-threshold historical WR/O; WR/O now falls back to the KEEP policy WR snapshot when the selected open-time matrix row is below the runtime KEEP floor. Display-only; no setup/email/autotrade/risk/TP/SL/order changes.
 # yver139: removes the v137 heavy emailed-setup audit backfill that could make /setup_audit slow/OOM on Render, replaces it with bounded in-memory emailed setup-id dedup/backfill, and reverts v138 extra scheduler instances to memory-safe single-instance scheduling. No setup/email/AutoTrade policy, TP/SL, risk, leverage, sizing, drift, or order logic changed.
@@ -86948,4 +86949,149 @@ except Exception:
     pass
 # =========================================================
 # end yver128
+# =========================================================
+
+
+# =========================================================
+# yver143 F8 BigMove email/setup/AutoTrade sync fix
+# =========================================================
+# 25-Jun review: confirmed BigMove O created a visible F8 KEEP setup and setup email,
+# but AutoTrade retried it repeatedly with AUTOTRADE_STRICT.  That was not a Bybit,
+# risk, leverage, TP/SL, drift or blackout issue; it was the secondary strict-edge
+# sample-count guard using a sparse rolling dataset after the F8 setup had already
+# passed the setup-matrix KEEP lane and delivery/audit lane.
+#
+# Rule for this patch:
+# - Normal/non-F8 setups keep the existing strict-edge guard exactly as-is.
+# - A confirmed F8/BigMove setup that is Policy=KEEP may bypass ONLY the duplicate
+#   strict-edge sample-count guard.
+# - All real execution safety gates still run afterwards: direction/leader-loser,
+#   symbol/hour blocks, duplicate/already-traded, blackout, drift, risk caps,
+#   leverage/liquidation, Bybit permission/order errors, TP/SL attachment.
+
+def _yver143_setup_attr(obj, name: str, default=''):
+    try:
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+
+def _yver143_combo_for_setup(setup_or_row, session_name: str = '') -> str:
+    try:
+        combo = str(_yver143_setup_attr(setup_or_row, 'combo', '') or _yver143_setup_attr(setup_or_row, 'combo_key', '') or '').upper().strip()
+        if combo:
+            return combo
+    except Exception:
+        pass
+    try:
+        return str(_autotrade_setup_exact_combo_key(setup_or_row, session_name or '') or '').upper().strip()
+    except Exception:
+        return ''
+
+
+def _yver143_is_f8_bigmove_setup(setup_or_row, session_name: str = '') -> bool:
+    try:
+        combo = _yver143_combo_for_setup(setup_or_row, session_name=session_name)
+        if combo.startswith('F8-'):
+            return True
+    except Exception:
+        pass
+    try:
+        fam = str(_yver143_setup_attr(setup_or_row, 'family', '') or _yver143_setup_attr(setup_or_row, 'family_id', '') or _yver143_setup_attr(setup_or_row, 'engine', '') or '').upper().strip()
+        if fam == 'F8' or 'BIGMOVE' in fam or 'BIG-MOVE' in fam or 'BIG_MOVE' in fam:
+            return True
+    except Exception:
+        pass
+    try:
+        sid = str(_yver143_setup_attr(setup_or_row, 'setup_id', '') or _yver143_setup_attr(setup_or_row, 'id', '') or '').upper().strip()
+        if sid.startswith('F8-') or 'BIGMOVE' in sid or 'BIG-MOVE' in sid or 'BIG_MOVE' in sid:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _yver143_policy_is_keep(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or user_id or 0)
+    except Exception:
+        owner_uid = int(user_id or 0)
+    sess = str(session_name or _yver143_setup_attr(setup_or_row, 'session', '') or _yver143_setup_attr(setup_or_row, 'source_session', '') or '').upper().strip()
+    combo = _yver143_combo_for_setup(setup_or_row, session_name=sess)
+    try:
+        state = dict(_setup_matrix_policy_source_state_for_setup(setup_or_row, session_name=sess, user_id=owner_uid) or {})
+        pol = str(state.get('policy') or state.get('status') or '').upper().strip()
+        if pol == 'KEEP':
+            return True, f'matrix_keep:{combo or str(state.get("combo") or "-")}'
+    except Exception:
+        pass
+    try:
+        pinfo = dict(_setup_combo_policy_lookup_for_setup(setup_or_row, session_name=sess, user_id=owner_uid) or {})
+        pol = _setup_policy_effective_status(str(pinfo.get('status') or '').upper().strip(), found=bool(pinfo.get('found')))
+        if str(pol or '').upper().strip() == 'KEEP':
+            return True, f'lookup_keep:{combo or str(pinfo.get("combo") or "-")}'
+    except Exception:
+        pass
+    try:
+        pol = str(_yver143_setup_attr(setup_or_row, 'policy', '') or '').upper().strip()
+        if pol == 'KEEP':
+            return True, f'row_keep:{combo or "-"}'
+    except Exception:
+        pass
+    return False, f'not_keep:{combo or "-"}'
+
+try:
+    _YVER143_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS = globals().get('_autotrade_policy_context_execution_allows')
+except Exception:
+    _YVER143_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS = None
+
+
+def _autotrade_policy_context_execution_allows(setup_or_row, session_name: str = '', user_id: int = 0) -> tuple[bool, str]:
+    orig = globals().get('_YVER143_ORIG_AUTOTRADE_POLICY_CONTEXT_EXECUTION_ALLOWS')
+    if orig is None:
+        return True, 'yver143_no_original_context_guard'
+    try:
+        ok, why = orig(setup_or_row, session_name=session_name, user_id=user_id)
+    except Exception as exc:
+        return False, f'yver143_original_context_error:{type(exc).__name__}'
+    why_s = str(why or '')
+    if ok:
+        return bool(ok), why_s
+
+    # Only fix the known mismatch: F8/BigMove KEEP setup was delivered, visible in
+    # /setup_audit, then rejected by the secondary strict-edge sample-count guard.
+    if 'autotrade_strict_keep_edge_block' not in why_s:
+        return bool(ok), why_s
+    if not _yver143_is_f8_bigmove_setup(setup_or_row, session_name=session_name):
+        return bool(ok), why_s
+    keep_ok, keep_why = _yver143_policy_is_keep(setup_or_row, session_name=session_name, user_id=user_id)
+    if not keep_ok:
+        return bool(ok), why_s
+
+    old_fn = globals().get('_autotrade_strict_keep_edge_enabled')
+    try:
+        globals()['_autotrade_strict_keep_edge_enabled'] = lambda: False
+        ok2, why2 = orig(setup_or_row, session_name=session_name, user_id=user_id)
+    except Exception as exc:
+        ok2, why2 = False, f'yver143_f8_strict_bypass_error:{type(exc).__name__}'
+    finally:
+        if old_fn is not None:
+            globals()['_autotrade_strict_keep_edge_enabled'] = old_fn
+    if ok2:
+        return True, f'yver143_f8_bigmove_keep_strict_bypass:{keep_why}'
+    return bool(ok2), str(why2 or why_s)
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v143'
+    SETUP_AUDIT_CACHE_VERSION = 'v143'
+except Exception:
+    pass
+try:
+    logger.info('yver143 loaded: F8/BigMove KEEP setup email/audit/autotrade sync; strict sample-count guard no longer blocks confirmed F8 KEEP, downstream safety unchanged')
+except Exception:
+    pass
+# =========================================================
+# end yver143
 # =========================================================
