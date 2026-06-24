@@ -1,3 +1,4 @@
+# yver138: scheduler-noise hardening after Render review: alert_job and autonomous_screen_sync_job allow a second lock-check instance so overlapping ticks exit quietly instead of APScheduler max_instances warnings; scan_intelligence misfire grace widened for Render pauses. No setup/email/AutoTrade policy, TP/SL, risk, leverage, sizing, or order logic changed.
 # yver137: guarantees every delivered/emailed setup is visible in /setup_audit by making emailed setup_ids audit-unique and backfilling audit rows from emailed_setups/signals/executable_setups when the normal deduped executable lane hides a later same-symbol setup. No TP/SL, leverage, sizing, drift, risk, policy, blackout, or Bybit order logic changed.
 # yver136: fixes WR/C display to read the freshest current /setup_matrix score snapshot (no stale policy cache) and treats Bybit 110126 required-agreement errors as permission-required holds with owner email alert/cooldown. No TP/SL, leverage, sizing, drift, risk, setup geometry, or order placement logic changed.
 # yver135: fixes WR/O to use one stable lane WR snapshot per Melbourne setup hour so same combo setups generated close together show the same WR/O, and keeps shadow executable/audit generation running before setup-email caps/gaps/blackouts can stop delivery. No TP/SL, leverage, sizing, drift, risk, or Bybit order geometry changed.
@@ -66126,9 +66127,12 @@ def main():
             first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
             name="alert_job",
             job_kwargs={
-                "max_instances": 1,
+                # yver138: allow one extra scheduler instance to enter and exit via
+                # ALERT_LOCK when the previous tick is still finishing. This removes
+                # noisy APScheduler max_instances warnings without allowing overlap.
+                "max_instances": 2,
                 "coalesce": True,
-                "misfire_grace_time": 300,
+                "misfire_grace_time": 900,
             },
         )
 
@@ -66148,9 +66152,12 @@ def main():
             first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
             name="autonomous_screen_sync_job",
             job_kwargs={
-                "max_instances": 1,
+                # yver138: this job has _AUTONOMOUS_SCREEN_SYNC_LOCK inside, so a
+                # second scheduler instance only records/returns instead of running
+                # duplicate setup/email work. Prevents Render max_instances noise.
+                "max_instances": 2,
                 "coalesce": True,
-                "misfire_grace_time": 900,
+                "misfire_grace_time": 1800,
             },
         )
 
@@ -66384,7 +66391,10 @@ def main():
                 job_kwargs={
                     "max_instances": 1,
                     "coalesce": True,
-                    "misfire_grace_time": 300,
+                    # yver138: Render cold starts/event-loop pauses can miss this
+                    # non-critical research job by slightly over 5 minutes. Widen
+                    # grace so it coalesces quietly instead of warning.
+                    "misfire_grace_time": 1800,
                 },
             )
 
@@ -84165,6 +84175,7 @@ except Exception:
     pass
 try:
     logger.info('yver137 loaded before main: every emailed/delivered setup_id is audit-unique and backfilled from emailed_setups so /setup_audit cannot hide later same-symbol email setups')
+    logger.info('yver138 loaded before main: scheduler-noise hardening for Render max_instances/misfire warnings; no trading/setup policy changes')
 except Exception:
     pass
 # =========================================================
