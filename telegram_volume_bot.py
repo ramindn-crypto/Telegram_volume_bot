@@ -1,3 +1,4 @@
+# yver137: guarantees every delivered/emailed setup is visible in /setup_audit by making emailed setup_ids audit-unique and backfilling audit rows from emailed_setups/signals/executable_setups when the normal deduped executable lane hides a later same-symbol setup. No TP/SL, leverage, sizing, drift, risk, policy, blackout, or Bybit order logic changed.
 # yver136: fixes WR/C display to read the freshest current /setup_matrix score snapshot (no stale policy cache) and treats Bybit 110126 required-agreement errors as permission-required holds with owner email alert/cooldown. No TP/SL, leverage, sizing, drift, risk, setup geometry, or order placement logic changed.
 # yver135: fixes WR/O to use one stable lane WR snapshot per Melbourne setup hour so same combo setups generated close together show the same WR/O, and keeps shadow executable/audit generation running before setup-email caps/gaps/blackouts can stop delivery. No TP/SL, leverage, sizing, drift, risk, or Bybit order geometry changed.
 # yver134: hard-locks /screen setup visibility to a 60-minute window with max 4 newest cards, keeps WR/O causal to the latest setup_matrix WR at-or-before setup generation time, and makes AutoTrade pre-entry setup-email sync obey the user email/session/cap config before any live entry. No TP/SL, leverage, sizing, drift, blackout, or order geometry changed.
@@ -83822,6 +83823,352 @@ except Exception:
     pass
 # =========================================================
 # end yver136
+# =========================================================
+
+
+# =========================================================
+# yver137 — emailed setup audit visibility lock
+# =========================================================
+# Problem observed 2026-06-24:
+#   An ETH setup email was delivered and AutoTrade placed it, but /setup_audit 4
+#   did not show the 13:54 ETH row because the audit dedup key grouped practical
+#   rows by Melbourne day + session + strategy + symbol + side + family.  A
+#   previous ETH F1-ASIA-NOR-SELL row from 10:40 occupied that practical bucket.
+#
+# Rule from owner: if a setup is emailed/delivered, it must be visible in
+# /setup_audit.  Raw repeated scanner saves can still be deduped, but delivered
+# setup_ids are audit facts and must not be hidden by same-symbol daily dedup.
+#
+# This patch is display/audit persistence only. It does not change setup geometry,
+# policy selection, email config, AutoTrade risk, sizing, leverage, drift,
+# blackout, or Bybit order placement.
+
+YVER137_VERSION = 'yver137_2026_06_24_emailed_setup_must_appear_in_setup_audit'
+
+
+def _yver137_owner_uid_fallback(uid: int = 0) -> int:
+    try:
+        owner = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        return owner if owner > 0 else int(uid or 0)
+    except Exception:
+        try:
+            return int(uid or 0)
+        except Exception:
+            return 0
+
+
+def _yver137_uid_candidates(uid: int = 0) -> list[int]:
+    out = []
+    for x in (uid, globals().get('AUTOTRADE_OWNER_UID', 0), 0):
+        try:
+            xi = int(x or 0)
+            if xi >= 0 and xi not in out:
+                out.append(xi)
+        except Exception:
+            pass
+    return out or [int(uid or 0)]
+
+
+def _yver137_table_exists(conn, table: str) -> bool:
+    try:
+        row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (str(table),)).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _yver137_table_cols(conn, table: str) -> set[str]:
+    try:
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
+
+
+def _yver137_setup_was_emailed(setup_id: str, uid: int = 0) -> bool:
+    sid = str(setup_id or '').strip()
+    if not sid:
+        return False
+    key = f"{int(uid or 0)}::{sid}"
+    cache = globals().setdefault('_YVER137_EMAILED_SETUP_ID_CACHE', {})
+    try:
+        item = cache.get(key)
+        now = float(time.time())
+        if isinstance(item, tuple) and len(item) == 2 and (now - float(item[0] or 0.0)) < 20.0:
+            return bool(item[1])
+    except Exception:
+        pass
+    found = False
+    try:
+        ids = _yver137_uid_candidates(uid)
+        with sqlite3.connect(DB_PATH) as conn:
+            if _yver137_table_exists(conn, 'emailed_setups'):
+                q = ','.join(['?'] * len(ids))
+                row = conn.execute(
+                    f"SELECT 1 FROM emailed_setups WHERE setup_id=? AND user_id IN ({q}) LIMIT 1",
+                    tuple([sid] + ids),
+                ).fetchone()
+                found = bool(row)
+    except Exception:
+        found = False
+    try:
+        cache[key] = (float(time.time()), bool(found))
+    except Exception:
+        pass
+    return bool(found)
+
+
+try:
+    _YVER137_ORIG_SETUP_AUDIT_UNIQUE_KEY = _setup_audit_unique_key
+except Exception:
+    _YVER137_ORIG_SETUP_AUDIT_UNIQUE_KEY = None
+
+
+def _setup_audit_unique_key(row: dict) -> str:
+    """v137: delivered/emailed setups are unique by setup_id in /setup_audit.
+
+    Raw scanner/executable repeats still use the existing practical dedup key, but
+    any row that has actually been emailed/delivered must not be hidden by an older
+    same-symbol setup in the same Melbourne day bucket.
+    """
+    try:
+        rr = _setup_audit_payload_from_row(row)
+        sid = str(rr.get('setup_id') or (row or {}).get('setup_id') or '').strip()
+        source_txt = ' '.join([
+            str((row or {}).get('source') or ''),
+            str((row or {}).get('source_kind') or ''),
+            str((row or {}).get('state') or ''),
+        ]).upper()
+        emailed_ts = 0.0
+        try:
+            emailed_ts = float((row or {}).get('emailed_ts') or rr.get('emailed_ts') or 0.0)
+        except Exception:
+            emailed_ts = 0.0
+        if sid and (emailed_ts > 0 or 'EMAIL' in source_txt or 'DELIVER' in source_txt or _yver137_setup_was_emailed(sid, int((row or {}).get('user_id') or 0))):
+            return f'EMAILED_SETUP_ID|{sid}'
+    except Exception:
+        pass
+    if callable(_YVER137_ORIG_SETUP_AUDIT_UNIQUE_KEY):
+        return _YVER137_ORIG_SETUP_AUDIT_UNIQUE_KEY(row)
+    try:
+        return str((row or {}).get('setup_id') or id(row))
+    except Exception:
+        return str(id(row))
+
+
+def _yver137_setup_select_expr(cols: set[str], col: str, default_sql: str = "''") -> str:
+    return col if col in cols else f"{default_sql} AS {col}"
+
+
+def _yver137_load_emailed_audit_rows(uid: int, cutoff: float = 0.0, limit: int = 0) -> list[dict]:
+    """Return delivered setup rows reconstructed from emailed_setups.
+
+    This is a safety net for the audit report: even if executable_setups was pruned,
+    overwritten, or deduped by a same-symbol practical bucket, the email delivery
+    row is authoritative proof that the setup was created/delivered.
+    """
+    rows: list[dict] = []
+    try:
+        ids = _yver137_uid_candidates(uid)
+        qids = ','.join(['?'] * len(ids))
+        params = list(ids)
+        where = f"e.user_id IN ({qids})"
+        if float(cutoff or 0.0) > 0:
+            where += " AND e.emailed_ts>=?"
+            params.append(float(cutoff or 0.0))
+        fetch_limit = max(200, int(limit or 0) * 12 if int(limit or 0) > 0 else 500)
+        params.append(int(fetch_limit))
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            if not _yver137_table_exists(conn, 'emailed_setups'):
+                return []
+            x_exists = _yver137_table_exists(conn, 'executable_setups')
+            s_exists = _yver137_table_exists(conn, 'signals')
+            g_exists = _yver137_table_exists(conn, 'generated_setups')
+            x_cols = _yver137_table_cols(conn, 'executable_setups') if x_exists else set()
+            s_cols = _yver137_table_cols(conn, 'signals') if s_exists else set()
+            g_cols = _yver137_table_cols(conn, 'generated_setups') if g_exists else set()
+
+            # Use correlated subqueries for generated_setups so duplicate generated
+            # snapshots do not fan out emailed rows.
+            x_join = "LEFT JOIN executable_setups x ON x.user_id=e.user_id AND x.setup_id=e.setup_id" if x_exists else ""
+            s_join = "LEFT JOIN signals s ON s.setup_id=e.setup_id" if s_exists else ""
+            select_parts = [
+                "e.user_id AS user_id",
+                "e.setup_id AS setup_id",
+                "e.session AS session",
+                "e.emailed_ts AS emailed_ts",
+                "COALESCE(NULLIF(x.executable_ts,0), e.emailed_ts) AS ts" if x_exists and 'executable_ts' in x_cols else "e.emailed_ts AS ts",
+                "COALESCE(NULLIF(x.signal_created_ts,0), NULLIF(s.created_ts,0), e.emailed_ts) AS signal_created_ts" if (x_exists and s_exists and 'signal_created_ts' in x_cols and 'created_ts' in s_cols) else ("COALESCE(NULLIF(x.signal_created_ts,0), e.emailed_ts) AS signal_created_ts" if x_exists and 'signal_created_ts' in x_cols else ("COALESCE(NULLIF(s.created_ts,0), e.emailed_ts) AS signal_created_ts" if s_exists and 'created_ts' in s_cols else "e.emailed_ts AS signal_created_ts")),
+                "'EMAIL_AUDIT' AS source",
+                "'emailed_setups' AS source_kind",
+            ]
+            for col, default_sql in [
+                ('symbol', "''"), ('market_symbol', "''"), ('side', "''"), ('conf', '0'),
+                ('entry', '0'), ('sl', '0'), ('tp', '0'), ('alt_target_a', '0'), ('alt_target_b', '0'),
+                ('fut_vol_usd', '0'), ('ch24', '0'), ('ch4', '0'), ('ch1', '0'), ('ch15', '0'),
+                ('engine', "''"), ('details_json', "''"), ('quality_score', '0'),
+                ('family_id', "''"), ('family_version', "''"), ('regime_id', "''"), ('regime_primary', "''"),
+                ('allocator_plan_id', "''"), ('param_set_id', "''"),
+                ('setup_strategy', "''"), ('original_setup_id', "''"), ('original_side', "''"), ('strategy_reason', "''"),
+            ]:
+                vals = []
+                if x_exists and col in x_cols:
+                    vals.append(f"NULLIF(x.{col}, {default_sql})" if default_sql in {"''", '0'} else f"x.{col}")
+                if s_exists and col in s_cols:
+                    vals.append(f"NULLIF(s.{col}, {default_sql})" if default_sql in {"''", '0'} else f"s.{col}")
+                # last generated snapshot fallback for same setup_id/user_id
+                if g_exists and col in g_cols:
+                    vals.append(f"(SELECT NULLIF(g.{col}, {default_sql}) FROM generated_setups g WHERE g.user_id=e.user_id AND g.setup_id=e.setup_id ORDER BY g.created_ts DESC LIMIT 1)")
+                if vals:
+                    select_parts.append(f"COALESCE({', '.join(vals)}, {default_sql}) AS {col}")
+                else:
+                    select_parts.append(f"{default_sql} AS {col}")
+
+            sql = f"""
+                SELECT {', '.join(select_parts)}
+                  FROM emailed_setups e
+                  {x_join}
+                  {s_join}
+                 WHERE {where}
+                 ORDER BY e.emailed_ts DESC
+                 LIMIT ?
+            """
+            raw_rows = [dict(r) for r in (conn.execute(sql, tuple(params)).fetchall() or [])]
+        for raw in raw_rows:
+            try:
+                rr = _setup_audit_payload_from_row(raw)
+                sid = str(rr.get('setup_id') or '').strip()
+                if not sid:
+                    continue
+                rr['source'] = 'EMAIL_AUDIT'
+                rr['source_kind'] = 'emailed_setups'
+                rr['emailed_ts'] = float(raw.get('emailed_ts') or rr.get('ts') or 0.0)
+                rr['ts'] = float(raw.get('ts') or raw.get('emailed_ts') or rr.get('created_ts') or 0.0)
+                rr['created_ts'] = float(raw.get('signal_created_ts') or rr.get('created_ts') or rr.get('ts') or 0.0)
+                if not _setup_volume_ok(float(rr.get('fut_vol_usd') or 0.0)):
+                    continue
+                # Do not re-run today's final delivery gate here. The setup already
+                # passed pre-send gates when emailed; /setup_audit is historical proof.
+                rows.append(rr)
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return rows
+
+
+try:
+    _YVER137_ORIG_SETUP_AUDIT_LOAD_ROWS = _setup_audit_load_rows
+except Exception:
+    _YVER137_ORIG_SETUP_AUDIT_LOAD_ROWS = None
+
+
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None) -> list[dict]:
+    """v137 wrapper: normal audit rows + any delivered setup rows hidden by dedup."""
+    base_rows = []
+    if callable(_YVER137_ORIG_SETUP_AUDIT_LOAD_ROWS):
+        try:
+            base_rows = list(_YVER137_ORIG_SETUP_AUDIT_LOAD_ROWS(uid, hours=hours, limit=0, dedup=dedup, start_ts=start_ts, apply_final_quality_gate=apply_final_quality_gate, source_mode_override=source_mode_override) or [])
+        except TypeError:
+            try:
+                base_rows = list(_YVER137_ORIG_SETUP_AUDIT_LOAD_ROWS(uid, hours, 0, dedup, start_ts, apply_final_quality_gate, source_mode_override) or [])
+            except Exception:
+                base_rows = []
+        except Exception:
+            base_rows = []
+    cutoff = 0.0
+    try:
+        if start_ts is not None and float(start_ts or 0.0) > 0:
+            cutoff = float(start_ts or 0.0)
+        elif hours is not None and int(hours or 0) > 0:
+            cutoff = float(time.time()) - float(int(hours or 0)) * 3600.0
+    except Exception:
+        cutoff = 0.0
+    email_rows = _yver137_load_emailed_audit_rows(int(uid or 0), cutoff=float(cutoff or 0.0), limit=max(int(limit or 0), 50))
+
+    by_sid: dict[str, dict] = {}
+    no_sid: list[dict] = []
+    # Prefer emailed/delivered reconstructed rows for the same setup_id because they
+    # carry emailed_ts/source_kind and therefore cannot be hidden by practical dedup.
+    for r in list(base_rows or []):
+        try:
+            sid = str((r or {}).get('setup_id') or '').strip()
+            if sid:
+                by_sid[sid] = dict(r)
+            else:
+                no_sid.append(dict(r))
+        except Exception:
+            continue
+    for r in list(email_rows or []):
+        try:
+            sid = str((r or {}).get('setup_id') or '').strip()
+            if sid:
+                old = by_sid.get(sid)
+                if old:
+                    merged = dict(old)
+                    for k, v in dict(r).items():
+                        try:
+                            force_email_meta = k in {'source', 'source_kind', 'emailed_ts'}
+                            missing_text = (str(merged.get(k) or '').strip() == '')
+                            missing_num = False
+                            if k in {'ts', 'created_ts', 'signal_created_ts', 'entry', 'sl', 'tp', 'fut_vol_usd'}:
+                                try:
+                                    missing_num = float(merged.get(k) or 0.0) == 0.0 and float(v or 0.0) != 0.0
+                                except Exception:
+                                    missing_num = False
+                            if force_email_meta or missing_text or missing_num:
+                                merged[k] = v
+                        except Exception:
+                            pass
+                    by_sid[sid] = merged
+                else:
+                    by_sid[sid] = dict(r)
+            else:
+                no_sid.append(dict(r))
+        except Exception:
+            continue
+    out = list(by_sid.values()) + list(no_sid)
+    out = sorted(out, key=lambda x: _setup_audit_row_ts(x), reverse=True)
+    if int(limit or 0) > 0:
+        out = out[:int(limit or 0)]
+    return out
+
+
+# Extra safety: when an email row is logged, make cache/versioning notice it.
+try:
+    _YVER137_ORIG_DB_MARK_EMAILED_SETUP = db_mark_emailed_setup
+except Exception:
+    _YVER137_ORIG_DB_MARK_EMAILED_SETUP = None
+
+
+def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts: float):
+    if callable(_YVER137_ORIG_DB_MARK_EMAILED_SETUP):
+        _YVER137_ORIG_DB_MARK_EMAILED_SETUP(user_id, setup_id, session, emailed_ts)
+    try:
+        sid = str(setup_id or '').strip()
+        if sid:
+            globals().setdefault('_YVER137_EMAILED_SETUP_ID_CACHE', {})[f"{int(user_id or 0)}::{sid}"] = (float(time.time()), True)
+            db_log_setup_pipeline_event(int(user_id or 0), stage='emailed_setup_audit_visibility_lock', status='ok', session=str(session or ''), mode='audit', setup_id=sid, details={'emailed_ts': float(emailed_ts or 0.0), 'version': YVER137_VERSION})
+    except Exception:
+        pass
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v137_emailed_audit_visibility'
+    SETUP_AUDIT_CACHE_VERSION = 'v137'
+    SCREEN_CACHE_VERSION = str(globals().get('SCREEN_CACHE_VERSION', '')) + ':v137'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver137_version', YVER137_VERSION)
+except Exception:
+    pass
+try:
+    logger.info('yver137 loaded before main: every emailed/delivered setup_id is audit-unique and backfilled from emailed_setups so /setup_audit cannot hide later same-symbol email setups')
+except Exception:
+    pass
+# =========================================================
+# end yver137
 # =========================================================
 
 if __name__ == "__main__":
