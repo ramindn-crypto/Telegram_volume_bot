@@ -81442,6 +81442,853 @@ except Exception:
 # end yver129
 # =========================================================
 
+
+
+# =========================================================
+# yver130 — ACTIVE engine_health F8/F9 visible-audit override
+# =========================================================
+# Purpose:
+#   v127/v128 engine-health fixes were appended after the __main__ call in this
+#   accumulated file, so they did not execute when Render runs the script. This
+#   active v130 block is deliberately inserted before __main__ and overrides the
+#   Telegram command that main() registers.
+#
+# Scope:
+#   - /engine_health F8 and /engine_health F9 only.
+#   - Read-only: no setup creation, no OHLCV scan, no backfill, no AutoTrade changes.
+#   - Counts only rows visible through the normal /setup_audit loader after the
+#     final visible gate, split by current Policy. Hidden generated-only rows are
+#     excluded from KEEP evidence and cannot appear as Latest.
+#   - Entry_old is not changed: it is the correct label when the 60-minute
+#     AutoTrade entry window has passed. The setup result itself remains OPEN
+#     until TP or SL.
+
+YVER130_VERSION = 'yver130_2026_06_24_active_engine_health_visible_audit_before_main'
+
+
+def _yver130_combo_for_audit_row(row: dict) -> str:
+    try:
+        c = str((row or {}).get('combo') or (row or {}).get('setup_combo') or '').upper().strip()
+        if c.startswith('F') and '-' in c:
+            return c
+    except Exception:
+        pass
+    try:
+        return str(_setup_combo_strategy_side_key_for_row(dict(row or {}), str((row or {}).get('session') or (row or {}).get('source_session') or '')) or '').upper().strip()
+    except Exception:
+        return ''
+
+
+def _yver130_policy_for_audit_row(uid: int, row: dict) -> str:
+    try:
+        rr = dict(row or {})
+        sess = str(rr.get('session') or rr.get('source_session') or '').upper().strip()
+        side = str(rr.get('side') or '').upper().strip()
+        pol = str(_setup_audit_policy_label(rr, uid=int(uid or 0), session_name=sess, side=side) or '').upper().strip()
+        if pol in {'KEEP', 'WATCH', 'TIGHTEN', 'DISABLE', 'OFF'}:
+            return 'DISABLE' if pol == 'OFF' else pol
+    except Exception:
+        pass
+    return 'OTHER'
+
+
+def _yver130_result_for_audit_row(row: dict) -> str:
+    """Use cached setup result only. Do not trigger fresh OHLCV resolution."""
+    try:
+        for k in ('result', 'outcome', 'res'):
+            v = str((row or {}).get(k) or '').upper().strip()
+            if v:
+                return _setup_audit_result_label(v)
+    except Exception:
+        pass
+    try:
+        sid = str((row or {}).get('setup_id') or '').strip()
+        if sid:
+            cached = _setup_audit_cached_result(sid, _setup_audit_result_horizon_hours(), allow_open_fresh_sec=999999) or {}
+            v = str(cached.get('result') or cached.get('outcome') or '').upper().strip()
+            if v:
+                return _setup_audit_result_label(v)
+    except Exception:
+        pass
+    return 'OPEN'
+
+
+def _yver130_load_visible_engine_rows(uid: int, engine: str, hours: int) -> list[dict]:
+    """Rows that can be inspected through /setup_audit; hidden-only rows excluded."""
+    eng = str(engine or '').upper().strip()
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    try:
+        hrs_i = max(1, min(8760, int(float(hours or 24))))
+    except Exception:
+        hrs_i = 24
+    try:
+        rows = _setup_audit_load_rows(
+            uid_i,
+            hours=int(hrs_i),
+            limit=0,
+            dedup=True,
+            apply_final_quality_gate=True,
+            source_mode_override=None,
+        ) or []
+    except Exception:
+        rows = []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for r0 in list(rows or []):
+        try:
+            r = dict(r0 or {})
+            combo = _yver130_combo_for_audit_row(r)
+            if not combo.startswith(eng + '-'):
+                continue
+            pol = _yver130_policy_for_audit_row(uid_i, r)
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            sym = str(r.get('symbol') or r.get('market_symbol') or '').upper().replace('USDT', '').strip()
+            side = str(r.get('side') or '').upper().strip()
+            key = str(_setup_audit_unique_key(r) or '') or f'{int(ts//60)}|{combo}|{sym}|{side}'
+            if key in seen:
+                continue
+            seen.add(key)
+            r['_combo_v130'] = combo
+            r['_policy_v130'] = pol
+            r['_result_v130'] = _yver130_result_for_audit_row(r)
+            r['_symbol_v130'] = sym
+            r['_side_v130'] = side
+            out.append(r)
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: float(_setup_audit_row_ts(x) or 0.0), reverse=True)
+
+
+def _yver130_count_results(rows: list[dict]) -> str:
+    try:
+        tp = sum(1 for r in rows or [] if str((r or {}).get('_result_v130') or '').upper() == 'TP')
+        sl = sum(1 for r in rows or [] if str((r or {}).get('_result_v130') or '').upper() == 'SL')
+        op = sum(1 for r in rows or [] if str((r or {}).get('_result_v130') or '').upper() == 'OPEN')
+        parts = []
+        if tp:
+            parts.append(f'TP:{tp}')
+        if sl:
+            parts.append(f'SL:{sl}')
+        if op:
+            parts.append(f'OPEN:{op}')
+        return ', '.join(parts) if parts else '-'
+    except Exception:
+        return '-'
+
+
+def _yver130_latest_keep_row(rows: list[dict]) -> str:
+    try:
+        if not rows:
+            return '-'
+        r = dict(rows[0] or {})
+        ts = float(_setup_audit_row_ts(r) or 0.0)
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if ts > 0 else '-- --:--'
+        return f"{dt} {r.get('_combo_v130','-')} {r.get('_symbol_v130','-')} {r.get('_side_v130','-')}".strip()
+    except Exception:
+        return '-'
+
+
+def _yver130_count_at_email(rows: list[dict]) -> tuple[int, int]:
+    """Best-effort visible-row delivery counts; no hidden setup rows are added."""
+    email_n = 0
+    at_n = 0
+    try:
+        for r in rows or []:
+            try:
+                state = str(_setup_audit_autotrade_state_label(dict(r or {}), uid=int(globals().get('AUTOTRADE_OWNER_UID') or 0), session_name=str((r or {}).get('session') or '')) or '').upper().strip()
+                if state in {'SENT', 'SENT_OLD'}:
+                    email_n += 1
+                if state.startswith('AT_'):
+                    at_n += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return int(email_n), int(at_n)
+
+
+def _yver130_keep_policy_combo_count(uid: int, engine: str) -> int:
+    try:
+        sets = _setup_matrix_policy_current_lane_sets(int(uid or 0)) or {}
+        keep = sets.get('keep') or sets.get('KEEP') or set()
+        return sum(1 for c in keep if str(c or '').upper().strip().startswith(str(engine).upper().strip() + '-'))
+    except Exception:
+        pass
+    try:
+        txt = str(_setup_combo_policy_text(int(uid or 0)) or '')
+        n = 0
+        for line in txt.splitlines():
+            parts = line.split()
+            if parts and parts[0].upper().startswith(str(engine).upper().strip() + '-') and 'KEEP' in [p.upper() for p in parts[1:4]]:
+                n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def _yver130_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    eng = str(engine or 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        return 'Usage: /engine_health F8 or /engine_health F9'
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID') or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    try:
+        baseline_ts = float(_yver122_policy_baseline_ts()) if callable(globals().get('_yver122_policy_baseline_ts')) else float(datetime(2026, 6, 1, 0, 0, tzinfo=MEL_TZ).astimezone(timezone.utc).timestamp())
+    except Exception:
+        baseline_ts = float(datetime(2026, 6, 1, 0, 0, tzinfo=MEL_TZ).astimezone(timezone.utc).timestamp())
+
+    windows = [('Last 2h', 2), ('Last 24h', 24), ('Last 7d', 168)]
+    table_rows = []
+    keep_24 = 0
+    for label, hrs in windows:
+        rows = _yver130_load_visible_engine_rows(uid_i, eng, hrs)
+        keep_rows = [r for r in rows if str((r or {}).get('_policy_v130') or '').upper() == 'KEEP']
+        watch_rows = [r for r in rows if str((r or {}).get('_policy_v130') or '').upper() == 'WATCH']
+        other_rows = [r for r in rows if str((r or {}).get('_policy_v130') or '').upper() not in {'KEEP', 'WATCH'}]
+        if label == 'Last 24h':
+            keep_24 = len(keep_rows)
+        email_n, at_n = _yver130_count_at_email(keep_rows)
+        table_rows.append([
+            label,
+            len(keep_rows),
+            len(watch_rows),
+            len(other_rows),
+            email_n,
+            at_n,
+            _yver130_count_results(keep_rows),
+            _yver130_latest_keep_row(keep_rows),
+        ])
+
+    status = 'OK' if int(keep_24 or 0) > 0 else 'IDLE_KEEP_24H'
+    title = 'F8 BigMove' if eng == 'F8' else 'F9 Multi-Day Leaders/Losers'
+    try:
+        base_txt = _yver122_melb_txt(baseline_ts) if callable(globals().get('_yver122_melb_txt')) else datetime.fromtimestamp(baseline_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        base_txt = '2026-06-01 00:00'
+    keep_policy_rows = _yver130_keep_policy_combo_count(uid_i, eng)
+    table = tabulate(table_rows, headers=['Window','KEEP','WATCH','Other','Email','AT','KEEP Results','Latest KEEP row'], tablefmt='plain')
+    lines = [
+        f"🧪 <b>Engine Health — {html.escape(title)}</b>",
+        HDR,
+        f"Status: <b>{html.escape(status)}</b> | Baseline: <b>{html.escape(str(base_txt))} Melbourne</b>",
+        "Read-only: no backfill, no repair, no setup creation, no OHLCV scan.",
+        "Source: <b>visible /setup_audit rows only</b>, split by current Policy.",
+        "Hidden generated-only rows are excluded; Latest can only be a visible KEEP audit row.",
+        f"KEEP policy combos for {html.escape(eng)}: <b>{int(keep_policy_rows or 0)}</b>",
+        "KEEP = setup-email/AutoTrade eligible evidence. WATCH/Other are diagnostic only.",
+    ]
+    if eng == 'F9':
+        lines.append('IDLE_KEEP_24H is valid when no strict 2-day Leader/Loser setup is currently KEEP-visible.')
+    lines.extend([HDR, '<pre>' + html.escape(table) + '</pre>'])
+    return '\n'.join(lines)
+
+
+# Keep the legacy worker name aligned too, in case another command calls it.
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    return _yver130_engine_health_text(uid, engine=engine, hours=hours)
+
+
+async def engine_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uid = int((update.effective_user.id if update and update.effective_user else 0) or globals().get('AUTOTRADE_OWNER_UID') or 0)
+        args = list(getattr(context, 'args', None) or [])
+        eng = str(args[0] if args else 'F8').upper().strip()
+        if eng not in {'F8', 'F9'}:
+            await update.message.reply_text('Usage: /engine_health F8 or /engine_health F9')
+            return
+        hours = 24
+        try:
+            if len(args) > 1:
+                hours = max(1, min(8760, int(float(args[1]))))
+        except Exception:
+            hours = 24
+        txt = await to_thread_fast(_yver130_engine_health_text, uid, eng, hours)
+        await send_long_message(update, txt, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as e:
+        try:
+            await update.message.reply_text(f'Engine health error: {type(e).__name__}: {e}')
+        except Exception:
+            pass
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v130'
+    SETUP_AUDIT_CACHE_VERSION = 'v130'
+except Exception:
+    pass
+try:
+    logger.info('yver130 loaded before main: active /engine_health F8/F9 visible-audit override; ENTRY_OLD unchanged by design')
+except Exception:
+    pass
+# =========================================================
+# end yver130
+# =========================================================
+
+
+# =========================================================
+# yver131 — WR/O + WR/C display sync for setup/open-times/AT report
+# =========================================================
+# Owner rule:
+# - /setup_matrix policy WR is CURRENT and can update after every TP/SL result.
+# - /setup_audit and /setup_open_times also need the OPEN-TIME WR snapshot.
+# - /autotrade_report needs both, so old trades can be reviewed against the WR at entry
+#   and the latest/current matrix WR.
+# Display-only patch. No setup generation, AutoTrade, risk, TP/SL, leverage, sizing,
+# blackout, or order-placement logic is changed.
+YVER131_VERSION = 'yver131_2026_06_24_wr_open_current_columns'
+
+
+def _yver131_combo_parts(combo: str) -> tuple[str, str, str, str]:
+    try:
+        parts = [p.strip().upper() for p in str(combo or '').split('-') if p.strip()]
+        fam = parts[0] if len(parts) > 0 else ''
+        sess = parts[1] if len(parts) > 1 else ''
+        strat = parts[2] if len(parts) > 2 else 'NOR'
+        side = parts[3] if len(parts) > 3 else 'BOTH'
+        return fam, sess, strat, side
+    except Exception:
+        return '', '', 'NOR', 'BOTH'
+
+
+def _yver131_current_wr_for_combo(uid: int, combo: str) -> str:
+    """Current WR/C from the latest /setup_matrix policy lane."""
+    try:
+        combo_u = str(combo or '').upper().strip()
+        fam, sess, strat, side = _yver131_combo_parts(combo_u)
+        if not fam or not sess:
+            return '-'
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        try:
+            _setup_combo_policy_migrate()
+        except Exception:
+            pass
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = cur.execute(
+                """
+                SELECT user_id,last_decided,last_win_rate,updated_ts,status,enabled
+                FROM setup_combo_policy
+                WHERE user_id IN (?,0)
+                  AND UPPER(family)=? AND UPPER(session)=?
+                  AND UPPER(strategy)=? AND UPPER(side)=?
+                ORDER BY CASE WHEN user_id=? THEN 0 ELSE 1 END, COALESCE(updated_ts,0) DESC
+                LIMIT 1
+                """,
+                (uid_i, fam, sess, strat, side, uid_i),
+            ).fetchone()
+            if rows is None:
+                # Fallback for very old policy rows that did not store side/strategy exactly.
+                rows = cur.execute(
+                    """
+                    SELECT user_id,last_decided,last_win_rate,updated_ts,status,enabled
+                    FROM setup_combo_policy
+                    WHERE user_id IN (?,0)
+                      AND UPPER(family)=? AND UPPER(session)=?
+                    ORDER BY CASE WHEN user_id=? THEN 0 ELSE 1 END, COALESCE(updated_ts,0) DESC
+                    LIMIT 1
+                    """,
+                    (uid_i, fam, sess, uid_i),
+                ).fetchone()
+            if rows is None:
+                return '-'
+            d = dict(rows)
+            dec = int(float(d.get('last_decided') or 0))
+            if dec <= 0:
+                return '-'
+            wr = float(d.get('last_win_rate') or 0.0)
+            return f'{wr:.1f}%'
+    except Exception:
+        return '-'
+
+
+def _yver131_wr_open_lookup(uid: int, start_ts: float = 0.0):
+    try:
+        fn = globals().get('_setup_open_times_historical_wr_lookup')
+        if callable(fn):
+            return fn(int(uid or 0), float(start_ts or 0.0))
+    except Exception:
+        pass
+    return lambda _combo, _ts: '-'
+
+
+def _yver131_wr_open_for_row(uid: int, row: dict, combo: str, lookup=None) -> str:
+    try:
+        ts = float(_setup_audit_row_ts(row) or 0.0)
+        if ts <= 0:
+            return '-'
+        if lookup is None:
+            lookup = _yver131_wr_open_lookup(int(uid or 0), max(0.0, ts - 14 * 86400.0))
+        return str(lookup(str(combo or ''), float(ts)) or '-')
+    except Exception:
+        return '-'
+
+
+def _setup_audit_text(uid: int, limit: int = 0, hours: int = 24) -> str:
+    """yver131: setup audit with WR/O and WR/C columns."""
+    limit = max(0, int(limit or 0))
+    hours = max(1, min(8760, int(hours or 24)))
+    result_horizon = _setup_audit_result_horizon_hours()
+    rows = _setup_audit_load_rows(int(uid), hours=hours, limit=limit, dedup=True)
+    min_vol_m = _setup_min_volume_floor_usd() / 1e6
+    if not rows:
+        return (
+            f"🧪 <b>Setup Audit</b>\n{HDR}\n"
+            f"No stored setup rows above ${min_vol_m:.0f}M volume in the last {hours}h.\n"
+            f"This is an analytics-data message only; it does not mean setup generation is blocked. "
+            f"Check <code>/email_decision</code>, <code>/why</code>, and <code>/screen</code> for current live scan status.\n\n"
+            f"Use <code>/setup_audit h</code> for the guide."
+        )
+
+    audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '5m') or '5m').strip().lower() or '5m'
+    candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf)
+    actual_pnl_by_setup = _setup_audit_actual_pnl_by_setup(int(uid), start_ts=float(time.time()) - float(hours) * 3600.0, end_ts=float(time.time()) + 3600.0)
+    closed_pnl_index = _setup_audit_closed_pnl_index(rows, uid=int(uid), hours=int(hours))
+    try:
+        min_row_ts = min([float(_setup_audit_row_ts(r) or 0.0) for r in rows if float(_setup_audit_row_ts(r) or 0.0) > 0] or [float(time.time()) - float(hours) * 3600.0])
+    except Exception:
+        min_row_ts = float(time.time()) - float(hours) * 3600.0
+    wr_open_lookup = _yver131_wr_open_lookup(int(uid), float(min_row_ts))
+
+    table_rows = []
+    tp_n = sl_n = nohit_n = open_n = 0
+    for r in rows:
+        sid = str(r.get('setup_id') or '').strip()
+        side = str(r.get('side') or '').upper().strip()
+        sym = str(r.get('symbol') or '').upper().strip()
+        if sym.endswith('USDT'):
+            sym = sym[:-4]
+        family_code = _setup_audit_family_code(r)
+        actual_pnl = float(actual_pnl_by_setup.get(sid, 0.0) or 0.0)
+        ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf, actual_pnl_usdt=actual_pnl)
+        result = _setup_audit_binary_display_result(r, ev.get('result'), result_horizon)
+        if result == 'TP':
+            tp_n += 1
+        elif result == 'SL':
+            sl_n += 1
+        elif result == 'NOHIT':
+            nohit_n += 1
+        else:
+            open_n += 1
+        sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+        ts = _setup_audit_row_ts(r)
+        try:
+            ttxt = datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if ts > 0 else '-'
+        except Exception:
+            ttxt = '-'
+        try:
+            volm = float(r.get('fut_vol_usd') or r.get('volume_usd') or r.get('vol_usd') or 0.0) / 1e6
+        except Exception:
+            volm = 0.0
+        combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
+        policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
+        at_state = _setup_audit_autotrade_state_label(r, uid=int(uid), session_name=sess_row)
+        at_pol = _yver57_policy_at_open_for_setup_row(r, uid=int(uid), at_state=at_state)
+        at_why = _setup_audit_autotrade_skip_reason(r, uid=int(uid), policy_label=policy_label, at_state=at_state, session_name=sess_row)
+        pnl_txt = _setup_audit_closed_pnl_for_row(r, uid=int(uid), at_state=at_state, pnl_index=closed_pnl_index)
+        wr_o = _yver131_wr_open_for_row(int(uid), r, combo_key, wr_open_lookup)
+        wr_c = _setup_audit_policy_wr_label(r, uid=int(uid), session_name=sess_row, side=side)
+        table_rows.append([ttxt, sym, side, combo_key, policy_label, wr_o, wr_c, at_state, at_pol, at_why, int(float(r.get('conf') or 0.0)), f"{volm:.0f}", pnl_txt, result])
+
+    decided = tp_n + sl_n
+    wr = (tp_n / decided * 100.0) if decided > 0 else 0.0
+    try:
+        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        now_txt = ''
+    win = _setup_audit_window_summary(rows)
+    display_rows = list(table_rows)
+    table = tabulate(
+        display_rows,
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'WR/O', 'WR/C', 'AT', 'ATPol', 'ATWhy', 'Conf', 'VolM', 'PnL', 'Res'],
+        tablefmt='plain',
+        colalign=('left', 'left', 'center', 'left', 'center', 'right', 'right', 'center', 'center', 'center', 'right', 'right', 'right', 'center'),
+    )
+    header_lines = [
+        "🧪 <b>Setup Audit</b>",
+        HDR,
+        f"Window: <b>last {hours}h</b> | Unique setups: <b>{len(rows)}</b> | Min vol: <b>${min_vol_m:.0f}M</b>" + (f" | Now: <b>{now_txt}</b>" if now_txt else ""),
+        f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        "AT legend: <b>SENT_OLD</b> = setup email was sent but the AutoTrade entry window is old; <b>WR/O</b> = open-time / generated-time lane WR snapshot; <b>WR/C</b> = current /setup_matrix lane WR after latest TP/SL evidence; <b>ATPol</b> is the stored AutoTrade open-time policy snapshot; <b>ATWhy</b> explains the current non-entry reason; <b>PnL</b> shows realised AutoTrade PnL for AT_CLOSED rows. <b>Res</b> is the independent setup price-path result. Result view has no expiry: unresolved setups stay OPEN until TP or SL is hit.",
+    ]
+    return "\n".join(header_lines) + "\n<pre>" + html.escape(table) + "</pre>"
+
+
+def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> str:
+    """yver131: KEEP opening-time analysis with WR/O and WR/C columns."""
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(owner_uid or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+
+    scope_label, start_ts, scope_hours = _setup_open_times_parse_scope(scope)
+    try:
+        row_limit = max(20, min(600, int(rows_limit or 220)))
+    except Exception:
+        row_limit = 220
+
+    try:
+        lane_sets = _setup_matrix_policy_current_lane_sets(uid_i) or {}
+        keep_combos = set(lane_sets.get('keep') or set())
+    except Exception:
+        keep_combos = set()
+
+    try:
+        rows = _setup_audit_load_rows(
+            int(uid_i),
+            hours=None,
+            limit=0,
+            dedup=True,
+            start_ts=float(start_ts or 0.0),
+            apply_final_quality_gate=False,
+            source_mode_override='ALL',
+        )
+        source_label = 'EXECUTABLE+GENERATED'
+    except Exception:
+        rows, source_label = [], 'EXECUTABLE+GENERATED'
+
+    result_horizon = _setup_audit_result_horizon_hours()
+
+    def _row_combo_u(r: dict) -> str:
+        try:
+            fam = _setup_audit_family_code(r)
+            sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+            strat = _setup_strategy_short_label(r)
+            side_row = _setup_side_suffix(value=str(r.get('side') or ''))
+            return str(_setup_combo_strategy_side_key(fam, sess_row, strat, side_row) or '').upper().strip()
+        except Exception:
+            return ''
+
+    historical_wr = _yver131_wr_open_lookup(int(uid_i), float(start_ts or 0.0))
+
+    matched: list[dict] = []
+    hour_stats: dict[int, dict] = defaultdict(lambda: {'set': 0, 'tp': 0, 'sl': 0, 'nh': 0, 'open': 0, 'r_sum': 0.0})
+    for r in list(rows or []):
+        try:
+            combo_u = _row_combo_u(r)
+            if combo_u not in keep_combos:
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if ts <= 0:
+                continue
+            res = _setup_audit_keep_watch_fast_result_label(r, result_horizon)
+            res = _setup_audit_result_label(res)
+            local_dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+            h = int(local_dt.hour)
+            st = hour_stats[h]
+            st['set'] += 1
+            if res == 'TP':
+                st['tp'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or 0.0)
+            elif res == 'SL':
+                st['sl'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or -1.0)
+            elif res == 'NOHIT':
+                st['nh'] += 1
+            else:
+                st['open'] += 1
+            wr_at_gen = historical_wr(combo_u, ts) if callable(historical_wr) else '-'
+            wr_current = _yver131_current_wr_for_combo(int(uid_i), combo_u)
+            matched.append({**dict(r or {}), '_combo': combo_u, '_wr_at_gen': wr_at_gen, '_wr_current': wr_current, '_res': res, '_time_txt': local_dt.strftime('%m-%d %H:%M')})
+        except Exception:
+            continue
+
+    matched = sorted(matched, key=lambda x: float(_setup_audit_row_ts(x) or 0.0), reverse=True)
+    proposals = _setup_open_times_proposals(hour_stats, scope_hours=int(scope_hours or 0))
+
+    top_lines = []
+    if proposals:
+        for p in proposals:
+            top_lines.append(
+                f"• <b>{html.escape(str(p.get('label') or '-'))}</b> — WR {float(p.get('wr', 0.0)):.1f}% | AvgR {float(p.get('avg_r', 0.0)):+.2f} | TP/SL {int(p.get('tp',0) or 0)}/{int(p.get('sl',0) or 0)} | Set {int(p.get('set',0) or 0)}"
+            )
+    else:
+        top_lines.append("• <b>No blackout suggested</b> — no KEEP setup-time hour had enough weak decided evidence in this window.")
+
+    detail_rows = []
+    for r in matched[:row_limit]:
+        try:
+            sym = str(r.get('symbol') or '').upper().strip()
+            if sym.endswith('USDT'):
+                sym = sym[:-4]
+            side = str(r.get('side') or '').upper().strip()
+            detail_rows.append([
+                str(r.get('_time_txt') or '-'),
+                sym or '-',
+                side or '-',
+                str(r.get('_combo') or '-'),
+                'KEEP',
+                str(r.get('_wr_at_gen') or '-'),
+                str(r.get('_wr_current') or '-'),
+                str(r.get('_res') or '-'),
+            ])
+        except Exception:
+            continue
+    table = tabulate(
+        detail_rows,
+        headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'WR/O', 'WR/C', 'Res'],
+        tablefmt='plain',
+        colalign=('left', 'left', 'center', 'left', 'center', 'right', 'right', 'center'),
+    ) if detail_rows else 'No KEEP setup rows matched this window.'
+
+    try:
+        win = _setup_audit_window_summary(matched)
+        start_txt = str(win.get('start_txt') or '-')
+        end_txt = str(win.get('end_txt') or '-')
+    except Exception:
+        start_txt = end_txt = '-'
+
+    decided = sum(int((st or {}).get('tp', 0) or 0) + int((st or {}).get('sl', 0) or 0) for st in hour_stats.values())
+    tp_n = sum(int((st or {}).get('tp', 0) or 0) for st in hour_stats.values())
+    sl_n = sum(int((st or {}).get('sl', 0) or 0) for st in hour_stats.values())
+    wr = (tp_n / decided * 100.0) if decided else 0.0
+    try:
+        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        now_txt = ''
+
+    lines = [
+        "⏱️ <b>KEEP Setup Opening-Time Analysis</b>",
+        HDR,
+        "<b>Suggested blackout windows only:</b>",
+        html.escape('Auto-blackout rule sync: suggestions above use the same 7d-only AUTO_BLACKOUT candidate rule: WR<45%, AvgR<0, decided TP+SL>=5. Applied windows may also retain a previous weak hour for one review for smoothing.'),
+        *top_lines,
+        HDR,
+        f"Window: <b>{html.escape(scope_label)}</b>" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
+        f"Rows: <b>{len(matched)}</b> KEEP setups | Decided: <b>{decided}</b> | TP/SL: <b>{tp_n}/{sl_n}</b> | WR: <b>{wr:.1f}%</b>",
+        f"Data start: <b>{html.escape(start_txt)}</b> | Data end: <b>{html.escape(end_txt)}</b> | Source: <b>{html.escape(source_label)}</b>",
+        "WR/O = open-time / generated-time /setup_matrix WR snapshot. WR/C = current /setup_matrix WR after latest TP/SL evidence.",
+        "Detailed rows below are KEEP-only setup opening times. Use <code>/setup_open_times 24</code>, <code>/setup_open_times 7d</code>, or <code>/setup_open_times all 400</code>.",
+        "<pre>" + html.escape(table) + "</pre>",
+    ]
+    if len(matched) > row_limit:
+        lines.append(f"Rows shown: <b>{row_limit}</b> / <b>{len(matched)}</b>. Increase the second argument to show more rows, e.g. <code>/setup_open_times all 400</code>.")
+    if not keep_combos:
+        lines.append("No KEEP policy lanes found. Run <code>/setup_matrix policy</code> first.")
+    return "\n".join(lines)
+
+
+try:
+    _YVER131_ORIG_AUTOTRADE_REPORT_TEXT_CACHED = _autotrade_report_text_cached
+except Exception:
+    _YVER131_ORIG_AUTOTRADE_REPORT_TEXT_CACHED = None
+
+
+def _yver131_parse_melb_md_hm(md_hm: str) -> float:
+    try:
+        s = str(md_hm or '').strip()
+        if not re.fullmatch(r'\d{2}-\d{2}\s+\d{2}:\d{2}', s):
+            return 0.0
+        now_local = datetime.now(MEL_TZ)
+        dt = datetime.strptime(f'{now_local.year}-{s}', '%Y-%m-%d %H:%M').replace(tzinfo=MEL_TZ)
+        if dt > now_local + timedelta(days=2):
+            dt = dt.replace(year=dt.year - 1)
+        return float(dt.astimezone(timezone.utc).timestamp())
+    except Exception:
+        return 0.0
+
+
+def _yver131_add_wr_cols_to_autotrade_report(text: str, owner_uid: int, lookback_h: int = 24) -> str:
+    try:
+        out = str(text or '')
+        if 'WR/O' in out and 'WR/C' in out:
+            return out
+        if '<pre>' not in out or '</pre>' not in out:
+            return out
+        before, rest = out.split('<pre>', 1)
+        raw_esc, after = rest.split('</pre>', 1)
+        raw = html.unescape(raw_esc)
+        lines = [ln.rstrip() for ln in raw.splitlines() if ln.strip()]
+        if len(lines) < 2 or not lines[0].lstrip().startswith('Open'):
+            return out
+        start_ts = float(time.time()) - float(max(1, int(lookback_h or 24))) * 3600.0 - 14 * 86400.0
+        wr_open_lookup = _yver131_wr_open_lookup(int(owner_uid or 0), start_ts)
+        table_rows = []
+        for ln in lines[1:]:
+            try:
+                toks = ln.split()
+                if len(toks) < 16 or not re.fullmatch(r'\d{2}-\d{2}', toks[0] or ''):
+                    continue
+                open_txt = toks[0] + ' ' + toks[1]
+                i = 2
+                if toks[i] == '-':
+                    close_txt = '-'
+                    i += 1
+                else:
+                    close_txt = toks[i] + ' ' + toks[i + 1]
+                    i += 2
+                result = toks[i]; sym = toks[i + 1]; side = toks[i + 2]; combo = toks[i + 3]
+                i += 4
+                rest_cells = toks[i:]
+                # Expected: ATPol SesC Conf Dyn Risk% Risk$ TP$ Parts PnL Reason.
+                if len(rest_cells) < 10:
+                    continue
+                if len(rest_cells) > 10:
+                    rest_cells = rest_cells[:9] + [' '.join(rest_cells[9:])]
+                open_ts = _yver131_parse_melb_md_hm(open_txt)
+                wr_o = wr_open_lookup(combo, open_ts) if callable(wr_open_lookup) else '-'
+                wr_c = _yver131_current_wr_for_combo(int(owner_uid or 0), combo)
+                table_rows.append([open_txt, close_txt, result, sym, side, combo, wr_o, wr_c] + rest_cells)
+            except Exception:
+                continue
+        if not table_rows:
+            return out
+        table = tabulate(
+            table_rows,
+            headers=['Open', 'Close', 'Result', 'Sym', 'Side', 'Combo', 'WR/O', 'WR/C', 'ATPol', 'SesC', 'Conf', 'Dyn', 'Risk%', 'Risk$', 'TP$', 'Parts', 'PnL', 'Reason'],
+            tablefmt='plain',
+            colalign=('left','left','center','left','center','left','right','right','center','center','right','right','right','right','right','right','right','left'),
+        )
+        note = 'WR/O = open-time / generated-time lane WR snapshot. WR/C = current /setup_matrix lane WR after latest TP/SL evidence.'
+        if 'WR/O = open-time' not in before:
+            before = before.replace('ATPol shows the stored AutoTrade open-time policy snapshot.', 'ATPol shows the stored AutoTrade open-time policy snapshot. ' + html.escape(note), 1)
+        return before + '<pre>' + html.escape(table) + '</pre>' + after
+    except Exception:
+        return str(text or '')
+
+
+def _autotrade_report_text_cached(owner_uid: int, lookback_h: int) -> str:
+    try:
+        base = _YVER131_ORIG_AUTOTRADE_REPORT_TEXT_CACHED(owner_uid, lookback_h) if callable(_YVER131_ORIG_AUTOTRADE_REPORT_TEXT_CACHED) else ''
+    except Exception as exc:
+        base = f"❌ /autotrade_report failed: {type(exc).__name__}: {html.escape(str(exc))}"
+    return _yver131_add_wr_cols_to_autotrade_report(base, int(owner_uid or 0), int(lookback_h or 24))
+
+
+async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """v131: cache-bust normal /setup_audit for WR/O + WR/C table."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    limit = 0
+    hours = 24
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and args[0].lower() in {'h', 'help', '?', 'guide'}:
+            await send_long_message(update, _setup_audit_help_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        if args and args[0].lower() in {'overall', 'alltime', 'all-time'}:
+            await _send_cached_or_queue_admin_report(update, "/setup_audit overall", f"admin:bg:v131:setup_audit_overall:{int(AUTOTRADE_OWNER_UID or uid)}", _setup_audit_overall_text, args=(int(AUTOTRADE_OWNER_UID or uid),), parse_mode=ParseMode.HTML, fresh_ttl=120, stale_ttl=12 * 3600, background_timeout=900)
+            return
+        if args and args[0].lower() in {'compare', 'reconcile', 'traded', 'autotrade'}:
+            cmp_hours = 24
+            try:
+                if len(args) >= 2 and re.fullmatch(r'\d+(\.\d+)?', str(args[1])):
+                    cmp_hours = int(float(args[1]))
+            except Exception:
+                cmp_hours = 24
+            await _send_cached_or_queue_admin_report(update, f"/setup_audit compare {int(cmp_hours)}", f"admin:bg:v131:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}", _setup_audit_compare_text, args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)), parse_mode=ParseMode.HTML, fresh_ttl=60, stale_ttl=12 * 3600, background_timeout=900)
+            return
+        if len(args) == 1:
+            if args[0].isdigit() or re.fullmatch(r'\d+(\.\d+)?', args[0]):
+                hours = int(float(args[0]))
+            elif args[0].lower() in {'all', 'unlimited', 'full'}:
+                limit = 0
+        elif len(args) >= 2:
+            if args[0].lower() in {'rows', 'row', 'limit', 'n'}:
+                limit = int(float(args[1]))
+                if len(args) >= 3:
+                    hours = int(float(args[2]))
+            else:
+                limit = 0 if args[0].lower() in {'all', 'unlimited', 'full', '0'} else int(float(args[0]))
+                hours = int(float(args[1]))
+    except Exception:
+        limit = 0
+        hours = 24
+    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+    latest_ts = _yver109_latest_setup_activity_ts(owner_uid, int(hours or 24)) if callable(globals().get('_yver109_latest_setup_activity_ts')) else time.time()
+    activity_bucket = int(float(latest_ts or 0.0) // 30)
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_audit {int(hours)}",
+        f"admin:bg:v131:setup_audit:{owner_uid}:{int(limit)}:{int(hours)}:act{activity_bucket}",
+        _setup_audit_text,
+        args=(owner_uid, int(limit), int(hours)),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=30,
+        stale_ttl=20 * 60,
+        background_timeout=600,
+    )
+
+
+async def setup_open_times_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    scope = ''
+    rows_limit = 220
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and args[0].lower() in {'h', 'help', '?', 'guide'}:
+            await send_long_message(update, _setup_open_times_help_text(), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        if args:
+            scope = args[0]
+        if len(args) >= 2 and re.fullmatch(r'\d+', args[1]):
+            rows_limit = int(args[1])
+    except Exception:
+        scope = ''
+        rows_limit = 220
+    scope_label, start_ts, scope_hours = _setup_open_times_parse_scope(scope)
+    cache_scope = str(scope or 'baseline').lower().replace(' ', '_')
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_open_times {html.escape(str(scope or 'all'))}",
+        f"admin:bg:v131:setup_open_times:{int(AUTOTRADE_OWNER_UID or uid)}:{cache_scope}:{int(rows_limit)}:{int(start_ts or 0)}:{int(scope_hours or 0)}",
+        _setup_open_times_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), str(scope or ''), int(rows_limit)),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=90,
+        stale_ttl=12 * 3600,
+        background_timeout=600,
+    )
+
+
+async def autotrade_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if int(uid) != int(AUTOTRADE_OWNER_UID) and (not is_admin_user(uid)):
+        await update.message.reply_text("⛔️ Owner/admin only.")
+        return
+    lookback_h = 24
+    try:
+        if context.args and str(context.args[0]).strip():
+            lookback_h = int(float(context.args[0]))
+    except Exception:
+        lookback_h = 24
+    lookback_h = int(clamp(lookback_h, 1, 168))
+    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/autotrade_report {lookback_h}",
+        f"autotrade_report_text_cmd:v131:{owner_uid}:{lookback_h}",
+        _autotrade_report_text_cached,
+        args=(owner_uid, lookback_h),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=45,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v131_wr_open_current'
+    SETUP_AUDIT_CACHE_VERSION = 'v131'
+except Exception:
+    pass
+try:
+    logger.info('yver131 loaded before main: WR/O + WR/C columns for setup_audit, setup_open_times, autotrade_report')
+except Exception:
+    pass
+# =========================================================
+# end yver131
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
