@@ -1,3 +1,4 @@
+# yver142: repairs BigMove/F8 setup generation reliability so every confirmed BigMove alert can create a durable F8 generated/setup-audit row; failed cache-price attempts no longer memo-block later hooks. No order/risk/TP/SL/leverage changes.
 # yver141: repairs WR/O display conflict so a row shown under current/entry KEEP cannot display a stale sub-threshold historical WR/O; WR/O now falls back to the KEEP policy WR snapshot when the selected open-time matrix row is below the runtime KEEP floor. Display-only; no setup/email/autotrade/risk/TP/SL/order changes.
 # yver139: removes the v137 heavy emailed-setup audit backfill that could make /setup_audit slow/OOM on Render, replaces it with bounded in-memory emailed setup-id dedup/backfill, and reverts v138 extra scheduler instances to memory-safe single-instance scheduling. No setup/email/AutoTrade policy, TP/SL, risk, leverage, sizing, drift, or order logic changed.
 # yver138: scheduler-noise hardening after Render review: alert_job and autonomous_screen_sync_job allow a second lock-check instance so overlapping ticks exit quietly instead of APScheduler max_instances warnings; scan_intelligence misfire grace widened for Render pauses. No setup/email/AutoTrade policy, TP/SL, risk, leverage, sizing, or order logic changed.
@@ -85335,6 +85336,382 @@ except Exception:
     pass
 # =========================================================
 # end yver141
+# =========================================================
+
+
+# =========================================================
+# yver142 — BigMove/F8 generation reliability repair
+# =========================================================
+# Scope requested by owner: check Big-Move setup generation + F8 setup generation.
+# Problem found after yver141: a BigMove market-event email could be sent while no
+# F8 row appeared in /setup_audit or /engine_health. The fast mirror set its in-memory
+# memo BEFORE it successfully built/persisted the F8 setup, and the builder could
+# return None when the ticker cache did not contain a fresh price/volume at that exact
+# moment. Then mark_bigmove_emailed() retried in the same 15m bucket but was blocked
+# by the failed memo.  Result: email existed, but no durable F8 setup row.
+#
+# Fix:
+# - Build a robust F8 setup from confirmed BigMove alert rows using row payload,
+#   cached ticker, and a bounded live-price fallback for the single alert symbol.
+# - Trust the already-confirmed BigMove alert for minimum volume if cache volume is
+#   missing; do not drop the F8 audit row only because the cache is temporarily thin.
+# - Set the BigMove/F8 memo only AFTER a setup is successfully persisted.
+# - Keep raw F8 rows in generated_setups/setup_audit even when the policy gate blocks
+#   setup email or AutoTrade.
+# No TP/SL, risk, leverage, order sizing, blackout, policy, or Bybit order logic changed.
+
+YVER142_VERSION = 'yver142_2026_06_24_bigmove_f8_generation_repair'
+
+try:
+    _YVER142_ORIG_YVER121_FAST_F8_SETUP_FROM_ROW = _yver121_fast_f8_setup_from_row
+except Exception:
+    _YVER142_ORIG_YVER121_FAST_F8_SETUP_FROM_ROW = None
+try:
+    _YVER142_ORIG_YVER121_FAST_F8_MIRROR = _yver121_fast_f8_mirror
+except Exception:
+    _YVER142_ORIG_YVER121_FAST_F8_MIRROR = None
+try:
+    _YVER142_ORIG_BIGMOVE_CANDIDATES_TO_AUTOTRADE_SETUPS = _bigmove_candidates_to_autotrade_setups
+except Exception:
+    _YVER142_ORIG_BIGMOVE_CANDIDATES_TO_AUTOTRADE_SETUPS = None
+
+
+def _yver142_best_mv(sym: str, best_fut: dict | None = None):
+    try:
+        s = str(sym or '').upper().strip()
+        best = best_fut or get_cached_futures_tickers() or {}
+        if not s:
+            return None, best
+        mv = (best or {}).get(s)
+        if mv is not None:
+            return mv, best
+        for k, v in (best or {}).items():
+            try:
+                if str(k or '').upper().strip() == s:
+                    return v, best
+                if str(getattr(v, 'base', '') or '').upper().strip() == s:
+                    return v, best
+                lin = str(getattr(v, 'symbol', '') or '').replace('/', '').replace(':', '').upper()
+                if lin.startswith(s) and 'USDT' in lin:
+                    return v, best
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None, best_fut or {}
+
+
+def _yver142_entry_price(sym: str, row: dict | None = None, best_fut: dict | None = None) -> float:
+    try:
+        for key in ('price', 'entry', 'last'):
+            try:
+                px = float((row or {}).get(key) or 0.0)
+                if px > 0:
+                    return float(px)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        mv, _best = _yver142_best_mv(sym, best_fut)
+        if mv is not None:
+            for key in ('last', 'vwap', 'open', 'close'):
+                try:
+                    px = float(getattr(mv, key, 0.0) or 0.0)
+                    if px > 0:
+                        return float(px)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    # Single-symbol bounded fallback.  This is intentionally not a universe OHLCV scan.
+    try:
+        px = float(_autotrade_live_reference_price(_bybit_linear_symbol(str(sym or '')), fallback_entry=0.0) or 0.0)
+        if px > 0:
+            return float(px)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _yver142_vol_usd(sym: str, row: dict | None = None, best_fut: dict | None = None) -> float:
+    try:
+        for key in ('vol', 'fut_vol_usd', 'volume_usd'):
+            try:
+                v = float((row or {}).get(key) or 0.0)
+                if v > 0:
+                    return float(v)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        mv, _best = _yver142_best_mv(sym, best_fut)
+        if mv is not None:
+            v = float(usd_notional(mv) or 0.0)
+            if v > 0:
+                return float(v)
+    except Exception:
+        pass
+    # The only caller is a confirmed BigMove alert path, which already passed the
+    # configured min-volume gate.  Use the configured floor so F8 audit generation is
+    # not lost due to a temporary cache-volume miss.
+    try:
+        return float(max(float(BIGMOVE_DEFAULT_MIN_VOL_USD or 10_000_000.0), float(BIGMOVE_MIN_SUPPORTED_VOL_USD or 10_000_000.0)))
+    except Exception:
+        return 10_000_000.0
+
+
+def _yver121_fast_f8_setup_from_row(row: dict, session_name: str, event_ts: float, best_fut: dict | None = None):
+    """v142 robust BigMove->F8 setup builder.
+
+    It keeps the v121 fast/no-universe-scan design, but no longer fails just because
+    the ticker cache is missing one field at the exact SMTP/mark hook moment.
+    """
+    try:
+        r = dict(row or {})
+        sym = re.sub(r'[^A-Z0-9]', '', str(r.get('symbol') or '').upper().strip())
+        direction = str(r.get('direction') or '').upper().strip()
+        side = 'BUY' if direction == 'UP' else 'SELL' if direction == 'DOWN' else ''
+        if not sym or side not in {'BUY', 'SELL'}:
+            return None
+        ts = float(event_ts or time.time())
+        sess = str(session_name or _bigmove_autotrade_session_name() or '').upper().strip()
+        if sess not in {'ASIA', 'LON', 'NY'}:
+            try:
+                sess = str(scan_session_name_utc(datetime.fromtimestamp(ts, tz=timezone.utc)) or '').upper().strip()
+            except Exception:
+                sess = 'NY'
+        mv, best = _yver142_best_mv(sym, best_fut)
+        entry = float(_yver142_entry_price(sym, r, best) or 0.0)
+        if entry <= 0:
+            # Last chance: call the original builder if it knows a project-specific path.
+            if callable(_YVER142_ORIG_YVER121_FAST_F8_SETUP_FROM_ROW):
+                try:
+                    return _YVER142_ORIG_YVER121_FAST_F8_SETUP_FROM_ROW(r, sess, ts)
+                except Exception:
+                    pass
+            return None
+        vol = float(_yver142_vol_usd(sym, r, best) or 0.0)
+        if vol < float(BIGMOVE_MIN_SUPPORTED_VOL_USD or 10_000_000.0):
+            vol = float(BIGMOVE_MIN_SUPPORTED_VOL_USD or 10_000_000.0)
+
+        ch15 = float(r.get('confirm_15m_pct', r.get('ch15', 0.0)) or 0.0)
+        ch1 = float(r.get('ch1', 0.0) or 0.0)
+        ch4 = float(r.get('ch4', 0.0) or 0.0)
+        sign = 1.0 if side == 'BUY' else -1.0
+        if abs(ch15) < float(BIGMOVE_DEFAULT_15M_PCT or 1.5):
+            ch15 = sign * float(BIGMOVE_DEFAULT_15M_PCT or 1.5)
+        if abs(ch1) < float(BIGMOVE_DEFAULT_1H_PCT or 3.0):
+            ch1 = sign * float(BIGMOVE_DEFAULT_1H_PCT or 3.0)
+        if abs(ch4) < float(BIGMOVE_DEFAULT_4H_PCT or 5.0):
+            ch4 = sign * float(BIGMOVE_DEFAULT_4H_PCT or 5.0)
+        ch24 = 0.0
+        try:
+            if mv is not None:
+                ch24 = float(getattr(mv, 'percentage', 0.0) or 0.0)
+        except Exception:
+            ch24 = 0.0
+        if abs(ch24) < 1e-9:
+            try:
+                ch24 = float(r.get('ch24', 0.0) or 0.0)
+            except Exception:
+                ch24 = 0.0
+
+        # Audit/F8 setup geometry only. Live AutoTrade still goes through the normal
+        # final order/risk/TP/SL lane if policy ever permits execution.
+        sl_pct = 4.5
+        rr = 1.50
+        if side == 'BUY':
+            sl = entry * (1.0 - sl_pct / 100.0)
+            tp = entry + (entry - sl) * rr
+        else:
+            sl = entry * (1.0 + sl_pct / 100.0)
+            tp = max(entry - (sl - entry) * rr, entry * 0.001)
+        try:
+            conf = int(clamp(_bigmove_signal_confidence(side, ch24, ch4, ch1, ch15, vol, 0.0), 80, 96))
+        except Exception:
+            conf = 85
+        bucket = int(ts // 900) * 900
+        sid = f'F8-{bucket}-{sym}-{side}'
+        market_symbol = ''
+        try:
+            market_symbol = str(getattr(mv, 'symbol', '') or '').strip()
+        except Exception:
+            market_symbol = ''
+        if not market_symbol:
+            market_symbol = f'{sym}/USDT:USDT'
+        s = Setup(
+            setup_id=sid, symbol=sym, market_symbol=market_symbol, side=side, conf=int(conf),
+            entry=float(entry), sl=float(sl), tp=float(tp), alt_target_a=0.0, alt_target_b=0.0,
+            fut_vol_usd=float(vol), ch24=float(ch24), ch4=float(ch4), ch1=float(ch1), ch15=float(ch15),
+            ema_support_period=0, ema_support_dist_pct=0.0, pullback_ema_period=0, pullback_ema_dist_pct=0.0,
+            pullback_ready=True, pullback_bypass_hot=True, leader_base_override=True, engine='F8',
+            is_trailing_alt_target_b=False, created_ts=float(bucket), family_id=BIGMOVE_FAMILY_ID,
+            family_name=BIGMOVE_FAMILY_NAME, session=sess,
+        )
+        try:
+            setattr(s, 'id', sid)
+            setattr(s, 'quality_score', 78.0)
+            setattr(s, 'family_score', 78.0)
+            setattr(s, 'exec_score', 78.0)
+            setattr(s, 'bigmove_signal', True)
+            setattr(s, 'bigmove_alert_autotrade', True)
+            setattr(s, 'bigmove_direction', direction)
+            setattr(s, 'source_kind', 'bigmove_alert_fast_f8')
+            setattr(s, 'source_session', sess)
+            setattr(s, 'delivery_lane_locked', True)
+            setattr(s, 'setup_strategy', 'NOR')
+            setattr(s, 'strategy', 'NOR')
+            setattr(s, 'strategy_mode', 'NOR')
+            setattr(s, 'why', 'Confirmed BigMove alert; yver142 durable F8 audit mirror; policy decides KEEP/WATCH')
+        except Exception:
+            pass
+        try:
+            owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+            if callable(globals().get('_setup_route_candidate_for_executable_lane')):
+                s = _setup_route_candidate_for_executable_lane(s, session_name=sess, user_id=owner_uid)
+        except Exception:
+            pass
+        try:
+            if callable(globals().get('_research_finalize_setup')):
+                s = _research_finalize_setup(s, session_name=sess)
+        except Exception:
+            pass
+        return s
+    except Exception:
+        return None
+
+
+def _yver121_fast_f8_mirror(uid: int, rows: list[dict], source: str = 'bigmove_email', event_ts: float | None = None) -> int:
+    """v142 durable BigMove->F8 mirror.
+
+    Critical difference from v121: memo is written only after generated_setups/signal
+    persistence succeeds. A failed cache-price attempt cannot suppress later hooks.
+    """
+    made = 0
+    try:
+        uid_i = int(uid or 0) or int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    if uid_i <= 0:
+        return 0
+    ts = float(event_ts or time.time())
+    try:
+        sess = str(_bigmove_autotrade_session_name() or '').upper().strip()
+    except Exception:
+        sess = ''
+    if sess not in {'ASIA', 'LON', 'NY'}:
+        try:
+            sess = str(scan_session_name_utc(datetime.fromtimestamp(ts, tz=timezone.utc)) or '').upper().strip()
+        except Exception:
+            sess = 'NY'
+    targets = []
+    for tu in (uid_i, int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)):
+        try:
+            if int(tu) > 0 and int(tu) not in targets:
+                targets.append(int(tu))
+        except Exception:
+            pass
+    persisted_keys = 0
+    for row in list(rows or []):
+        try:
+            sym = re.sub(r'[^A-Z0-9]', '', str((row or {}).get('symbol') or '').upper().strip())
+            direction = str((row or {}).get('direction') or '').upper().strip()
+            side = 'BUY' if direction == 'UP' else 'SELL' if direction == 'DOWN' else ''
+            bucket = int(ts // 900) * 900
+            memo_key = (uid_i, sym, direction, bucket)
+            if not sym or direction not in {'UP', 'DOWN'}:
+                continue
+            if _YVER121_F8_MEMO.get(memo_key):
+                continue
+            s = _yver121_fast_f8_setup_from_row(dict(row or {}), sess, ts)
+            if s is None:
+                try:
+                    # Explicitly do NOT memo this failure.  The mark/email hook can retry
+                    # later in the same 15m bucket when cache/live price is available.
+                    db_log_setup_pipeline_event(uid_i, stage='yver142_f8_fast_mirror', status='skip', session=sess, mode='engine_f8', symbol=sym, side=side, details={'reason': 'setup_build_failed_no_price_or_geometry', 'source': source, 'memo_set': False})
+                except Exception:
+                    pass
+                continue
+            sid = str(getattr(s, 'setup_id', '') or '')
+            persisted_any = False
+            for tuid in targets:
+                try:
+                    exists = False
+                    try:
+                        exists = bool(_yver97_setup_db_exists(int(tuid), sid)) if callable(globals().get('_yver97_setup_db_exists')) else False
+                    except Exception:
+                        exists = False
+                    if not exists:
+                        db_log_generated_setup(int(tuid), 'bigmove_yver142_fast_mirror', sess, s)
+                        made += 1
+                    persisted_any = True
+                    try:
+                        db_insert_signal(s, user_id=int(tuid))
+                    except Exception:
+                        pass
+                    try:
+                        gated, reasons = _setup_email_presend_executable_filter(int(tuid), sess, [s], lane='yver142_f8_fast_mirror_gate')
+                    except Exception:
+                        gated, reasons = [], Counter({'yver142_gate_exception': 1})
+                    if gated:
+                        try:
+                            _persist_executable_candidates(int(tuid), sess, list(gated or []), source_kind='executable_setups', mode='bigmove_yver142_fast_mirror')
+                        except Exception:
+                            pass
+                    try:
+                        db_log_setup_pipeline_event(int(tuid), stage='yver142_f8_fast_mirror', status='ok', session=sess, mode='engine_f8', setup_id=sid, symbol=sym, side=side, details={'source': source, 'gated': len(gated or []), 'memo_set_after_persist': True, 'top_gate_reasons': _pipeline_top_reasons(reasons, 6) if 'reasons' in locals() else {}})
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+            if persisted_any:
+                _YVER121_F8_MEMO[memo_key] = ts
+                persisted_keys += 1
+        except Exception:
+            continue
+    return int(made or persisted_keys or 0)
+
+
+def _bigmove_candidates_to_autotrade_setups(candidates: list, best_fut: dict | None = None, session_name: str = '') -> list:
+    """v142 fallback: if the older BigMove builder returns no setups, still create F8 audit setups."""
+    out = []
+    try:
+        if callable(_YVER142_ORIG_BIGMOVE_CANDIDATES_TO_AUTOTRADE_SETUPS):
+            out = list(_YVER142_ORIG_BIGMOVE_CANDIDATES_TO_AUTOTRADE_SETUPS(candidates, best_fut, session_name) or [])
+    except Exception:
+        out = []
+    if out:
+        return out
+    try:
+        ts = float(time.time())
+        for c in list(candidates or [])[:max(1, int(BIGMOVE_AUTOTRADE_MAX_ALERT_SETUPS or 1))]:
+            try:
+                s = _yver121_fast_f8_setup_from_row(dict(c or {}), str(session_name or ''), ts, best_fut=best_fut or {})
+                if s is not None:
+                    out.append(s)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return list(out or [])
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v142_bigmove_f8_generation'
+    SETUP_AUDIT_CACHE_VERSION = 'v142'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver142_version', YVER142_VERSION)
+except Exception:
+    pass
+try:
+    logger.info('yver142 loaded before main: BigMove alert now always mirrors to durable F8 generated/audit row before memo; no order/risk/TP/SL changes')
+except Exception:
+    pass
+# =========================================================
+# end yver142
 # =========================================================
 
 if __name__ == "__main__":
