@@ -80877,6 +80877,607 @@ try:
 except Exception:
     pass
 
+
+
+# =========================================================
+# yver135: audit windows + KEEP baseline + multi-window health
+# =========================================================
+# Fixes observed after yver134 deployment:
+#   • /setup_audit 72/168 was effectively showing only the current deliverable
+#     slice because historical audit rows were still passing through final live
+#     quality gates.  Detailed audit is historical/diagnostic, so it must load
+#     canonical setup rows without current entry-window delivery gating.
+#   • /setup_audit_keep Overall used the physical DB start (May 20) while
+#     /setup_open_times all uses the owner policy baseline (01 Jun 2026).  KEEP
+#     summary now uses the same baseline so the totals/WR reconcile.
+#   • /engine_health F8 24 is not enough context.  Health now prints Last 24h,
+#     Last 7d and Overall/baseline in one read-only report.
+# No live TP/SL, risk sizing, leverage, or Bybit order placement geometry changed.
+YVER135_VERSION = 'yver135_audit_windows_keep_baseline_health_multiwindow'
+
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v135'
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v135'
+except Exception:
+    pass
+
+
+def _yver135_baseline_ts() -> float:
+    try:
+        return float(_overall_report_start_ts() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _yver135_baseline_txt() -> str:
+    try:
+        return str(_overall_report_start_txt() or '2026-06-01 00:00')
+    except Exception:
+        return '2026-06-01 00:00'
+
+
+def _yver135_parse_hours_arg(raw, default: int = 168) -> int:
+    """Accept 72, 168, 7d, 14d, 1w etc. Return hours."""
+    try:
+        a = str(raw or '').strip().lower()
+        if not a:
+            return int(default)
+        if a in {'all', 'overall', 'baseline', 'since'}:
+            return 0
+        if a in {'24', '24h', '1d', 'day', 'today'}:
+            return 24
+        if a in {'7', '7d', 'week', '1w', 'lastweek', 'last_week'}:
+            return 168
+        if a in {'14', '14d', '2w', 'fortnight'}:
+            return 336
+        m = re.fullmatch(r'(\d+(?:\.\d+)?)(h|hr|hrs|hour|hours|d|day|days|w|wk|week|weeks)?', a)
+        if m:
+            val = float(m.group(1))
+            unit = str(m.group(2) or 'h').lower()
+            mult = 168.0 if unit.startswith('w') else (24.0 if unit.startswith('d') else 1.0)
+            return int(max(1, min(8760, round(val * mult))))
+    except Exception:
+        pass
+    return int(default)
+
+
+try:
+    _YVER135_ORIG_SETUP_AUDIT_LOAD_ROWS = _setup_audit_load_rows
+except Exception:
+    _YVER135_ORIG_SETUP_AUDIT_LOAD_ROWS = None
+
+
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True,
+                           start_ts: float | None = None, apply_final_quality_gate: bool | None = None,
+                           source_mode_override: str | None = None) -> list[dict]:
+    """Historical audit loader.
+
+    yver135 default: read real canonical setup rows, not only rows still passing
+    the current live delivery/entry gate.  This is the reason /setup_audit 72
+    and /setup_audit 168 must expand beyond the last 24h.
+    """
+    if not callable(_YVER135_ORIG_SETUP_AUDIT_LOAD_ROWS):
+        return []
+    try:
+        # Detailed audit and summary validation should see the same durable source
+        # as /setup_open_times unless a caller explicitly requested another mode.
+        smode = 'ALL' if source_mode_override is None else source_mode_override
+        # Historical audit must not be trimmed by current entry-window/session/email gates.
+        fg = False if apply_final_quality_gate is None else bool(apply_final_quality_gate)
+        return _YVER135_ORIG_SETUP_AUDIT_LOAD_ROWS(
+            int(uid), hours=hours, limit=limit, dedup=dedup, start_ts=start_ts,
+            apply_final_quality_gate=fg, source_mode_override=smode,
+        )
+    except Exception:
+        return []
+
+
+try:
+    _YVER135_ORIG_SETUP_AUDIT_TEXT = _setup_audit_text
+except Exception:
+    _YVER135_ORIG_SETUP_AUDIT_TEXT = None
+
+
+def _setup_audit_text(uid: int, limit: int = 0, hours: int = 168) -> str:
+    """Default detailed setup audit is now Last 7d; numeric hours still work."""
+    try:
+        h = int(hours or 168)
+        if h <= 0:
+            # overall/baseline mode: build by start_ts to avoid accidental full-DB May rows.
+            rows = _setup_audit_load_rows(int(uid), hours=None, limit=limit, dedup=True,
+                                          start_ts=_yver135_baseline_ts(), apply_final_quality_gate=False,
+                                          source_mode_override='ALL')
+            # Reuse the original renderer by temporarily passing a very large window
+            # is unsafe because it recomputes rows.  Render a compact direct table here.
+            return _yver135_render_setup_audit_rows(int(uid), rows, label=f"from {_yver135_baseline_txt()} Melbourne", limit=int(limit or 0))
+        return _YVER135_ORIG_SETUP_AUDIT_TEXT(int(uid), limit=limit, hours=max(1, min(8760, h))) if callable(_YVER135_ORIG_SETUP_AUDIT_TEXT) else 'setup_audit unavailable'
+    except Exception as e:
+        return f"🧪 <b>Setup Audit</b>\n{HDR}\nERROR: {html.escape(type(e).__name__)}: {html.escape(str(e))}"
+
+
+def _yver135_render_setup_audit_rows(uid: int, rows: list[dict], label: str, limit: int = 0) -> str:
+    """Small renderer used only for /setup_audit all/baseline."""
+    try:
+        rows = list(rows or [])
+        if int(limit or 0) > 0:
+            rows = rows[:int(limit)]
+        result_horizon = _setup_audit_result_horizon_hours()
+        audit_tf = str(os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m') or '15m').strip().lower() or '15m'
+        candles_by_symbol = _setup_audit_preload_ohlcv(rows, hours=result_horizon, timeframe=audit_tf) if rows else {}
+        table_rows = []
+        tp_n = sl_n = open_n = 0
+        for r in rows:
+            try:
+                side = str(r.get('side') or '').upper().strip()
+                sym = str(r.get('symbol') or '').upper().strip()
+                if sym.endswith('USDT'):
+                    sym = sym[:-4]
+                sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+                ts = _setup_audit_row_ts(r)
+                ttxt = datetime.fromtimestamp(float(ts or 0.0), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M') if ts > 0 else '-'
+                family_code = _setup_audit_family_code(r)
+                combo_key = _setup_combo_strategy_side_key(family_code, sess_row, r, side)
+                ev = _setup_audit_resolve_result(r, horizon_hours=result_horizon, user_id=int(uid), candles_by_symbol=candles_by_symbol, audit_timeframe=audit_tf)
+                result = _setup_audit_binary_display_result(r, ev.get('result'), result_horizon)
+                if result == 'TP':
+                    tp_n += 1
+                elif result == 'SL':
+                    sl_n += 1
+                else:
+                    open_n += 1
+                policy_label = _setup_audit_policy_label(r, uid=int(uid), session_name=sess_row, side=side)
+                policy_wr = _setup_audit_policy_wr_label(r, uid=int(uid), session_name=sess_row, side=side)
+                table_rows.append([ttxt, sym, side, combo_key, policy_label, policy_wr, int(float(r.get('conf') or 0.0)), result])
+            except Exception:
+                continue
+        dec = tp_n + sl_n
+        wr = (tp_n / dec * 100.0) if dec else 0.0
+        win = _setup_audit_window_summary(rows)
+        table = tabulate(table_rows, headers=['Time','Sym','Side','Combo','CurrentPol','WR','Conf','Res'], tablefmt='plain',
+                         colalign=('left','left','center','left','center','right','right','center')) if table_rows else 'No canonical setup rows matched.'
+        return "\n".join([
+            "🧪 <b>Setup Audit</b>", HDR,
+            f"Window: <b>{html.escape(str(label))}</b> | Unique setups: <b>{len(rows)}</b>",
+            f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+            f"Results: TP/SL/Open <b>{tp_n}/{sl_n}/{open_n}</b> | WR: <b>{wr:.1f}%</b>",
+            "Historical audit rows are canonical setup rows; current live delivery gates do not hide older rows.",
+            "<pre>" + html.escape(table) + "</pre>",
+        ])
+    except Exception as e:
+        return f"🧪 <b>Setup Audit</b>\n{HDR}\nERROR: {html.escape(type(e).__name__)}: {html.escape(str(e))}"
+
+
+async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """yver135: /setup_audit defaults to 7d and accepts 7d/14d/all."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    limit = 0
+    hours = 168
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args and args[0].lower() in {'h', 'help', '?', 'guide'}:
+            await send_long_message(update, _setup_audit_help_text() + "\n\n<b>yver135:</b> <code>/setup_audit</code> defaults to last 7d. Use <code>/setup_audit 24</code>, <code>/setup_audit 72</code>, <code>/setup_audit 7d</code>, or <code>/setup_audit all</code>.", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        if args and args[0].lower() in {'overall', 'alltime', 'all-time'}:
+            args[0] = 'all'
+        if args and args[0].lower() in {'compare', 'reconcile', 'traded', 'autotrade'}:
+            cmp_hours = 24
+            try:
+                if len(args) >= 2:
+                    cmp_hours = _yver135_parse_hours_arg(args[1], default=24) or 24
+            except Exception:
+                cmp_hours = 24
+            await _send_cached_or_queue_admin_report(
+                update, f"/setup_audit compare {int(cmp_hours)}",
+                f"admin:bg:v135:setup_audit_compare:{int(AUTOTRADE_OWNER_UID or uid)}:{int(cmp_hours)}",
+                _setup_audit_compare_text,
+                args=(int(AUTOTRADE_OWNER_UID or uid), int(cmp_hours)),
+                parse_mode=ParseMode.HTML, fresh_ttl=60, stale_ttl=12 * 3600, background_timeout=900,
+            )
+            return
+        if len(args) == 1:
+            hours = _yver135_parse_hours_arg(args[0], default=168)
+        elif len(args) >= 2:
+            if args[0].lower() in {'rows', 'row', 'limit', 'n'}:
+                limit = int(float(args[1]))
+                if len(args) >= 3:
+                    hours = _yver135_parse_hours_arg(args[2], default=168)
+            else:
+                limit = 0 if args[0].lower() in {'all', 'unlimited', 'full', '0'} else int(float(args[0]))
+                hours = _yver135_parse_hours_arg(args[1], default=168)
+    except Exception:
+        limit = 0
+        hours = 168
+    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+    latest_ts = _yver109_latest_setup_activity_ts(owner_uid, int(hours or 168 if hours else 168)) if callable(globals().get('_yver109_latest_setup_activity_ts')) else time.time()
+    activity_bucket = int(float(latest_ts or 0.0) // 30)
+    label_hours = 'all' if int(hours or 0) <= 0 else str(int(hours))
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_audit {label_hours}",
+        f"admin:bg:v135:setup_audit:{owner_uid}:{int(limit)}:{label_hours}:act{activity_bucket}",
+        _setup_audit_text,
+        args=(owner_uid, int(limit), int(hours or 0)),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=30,
+        stale_ttl=20 * 60,
+        background_timeout=900,
+    )
+
+
+try:
+    _YVER135_ORIG_SETUP_AUDIT_KEEP_TEXT = _setup_audit_keep_text
+except Exception:
+    _YVER135_ORIG_SETUP_AUDIT_KEEP_TEXT = None
+
+
+def _setup_audit_keep_text(uid: int, hours: int = 24, limit: int = 0) -> str:
+    """KEEP summary aligned to /setup_open_times all baseline (01 Jun)."""
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(owner_uid or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    try:
+        cache_bucket = int(time.time() // max(60, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)))
+        cache_key = f"keep_only_summary:v135::{uid_i}::{cache_bucket}"
+        cache = globals().get('_SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE', {}) or {}
+        cached = cache.get(cache_key) if isinstance(cache, dict) else None
+        if cached and (float(time.time()) - float(cached.get('ts') or 0.0)) <= max(30, int(globals().get('SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE_SEC', 300) or 300)):
+            return str(cached.get('text') or '')
+    except Exception:
+        cache_key = ''
+    try:
+        lane_sets = _setup_matrix_policy_current_lane_sets(uid_i)
+        keep_combos = set(lane_sets.get('keep') or set())
+    except Exception:
+        keep_combos = set()
+    baseline_ts = _yver135_baseline_ts()
+    try:
+        rows = _setup_audit_load_rows(int(uid_i), hours=None, limit=0, dedup=True, start_ts=float(baseline_ts or 0.0), apply_final_quality_gate=False, source_mode_override='ALL')
+        source_label = 'EXECUTABLE+GENERATED'
+        if not rows:
+            rows, source_label = _overall_report_source_rows(uid_i, start_ts=float(baseline_ts or 0.0), limit=0, dedup=True)
+    except Exception:
+        rows, source_label = [], 'EXECUTABLE+GENERATED'
+    result_horizon = _setup_audit_result_horizon_hours()
+    audit_tf = str(os.environ.get('SETUP_AUDIT_OVERALL_TIMEFRAME', os.environ.get('SETUP_AUDIT_TIMEFRAME', '15m')) or '15m').strip().lower() or '15m'
+    now_ts = float(time.time())
+
+    def _row_combo_u(r: dict) -> str:
+        try:
+            fam = _setup_audit_family_code(r)
+            sess_row = str(r.get('session') or r.get('source_session') or '-').upper().strip() or '-'
+            strat = _setup_strategy_short_label(r)
+            side_row = _setup_side_suffix(value=str(r.get('side') or ''))
+            return str(_setup_combo_strategy_side_key(fam, sess_row, strat, side_row) or '').upper().strip()
+        except Exception:
+            return ''
+
+    enriched_rows: list[tuple[float, str, str]] = []
+    matched_all_for_dates: list[dict] = []
+    for r in list(rows or []):
+        try:
+            combo_u = _row_combo_u(r)
+            if combo_u not in keep_combos:
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if ts <= 0:
+                continue
+            res = _setup_audit_keep_watch_fast_result_label(r, result_horizon)
+            enriched_rows.append((ts, combo_u, res))
+            matched_all_for_dates.append(r)
+        except Exception:
+            continue
+
+    def _stats_for_window(start_ts: float | None = None) -> dict:
+        keep_hit: set[str] = set()
+        set_n = tp = sl = nh = op = 0
+        for ts, combo_u, res in enriched_rows:
+            try:
+                if start_ts is not None and float(ts or 0.0) < float(start_ts):
+                    continue
+                keep_hit.add(combo_u)
+                set_n += 1
+                if res == 'TP':
+                    tp += 1
+                elif res == 'SL':
+                    sl += 1
+                elif res == 'NOHIT':
+                    nh += 1
+                else:
+                    op += 1
+            except Exception:
+                continue
+        dec = tp + sl
+        wr = (tp / dec * 100.0) if dec > 0 else 0.0
+        return {'keep': len(keep_combos), 'watch': 0, 'used_keep': len(keep_hit), 'used_watch': 0, 'set': set_n, 'tp': tp, 'sl': sl, 'nh': nh, 'open': op, 'wr': wr}
+
+    windows = [
+        ('Last 24h', now_ts - 24 * 3600),
+        ('Last 7d', now_ts - 7 * 86400),
+        ('Last 14d', now_ts - 14 * 86400),
+        ('Overall', baseline_ts if baseline_ts > 0 else None),
+    ]
+    table_rows = []
+    for label, start_ts in windows:
+        st = _stats_for_window(start_ts)
+        table_rows.append([label, st['keep'], st['watch'], st['used_keep'], st['used_watch'], st['set'], st['tp'], st['sl'], st['open'], f"{st['wr']:.1f}%"])
+    try:
+        win = _setup_audit_window_summary(matched_all_for_dates)
+        data_start_txt = str(win.get('start_txt') or '-')
+        data_end_txt = str(win.get('end_txt') or '-')
+    except Exception:
+        data_start_txt = data_end_txt = '-'
+    table = tabulate(table_rows, headers=['Window','Keep','Watch','UsedK','UsedW','Set','TP','SL','Open','WR'], tablefmt='plain',
+                     colalign=('left','right','right','right','right','right','right','right','right','right'))
+    lines = [
+        "📊 <b>Setup KEEP Summary</b>", HDR,
+        "Policy source: <b>/setup_matrix policy KEEP lanes only</b>",
+        f"Current policy combos: <b>{len(keep_combos)}</b> (KEEP: <b>{len(keep_combos)}</b> | WATCH: <b>0</b>)",
+        f"Data start: <b>{html.escape(data_start_txt)}</b> | Data end: <b>{html.escape(data_end_txt)}</b>",
+        f"Source: <b>{html.escape(str(source_label or 'EXECUTABLE+GENERATED'))}</b> | Evaluation: <b>{_setup_audit_result_horizon_label(result_horizon)}</b> | TF: <b>{html.escape(audit_tf)}</b>",
+        f"Overall row: <b>from {_yver135_baseline_txt()} Melbourne</b>, matching <code>/setup_open_times all</code>.",
+        "WR basis: <b>TP/(TP+SL)</b>; OPEN means not hit yet and is excluded from WR. Setups have <b>no due date</b>.",
+        HDR,
+        "<pre>" + html.escape(table) + "</pre>",
+    ]
+    if not keep_combos:
+        lines.append("No active KEEP policy lanes found. Run <code>/setup_matrix policy</code> to refresh policy first.")
+    elif not enriched_rows:
+        lines.append("No historical setup rows matched the current KEEP lanes yet.")
+    txt = "\n".join(lines)
+    try:
+        if cache_key:
+            _SETUP_AUDIT_KEEP_WATCH_SUMMARY_CACHE[cache_key] = {'ts': float(time.time()), 'text': txt}
+    except Exception:
+        pass
+    return txt
+
+
+# yver135 legacy F8 dedupe key for health: old rows used F8-<bucket>-<sym>-<rawSide>-RV.
+def _yver135_f8_canonical_health_key(row: dict) -> str:
+    try:
+        sid = str((row or {}).get('setup_id') or (row or {}).get('id') or '').strip()
+        sym = _yver134_symbol((row or {}).get('symbol') or (row or {}).get('raw_symbol') or '')
+        final_side = _yver134_norm_side((row or {}).get('side') or (row or {}).get('final_side') or '')
+        raw_side = _yver134_norm_side((row or {}).get('raw_side') or '')
+        bucket = 0
+        if sid.startswith('F8:'):
+            parts = sid.split(':')
+            if len(parts) >= 5:
+                bucket = int(float(parts[1] or 0))
+                sym = sym or _yver134_symbol(parts[2])
+                raw_side = raw_side or _yver134_norm_side(parts[3])
+                final_side = final_side or _yver134_norm_side(parts[4])
+        elif sid.startswith('F8-'):
+            parts = sid.split('-')
+            if len(parts) >= 4:
+                bucket = int(float(parts[1] or 0))
+                sym = sym or _yver134_symbol(parts[2])
+                raw_side = raw_side or _yver134_norm_side(parts[3])
+        if not bucket:
+            bucket = _yver134_bucket_15m(_yver134_row_time(row))
+        if not raw_side:
+            raw_side = _yver134_norm_side((row or {}).get('raw_side') or _yver134_side_from_direction((row or {}).get('raw_direction') or (row or {}).get('direction') or '')) or final_side
+        if not final_side:
+            final_side = _yver134_norm_side((row or {}).get('final_side') or raw_side)
+        if sym and raw_side and final_side:
+            return f'F8:{bucket}:{sym}:{raw_side}:{final_side}'
+    except Exception:
+        pass
+    return _yver134_health_key(row)
+
+
+try:
+    _YVER135_ORIG_HEALTH_KEY = _yver134_health_key
+except Exception:
+    _YVER135_ORIG_HEALTH_KEY = None
+
+
+def _yver134_health_key(row: dict) -> str:
+    try:
+        if _yver134_family_code(row, '') == 'F8':
+            return _yver135_f8_canonical_health_key(row)
+    except Exception:
+        pass
+    return _YVER135_ORIG_HEALTH_KEY(row) if callable(_YVER135_ORIG_HEALTH_KEY) else str((row or {}).get('setup_id') or '')
+
+
+def _yver135_raw_engine_rows(rows: list[dict], engine: str, f9_source: dict | None = None) -> list[dict]:
+    eng = str(engine or '').upper().strip()
+    out = []
+    eligible_f9 = set((f9_source or {}).get('eligible') or set())
+    for r in rows or []:
+        try:
+            fam = _yver134_family_code(r, '')
+            if fam != eng:
+                continue
+            if eng == 'F9':
+                if not eligible_f9:
+                    continue
+                sym = _yver134_symbol(r.get('symbol'))
+                side = _yver134_norm_side(r.get('side'))
+                if (sym, side) not in eligible_f9:
+                    continue
+            out.append(r)
+        except Exception:
+            continue
+    return out
+
+
+def _yver135_health_counts_for_window(cur, uid: int, eng: str, since_ts: float, label: str) -> dict:
+    f9_source = _yver134_current_f9_source(24) if eng == 'F9' else None
+    if eng == 'F8':
+        source_rows = _yver134_f8_source_events(cur, since_ts, uid=uid)
+    else:
+        # F9 health remains current-source based by design; stale historical F9 rows are ignored.
+        source_rows = [{'symbol': s, 'side': side} for (s, side) in sorted((f9_source or {}).get('eligible') or set())]
+    gen_raw = _yver135_raw_engine_rows(_yver134_select_recent(cur, 'generated_setups', since_ts, uid=uid, max_rows=5000), eng, f9_source)
+    audit_raw = _yver135_raw_engine_rows(_yver134_select_recent(cur, 'setup_audit_results', since_ts, uid=uid, max_rows=5000), eng, f9_source)
+    exe_raw = _yver135_raw_engine_rows(_yver134_select_recent(cur, 'executable_setups', since_ts, uid=uid, max_rows=5000), eng, f9_source)
+    email_raw = _yver135_raw_engine_rows(_yver134_select_recent(cur, 'emailed_setups', since_ts, uid=uid, max_rows=5000), eng, f9_source)
+    at_raw = _yver135_raw_engine_rows(_yver134_select_recent(cur, 'autotrade_trades', since_ts, uid=uid, max_rows=5000), eng, f9_source)
+
+    def _dedupe(rows):
+        out, seen = [], set()
+        for r in rows or []:
+            k = _yver134_health_key(r)
+            if not k or k in seen:
+                continue
+            seen.add(k); out.append(r)
+        return out
+
+    gen = _dedupe(gen_raw); audit = _dedupe(audit_raw); exe = _dedupe(exe_raw); emails = _dedupe(email_raw); at = _dedupe(at_raw)
+    results = {}
+    for r in audit:
+        res = str(r.get('result') or r.get('status') or r.get('outcome') or 'UNKNOWN').upper().strip() or 'UNKNOWN'
+        results[res] = results.get(res, 0) + 1
+    problems = []
+    status = 'OK'
+    if eng == 'F9' and len(source_rows) == 0:
+        status = 'IDLE'
+    else:
+        if len(source_rows) > 0 and len(gen) == 0:
+            status = 'CHECK'; problems.append('source_without_generated')
+        if eng == 'F8' and len(source_rows) > 0 and len(gen) > len(source_rows):
+            status = 'CHECK'; problems.append('generated_gt_source_unique')
+        if len(audit) > max(len(gen), len(source_rows)) + 1:
+            status = 'CHECK'; problems.append('audit_gt_generated_unique')
+        if len(at) > 0 and len(emails) == 0 and _autotrade_require_setup_email_for_entry():
+            status = 'ERROR'; problems.append('autotrade_without_delivered_setup_email')
+    dup_ignored = max(0, len(gen_raw) - len(gen)) + max(0, len(audit_raw) - len(audit)) + max(0, len(exe_raw) - len(exe))
+    return {
+        'label': label, 'status': status, 'problems': problems, 'source': len(source_rows),
+        'gen': len(gen), 'audit': len(audit), 'exe': len(exe), 'emails': len(emails), 'at': len(at),
+        'policy': _yver134_policy_count(cur, eng), 'results': results, 'dup_ignored': dup_ignored,
+        'recent_rows': [('GEN', gen), ('AUDIT', audit), ('EXE', exe), ('EMAIL', emails), ('AT', at)],
+    }
+
+
+def _yver135_results_label(results: dict) -> str:
+    try:
+        return ','.join(f'{k}:{v}' for k, v in sorted((results or {}).items())) or '-'
+    except Exception:
+        return '-'
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    """Read-only multi-window health: Last 24h, Last 7d, Overall baseline."""
+    eng = str(engine or 'F8').upper().strip()
+    if eng not in {'F8', 'F9'}:
+        eng = 'F8'
+    now_ts = _yver134_now_ts()
+    baseline_ts = _yver135_baseline_ts()
+    windows = [
+        ('Last 24h', now_ts - 24 * 3600),
+        ('Last 7d', now_ts - 7 * 86400),
+        (f'Overall', baseline_ts if baseline_ts > 0 else 0.0),
+    ]
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            counts = [_yver135_health_counts_for_window(cur, int(uid), eng, float(st or 0.0), lab) for lab, st in windows]
+    except Exception as e:
+        return f"🧭 Engine Health {eng}\nStatus: ERROR\nRead failed: {e}"
+    overall_status = 'OK'
+    all_probs = []
+    if any(c.get('status') == 'ERROR' for c in counts):
+        overall_status = 'ERROR'
+    elif any(c.get('status') == 'CHECK' for c in counts):
+        overall_status = 'CHECK'
+    elif eng == 'F9' and all(c.get('status') == 'IDLE' for c in counts):
+        overall_status = 'IDLE'
+    for c in counts:
+        for p in c.get('problems') or []:
+            all_probs.append(f"{c.get('label')}:{p}")
+    table_rows = []
+    for c in counts:
+        table_rows.append([
+            c.get('label'), c.get('status'), c.get('source'), c.get('gen'), c.get('audit'),
+            c.get('exe'), c.get('emails'), c.get('at'), c.get('policy'), c.get('dup_ignored'),
+            _yver135_results_label(c.get('results') or {}),
+        ])
+    table = tabulate(table_rows, headers=['Window','Status','Source','Gen','Audit','Exe','Email','AT','Policy','DupIgn','Results'], tablefmt='plain',
+                     colalign=('left','center','right','right','right','right','right','right','right','right','left'))
+    all_recent = []
+    for c in counts:
+        for table_name, rows in c.get('recent_rows') or []:
+            for r in rows or []:
+                rr = dict(r); rr['_table'] = table_name; rr['_t'] = _yver134_row_time(r); all_recent.append(rr)
+    all_recent.sort(key=lambda x: float(x.get('_t') or 0.0), reverse=True)
+    recent_lines, seen = [], set()
+    for r in all_recent:
+        key = _yver134_health_key(r)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        recent_lines.append(f"{r.get('_table','-')} {_yver134_mel_label(float(r.get('_t') or 0), True)} {str(key)[:46]} {str(r.get('symbol') or '-').upper()} {str(r.get('side') or '-').upper()} {str(r.get('combo') or '-')}")
+        if len(recent_lines) >= 5:
+            break
+    source_label = 'confirmed BigMove events' if eng == 'F8' else 'current 2-day Leader/Loser sources'
+    lines = [
+        f"🧭 Engine Health {eng}",
+        f"Status: {overall_status}" + (f" | {'; '.join(all_probs[:6])}" if all_probs else ''),
+        HDR,
+        f"Source definition: {source_label}",
+        f"Overall window: from {_yver135_baseline_txt()} Melbourne",
+        "Read-only: no backfill, no repair, no setup creation, no OHLCV scan.",
+        HDR,
+        "<pre>" + html.escape(table) + "</pre>",
+        HDR,
+        "Recent unique canonical rows:",
+        "<pre>" + html.escape('\n'.join(recent_lines or ['-'])) + "</pre>",
+    ]
+    if eng == 'F9' and overall_status == 'IDLE':
+        lines.append('Note: old historical F9 evidence is ignored here while the current 2-day source is empty.')
+    return '\n'.join(lines)
+
+
+def _yver135_apply_entry_source_default() -> None:
+    try:
+        target = YVER135_VERSION
+        if str(_autotrade_config_get('yver135_entry_source_sync_version', '') or '') != target:
+            # Correct stale yver134 DBs that still had the old direct-queue setting.
+            _autotrade_config_set(AUTOTRADE_CFG_REQUIRE_SETUP_EMAIL_FOR_ENTRY_KEY, '1')
+            _autotrade_config_set('yver135_entry_source_sync_version', target)
+    except Exception:
+        pass
+
+_yver135_apply_entry_source_default()
+
+
+
+async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """yver135: cache key bumped so old May-20 Overall summaries cannot be reused."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    hours = 24
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args:
+            hours = _yver135_parse_hours_arg(args[0], default=24) or 24
+    except Exception:
+        hours = 24
+    await _send_cached_or_queue_admin_report(
+        update,
+        f"/setup_audit_keep {int(hours)}",
+        f"admin:bg:v135:setup_audit_keep:{int(AUTOTRADE_OWNER_UID or uid)}:{int(hours)}",
+        _setup_audit_keep_text,
+        args=(int(AUTOTRADE_OWNER_UID or uid), int(hours), 0),
+        parse_mode=ParseMode.HTML,
+        fresh_ttl=30,
+        stale_ttl=12 * 3600,
+        background_timeout=900,
+    )
+
+logger.info("%s loaded: setup_audit 7d/default, KEEP baseline aligned with setup_open_times, multi-window engine_health", YVER135_VERSION)
+
 logger.info("%s loaded: canonical F8/F9 setup identity, read-only engine_health, delivered-setup AutoTrade gate", YVER134_VERSION)
 
 if __name__ == "__main__":
