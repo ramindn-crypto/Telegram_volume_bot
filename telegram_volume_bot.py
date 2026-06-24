@@ -81480,6 +81480,403 @@ logger.info("%s loaded: setup_audit 7d/default, KEEP baseline aligned with setup
 
 logger.info("%s loaded: canonical F8/F9 setup identity, read-only engine_health, delivered-setup AutoTrade gate", YVER134_VERSION)
 
+
+
+# =========================================================
+# yver136 — zero-lag setup audit command path
+# =========================================================
+# yver135 fixed the audit windows, but the command still queued the old full
+# audit renderer on cache miss. That renderer can preload OHLCV / call live
+# AutoTrade diagnostics and consume enough CPU/GIL to delay /help_admin and
+# /start. This patch makes /setup_audit a fast SQLite/cached-result snapshot by
+# default. Heavy recalculation is not started from the command.
+YVER136_VERSION = "yver136"
+
+try:
+    SETUP_AUDIT_CACHE_VERSION = 'v136'
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v136'
+except Exception:
+    pass
+
+# /start must also be in the instant lane.  Existing /help_admin already is, but
+# adding /start means a user can always prove the bot is alive even while a report
+# snapshot is being built in a worker.
+try:
+    FAST_PATH_COMMANDS.add('start')
+except Exception:
+    pass
+
+
+def _yver136_safe_mel_time(ts: float) -> str:
+    try:
+        if float(ts or 0.0) <= 0:
+            return '-'
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).astimezone(MEL_TZ).strftime('%m-%d %H:%M')
+    except Exception:
+        return '-'
+
+
+def _yver136_setup_combo(row: dict) -> str:
+    try:
+        rr = dict(row or {})
+        side = str(rr.get('side') or '').upper().strip()
+        sess = str(rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
+        fam = _setup_audit_family_code(rr)
+        combo = str(rr.get('combo') or rr.get('setup_combo') or '').upper().strip()
+        if combo:
+            return combo
+        return _setup_combo_strategy_side_key(fam, sess, rr, side)
+    except Exception:
+        try:
+            return str((row or {}).get('combo') or '-') or '-'
+        except Exception:
+            return '-'
+
+
+def _yver136_fast_result_label(row: dict) -> str:
+    """Return TP/SL/OPEN using stored/cached audit results only; no OHLCV scan."""
+    try:
+        rr = dict(row or {})
+        for k in ('result', 'res', 'outcome', 'audit_result', 'status'):
+            v = str(rr.get(k) or '').upper().strip()
+            lab = _setup_audit_result_label(v)
+            if lab in {'TP', 'SL', 'OPEN'}:
+                return _setup_audit_binary_display_result(rr, lab, _setup_audit_result_horizon_hours())
+        try:
+            return _setup_audit_keep_watch_fast_result_label(rr, _setup_audit_result_horizon_hours())
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return 'OPEN'
+
+
+def _yver136_fast_autotrade_meta(row: dict, uid: int = 0) -> tuple[str, str, str]:
+    """DB-only AutoTrade attachment for audit rows: (AT, ATPol, ATWhy)."""
+    try:
+        rr = dict(row or {})
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+        if owner_uid <= 0:
+            return '-', '-', '-'
+        sid = str(rr.get('setup_id') or '').strip()
+        sym_base = _symbol_base(str(rr.get('symbol') or rr.get('market_symbol') or ''))
+        side_u = str(rr.get('side') or '').upper().strip()
+        setup_ts = float(_setup_audit_row_ts(rr) or 0.0)
+        try:
+            entry_win_sec = float(max(60, int(_autotrade_entry_window_min()) * 60))
+        except Exception:
+            entry_win_sec = 3600.0
+        with sqlite3.connect(DB_PATH, timeout=0.75) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = []
+            cols = {r[1] for r in cur.execute('PRAGMA table_info(autotrade_trades)').fetchall() or []}
+            pol_expr = 'policy_at_open' if 'policy_at_open' in cols else ("policy_combo_at_open" if 'policy_combo_at_open' in cols else ("setup_combo_at_open" if 'setup_combo_at_open' in cols else "''"))
+            combo_expr = 'policy_combo_at_open' if 'policy_combo_at_open' in cols else ("setup_combo_at_open" if 'setup_combo_at_open' in cols else "''")
+            if sid:
+                try:
+                    rows = [dict(r) for r in (cur.execute(f"""
+                        SELECT setup_id, symbol, side, status, outcome, opened_ts, closed_ts,
+                               {pol_expr} AS atpol, {combo_expr} AS atcombo, pnl_usdt
+                        FROM autotrade_trades
+                        WHERE uid=? AND setup_id=?
+                        ORDER BY COALESCE(opened_ts,created_ts,0) DESC
+                        LIMIT 5
+                    """, (owner_uid, sid)).fetchall() or [])]
+                except Exception:
+                    rows = []
+            if not rows and sym_base and side_u in {'BUY','SELL'} and setup_ts > 0:
+                try:
+                    cand = [dict(r) for r in (cur.execute(f"""
+                        SELECT setup_id, symbol, side, status, outcome, opened_ts, closed_ts,
+                               {pol_expr} AS atpol, {combo_expr} AS atcombo, pnl_usdt
+                        FROM autotrade_trades
+                        WHERE uid=? AND UPPER(COALESCE(side,''))=?
+                          AND COALESCE(opened_ts,created_ts,0)>=?
+                          AND COALESCE(opened_ts,created_ts,0)<=?
+                        ORDER BY COALESCE(opened_ts,created_ts,0) DESC
+                        LIMIT 20
+                    """, (owner_uid, side_u, max(0.0, setup_ts-300.0), setup_ts+entry_win_sec+900.0)).fetchall() or [])]
+                    for tr in cand:
+                        if _symbol_base(str(tr.get('symbol') or '')) == sym_base and _yver58_setup_audit_trade_match_safe(rr, tr, uid=owner_uid):
+                            rows = [tr]
+                            break
+                except Exception:
+                    rows = []
+            if rows:
+                tr = rows[0]
+                out = str(tr.get('outcome') or tr.get('status') or '').upper().strip()
+                st = str(tr.get('status') or '').upper().strip()
+                if out in {'TP','SL'}:
+                    at = 'AT_' + out
+                elif st == 'OPEN' and not tr.get('closed_ts'):
+                    at = 'AT_OPEN'
+                else:
+                    at = 'AT_CLOSED'
+                pol = str(tr.get('atpol') or '').upper().strip()
+                if not pol:
+                    pol = 'KEEP' if str(tr.get('atcombo') or '').strip() else '-'
+                return at, pol[:10] or '-', '-'
+            if sid:
+                try:
+                    er = cur.execute("SELECT MAX(emailed_ts) FROM emailed_setups WHERE user_id=? AND setup_id=?", (owner_uid, sid)).fetchone()
+                    ets = float((er[0] if er else 0.0) or 0.0)
+                    if ets > 0:
+                        if (float(time.time()) - ets) <= entry_win_sec:
+                            return 'SENT', '-', '-'
+                        return 'SENT_OLD', '-', '-'
+                except Exception:
+                    pass
+        # Lightweight current reason, no live-position/Bybit calls.
+        pol_now = '-'
+        try:
+            pol_now = _setup_audit_policy_label(rr, uid=owner_uid, session_name=str(rr.get('session') or ''))
+        except Exception:
+            pol_now = '-'
+        if pol_now in {'WATCH', 'TIGHTEN', 'DISABLE', 'OFF'}:
+            return '-', '-', pol_now
+        return '-', '-', '-'
+    except Exception:
+        return '-', '-', '-'
+
+
+def _yver136_load_audit_rows_fast(uid: int, hours: int | None = 168, limit: int = 0, start_ts: float | None = None) -> list[dict]:
+    """SQLite-only loader; explicitly avoids final live gate and OHLCV result resolving."""
+    try:
+        rows = _setup_audit_load_rows(
+            int(uid),
+            hours=hours,
+            limit=0,
+            dedup=True,
+            start_ts=start_ts,
+            apply_final_quality_gate=False,
+            source_mode_override='ALL',
+        )
+        rows = list(rows or [])
+        if int(limit or 0) > 0:
+            rows = rows[:int(limit)]
+        return rows
+    except Exception:
+        return []
+
+
+def _yver136_setup_audit_text_fast(uid: int, limit: int = 0, hours: int = 168, start_ts: float | None = None, label: str | None = None) -> str:
+    started = time.time()
+    uid_i = int(uid or 0)
+    rows = _yver136_load_audit_rows_fast(uid_i, hours=None if start_ts else int(hours or 168), start_ts=start_ts)
+    total = len(rows)
+    try:
+        max_default = int(os.getenv('SETUP_AUDIT_FAST_DISPLAY_MAX_ROWS', str(globals().get('SETUP_AUDIT_DISPLAY_MAX_ROWS', 60) or 60)) or 60)
+    except Exception:
+        max_default = 60
+    show_n = int(limit or 0) if int(limit or 0) > 0 else max(20, min(120, max_default))
+    shown = rows[:show_n]
+    result_horizon = _setup_audit_result_horizon_hours()
+    counts = {'TP': 0, 'SL': 0, 'OPEN': 0}
+    rendered = []
+    for r in rows:
+        lab = _yver136_fast_result_label(r)
+        if lab not in counts:
+            lab = 'OPEN'
+        counts[lab] = counts.get(lab, 0) + 1
+    win = _setup_audit_window_summary(rows)
+    now_txt = datetime.now(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    if label:
+        win_label = str(label)
+    elif int(hours or 0) >= 168:
+        win_label = 'last 7d'
+    else:
+        win_label = f'last {int(hours or 0)}h'
+    try:
+        decided = int(counts.get('TP',0) + counts.get('SL',0))
+        wr = (100.0 * float(counts.get('TP',0)) / float(decided)) if decided > 0 else 0.0
+    except Exception:
+        decided, wr = 0, 0.0
+    header = [
+        "🧪 <b>Setup Audit</b> <code>FAST</code>",
+        HDR,
+        f"Window: <b>{html.escape(win_label)}</b> | Unique setups: <b>{int(total)}</b> | Now: <b>{html.escape(now_txt)}</b>",
+        f"Start: <b>{html.escape(str(win.get('start_txt') or '-'))}</b> | End: <b>{html.escape(str(win.get('end_txt') or '-'))}</b>",
+        f"Results: TP={counts.get('TP',0)} | SL={counts.get('SL',0)} | OPEN={counts.get('OPEN',0)} | WR={wr:.1f}%",
+        "Mode: SQLite/cached results only — no OHLCV scan, no repair, no backfill, no live Bybit calls.",
+    ]
+    table_rows = []
+    for r in shown:
+        try:
+            rr = dict(r or {})
+            ts = _setup_audit_row_ts(rr)
+            sym = str(rr.get('symbol') or rr.get('market_symbol') or '-')[:10].upper()
+            side = str(rr.get('side') or '-')[:4].upper()
+            combo = _yver136_setup_combo(rr)[:18]
+            sess = str(rr.get('session') or rr.get('source_session') or '-')
+            pol = _setup_audit_policy_label(rr, uid=uid_i, session_name=sess, side=side)
+            wr_lab = _setup_audit_policy_wr_label(rr, uid=uid_i, session_name=sess, side=side)
+            at, atpol, atwhy = _yver136_fast_autotrade_meta(rr, uid=uid_i)
+            try:
+                conf = int(float(rr.get('conf') or 0))
+            except Exception:
+                conf = 0
+            try:
+                volm = int(round(float(rr.get('fut_vol_usd') or 0.0) / 1_000_000.0))
+            except Exception:
+                volm = 0
+            res = _yver136_fast_result_label(rr)
+            table_rows.append([_yver136_safe_mel_time(ts), sym, side, combo, str(pol or '-')[:10], str(wr_lab or '-')[:6], str(at or '-')[:9], str(atpol or '-')[:8], str(atwhy or '-')[:14], conf, volm, res])
+        except Exception:
+            continue
+    if table_rows:
+        table = tabulate(
+            table_rows,
+            headers=['Time','Sym','Side','Combo','CurrentPol','WR','AT','ATPol','ATWhy','Conf','VolM','Res'],
+            tablefmt='plain',
+            colalign=('left','left','left','left','left','right','left','left','left','right','right','left'),
+        )
+        header.append('<pre>' + html.escape(table) + '</pre>')
+    else:
+        header.append('No canonical setup rows found for this window.')
+    if total > len(shown):
+        header.append(f"Rows shown: <b>{len(shown)} / {total}</b>. Add a second number to show more, e.g. <code>/setup_audit 168 200</code>.")
+    header.append(f"Render time: {max(0.0, time.time()-started):.2f}s")
+    return "\n".join(header)
+
+
+def _yver136_parse_setup_audit_args(args: list[str]) -> tuple[int | None, int, str | None]:
+    """Return (hours, limit, label). hours=None means baseline/all."""
+    hours = 168
+    limit = 0
+    label = None
+    a = [str(x).strip().lower() for x in list(args or []) if str(x).strip()]
+    if a:
+        x = a[0]
+        if x in {'h','help','?'}:
+            return -1, 0, None
+        if x in {'all','overall','baseline'}:
+            return None, (int(float(a[1])) if len(a) > 1 and re.fullmatch(r'\d+', a[1]) else 0), f"from {_yver135_baseline_txt()} Melbourne"
+        if x.endswith('d') and re.fullmatch(r'\d+d', x):
+            hours = int(x[:-1]) * 24
+        elif x == '7d':
+            hours = 168
+        elif re.fullmatch(r'\d+(\.\d+)?', x):
+            val = float(x)
+            # Keep legacy semantics: numeric argument is hours.
+            hours = int(max(1, min(8760, val)))
+        if len(a) > 1 and re.fullmatch(r'\d+', a[1]):
+            limit = int(a[1])
+    return hours, limit, label
+
+
+async def setup_audit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """yver136: fast, read-only /setup_audit. Never starts a heavy rebuild."""
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    try:
+        hours, limit, label = _yver136_parse_setup_audit_args(list(context.args or []))
+        if hours == -1:
+            await send_long_message(update, _setup_audit_help_text() + "\n\n<b>yver136:</b> <code>/setup_audit</code> is fast/read-only and defaults to last 7d. Use <code>/setup_audit 24</code>, <code>/setup_audit 72</code>, <code>/setup_audit 168</code>, <code>/setup_audit all</code>, or <code>/setup_audit 168 200</code>.", parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return
+        owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+        if hours is None:
+            baseline_ts = _yver135_setup_open_times_baseline_ts()
+            task = _safe_create_task(to_thread_fast(_yver136_setup_audit_text_fast, owner_uid, int(limit or 0), 0, float(baseline_ts or 0.0), label), 'yver136_setup_audit_fast_all')
+            title = '/setup_audit all'
+        else:
+            task = _safe_create_task(to_thread_fast(_yver136_setup_audit_text_fast, owner_uid, int(limit or 0), int(hours or 168), None, None), 'yver136_setup_audit_fast')
+            title = f"/setup_audit {int(hours)}"
+        try:
+            txt = await asyncio.wait_for(asyncio.shield(task), timeout=float(os.getenv('SETUP_AUDIT_FAST_COMMAND_TIMEOUT_SEC', '3.0') or 3.0))
+            try:
+                cache_set(f"admin:bg:v136:setup_audit:{owner_uid}:{int(limit or 0)}:{str(hours)}", txt)
+            except Exception:
+                pass
+            await send_long_message(update, str(txt or 'No data found.'), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except asyncio.TimeoutError:
+            # Do not keep a CPU-heavy worker running just to post later.  It is a
+            # fast DB snapshot; if it cannot finish within the short budget, stop
+            # tying up the command path and let the user try a smaller window.
+            try:
+                task.cancel()
+            except Exception:
+                pass
+            await update.message.reply_text(f"⚠️ {title} fast snapshot exceeded 3s, so I stopped it to keep the bot responsive. Try `/setup_audit 24 60` or `/setup_audit 168 60`.", parse_mode=None, disable_web_page_preview=True)
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ /setup_audit fast report failed: {type(exc).__name__}: {exc}")
+
+
+# KEEP summary also must not queue the old background report on cache miss.  It is
+# already fast enough when computed from cached audit outcomes; run it in FAST and
+# use a short timeout instead of occupying the background executor.
+async def setup_audit_keep_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = int(update.effective_user.id)
+    if not is_admin_user(uid):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    hours = 24
+    try:
+        args = [str(a).strip() for a in (context.args or []) if str(a).strip()]
+        if args:
+            hours = _yver135_parse_hours_arg(args[0], default=24) or 24
+    except Exception:
+        hours = 24
+    owner_uid = int(AUTOTRADE_OWNER_UID or uid)
+    cache_key = f"admin:bg:v136:setup_audit_keep:{owner_uid}:{int(hours)}"
+    cached, age = _admin_report_cache_get_with_age(cache_key, 45)
+    if cached:
+        await send_long_message(update, cached, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        return
+    task = _safe_create_task(to_thread_fast(_setup_audit_keep_text, owner_uid, int(hours), 0), 'yver136_setup_audit_keep_fast')
+    try:
+        txt = await asyncio.wait_for(asyncio.shield(task), timeout=float(os.getenv('SETUP_AUDIT_KEEP_FAST_TIMEOUT_SEC', '4.0') or 4.0))
+        try:
+            cache_set(cache_key, txt)
+        except Exception:
+            pass
+        await send_long_message(update, str(txt or 'No data found.'), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except asyncio.TimeoutError:
+        try:
+            task.cancel()
+        except Exception:
+            pass
+        stale, stale_age = _admin_report_cache_get_with_age(cache_key, 12*3600)
+        if stale:
+            await send_long_message(update, f"⚡ <b>Latest cached result:</b> /setup_audit_keep {int(hours)} (age {html.escape(_admin_report_age_text(stale_age))}). Fresh rebuild skipped to avoid lag.\n{SEP}\n" + stale, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        else:
+            await update.message.reply_text("⚠️ /setup_audit_keep exceeded the fast timeout and no cache is available. Try again in a smaller window.")
+
+
+# Wrap the fast router so /start is instant.  For other fast commands use the
+# existing router.
+try:
+    _YVER136_ORIG_FAST_PATH_ROUTER = _fast_path_command_router
+except Exception:
+    _YVER136_ORIG_FAST_PATH_ROUTER = None
+
+async def _fast_path_command_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = getattr(update, 'message', None)
+        txt = str(getattr(msg, 'text', '') or '').strip()
+        cmd = txt.split()[0][1:].split('@')[0].strip().lower() if txt.startswith('/') else ''
+        if cmd == 'start':
+            await update.message.reply_text("✅ PulseFutures is running. Commands are responsive. Use /help_admin, /screen, /setup_audit, /autotrade_config.")
+            raise ApplicationHandlerStop
+    except ApplicationHandlerStop:
+        raise
+    except Exception:
+        pass
+    if callable(_YVER136_ORIG_FAST_PATH_ROUTER):
+        return await _YVER136_ORIG_FAST_PATH_ROUTER(update, context)
+    return None
+
+logger.info("%s loaded: setup_audit is fast/read-only; no command-time heavy audit rebuild", YVER136_VERSION)
+# =========================================================
+# end yver136 zero-lag setup audit path
+# =========================================================
+
+
 if __name__ == "__main__":
     main()
 
