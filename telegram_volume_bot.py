@@ -1,3 +1,4 @@
+# yver136: fixes WR/C display to read the freshest current /setup_matrix score snapshot (no stale policy cache) and treats Bybit 110126 required-agreement errors as permission-required holds with owner email alert/cooldown. No TP/SL, leverage, sizing, drift, risk, setup geometry, or order placement logic changed.
 # yver135: fixes WR/O to use one stable lane WR snapshot per Melbourne setup hour so same combo setups generated close together show the same WR/O, and keeps shadow executable/audit generation running before setup-email caps/gaps/blackouts can stop delivery. No TP/SL, leverage, sizing, drift, risk, or Bybit order geometry changed.
 # yver134: hard-locks /screen setup visibility to a 60-minute window with max 4 newest cards, keeps WR/O causal to the latest setup_matrix WR at-or-before setup generation time, and makes AutoTrade pre-entry setup-email sync obey the user email/session/cap config before any live entry. No TP/SL, leverage, sizing, drift, blackout, or order geometry changed.
 # yver86: disables v85 automatic 24h self-block for Bybit trading-terms/permission errors, clears existing CL-style permission blocks, records a manual-acceptance notice instead, and adds lightweight setup-activity diagnostics. Bybit V5 exposes 110125 as an order rejection; no documented API endpoint is used to auto-accept legal trading terms. No TP/SL, leverage, setup generation, blackout, or order sizing logic changed.
@@ -83425,6 +83426,402 @@ except Exception:
     pass
 # =========================================================
 # end yver135
+# =========================================================
+
+
+
+# =========================================================
+# yver136 — fresh WR/C + Bybit 110126 required-agreement handling
+# =========================================================
+# Owner review after v135:
+# - WR/O is now stable, but WR/C in /setup_audit and /autotrade_report could lag
+#   behind the freshly rebuilt /setup_matrix policy table because it reused a
+#   cached policy-source map. WR/C must be CURRENT, so it now reads the newest
+#   setup_combo_scores run directly.
+# - Bybit retCode 110126 ("You must sign the required agreement") is an exchange
+#   permission/terms problem, not a setup failure. The bot must not keep trying
+#   the same contract every few minutes as if it were a strategy/risk issue.
+YVER136_VERSION = 'yver136_2026_06_24_fresh_wr_c_bybit_110126_permission_hold'
+YVER136_PERMISSION_HOLD_KEY = 'yver136_permission_agreement_holds_json'
+YVER136_PERMISSION_HOLD_SEC = float(os.environ.get('AUTOTRADE_PERMISSION_AGREEMENT_HOLD_SEC', '7200') or 7200)
+
+
+def _yver136_json_load(raw, default):
+    try:
+        if raw is None or str(raw).strip() == '':
+            return default
+        val = json.loads(str(raw))
+        return val if isinstance(val, type(default)) else default
+    except Exception:
+        return default
+
+
+def _yver136_json_save(obj) -> str:
+    try:
+        return json.dumps(obj or {}, separators=(',', ':'), sort_keys=True)
+    except Exception:
+        return '{}'
+
+
+def _yver136_combo_keys(combo: str) -> list[str]:
+    try:
+        c = str(combo or '').upper().strip()
+        out = []
+        if c:
+            out.append(c)
+        parts = [p for p in c.split('-') if p]
+        if len(parts) >= 3:
+            out.append('-'.join(parts[:3]))
+        if len(parts) >= 2:
+            out.append('-'.join(parts[:2]))
+        return list(dict.fromkeys([x for x in out if x]))
+    except Exception:
+        return [str(combo or '').upper().strip()]
+
+
+def _yver136_score_combo_from_row(d: dict) -> str:
+    try:
+        combo = str((d or {}).get('combo') or '').upper().strip()
+        if combo:
+            return combo
+        fam = str((d or {}).get('family') or '').upper().strip()
+        sess = str((d or {}).get('session') or '').upper().strip()
+        strat = _setup_strategy_suffix(value=str((d or {}).get('strategy') or 'NOR'))
+        side = _setup_side_suffix(value=str((d or {}).get('side') or 'BOTH'))
+        if fam and sess and side in {'BUY', 'SELL'}:
+            return _setup_combo_strategy_side_key(fam, sess, strat, side)
+        if fam and sess:
+            return _setup_combo_strategy_key(fam, sess, strat)
+    except Exception:
+        pass
+    return ''
+
+
+def _yver136_latest_matrix_score_rows_no_cache(uid: int = 0) -> dict:
+    """Read the freshest setup_combo_scores run directly, bypassing runtime caches.
+
+    This mirrors the current /setup_matrix policy display basis for WR/C.  It is
+    display-only and does not alter policy, setup generation, email, or trading.
+    """
+    rows_by_combo: dict[str, dict] = {}
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(uid or owner_uid or 0)
+        ids = list(dict.fromkeys([int(x) for x in [uid_i, 0] if int(x or 0) >= 0])) or [0]
+        qmarks = ','.join(['?'] * len(ids))
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            latest = cur.execute(
+                f"SELECT run_id FROM setup_combo_scores WHERE user_id IN ({qmarks}) ORDER BY evaluated_ts DESC LIMIT 1",
+                tuple(ids),
+            ).fetchone()
+            run_id = str(latest['run_id'] if latest else '' or '')
+            if not run_id:
+                return {}
+            rows = [dict(r) for r in cur.execute(
+                f"SELECT * FROM setup_combo_scores WHERE run_id=? AND user_id IN ({qmarks}) ORDER BY user_id DESC, combo, family, session, strategy, side",
+                tuple([run_id] + ids),
+            ).fetchall() or []]
+        for d in rows:
+            try:
+                combo = _yver136_score_combo_from_row(d)
+                if not combo:
+                    continue
+                combo = str(combo).upper().strip()
+                rows_by_combo[combo] = d
+                fam = str(d.get('family') or '').upper().strip()
+                sess = str(d.get('session') or '').upper().strip()
+                strat = _setup_strategy_suffix(value=str(d.get('strategy') or 'NOR'))
+                if fam and sess and strat:
+                    rows_by_combo.setdefault(_setup_combo_strategy_key(fam, sess, strat), d)
+                if fam and sess:
+                    rows_by_combo.setdefault(f'{fam}-{sess}', d)
+            except Exception:
+                continue
+    except Exception:
+        return {}
+    return dict(rows_by_combo)
+
+
+def _yver136_current_wr_label_for_combo(uid: int, combo: str) -> str:
+    try:
+        rows = _yver136_latest_matrix_score_rows_no_cache(int(uid or 0)) or {}
+        for key in _yver136_combo_keys(combo):
+            d = dict(rows.get(str(key or '').upper().strip()) or {})
+            if not d:
+                continue
+            dec = int(float(d.get('decided') if d.get('decided') is not None else (d.get('last_decided') or 0)))
+            if dec <= 0:
+                return '-'
+            wr = float(d.get('win_rate') if d.get('win_rate') is not None else (d.get('wr') if d.get('wr') is not None else (d.get('last_win_rate') or 0.0)))
+            return f'{wr:.1f}%'
+    except Exception:
+        pass
+    return '-'
+
+
+try:
+    _YVER136_ORIG_YVER131_CURRENT_WR_FOR_COMBO = _yver131_current_wr_for_combo
+except Exception:
+    _YVER136_ORIG_YVER131_CURRENT_WR_FOR_COMBO = None
+
+
+def _yver131_current_wr_for_combo(uid: int, combo: str) -> str:
+    try:
+        fresh = _yver136_current_wr_label_for_combo(int(uid or 0), str(combo or ''))
+        if fresh and fresh != '-':
+            return fresh
+    except Exception:
+        pass
+    if _YVER136_ORIG_YVER131_CURRENT_WR_FOR_COMBO is not None:
+        return _YVER136_ORIG_YVER131_CURRENT_WR_FOR_COMBO(uid, combo)
+    return '-'
+
+
+try:
+    _YVER136_ORIG_SETUP_AUDIT_POLICY_WR_LABEL = _setup_audit_policy_wr_label
+except Exception:
+    _YVER136_ORIG_SETUP_AUDIT_POLICY_WR_LABEL = None
+
+
+def _setup_audit_policy_wr_label(row: dict, uid: int = 0, session_name: str = '', side: str = '') -> str:
+    try:
+        rr = dict(row or {})
+        sess = str(session_name or rr.get('session') or rr.get('source_session') or '-').upper().strip() or '-'
+        side_u = str(side or rr.get('side') or '').upper().strip()
+        if side_u in {'BUY', 'SELL'}:
+            rr['side'] = side_u
+        fam = _setup_audit_family_code(rr)
+        combo = _setup_combo_strategy_side_key(fam, sess, rr, side_u)
+        fresh = _yver136_current_wr_label_for_combo(int(uid or 0), combo)
+        if fresh and fresh != '-':
+            return fresh
+    except Exception:
+        pass
+    if _YVER136_ORIG_SETUP_AUDIT_POLICY_WR_LABEL is not None:
+        return _YVER136_ORIG_SETUP_AUDIT_POLICY_WR_LABEL(row, uid=uid, session_name=session_name, side=side)
+    return '-'
+
+
+def _yver136_permission_error(reason: str) -> bool:
+    try:
+        r = str(reason or '').lower()
+        compact = re.sub(r'[^a-z0-9]+', '_', r).strip('_')
+        return (
+            '110126' in r
+            or '110125' in r
+            or '110123' in r
+            or 'you_must_sign_the_required_agreement' in compact
+            or 'you_must_sign_the_required_agreemen' in compact
+            or 'must_sign_the_required_agreement' in compact
+            or 'required_agreement' in compact
+            or ('must' in r and 'sign' in r and 'agreement' in r)
+            or ('required' in r and 'agreement' in r and ('sign' in r or 'accept' in r or 'confirm' in r))
+            or ('trading terms' in r)
+            or ('risk disclosure' in r and ('confirm' in r or 'agree' in r or 'read' in r))
+            or ('permission' in r and ('trade' in r or 'contract' in r))
+        )
+    except Exception:
+        return False
+
+
+try:
+    _YVER136_ORIG_YVER85_IS_PERMISSION_ERROR = _yver85_is_permission_error
+except Exception:
+    _YVER136_ORIG_YVER85_IS_PERMISSION_ERROR = None
+
+
+def _yver85_is_permission_error(reason: str) -> bool:
+    try:
+        if _yver136_permission_error(reason):
+            return True
+    except Exception:
+        pass
+    if _YVER136_ORIG_YVER85_IS_PERMISSION_ERROR is not None:
+        return bool(_YVER136_ORIG_YVER85_IS_PERMISSION_ERROR(reason))
+    return False
+
+
+try:
+    _YVER136_ORIG_YVER87_PERMISSION_ERROR = _yver87_permission_error
+except Exception:
+    _YVER136_ORIG_YVER87_PERMISSION_ERROR = None
+
+
+def _yver87_permission_error(reason: str) -> bool:
+    try:
+        if _yver136_permission_error(reason):
+            return True
+    except Exception:
+        pass
+    if _YVER136_ORIG_YVER87_PERMISSION_ERROR is not None:
+        return bool(_YVER136_ORIG_YVER87_PERMISSION_ERROR(reason))
+    return False
+
+
+def _yver136_permission_hold_record(symbol: str, reason: str) -> None:
+    try:
+        base = _symbol_base(str(symbol or '')).upper().strip()
+        if not base:
+            return
+        ttl = max(900.0, min(86400.0, float(globals().get('YVER136_PERMISSION_HOLD_SEC', 7200.0) or 7200.0)))
+        now = float(time.time())
+        data = _yver136_json_load(_autotrade_config_get(YVER136_PERMISSION_HOLD_KEY, '{}'), {})
+        if not isinstance(data, dict):
+            data = {}
+        data[base] = {
+            'created_ts': now,
+            'expires_ts': now + ttl,
+            'reason': str(reason or '')[:300],
+            'source': 'yver136_bybit_required_agreement',
+        }
+        _autotrade_config_set(YVER136_PERMISSION_HOLD_KEY, _yver136_json_save(data))
+        _autotrade_config_set('yver136_last_permission_hold', f'{base}:{str(reason or "")[:180]}')
+        _autotrade_config_set('yver136_last_permission_hold_ts', str(int(now)))
+    except Exception:
+        pass
+
+
+def _yver136_permission_hold_block_reason(symbol: str) -> str:
+    try:
+        base = _symbol_base(str(symbol or '')).upper().strip()
+        if not base:
+            return ''
+        data = _yver136_json_load(_autotrade_config_get(YVER136_PERMISSION_HOLD_KEY, '{}'), {})
+        if not isinstance(data, dict):
+            return ''
+        now = float(time.time())
+        changed = False
+        for k in list(data.keys()):
+            try:
+                exp = float((data.get(k) or {}).get('expires_ts') or 0.0)
+                if exp <= now:
+                    data.pop(k, None)
+                    changed = True
+            except Exception:
+                data.pop(k, None)
+                changed = True
+        if changed:
+            try:
+                _autotrade_config_set(YVER136_PERMISSION_HOLD_KEY, _yver136_json_save(data))
+            except Exception:
+                pass
+        item = data.get(base) or {}
+        exp = float((item or {}).get('expires_ts') or 0.0)
+        if exp <= now:
+            return ''
+        remain_min = max(1, int(math.ceil((exp - now) / 60.0)))
+        reason = str((item or {}).get('reason') or '')
+        detail = _yver71_clean_live_fail_reason(reason, 42) if callable(globals().get('_yver71_clean_live_fail_reason')) else re.sub(r'[^A-Za-z0-9_]+', '_', reason)[:42]
+        return f'blocked_by_permission_agreement:{base}:{remain_min}m:{detail}'
+    except Exception:
+        return ''
+
+
+try:
+    _YVER136_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL = _yver70_note_live_open_fail
+except Exception:
+    _YVER136_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL = None
+
+
+def _yver70_note_live_open_fail(uid: int, setup_id: str, symbol: str, side: str, reason: str) -> None:
+    try:
+        if _YVER136_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL is not None:
+            _YVER136_ORIG_YVER70_NOTE_LIVE_OPEN_FAIL(uid, setup_id, symbol, side, reason)
+    finally:
+        try:
+            if _yver136_permission_error(reason):
+                _yver136_permission_hold_record(symbol, reason)
+        except Exception:
+            pass
+
+
+try:
+    _YVER136_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON = _yver70_live_open_fail_block_reason
+except Exception:
+    _YVER136_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON = None
+
+
+def _yver70_live_open_fail_block_reason(uid: int, setup_id: str, symbol: str, side: str) -> str:
+    try:
+        pr = _yver136_permission_hold_block_reason(symbol)
+        if pr:
+            return pr
+    except Exception:
+        pass
+    if _YVER136_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON is not None:
+        return _YVER136_ORIG_YVER70_LIVE_OPEN_FAIL_BLOCK_REASON(uid, setup_id, symbol, side)
+    return ''
+
+
+try:
+    _YVER136_ORIG_SETUP_AUDIT_SHORT_AT_REASON = _setup_audit_short_autotrade_reason
+except Exception:
+    _YVER136_ORIG_SETUP_AUDIT_SHORT_AT_REASON = None
+
+
+def _setup_audit_short_autotrade_reason(reason: str) -> str:
+    try:
+        raw = str(reason or '')
+        if 'blocked_by_permission_agreement' in raw.lower() or _yver136_permission_error(raw):
+            detail = _yver71_clean_live_fail_reason(raw, 40) if callable(globals().get('_yver71_clean_live_fail_reason')) else re.sub(r'[^A-Za-z0-9_]+', '_', raw).strip('_')[:40]
+            return ('PERMISSION_REQUIRED:' + detail)[:58] if detail else 'PERMISSION_REQUIRED'
+    except Exception:
+        pass
+    if _YVER136_ORIG_SETUP_AUDIT_SHORT_AT_REASON is not None:
+        return _YVER136_ORIG_SETUP_AUDIT_SHORT_AT_REASON(reason)
+    return re.sub(r'[^A-Z0-9_]+', '_', str(reason or '').upper()).strip('_')[:16] or '-'
+
+
+def _yver136_import_existing_permission_failures() -> None:
+    try:
+        marker = 'yver136_existing_permission_failures_imported'
+        if str(_autotrade_config_get(marker, '') or '').strip() == YVER136_VERSION:
+            return
+        _yver70_live_open_fail_migrate()
+        imported = 0
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = cur.execute(
+                "SELECT symbol, reason FROM autotrade_live_open_failures WHERE COALESCE(last_ts,0)>=? ORDER BY last_ts DESC LIMIT 50",
+                (float(time.time()) - 7 * 86400.0,),
+            ).fetchall() or []
+        for r in rows:
+            try:
+                reason = str(r['reason'] or '')
+                if _yver136_permission_error(reason):
+                    _yver136_permission_hold_record(str(r['symbol'] or ''), reason)
+                    imported += 1
+            except Exception:
+                continue
+        _autotrade_config_set(marker, YVER136_VERSION)
+        _autotrade_config_set('yver136_existing_permission_failures_imported_count', int(imported))
+    except Exception:
+        pass
+
+
+try:
+    _yver136_import_existing_permission_failures()
+except Exception:
+    pass
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v136_fresh_wr_c_permission110126'
+    SETUP_AUDIT_CACHE_VERSION = 'v136'
+    SCREEN_CACHE_VERSION = str(globals().get('SCREEN_CACHE_VERSION', '')) + ':v136'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver136_version', YVER136_VERSION)
+except Exception:
+    pass
+try:
+    logger.info('yver136 loaded before main: fresh WR/C direct from latest matrix scores; Bybit 110126 required-agreement errors trigger permission hold/email and stop repeated live-open retries')
+except Exception:
+    pass
+# =========================================================
+# end yver136
 # =========================================================
 
 if __name__ == "__main__":
