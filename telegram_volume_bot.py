@@ -84559,6 +84559,582 @@ except Exception:
 # end yver139
 # =========================================================
 
+
+# =========================================================
+# yver140 — hard setup-email duplicate + current direction lock
+# =========================================================
+# Review 2026-06-24 ARX:
+# - The same ARX setup_id was emailed repeatedly within the 60m entry window.
+#   The direct AutoTrade pre-entry email sender bypassed the older setup-email
+#   duplicate lock, so the same delivered setup could be mailed again on each
+#   follow-up/retry tick.
+# - ARX was also a current Loser while the setup was BUY.  AutoTrade correctly
+#   rejected it with DIRECTION, but email/screen delivery could still expose it
+#   when the setup object did not carry enough current mover context.
+#
+# v140 fixes only delivery/visibility safeguards:
+# - one persistent pre-SMTP guard used by normal setup email and AutoTrade pre-entry
+#   email paths;
+# - exact setup_id + symbol/side + geometry duplicate suppression for the full
+#   setup-email cooldown;
+# - current Leaders/Losers snapshot check before setup email and /screen cards.
+#
+# No setup generation, matrix policy, AutoTrade order placement, TP/SL, leverage,
+# risk, sizing, drift, or blackout logic is changed.
+
+YVER140_VERSION = 'yver140_2026_06_24_email_dedup_direction_delivery_lock'
+
+
+def _yver140_email_cooldown_sec(session_name: str = '') -> float:
+    try:
+        h = float(email_setup_cooldown_hours_for_session(str(session_name or '')) or 0.0)
+    except Exception:
+        h = float(globals().get('EMAIL_SETUP_SYMBOL_COOLDOWN_HOURS', 3.0) or 3.0)
+    # Never allow sub-1h duplicate setup email loops; production default remains 3h.
+    return max(3600.0, min(24.0 * 3600.0, h * 3600.0))
+
+
+def _yver140_setup_sid(s) -> str:
+    try:
+        return str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+    except Exception:
+        return ''
+
+
+def _yver140_setup_symbol_side(s) -> tuple[str, str]:
+    try:
+        sym = str(_bybit_linear_symbol(getattr(s, 'symbol', '') or getattr(s, 'market_symbol', '') or '') or '').upper().strip()
+    except Exception:
+        sym = str(getattr(s, 'symbol', '') or getattr(s, 'market_symbol', '') or '').upper().strip()
+    return sym, str(getattr(s, 'side', '') or '').upper().strip()
+
+
+def _yver140_setup_level_key(s) -> str:
+    try:
+        sym, side = _yver140_setup_symbol_side(s)
+        e = round(float(getattr(s, 'entry', 0.0) or 0.0), 8)
+        sl = round(float(getattr(s, 'sl', 0.0) or 0.0), 8)
+        tp = round(float(_setup_target_tp(s, 0.0) or 0.0), 8)
+        return f'{sym}|{side}|{e:.8f}|{sl:.8f}|{tp:.8f}'
+    except Exception:
+        try:
+            sym, side = _yver140_setup_symbol_side(s)
+            return f'{sym}|{side}'
+        except Exception:
+            return ''
+
+
+def _yver140_email_scope_uid(uid: int = 0) -> int:
+    """Collapse owner/admin paths to one duplicate scope so parallel senders cannot race."""
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    try:
+        owner = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+    except Exception:
+        owner = 0
+    try:
+        if owner > 0 and (uid_i == owner or is_admin_user(uid_i)):
+            return owner
+    except Exception:
+        pass
+    return uid_i if uid_i > 0 else owner
+
+
+def _yver140_email_guard_keys(uid: int, session_name: str, s) -> list[str]:
+    scope = _yver140_email_scope_uid(uid)
+    sid = _yver140_setup_sid(s)
+    sym, side = _yver140_setup_symbol_side(s)
+    lvl = _yver140_setup_level_key(s)
+    keys = []
+    # Exact delivered setup: never email the same setup_id twice inside cooldown.
+    if sid:
+        keys.append(f'{scope}|sid|{sid}')
+    # Owner-requested behaviour: same symbol+side setup emails obey cooldown even if
+    # a fresh setup_id is reconstructed by a retry/screen/pre-entry path.
+    if sym and side:
+        keys.append(f'{scope}|sym_side|{sym}|{side}')
+    if lvl:
+        keys.append(f'{scope}|levels|{lvl}')
+    return list(dict.fromkeys(keys))
+
+
+
+_YVER140_ACTIVE_EMAIL_LOCK_KEYS = set()
+
+
+def _yver140_keys_for_setup_list(uid: int, session_name: str, setups: list) -> set[str]:
+    keys = set()
+    for _s in list(setups or []):
+        try:
+            keys.update(_yver140_email_guard_keys(int(uid or 0), str(session_name or ''), _s))
+        except Exception:
+            continue
+    return keys
+
+
+def _yver140_ensure_email_guard_table(conn) -> None:
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS setup_email_send_locks_v140 (
+        scope_uid INTEGER NOT NULL,
+        guard_key TEXT NOT NULL,
+        user_id INTEGER NOT NULL DEFAULT 0,
+        setup_id TEXT NOT NULL DEFAULT '',
+        symbol TEXT NOT NULL DEFAULT '',
+        side TEXT NOT NULL DEFAULT '',
+        session TEXT NOT NULL DEFAULT '',
+        locked_ts REAL NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'sending',
+        note TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(scope_uid, guard_key)
+    )""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_setup_email_send_locks_v140_ts ON setup_email_send_locks_v140(locked_ts)")
+
+
+def _yver140_recent_email_db_exists(uid: int, session_name: str, s, cooldown_sec: float | None = None) -> tuple[bool, str]:
+    """Fast duplicate check before SMTP.  Uses exact id, symbol-side, old cooldown table and v140 lock table."""
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    sess = str(session_name or '').upper().strip()
+    sid = _yver140_setup_sid(s)
+    sym, side = _yver140_setup_symbol_side(s)
+    cooldown = float(cooldown_sec if cooldown_sec is not None else _yver140_email_cooldown_sec(sess))
+    now_ts = float(time.time())
+    cutoff = max(now_ts - cooldown, float(_autotrade_cooldown_reset_ts() or 0.0))
+
+    # Existing exact setup-id check.
+    try:
+        if sid and db_has_emailed_setup(int(uid_i), sid, lookback_hours=max(1, int(math.ceil(cooldown / 3600.0)))):
+            return True, 'duplicate_exact_setup_id'
+    except Exception:
+        pass
+    try:
+        if callable(globals().get('_yver133_recent_email_exists')) and sid:
+            # Avoid recursion if this function is being called from the wrapper below.
+            orig = globals().get('_YVER140_ORIG_YVER133_RECENT_EMAIL_EXISTS')
+            if callable(orig) and bool(orig(int(uid_i), s, max_age_sec=cooldown)):
+                return True, 'duplicate_recent_preentry_email'
+    except Exception:
+        pass
+    # Existing symbol-side cooldown table + emailed_setups/signals scan.
+    try:
+        if sym and side and _email_symbol_recently_sent(int(uid_i), sym, side, sess, setup_id=sid):
+            return True, 'duplicate_symbol_side_cooldown'
+    except Exception:
+        pass
+
+    # v140 persistent lock table catches direct send_email paths and concurrent races.
+    try:
+        scope = _yver140_email_scope_uid(uid_i)
+        keys = _yver140_email_guard_keys(uid_i, sess, s)
+        if scope > 0 and keys:
+            with sqlite3.connect(DB_PATH, timeout=15) as conn:
+                _yver140_ensure_email_guard_table(conn)
+                q = ','.join(['?'] * len(keys))
+                rows = conn.execute(
+                    f"SELECT guard_key,status,locked_ts FROM setup_email_send_locks_v140 WHERE scope_uid=? AND guard_key IN ({q}) AND locked_ts>=? ORDER BY locked_ts DESC LIMIT 8",
+                    tuple([int(scope)] + keys + [float(cutoff)]),
+                ).fetchall() or []
+                active_keys = set(globals().get('_YVER140_ACTIVE_EMAIL_LOCK_KEYS') or set())
+                for row in rows:
+                    gkey = str(row[0] if row else '')
+                    if gkey and gkey in active_keys:
+                        continue
+                    return True, f'duplicate_v140_lock:{str(row[1] if len(row) > 1 else "sent")}'
+    except Exception:
+        pass
+    return False, ''
+
+
+def _yver140_acquire_email_send_locks(uid: int, session_name: str, setups: list, note: str = '') -> tuple[list, list[dict]]:
+    uid_i = int(uid or 0)
+    sess = str(session_name or '').upper().strip()
+    cooldown = _yver140_email_cooldown_sec(sess)
+    now_ts = float(time.time())
+    cutoff = max(now_ts - cooldown, float(_autotrade_cooldown_reset_ts() or 0.0))
+    kept = []
+    skipped = []
+    scope = _yver140_email_scope_uid(uid_i)
+    if scope <= 0 or not setups:
+        return list(setups or []), []
+    try:
+        with sqlite3.connect(DB_PATH, timeout=20) as conn:
+            _yver140_ensure_email_guard_table(conn)
+            cur = conn.cursor()
+            try:
+                cur.execute("DELETE FROM setup_email_send_locks_v140 WHERE locked_ts < ?", (float(cutoff),))
+            except Exception:
+                pass
+            conn.commit()
+            for s in list(setups or []):
+                sid = _yver140_setup_sid(s)
+                sym, side = _yver140_setup_symbol_side(s)
+                recent, recent_why = _yver140_recent_email_db_exists(uid_i, sess, s, cooldown_sec=cooldown)
+                if recent:
+                    skipped.append({'setup_id': sid, 'symbol': sym, 'side': side, 'reason': recent_why or 'duplicate_recent_email'})
+                    continue
+                keys = _yver140_email_guard_keys(uid_i, sess, s)
+                if not keys:
+                    kept.append(s)
+                    continue
+                acquired = []
+                conflict = ''
+                for key in keys:
+                    try:
+                        cur.execute(
+                            "INSERT OR IGNORE INTO setup_email_send_locks_v140(scope_uid,guard_key,user_id,setup_id,symbol,side,session,locked_ts,status,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (int(scope), str(key), int(uid_i), sid, sym, side, sess, now_ts, 'sending', str(note or '')[:200]),
+                        )
+                        if int(cur.rowcount or 0) > 0:
+                            acquired.append(key)
+                        else:
+                            conflict = key
+                            break
+                    except Exception as exc:
+                        conflict = f'lock_error:{type(exc).__name__}'
+                        break
+                if conflict:
+                    # Roll back partial keys for this candidate only.
+                    for key in acquired:
+                        try:
+                            cur.execute("DELETE FROM setup_email_send_locks_v140 WHERE scope_uid=? AND guard_key=? AND status='sending'", (int(scope), str(key)))
+                        except Exception:
+                            pass
+                    skipped.append({'setup_id': sid, 'symbol': sym, 'side': side, 'reason': f'duplicate_lock:{conflict}'})
+                    continue
+                kept.append(s)
+            conn.commit()
+    except Exception as exc:
+        # Fail safe for user experience: if lock DB itself errors, fall back to old gates.
+        try:
+            logger.warning('yver140 email lock acquire failed: %s: %s', type(exc).__name__, exc)
+        except Exception:
+            pass
+        return list(setups or []), []
+    return kept, skipped
+
+
+def _yver140_release_email_send_locks(uid: int, session_name: str, setups: list, sent: bool, note: str = '') -> None:
+    try:
+        uid_i = int(uid or 0)
+        scope = _yver140_email_scope_uid(uid_i)
+        if scope <= 0:
+            return
+        sess = str(session_name or '').upper().strip()
+        now_ts = float(time.time())
+        with sqlite3.connect(DB_PATH, timeout=15) as conn:
+            _yver140_ensure_email_guard_table(conn)
+            cur = conn.cursor()
+            for s in list(setups or []):
+                for key in _yver140_email_guard_keys(uid_i, sess, s):
+                    try:
+                        if sent:
+                            cur.execute(
+                                "UPDATE setup_email_send_locks_v140 SET locked_ts=?, status='sent', note=? WHERE scope_uid=? AND guard_key=?",
+                                (now_ts, str(note or 'sent')[:200], int(scope), str(key)),
+                            )
+                        else:
+                            cur.execute("DELETE FROM setup_email_send_locks_v140 WHERE scope_uid=? AND guard_key=? AND status='sending'", (int(scope), str(key)))
+                    except Exception:
+                        continue
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _yver140_row_symbol(row) -> str:
+    try:
+        if isinstance(row, dict):
+            return _symbol_base(str(row.get('symbol') or row.get('market_symbol') or row.get('sym') or '')).upper().strip()
+        return _symbol_base(str(getattr(row, 'symbol', '') or getattr(row, 'market_symbol', '') or '')).upper().strip()
+    except Exception:
+        return ''
+
+
+def _yver140_extract_mover_set(items) -> set[str]:
+    out = set()
+    for it in list(items or []):
+        try:
+            if isinstance(it, str):
+                sym = it
+            elif isinstance(it, dict):
+                sym = it.get('symbol') or it.get('sym') or it.get('base') or ''
+            else:
+                sym = getattr(it, 'symbol', '') or getattr(it, 'sym', '') or ''
+            base = _symbol_base(str(sym or '')).upper().strip()
+            if base:
+                out.add(base)
+        except Exception:
+            continue
+    return out
+
+
+def _yver140_current_direction_guard_allows(setup_or_row, session_name: str = '', best_fut: dict | None = None) -> tuple[bool, str, dict]:
+    """Fail-closed delivery check using current leaders/losers, not only setup attrs."""
+    meta = {}
+    try:
+        if not bool(globals().get('DIRECTIONAL_CONTEXT_GUARD_ENABLED', True)):
+            return True, 'direction_guard_disabled', meta
+        side = str(_autotrade_setup_attr(setup_or_row, 'side', '') or '').upper().strip()
+        sym = _symbol_base(str(_autotrade_setup_attr(setup_or_row, 'symbol', '') or _autotrade_setup_attr(setup_or_row, 'market_symbol', '') or '')).upper().strip()
+        if side not in {'BUY', 'SELL'} or not sym:
+            return True, 'direction_guard_missing_symbol_side', meta
+        # First keep the existing guard.  It may already block when setup carries ch24/ch4.
+        try:
+            ok0, why0, meta0 = _setup_directional_context_guard_allows_setup(setup_or_row, session_name=session_name, user_id=int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+            meta.update(dict(meta0 or {}))
+            if not ok0:
+                return False, str(why0 or 'directional_context_blocked'), meta
+        except Exception as exc:
+            meta['orig_direction_guard_error'] = f'{type(exc).__name__}: {exc}'
+
+        bf = best_fut or {}
+        if not bf:
+            try:
+                fn = globals().get('get_cached_futures_tickers')
+                if callable(fn):
+                    bf = fn() or {}
+            except Exception:
+                bf = {}
+        leaders = []
+        losers = []
+        try:
+            leaders, losers = compute_directional_lists(bf or {})
+        except Exception as exc:
+            meta['compute_directional_lists_error'] = f'{type(exc).__name__}: {exc}'
+        leader_set = _yver140_extract_mover_set(leaders)
+        loser_set = _yver140_extract_mover_set(losers)
+        meta.update({'yver140_current_leader': sym in leader_set, 'yver140_current_loser': sym in loser_set, 'yver140_symbol': sym, 'yver140_side': side})
+        if side == 'SELL' and sym in leader_set:
+            return False, f'directional_context_blocks_sell_current_leader:{sym}', meta
+        if side == 'BUY' and sym in loser_set:
+            return False, f'directional_context_blocks_buy_current_loser:{sym}', meta
+    except Exception as exc:
+        meta['yver140_direction_guard_error'] = f'{type(exc).__name__}: {exc}'
+        # Delivery must not expose a row when the direction safety check itself fails.
+        return False, f'direction_guard_exception:{type(exc).__name__}', meta
+    return True, 'direction_guard_ok', meta
+
+
+try:
+    _YVER140_ORIG_YVER133_RECENT_EMAIL_EXISTS = _yver133_recent_email_exists
+except Exception:
+    _YVER140_ORIG_YVER133_RECENT_EMAIL_EXISTS = None
+
+
+def _yver133_recent_email_exists(uid: int, s, max_age_sec: float | None = None) -> bool:
+    try:
+        if callable(_YVER140_ORIG_YVER133_RECENT_EMAIL_EXISTS) and bool(_YVER140_ORIG_YVER133_RECENT_EMAIL_EXISTS(uid, s, max_age_sec=max_age_sec)):
+            return True
+    except Exception:
+        pass
+    try:
+        sess = str(getattr(s, 'source_session', '') or getattr(s, 'session', '') or '').upper().strip()
+        cooldown = float(max_age_sec if max_age_sec is not None else _yver140_email_cooldown_sec(sess))
+        recent, _why = _yver140_recent_email_db_exists(int(uid or 0), sess, s, cooldown_sec=cooldown)
+        return bool(recent)
+    except Exception:
+        return False
+
+
+try:
+    _YVER140_ORIG_SETUP_EMAIL_PRESEND_FILTER = _setup_email_presend_executable_filter
+except Exception:
+    _YVER140_ORIG_SETUP_EMAIL_PRESEND_FILTER = None
+
+
+def _setup_email_presend_executable_filter(user_id: int, session_name: str, setups: list, lane: str = 'email') -> tuple[list, Counter]:
+    # Keep the old executable/policy gate, then add current-direction and duplicate checks.
+    if callable(_YVER140_ORIG_SETUP_EMAIL_PRESEND_FILTER):
+        base, reasons = _YVER140_ORIG_SETUP_EMAIL_PRESEND_FILTER(user_id, session_name, setups, lane=lane)
+    else:
+        base, reasons = list(setups or []), Counter()
+    reasons = Counter(reasons or {})
+    out = []
+    sess = str(session_name or '').upper().strip()
+    try:
+        best = _yver133_best_fut_fast() if callable(globals().get('_yver133_best_fut_fast')) else {}
+    except Exception:
+        best = {}
+    for s in list(base or []):
+        try:
+            ok_dir, why_dir, meta_dir = _yver140_current_direction_guard_allows(s, session_name=sess, best_fut=best)
+            if not ok_dir:
+                reasons[str(why_dir or 'direction_block')] += 1
+                try:
+                    db_log_setup_pipeline_event(int(user_id or 0), stage='yver140_presend_direction_guard', status='skip', session=sess, mode=str(lane or 'email'), setup_id=_yver140_setup_sid(s), symbol=_yver140_setup_symbol_side(s)[0], side=_yver140_setup_symbol_side(s)[1], details={'reason': str(why_dir or ''), 'meta': dict(meta_dir or {})})
+                except Exception:
+                    pass
+                continue
+            recent, why_dup = _yver140_recent_email_db_exists(int(user_id or 0), sess, s)
+            if recent:
+                reasons[str(why_dup or 'duplicate_recent_email')] += 1
+                continue
+            out.append(s)
+        except Exception as exc:
+            reasons[f'yver140_presend_exception:{type(exc).__name__}'] += 1
+            continue
+    return out, reasons
+
+
+try:
+    _YVER140_ORIG_SEND_EMAIL_ALERT_MULTI = send_email_alert_multi
+except Exception:
+    _YVER140_ORIG_SEND_EMAIL_ALERT_MULTI = None
+
+
+def send_email_alert_multi(user: dict, sess: dict, setups: List[Setup], best_fut) -> bool:
+    """v140 wrapper: all normal setup emails obey current direction and persistent duplicate locks."""
+    if not callable(_YVER140_ORIG_SEND_EMAIL_ALERT_MULTI):
+        return False
+    try:
+        uid = int((user or {}).get('user_id') or 0)
+    except Exception:
+        uid = 0
+    session_name = str((sess or {}).get('name') or '').upper().strip()
+    candidates = []
+    skipped = []
+    for s in list(setups or []):
+        ok_dir, why_dir, meta_dir = _yver140_current_direction_guard_allows(s, session_name=session_name, best_fut=best_fut or {})
+        if not ok_dir:
+            skipped.append({'setup_id': _yver140_setup_sid(s), 'symbol': _yver140_setup_symbol_side(s)[0], 'side': _yver140_setup_symbol_side(s)[1], 'reason': why_dir})
+            continue
+        candidates.append(s)
+    kept, lock_skipped = _yver140_acquire_email_send_locks(uid, session_name, candidates, note='normal_setup_email')
+    skipped.extend(lock_skipped or [])
+    if skipped:
+        try:
+            db_log_setup_pipeline_event(int(uid or 0), stage='yver140_email_delivery_guard', status='skip_some' if kept else 'empty', session=session_name, mode='email', details={'skipped': skipped[:12], 'input': len(list(setups or [])), 'kept': len(kept)})
+        except Exception:
+            pass
+    if not kept:
+        try:
+            tz, _ = _zoneinfo_or_default((user or {}).get('tz') or (user or {}).get('timezone'))
+            _LAST_EMAIL_DECISION[int(uid or 0)] = {'status': 'SKIP', 'picked': '-', 'when': datetime.now(tz).isoformat(timespec='seconds'), 'reasons': ['yver140_duplicate_or_direction_guard', str(skipped[:4])[:240]]}
+        except Exception:
+            pass
+        return False
+    sent = False
+    active_keys = _yver140_keys_for_setup_list(uid, session_name, kept)
+    try:
+        globals().setdefault('_YVER140_ACTIVE_EMAIL_LOCK_KEYS', set()).update(active_keys)
+        sent = bool(_YVER140_ORIG_SEND_EMAIL_ALERT_MULTI(user, sess, list(kept or []), best_fut))
+        return sent
+    finally:
+        try:
+            globals().setdefault('_YVER140_ACTIVE_EMAIL_LOCK_KEYS', set()).difference_update(active_keys)
+        except Exception:
+            pass
+        _yver140_release_email_send_locks(uid, session_name, kept, bool(sent), note='normal_setup_email_sent' if sent else 'normal_setup_email_failed')
+
+
+try:
+    _YVER140_ORIG_YVER133_SEND_PREENTRY_SETUP_EMAIL = _yver133_send_preentry_setup_email
+except Exception:
+    _YVER140_ORIG_YVER133_SEND_PREENTRY_SETUP_EMAIL = None
+
+
+def _yver133_send_preentry_setup_email(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    """v140: direct AutoTrade pre-entry email also obeys duplicate + current direction guards."""
+    if not callable(_YVER140_ORIG_YVER133_SEND_PREENTRY_SETUP_EMAIL):
+        return False, 'preentry_email_sender_missing'
+    uid_i = int(uid or 0)
+    sess = str(session_label or '').upper().strip()
+    try:
+        best = _yver133_best_fut_fast() if callable(globals().get('_yver133_best_fut_fast')) else {}
+    except Exception:
+        best = {}
+    candidates = []
+    skipped = []
+    for s in list(setups or []):
+        ok_dir, why_dir, meta_dir = _yver140_current_direction_guard_allows(s, session_name=sess, best_fut=best)
+        if not ok_dir:
+            skipped.append({'setup_id': _yver140_setup_sid(s), 'symbol': _yver140_setup_symbol_side(s)[0], 'side': _yver140_setup_symbol_side(s)[1], 'reason': why_dir})
+            try:
+                db_log_setup_pipeline_event(uid_i, stage='yver140_preentry_direction_guard', status='skip', session=sess, mode='autotrade', setup_id=_yver140_setup_sid(s), symbol=_yver140_setup_symbol_side(s)[0], side=_yver140_setup_symbol_side(s)[1], details={'reason': str(why_dir or ''), 'meta': dict(meta_dir or {})})
+            except Exception:
+                pass
+            continue
+        candidates.append(s)
+    if skipped and not candidates:
+        return False, str((skipped[0] or {}).get('reason') or 'direction_guard_blocked')
+    kept, lock_skipped = _yver140_acquire_email_send_locks(uid_i, sess, candidates, note='autotrade_preentry_email')
+    if lock_skipped and not kept:
+        # Already delivered or in-flight. Do not send another email; allow AutoTrade
+        # to continue only if the exact recent email gate can see the delivery.
+        try:
+            for s in list(candidates or []):
+                if _yver133_recent_email_exists(uid_i, s, max_age_sec=_yver140_email_cooldown_sec(sess)):
+                    return True, 'already_recently_emailed'
+        except Exception:
+            pass
+        return True, 'duplicate_preentry_email_suppressed'
+    ok = False
+    why = ''
+    active_keys = _yver140_keys_for_setup_list(uid_i, sess, kept)
+    try:
+        globals().setdefault('_YVER140_ACTIVE_EMAIL_LOCK_KEYS', set()).update(active_keys)
+        ok, why = _YVER140_ORIG_YVER133_SEND_PREENTRY_SETUP_EMAIL(uid_i, sess, list(kept or []))
+        return bool(ok), str(why or ('sent' if ok else 'setup_email_failed'))
+    finally:
+        try:
+            globals().setdefault('_YVER140_ACTIVE_EMAIL_LOCK_KEYS', set()).difference_update(active_keys)
+        except Exception:
+            pass
+        _yver140_release_email_send_locks(uid_i, sess, kept, bool(ok), note='autotrade_preentry_email_sent' if ok else 'autotrade_preentry_email_failed')
+
+
+try:
+    _YVER140_ORIG_SCREEN_FORMAT_SETUP_CARDS = _screen_format_setup_cards
+except Exception:
+    _YVER140_ORIG_SCREEN_FORMAT_SETUP_CARDS = None
+
+
+def _screen_format_setup_cards(setups: list, uid: int, session: str) -> str:
+    """v140: /screen cards cannot show current Leader->SELL or Loser->BUY rows."""
+    filtered = []
+    try:
+        best = _yver133_best_fut_fast() if callable(globals().get('_yver133_best_fut_fast')) else {}
+    except Exception:
+        best = {}
+    for s in list(setups or []):
+        try:
+            ok_dir, why_dir, meta_dir = _yver140_current_direction_guard_allows(s, session_name=str(session or ''), best_fut=best)
+            if ok_dir:
+                filtered.append(s)
+            else:
+                try:
+                    db_log_setup_pipeline_event(int(uid or 0), stage='yver140_screen_direction_guard', status='skip', session=str(session or ''), mode='screen', setup_id=_yver140_setup_sid(s), symbol=_yver140_setup_symbol_side(s)[0], side=_yver140_setup_symbol_side(s)[1], details={'reason': str(why_dir or ''), 'meta': dict(meta_dir or {})})
+                except Exception:
+                    pass
+        except Exception:
+            filtered.append(s)
+    if callable(_YVER140_ORIG_SCREEN_FORMAT_SETUP_CARDS):
+        return _YVER140_ORIG_SCREEN_FORMAT_SETUP_CARDS(list(filtered or []), uid, session)
+    return '_No high-quality setups right now._'
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v140_email_dedup_direction'
+    SETUP_AUDIT_CACHE_VERSION = 'v140'
+    SCREEN_CACHE_VERSION = str(globals().get('SCREEN_CACHE_VERSION', '')) + ':v140_direction_email_dedup'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver140_version', YVER140_VERSION)
+except Exception:
+    pass
+try:
+    logger.info('yver140 loaded before main: hard duplicate setup-email lock across normal/preentry paths and current Leaders/Losers direction guard before email/screen; no order/risk/TP/SL changes')
+except Exception:
+    pass
+# =========================================================
+# end yver140
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
