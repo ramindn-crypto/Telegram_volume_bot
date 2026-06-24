@@ -1,3 +1,4 @@
+# yver135: fixes WR/O to use one stable lane WR snapshot per Melbourne setup hour so same combo setups generated close together show the same WR/O, and keeps shadow executable/audit generation running before setup-email caps/gaps/blackouts can stop delivery. No TP/SL, leverage, sizing, drift, risk, or Bybit order geometry changed.
 # yver134: hard-locks /screen setup visibility to a 60-minute window with max 4 newest cards, keeps WR/O causal to the latest setup_matrix WR at-or-before setup generation time, and makes AutoTrade pre-entry setup-email sync obey the user email/session/cap config before any live entry. No TP/SL, leverage, sizing, drift, blackout, or order geometry changed.
 # yver86: disables v85 automatic 24h self-block for Bybit trading-terms/permission errors, clears existing CL-style permission blocks, records a manual-acceptance notice instead, and adds lightweight setup-activity diagnostics. Bybit V5 exposes 110125 as an order rejection; no documented API endpoint is used to auto-accept legal trading terms. No TP/SL, leverage, setup generation, blackout, or order sizing logic changed.
 # yver78: makes the owner-selected AutoTrade runtime profile editable again; applies one-time defaults risk=1%, open risk cap=8%, daily risk cap=10%, max trades/day=100, then stops the yver76 recurring force from overwriting /autotrade_config edits. No TP/SL, leverage, blackout, setup generation, or Bybit order logic changed.
@@ -63112,6 +63113,67 @@ async def _alert_job_async_internal(context: ContextTypes.DEFAULT_TYPE):
                         pass
 
         # -----------------------------------------------------
+        # v135 shadow/audit persistence BEFORE email caps/gaps
+        # -----------------------------------------------------
+        # Email caps, daily caps, session caps, gap timers and delivery blackout must
+        # stop only delivery and AutoTrade entry. They must not stop setup discovery,
+        # executable-lane persistence, or /setup_audit learning. Older builds only
+        # persisted the owner executable queue inside the per-user email-send branch,
+        # so once an email cap/gap was hit the audit/executable lane could look frozen.
+        try:
+            _shadow_owner_uid = int(owner_uid_for_email or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        except Exception:
+            _shadow_owner_uid = 0
+        try:
+            _shadow_targets = []
+            if _shadow_owner_uid > 0:
+                _shadow_targets.append(int(_shadow_owner_uid))
+            _shadow_targets.append(0)  # shared executable lane used by email pool fallback
+            _shadow_targets = list(dict.fromkeys([int(x) for x in _shadow_targets if int(x or 0) >= 0]))
+            for _shadow_sess_name, _shadow_setups in list((setups_by_session or {}).items()):
+                _shadow_sess_u = str(_shadow_sess_name or '').upper().strip()
+                _shadow_list = [s for s in list(_shadow_setups or []) if s is not None]
+                if not _shadow_sess_u or not _shadow_list:
+                    continue
+                for _shadow_uid in _shadow_targets:
+                    try:
+                        _st = _persist_executable_candidates(
+                            int(_shadow_uid),
+                            _shadow_sess_u,
+                            list(_shadow_list),
+                            source_kind='executable_setups',
+                            mode='shadow_generation_pre_email_caps',
+                        )
+                        db_log_setup_pipeline_event(
+                            int(_shadow_uid),
+                            stage='shadow_generation_pre_email_caps',
+                            status='ok',
+                            session=_shadow_sess_u,
+                            mode='shadow',
+                            details={'setups': len(_shadow_list), 'persisted': int((_st or {}).get('persisted') or 0), 'attempted': int((_st or {}).get('attempted') or 0)},
+                        )
+                    except Exception as _shadow_exc:
+                        try:
+                            db_log_setup_pipeline_event(
+                                int(_shadow_uid),
+                                stage='shadow_generation_pre_email_caps',
+                                status='error',
+                                session=_shadow_sess_u,
+                                mode='shadow',
+                                details={'error': f'{type(_shadow_exc).__name__}: {_shadow_exc}', 'setups': len(_shadow_list)},
+                            )
+                        except Exception:
+                            pass
+                if _shadow_owner_uid > 0:
+                    for _shadow_s in _shadow_list:
+                        try:
+                            db_log_generated_setup(int(_shadow_owner_uid), 'shadow', _shadow_sess_u, _shadow_s)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # -----------------------------------------------------
         # Per-user send / skip logic
         # -----------------------------------------------------
         try:
@@ -83159,6 +83221,210 @@ except Exception:
     pass
 # =========================================================
 # end yver134
+# =========================================================
+
+
+
+# =========================================================
+# yver135 — stable WR/O hour snapshot + shadow generation before email caps
+# =========================================================
+# Owner fixes:
+# 1) WR/O must not jump between same-combo setups opened a few minutes apart.
+#    It now uses one stable lane snapshot per Melbourne setup hour. All rows for
+#    the same combo inside the same Melbourne hour use the same WR/O value.
+# 2) Setup discovery/audit persistence must continue even when setup-email delivery
+#    is stopped by user config, gap, daily/session cap, or blackout. Delivery and
+#    AutoTrade still obey those gates; shadow/audit learning does not.
+YVER135_VERSION = 'yver135_2026_06_24_wr_open_hour_snapshot_shadow_before_email_caps'
+YVER135_WR_OPEN_BUCKET_MIN = int(os.environ.get('YVER135_WR_OPEN_BUCKET_MIN', '60') or 60)
+YVER135_WR_OPEN_BEFORE_MAX_AGE_SEC = float(os.environ.get('YVER135_WR_OPEN_BEFORE_MAX_AGE_SEC', '21600') or 21600)
+YVER135_WR_OPEN_AFTER_BUCKET_GRACE_SEC = float(os.environ.get('YVER135_WR_OPEN_AFTER_BUCKET_GRACE_SEC', '0') or 0)
+
+
+def _yver135_combo_fallback_keys(combo: str) -> list[str]:
+    try:
+        c = str(combo or '').upper().strip()
+        keys = []
+        if c:
+            keys.append(c)
+        parts = [x for x in c.split('-') if x]
+        if len(parts) >= 3:
+            keys.append('-'.join(parts[:3]))
+        if len(parts) >= 2:
+            keys.append('-'.join(parts[:2]))
+        return list(dict.fromkeys([k for k in keys if k]))
+    except Exception:
+        return [str(combo or '').upper().strip()]
+
+
+def _yver135_bucket_start_ts(setup_ts: float) -> float:
+    try:
+        ts = float(setup_ts or 0.0)
+        if ts <= 0:
+            return 0.0
+        bucket_min = max(5, int(globals().get('YVER135_WR_OPEN_BUCKET_MIN', 60) or 60))
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+        minute = (int(dt.minute) // bucket_min) * bucket_min if bucket_min < 60 else 0
+        bdt = dt.replace(minute=minute, second=0, microsecond=0)
+        return float(bdt.astimezone(timezone.utc).timestamp())
+    except Exception:
+        try:
+            return math.floor(float(setup_ts or 0.0) / 3600.0) * 3600.0
+        except Exception:
+            return 0.0
+
+
+def _yver135_build_wr_snapshot_data(uid: int = 0, start_ts: float = 0.0) -> dict:
+    data: dict[str, list[tuple[float, int, float, int, str]]] = {}
+    try:
+        _setup_combo_policy_migrate()
+    except Exception:
+        pass
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(uid or owner_uid or 0)
+        ids = list(dict.fromkeys([int(x) for x in [uid_i, 0] if int(x or 0) >= 0])) or [0]
+        qmarks = ','.join(['?'] * len(ids))
+        min_ts = float(start_ts or 0.0)
+        if min_ts > 0:
+            min_ts = max(0.0, min_ts - 14.0 * 86400.0)
+        now_ts = float(time.time()) + 600.0
+        row_map = {}
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            rows = cur.execute(
+                f"""SELECT run_id,evaluated_ts,user_id,combo,family,session,strategy,side,decided,win_rate
+                    FROM setup_combo_scores
+                    WHERE user_id IN ({qmarks}) AND COALESCE(evaluated_ts,0)>=? AND COALESCE(evaluated_ts,0)<=?
+                    ORDER BY evaluated_ts ASC, user_id ASC""",
+                tuple(list(ids) + [float(min_ts), float(now_ts)]),
+            ).fetchall() or []
+            for sr in rows:
+                d = dict(sr)
+                ts = float(d.get('evaluated_ts') or 0.0)
+                if ts <= 0:
+                    continue
+                fam = str(d.get('family') or '').upper().strip()
+                sess = str(d.get('session') or '').upper().strip()
+                strat = _setup_strategy_suffix(value=str(d.get('strategy') or 'NOR'))
+                side = _setup_side_suffix(value=str(d.get('side') or 'BOTH'))
+                combo = str(d.get('combo') or '').upper().strip()
+                if not combo and fam and sess:
+                    combo = _setup_combo_strategy_side_key(fam, sess, strat, side) if side in {'BUY', 'SELL'} else _setup_combo_strategy_key(fam, sess, strat)
+                if not combo:
+                    continue
+                dec = int(float(d.get('decided') or 0.0))
+                wr = float(d.get('win_rate') or 0.0)
+                uid_row = int(d.get('user_id') or 0)
+                run_id = str(d.get('run_id') or '')
+                old = row_map.get((combo, ts))
+                # Prefer owner/user-specific score over global at the same timestamp.
+                if old is None or (uid_row == uid_i and int(old[3] or 0) != uid_i):
+                    row_map[(combo, ts)] = (ts, dec, wr, uid_row, run_id)
+        for combo, ts in sorted(row_map.keys(), key=lambda k: (k[0], k[1])):
+            data.setdefault(str(combo).upper().strip(), []).append(row_map[(combo, ts)])
+        for combo in list(data.keys()):
+            data[combo] = sorted(data.get(combo) or [], key=lambda x: float(x[0] or 0.0))
+    except Exception:
+        data = {}
+    return data
+
+
+def _yver135_wr_lookup_from_data(data: dict):
+    bucket_cache: dict[tuple[str, float], str] = {}
+
+    def _fmt(dec, wr) -> str:
+        try:
+            if int(dec or 0) <= 0:
+                return '-'
+            return f"{float(wr or 0.0):.1f}%"
+        except Exception:
+            return '-'
+
+    def _lookup(combo: str, setup_ts: float) -> str:
+        try:
+            ts = float(setup_ts or 0.0)
+            if ts <= 0:
+                return '-'
+            bucket_start = float(_yver135_bucket_start_ts(ts) or 0.0)
+            bucket_min = max(5, int(globals().get('YVER135_WR_OPEN_BUCKET_MIN', 60) or 60))
+            bucket_end = bucket_start + float(bucket_min) * 60.0
+            after_grace = max(0.0, float(globals().get('YVER135_WR_OPEN_AFTER_BUCKET_GRACE_SEC', 0.0) or 0.0))
+            before_max_age = float(globals().get('YVER135_WR_OPEN_BEFORE_MAX_AGE_SEC', 21600.0) or 21600.0)
+            import bisect as _bisect
+            for key in _yver135_combo_fallback_keys(combo):
+                key_u = str(key or '').upper().strip()
+                if not key_u:
+                    continue
+                ckey = (key_u, bucket_start)
+                if ckey in bucket_cache:
+                    val = str(bucket_cache.get(ckey) or '-')
+                    if val != '-':
+                        return val
+                    continue
+                arr = list(data.get(key_u) or [])
+                if not arr:
+                    bucket_cache[ckey] = '-'
+                    continue
+                ts_list = [float(x[0] or 0.0) for x in arr]
+                # Stable bucket rule: all same-combo setups in the same Melbourne
+                # bucket use the same score, chosen as the latest score available
+                # by the bucket close. This prevents per-symbol/per-row matrix writes
+                # from producing different WR/O for setups generated minutes apart.
+                idx = _bisect.bisect_right(ts_list, bucket_end + after_grace) - 1
+                chosen = None
+                if idx >= 0:
+                    cand = arr[idx]
+                    cts = float(cand[0] or 0.0)
+                    if cts >= bucket_start - before_max_age:
+                        chosen = cand
+                if chosen is None:
+                    # Fallback to latest score before the actual setup timestamp.
+                    idx2 = _bisect.bisect_right(ts_list, ts) - 1
+                    if idx2 >= 0:
+                        cand = arr[idx2]
+                        cts = float(cand[0] or 0.0)
+                        if before_max_age <= 0 or (ts - cts) <= before_max_age:
+                            chosen = cand
+                val = _fmt(chosen[1], chosen[2]) if chosen else '-'
+                bucket_cache[ckey] = val
+                if val != '-':
+                    return val
+            return '-'
+        except Exception:
+            return '-'
+    return _lookup
+
+
+def _yver131_wr_open_lookup(uid: int = 0, start_ts: float = 0.0):
+    """v135: WR/O is one stable lane-WR snapshot per Melbourne setup hour.
+
+    Same combo + same Melbourne hour => same WR/O. WR/C remains current/flexible.
+    """
+    return _yver135_wr_lookup_from_data(_yver135_build_wr_snapshot_data(int(uid or 0), float(start_ts or 0.0)))
+
+
+def _setup_open_times_historical_wr_lookup(uid: int = 0, start_ts: float = 0.0):
+    """v135: keep /setup_open_times WR aligned with setup_audit WR/O."""
+    return _yver135_wr_lookup_from_data(_yver135_build_wr_snapshot_data(int(uid or 0), float(start_ts or 0.0)))
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v135_wr_hour_shadow'
+    SETUP_AUDIT_CACHE_VERSION = 'v135'
+    SCREEN_CACHE_VERSION = str(globals().get('SCREEN_CACHE_VERSION', '')) + ':v135'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver135_version', YVER135_VERSION)
+except Exception:
+    pass
+try:
+    logger.info('yver135 loaded before main: WR/O stable per Melbourne setup hour; shadow audit/executable persistence runs before email caps/gaps; no order/risk/TP/SL changes')
+except Exception:
+    pass
+# =========================================================
+# end yver135
 # =========================================================
 
 if __name__ == "__main__":
