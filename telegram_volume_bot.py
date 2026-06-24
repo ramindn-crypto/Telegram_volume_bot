@@ -1,3 +1,4 @@
+# yver139: removes the v137 heavy emailed-setup audit backfill that could make /setup_audit slow/OOM on Render, replaces it with bounded in-memory emailed setup-id dedup/backfill, and reverts v138 extra scheduler instances to memory-safe single-instance scheduling. No setup/email/AutoTrade policy, TP/SL, risk, leverage, sizing, drift, or order logic changed.
 # yver138: scheduler-noise hardening after Render review: alert_job and autonomous_screen_sync_job allow a second lock-check instance so overlapping ticks exit quietly instead of APScheduler max_instances warnings; scan_intelligence misfire grace widened for Render pauses. No setup/email/AutoTrade policy, TP/SL, risk, leverage, sizing, or order logic changed.
 # yver137: guarantees every delivered/emailed setup is visible in /setup_audit by making emailed setup_ids audit-unique and backfilling audit rows from emailed_setups/signals/executable_setups when the normal deduped executable lane hides a later same-symbol setup. No TP/SL, leverage, sizing, drift, risk, policy, blackout, or Bybit order logic changed.
 # yver136: fixes WR/C display to read the freshest current /setup_matrix score snapshot (no stale policy cache) and treats Bybit 110126 required-agreement errors as permission-required holds with owner email alert/cooldown. No TP/SL, leverage, sizing, drift, risk, setup geometry, or order placement logic changed.
@@ -66127,10 +66128,9 @@ def main():
             first=max(10, min(int(AUTONOMOUS_SETUP_PIPELINE_FIRST_SEC or 20), interval_sec // 2)),
             name="alert_job",
             job_kwargs={
-                # yver138: allow one extra scheduler instance to enter and exit via
-                # ALERT_LOCK when the previous tick is still finishing. This removes
-                # noisy APScheduler max_instances warnings without allowing overlap.
-                "max_instances": 2,
+                # yver139: keep one scheduler instance only. The v138 value of 2
+                # reduced warning noise but could add memory pressure on Render.
+                "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 900,
             },
@@ -66152,10 +66152,9 @@ def main():
             first=max(30, min(int(AUTONOMOUS_SCREEN_SYNC_FIRST_SEC or 55), auto_screen_interval_sec // 2)),
             name="autonomous_screen_sync_job",
             job_kwargs={
-                # yver138: this job has _AUTONOMOUS_SCREEN_SYNC_LOCK inside, so a
-                # second scheduler instance only records/returns instead of running
-                # duplicate setup/email work. Prevents Render max_instances noise.
-                "max_instances": 2,
+                # yver139: memory-safe single instance. Screen sync already has an
+                # internal lock; do not allow an extra Python task on the 4GB worker.
+                "max_instances": 1,
                 "coalesce": True,
                 "misfire_grace_time": 1800,
             },
@@ -66293,7 +66292,9 @@ def main():
             job_kwargs={
                 "max_instances": 1,
                 "coalesce": True,
-                "misfire_grace_time": 120,
+                # yver139: Render pauses/network stalls can make guardian ticks late;
+                # coalesce quietly instead of piling up warnings.
+                "misfire_grace_time": 300,
             },
         )
 
@@ -84180,6 +84181,382 @@ except Exception:
     pass
 # =========================================================
 # end yver137
+# =========================================================
+
+
+# =========================================================
+# yver139 — Render memory/lag rollback for v137-v138 audit changes
+# =========================================================
+# Render review 2026-06-24:
+# - The instance exceeded the 4GB memory limit after v137/v138.
+# - The risky addition was the v137 emailed-setup audit backfill. It rebuilt audit
+#   rows from emailed_setups with wide joins/correlated lookups and also checked
+#   emailed_setups from inside the per-row dedup key. That made /setup_audit heavy
+#   and could keep a background rebuild alive long enough to slow Telegram polling.
+# - v138 also allowed an extra alert/screen-sync scheduler instance; revert to
+#   memory-safe single-instance scheduling above.
+#
+# Owner rule still preserved:
+#   Any emailed/delivered setup must be visible in /setup_audit.
+#
+# New approach:
+# - No wide email backfill query in normal /setup_audit.
+# - Load normal executable/generated rows with the pre-v137 loader, but with dedup
+#   disabled; then do a bounded, in-memory dedup.
+# - Recent emailed setup_ids are loaded once per short TTL and treated as unique
+#   by setup_id, so a later ETH email cannot be hidden by an older same-day ETH.
+# - A tiny direct executable/generated lookup is used only for emailed setup_ids
+#   missing from the normal row list. No signals fan-out, no wide cross joins.
+#
+# No setup generation, setup email, AutoTrade policy, TP/SL, risk, leverage,
+# sizing, drift, blackout, or Bybit order placement is changed.
+
+YVER139_VERSION = 'yver139_2026_06_24_lightweight_audit_visibility_no_oom'
+
+
+def _yver139_now() -> float:
+    try:
+        return float(time.time())
+    except Exception:
+        return 0.0
+
+
+def _yver139_uid_candidates(uid: int = 0) -> list[int]:
+    out = []
+    for x in (uid, globals().get('AUTOTRADE_OWNER_UID', 0), 0):
+        try:
+            xi = int(x or 0)
+            if xi >= 0 and xi not in out:
+                out.append(xi)
+        except Exception:
+            pass
+    return out or [int(uid or 0)]
+
+
+def _yver139_table_exists(conn, table: str) -> bool:
+    try:
+        return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (str(table),)).fetchone())
+    except Exception:
+        return False
+
+
+def _yver139_table_cols(conn, table: str) -> set[str]:
+    try:
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
+
+
+_YVER139_EMAIL_ID_CACHE = {'key': None, 'ts': 0.0, 'ids': set(), 'rows': {}}
+
+
+def _yver139_recent_emailed_ids(uid: int, cutoff: float = 0.0, max_rows: int = 240) -> tuple[set[str], dict[str, dict]]:
+    """Bounded emailed setup_id lookup for audit dedup.
+
+    This replaces the v137 per-row DB check and wide backfill query.  It reads only
+    setup_id/session/emailed_ts and caches the result briefly.
+    """
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    try:
+        cutoff_f = float(cutoff or 0.0)
+    except Exception:
+        cutoff_f = 0.0
+    try:
+        max_n = max(20, min(500, int(max_rows or 240)))
+    except Exception:
+        max_n = 240
+    key = (uid_i, int(cutoff_f // 60), int(max_n))
+    try:
+        cache = globals().setdefault('_YVER139_EMAIL_ID_CACHE', {'key': None, 'ts': 0.0, 'ids': set(), 'rows': {}})
+        if cache.get('key') == key and (_yver139_now() - float(cache.get('ts') or 0.0)) < 20.0:
+            return set(cache.get('ids') or set()), dict(cache.get('rows') or {})
+    except Exception:
+        pass
+    ids_set: set[str] = set()
+    meta: dict[str, dict] = {}
+    try:
+        ids = _yver139_uid_candidates(uid_i)
+        qids = ','.join(['?'] * len(ids))
+        params = list(ids)
+        where = f"user_id IN ({qids})"
+        if cutoff_f > 0:
+            where += " AND emailed_ts>=?"
+            params.append(float(cutoff_f))
+        params.append(int(max_n))
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            if not _yver139_table_exists(conn, 'emailed_setups'):
+                return set(), {}
+            rows = conn.execute(
+                f"""
+                SELECT user_id, setup_id, session, emailed_ts
+                  FROM emailed_setups
+                 WHERE {where}
+                 ORDER BY emailed_ts DESC
+                 LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall() or []
+        for r in rows:
+            try:
+                sid = str(r['setup_id'] or '').strip()
+                if not sid:
+                    continue
+                ids_set.add(sid)
+                # newest metadata wins
+                if sid not in meta or float(r['emailed_ts'] or 0.0) > float((meta.get(sid) or {}).get('emailed_ts') or 0.0):
+                    meta[sid] = {'user_id': int(r['user_id'] or 0), 'setup_id': sid, 'session': str(r['session'] or ''), 'emailed_ts': float(r['emailed_ts'] or 0.0)}
+            except Exception:
+                continue
+    except Exception:
+        ids_set, meta = set(), {}
+    try:
+        cache = globals().setdefault('_YVER139_EMAIL_ID_CACHE', {'key': None, 'ts': 0.0, 'ids': set(), 'rows': {}})
+        cache.update({'key': key, 'ts': _yver139_now(), 'ids': set(ids_set), 'rows': dict(meta)})
+    except Exception:
+        pass
+    return set(ids_set), dict(meta)
+
+
+try:
+    _YVER139_PRACTICAL_UNIQUE_KEY = _YVER137_ORIG_SETUP_AUDIT_UNIQUE_KEY if callable(globals().get('_YVER137_ORIG_SETUP_AUDIT_UNIQUE_KEY')) else None
+except Exception:
+    _YVER139_PRACTICAL_UNIQUE_KEY = None
+
+
+def _setup_audit_unique_key(row: dict) -> str:
+    """v139 lightweight key.
+
+    Do not query SQLite from inside the key function.  Emailed uniqueness is handled
+    by _setup_audit_load_rows using one cached set of recent emailed setup_ids.
+    """
+    if callable(_YVER139_PRACTICAL_UNIQUE_KEY):
+        try:
+            return _YVER139_PRACTICAL_UNIQUE_KEY(row)
+        except Exception:
+            pass
+    try:
+        rr = _setup_audit_payload_from_row(row)
+        sid = str(rr.get('setup_id') or '').strip()
+        if sid:
+            # fallback only; normal dedup should use the original practical key
+            return sid
+    except Exception:
+        pass
+    try:
+        return str((row or {}).get('setup_id') or id(row))
+    except Exception:
+        return str(id(row))
+
+
+def _yver139_direct_lookup_missing_emailed_rows(uid: int, missing_ids: list[str], email_meta: dict[str, dict]) -> list[dict]:
+    """Very small safety backfill for emailed setup_ids absent from normal rows.
+
+    Reads only executable_setups first, then generated_setups.  It is capped and
+    does not join signals or fan out generated snapshots.
+    """
+    out: list[dict] = []
+    ids = [str(x or '').strip() for x in list(missing_ids or []) if str(x or '').strip()]
+    if not ids:
+        return out
+    ids = ids[:40]
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    try:
+        uid_list = _yver139_uid_candidates(uid_i)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            found: set[str] = set()
+            for table, ts_col, source_name in [('executable_setups', 'executable_ts', 'EMAIL_EXEC_BACKFILL'), ('generated_setups', 'created_ts', 'EMAIL_GEN_BACKFILL')]:
+                if not _yver139_table_exists(conn, table):
+                    continue
+                cols = _yver139_table_cols(conn, table)
+                if 'setup_id' not in cols:
+                    continue
+                need = [sid for sid in ids if sid not in found]
+                if not need:
+                    break
+                qids = ','.join(['?'] * len(need))
+                quid = ','.join(['?'] * len(uid_list))
+                # Keep SELECT simple and let _setup_audit_payload_from_row handle absent fields.
+                rows = conn.execute(
+                    f"SELECT * FROM {table} WHERE setup_id IN ({qids}) AND user_id IN ({quid}) ORDER BY {ts_col} DESC LIMIT ?",
+                    tuple(need + uid_list + [max(80, len(need) * 3)]),
+                ).fetchall() or []
+                for r in rows:
+                    try:
+                        raw = dict(r)
+                        sid = str(raw.get('setup_id') or '').strip()
+                        if not sid or sid in found:
+                            continue
+                        rr = _setup_audit_payload_from_row(raw)
+                        if not str(rr.get('setup_id') or '').strip():
+                            rr['setup_id'] = sid
+                        meta = dict(email_meta.get(sid) or {})
+                        if meta:
+                            rr['emailed_ts'] = float(meta.get('emailed_ts') or rr.get('ts') or 0.0)
+                            rr['session'] = str(rr.get('session') or meta.get('session') or '')
+                        rr['source'] = source_name
+                        rr['source_kind'] = source_name.lower()
+                        if not _setup_volume_ok(float(rr.get('fut_vol_usd') or 0.0)):
+                            continue
+                        out.append(rr)
+                        found.add(sid)
+                    except Exception:
+                        continue
+    except Exception:
+        return out
+    return out
+
+
+try:
+    _YVER139_BASE_SETUP_AUDIT_LOAD_ROWS = _YVER137_ORIG_SETUP_AUDIT_LOAD_ROWS if callable(globals().get('_YVER137_ORIG_SETUP_AUDIT_LOAD_ROWS')) else None
+except Exception:
+    _YVER139_BASE_SETUP_AUDIT_LOAD_ROWS = None
+
+
+def _setup_audit_load_rows(uid: int, hours: int | None = 24, limit: int = 0, dedup: bool = True, start_ts: float | None = None, apply_final_quality_gate: bool | None = None, source_mode_override: str | None = None) -> list[dict]:
+    """v139 memory-safe audit loader.
+
+    Preserves the v137 contract that emailed setup_ids are audit-unique, without the
+    heavy v137 email backfill and without DB lookups inside each dedup key.
+    """
+    if not callable(_YVER139_BASE_SETUP_AUDIT_LOAD_ROWS):
+        return []
+    cutoff = 0.0
+    try:
+        if start_ts is not None and float(start_ts or 0.0) > 0:
+            cutoff = float(start_ts or 0.0)
+        elif hours is not None and int(hours or 0) > 0:
+            cutoff = float(time.time()) - float(int(hours or 0)) * 3600.0
+    except Exception:
+        cutoff = 0.0
+    # Keep raw pull bounded to avoid Render OOM. The display itself is capped, and
+    # the practical dedup below preserves the same visible meaning.
+    try:
+        h = int(hours or 0) if hours is not None else 0
+    except Exception:
+        h = 24
+    try:
+        requested_limit = int(limit or 0)
+    except Exception:
+        requested_limit = 0
+    if requested_limit > 0:
+        raw_limit = max(requested_limit * 12, requested_limit + 80)
+    elif h > 0 and h <= 4:
+        raw_limit = int(os.environ.get('SETUP_AUDIT_V139_RAW_LIMIT_4H', '500') or 500)
+    elif h > 0 and h <= 24:
+        raw_limit = int(os.environ.get('SETUP_AUDIT_V139_RAW_LIMIT_24H', '1400') or 1400)
+    else:
+        raw_limit = int(os.environ.get('SETUP_AUDIT_V139_RAW_LIMIT_LONG', '2500') or 2500)
+    raw_limit = max(100, min(5000, int(raw_limit)))
+
+    try:
+        base_rows = list(_YVER139_BASE_SETUP_AUDIT_LOAD_ROWS(uid, hours=hours, limit=raw_limit, dedup=False, start_ts=start_ts, apply_final_quality_gate=apply_final_quality_gate, source_mode_override=source_mode_override) or [])
+    except TypeError:
+        try:
+            base_rows = list(_YVER139_BASE_SETUP_AUDIT_LOAD_ROWS(uid, hours, raw_limit, False, start_ts, apply_final_quality_gate, source_mode_override) or [])
+        except Exception:
+            base_rows = []
+    except Exception:
+        base_rows = []
+
+    email_ids, email_meta = _yver139_recent_emailed_ids(int(uid or 0), cutoff=float(cutoff or 0.0), max_rows=240)
+    by_sid_present = {str((r or {}).get('setup_id') or '').strip() for r in base_rows if str((r or {}).get('setup_id') or '').strip()}
+    missing_emailed = [sid for sid in list(email_ids) if sid not in by_sid_present]
+    if missing_emailed:
+        base_rows.extend(_yver139_direct_lookup_missing_emailed_rows(int(uid or 0), missing_emailed, email_meta))
+
+    # Apply final dedup. Emailed setup_ids get their own key; non-emailed scanner
+    # repeats keep the pre-v137 practical dedup key and earliest row in that bucket.
+    if bool(dedup):
+        deduped: dict[str, dict] = {}
+        for r in sorted(list(base_rows or []), key=lambda x: _setup_audit_row_ts(x)):
+            try:
+                sid = str((r or {}).get('setup_id') or '').strip()
+                source_txt = ' '.join([str((r or {}).get('source') or ''), str((r or {}).get('source_kind') or '')]).upper()
+                emailed_ts = float((r or {}).get('emailed_ts') or (email_meta.get(sid) or {}).get('emailed_ts') or 0.0) if sid else 0.0
+                if sid and (sid in email_ids or emailed_ts > 0 or 'EMAIL' in source_txt or 'DELIVER' in source_txt):
+                    key = f'EMAILED_SETUP_ID|{sid}'
+                    if emailed_ts > 0:
+                        try:
+                            r['emailed_ts'] = emailed_ts
+                        except Exception:
+                            pass
+                else:
+                    key = _setup_audit_unique_key(r)
+                if key not in deduped:
+                    deduped[key] = r
+            except Exception:
+                continue
+        final = sorted(list(deduped.values()), key=lambda x: _setup_audit_row_ts(x), reverse=True)
+    else:
+        seen: set[str] = set()
+        final = []
+        for r in sorted(list(base_rows or []), key=lambda x: _setup_audit_row_ts(x), reverse=True):
+            try:
+                sid = str((r or {}).get('setup_id') or '').strip()
+                key = sid or str(id(r))
+                if key in seen:
+                    continue
+                seen.add(key)
+                final.append(r)
+            except Exception:
+                continue
+
+    if requested_limit > 0:
+        final = final[:requested_limit]
+    return final
+
+
+# Keep the v137 email marker wrapper, but remove the extra DB pipeline write from
+# each email event to avoid needless write amplification during active sessions.
+try:
+    _YVER139_ORIG_DB_MARK_EMAILED_SETUP = _YVER137_ORIG_DB_MARK_EMAILED_SETUP if callable(globals().get('_YVER137_ORIG_DB_MARK_EMAILED_SETUP')) else None
+except Exception:
+    _YVER139_ORIG_DB_MARK_EMAILED_SETUP = None
+
+
+def db_mark_emailed_setup(user_id: int, setup_id: str, session: str, emailed_ts: float):
+    if callable(_YVER139_ORIG_DB_MARK_EMAILED_SETUP):
+        _YVER139_ORIG_DB_MARK_EMAILED_SETUP(user_id, setup_id, session, emailed_ts)
+    try:
+        sid = str(setup_id or '').strip()
+        if sid:
+            cache = globals().setdefault('_YVER139_EMAIL_ID_CACHE', {'key': None, 'ts': 0.0, 'ids': set(), 'rows': {}})
+            try:
+                cache['ids'] = set(cache.get('ids') or set()) | {sid}
+                rows = dict(cache.get('rows') or {})
+                rows[sid] = {'user_id': int(user_id or 0), 'setup_id': sid, 'session': str(session or ''), 'emailed_ts': float(emailed_ts or time.time())}
+                cache['rows'] = rows
+                cache['ts'] = _yver139_now()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v139_light_audit'
+    SETUP_AUDIT_CACHE_VERSION = 'v139'
+    SCREEN_CACHE_VERSION = str(globals().get('SCREEN_CACHE_VERSION', '')) + ':v139'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver139_version', YVER139_VERSION)
+except Exception:
+    pass
+try:
+    logger.info('yver139 loaded before main: replaced heavy v137 emailed audit backfill with bounded in-memory emailed setup-id dedup/backfill; v138 extra scheduler instances reverted for Render memory safety')
+except Exception:
+    pass
+# =========================================================
+# end yver139
 # =========================================================
 
 if __name__ == "__main__":
