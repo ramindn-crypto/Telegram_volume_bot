@@ -82289,6 +82289,504 @@ except Exception:
 # end yver131
 # =========================================================
 
+
+# =========================================================
+# yver132 — WR/O open-time snapshot fix
+# =========================================================
+# Problem in v131:
+#   WR/O used only the latest setup_combo_scores row with evaluated_ts <= setup_ts.
+#   When the matrix refresh for that exact setup/result batch is written a few minutes
+#   after the setup timestamp, WR/O can show an older stale score (example: WLD 10:10
+#   showed 78.0% while the actual around-generation matrix WR was already 63.4%).
+# Fix:
+#   WR/O now uses the nearest matrix score around the setup generation time:
+#     1) first score at/after setup_ts within a short refresh grace window;
+#     2) otherwise latest score before setup_ts.
+#   This is display-only and feeds all three WR/O commands because they already call
+#   _yver131_wr_open_lookup:
+#     /setup_audit, /setup_open_times, /autotrade_report.
+YVER132_VERSION = 'yver132_2026_06_24_wr_open_nearest_matrix_snapshot'
+YVER132_WR_OPEN_AFTER_GRACE_SEC = float(os.environ.get('YVER132_WR_OPEN_AFTER_GRACE_SEC', '1800') or 1800)  # 30m
+YVER132_WR_OPEN_BEFORE_MAX_AGE_SEC = float(os.environ.get('YVER132_WR_OPEN_BEFORE_MAX_AGE_SEC', '21600') or 21600)  # 6h
+
+
+def _yver132_combo_fallback_keys(combo: str) -> list[str]:
+    try:
+        c = str(combo or '').upper().strip()
+        keys = []
+        if c:
+            keys.append(c)
+        parts = [x for x in c.split('-') if x]
+        # Prefer exact Family-Session-Strategy-Side. Only fall back when old score rows
+        # really do not have exact lanes.
+        if len(parts) >= 3:
+            keys.append('-'.join(parts[:3]))
+        if len(parts) >= 2:
+            keys.append('-'.join(parts[:2]))
+        return list(dict.fromkeys([k for k in keys if k]))
+    except Exception:
+        return [str(combo or '').upper().strip()]
+
+
+def _yver131_wr_open_lookup(uid: int = 0, start_ts: float = 0.0):
+    """v132 replacement for v131 WR/O lookup.
+
+    Returns lookup(combo, setup_ts) -> WR label.  It avoids stale WR/O by allowing
+    the first setup_matrix score refresh shortly after setup_ts to represent the
+    open-time/generation snapshot.  If there is no near-after refresh, it falls
+    back to the latest prior score, capped by YVER132_WR_OPEN_BEFORE_MAX_AGE_SEC.
+    """
+    data = {}
+    try:
+        _setup_combo_policy_migrate()
+    except Exception:
+        pass
+    try:
+        owner_uid = int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        uid_i = int(uid or owner_uid or 0)
+        ids = list(dict.fromkeys([int(x) for x in [uid_i, 0] if int(x or 0) >= 0])) or [0]
+        qmarks = ','.join(['?'] * len(ids))
+        min_ts = float(start_ts or 0.0)
+        if min_ts > 0:
+            min_ts = max(0.0, min_ts - 14.0 * 86400.0)
+        # Include some future relative to now because report rows can be very fresh
+        # and the policy-refresh row may be written a few minutes after generation.
+        now_ts = float(time.time()) + max(3600.0, float(YVER132_WR_OPEN_AFTER_GRACE_SEC) + 600.0)
+        params = list(ids) + [float(min_ts), float(now_ts)]
+        row_map = {}
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            for sr in cur.execute(
+                f"""SELECT evaluated_ts,user_id,combo,family,session,strategy,side,decided,win_rate
+                    FROM setup_combo_scores
+                    WHERE user_id IN ({qmarks}) AND evaluated_ts>=? AND evaluated_ts<=?
+                    ORDER BY evaluated_ts ASC, user_id ASC""",
+                tuple(params),
+            ).fetchall() or []:
+                d = dict(sr)
+                ts = float(d.get('evaluated_ts') or 0.0)
+                if ts <= 0:
+                    continue
+                fam = str(d.get('family') or '').upper().strip()
+                sess = str(d.get('session') or '').upper().strip()
+                strat = _setup_strategy_suffix(value=str(d.get('strategy') or 'NOR'))
+                side = _setup_side_suffix(value=str(d.get('side') or 'BOTH'))
+                combo = str(d.get('combo') or '').upper().strip()
+                if not combo and fam and sess:
+                    combo = _setup_combo_strategy_side_key(fam, sess, strat, side) if side in {'BUY', 'SELL'} else _setup_combo_strategy_key(fam, sess, strat)
+                if not combo:
+                    continue
+                dec = int(float(d.get('decided') or 0.0))
+                wr = float(d.get('win_rate') or 0.0)
+                uid_row = int(d.get('user_id') or 0)
+                # user-specific rows should win over global rows at the same timestamp.
+                old = row_map.get((combo, ts))
+                if old is None or (uid_row == uid_i and int(old[3] or 0) != uid_i):
+                    row_map[(combo, ts)] = (ts, dec, wr, uid_row)
+        for combo, ts in sorted(row_map.keys(), key=lambda k: (k[0], k[1])):
+            data.setdefault(str(combo).upper().strip(), []).append(row_map[(combo, ts)])
+        for combo in list(data.keys()):
+            data[combo] = sorted(data.get(combo) or [], key=lambda x: float(x[0] or 0.0))
+    except Exception:
+        data = {}
+
+    def _lookup(combo: str, setup_ts: float) -> str:
+        try:
+            ts = float(setup_ts or 0.0)
+            if ts <= 0:
+                return '-'
+            import bisect as _bisect
+            after_grace = float(globals().get('YVER132_WR_OPEN_AFTER_GRACE_SEC', 1800.0) or 1800.0)
+            before_max_age = float(globals().get('YVER132_WR_OPEN_BEFORE_MAX_AGE_SEC', 21600.0) or 21600.0)
+            for key in _yver132_combo_fallback_keys(combo):
+                arr = list(data.get(str(key or '').upper().strip()) or [])
+                if not arr:
+                    continue
+                ts_list = [float(x[0] or 0.0) for x in arr]
+                # Prefer first refresh at/after setup timestamp if close enough.
+                idx_after = _bisect.bisect_left(ts_list, ts)
+                if 0 <= idx_after < len(arr):
+                    ats, dec, wr, _uid = arr[idx_after]
+                    if float(ats or 0.0) >= ts and (float(ats or 0.0) - ts) <= after_grace:
+                        if int(dec or 0) <= 0:
+                            return '-'
+                        return f"{float(wr or 0.0):.1f}%"
+                # Otherwise use latest prior score, but do not reuse a very old stale score.
+                idx_before = _bisect.bisect_right(ts_list, ts) - 1
+                if idx_before >= 0:
+                    bts, dec, wr, _uid = arr[idx_before]
+                    if before_max_age > 0 and (ts - float(bts or 0.0)) > before_max_age:
+                        return '-'
+                    if int(dec or 0) <= 0:
+                        return '-'
+                    return f"{float(wr or 0.0):.1f}%"
+            return '-'
+        except Exception:
+            return '-'
+    return _lookup
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v132_wr_open_nearest'
+    SETUP_AUDIT_CACHE_VERSION = 'v132'
+except Exception:
+    pass
+try:
+    logger.info('yver132 loaded before main: WR/O uses nearest around-generation matrix snapshot for setup_audit/setup_open_times/autotrade_report')
+except Exception:
+    pass
+# =========================================================
+# end yver132
+# =========================================================
+
+
+
+# =========================================================
+# yver133 — AutoTrade pre-entry delivery sync
+# =========================================================
+# Problem:
+#   Direct KEEP queue AutoTrade can open a setup that has not yet passed through
+#   the setup-email / recent-delivery lane.  Then /setup_audit shows AT_OPEN, but
+#   the user never received the setup email and /screen shows a different recent
+#   email.  From this build, AutoTrade may still consume the direct KEEP queue,
+#   but before a fresh direct setup is opened it is first delivered/logged into the
+#   same setup-email lane used by /screen.
+# Scope:
+#   Display/delivery sync only. No risk, TP/SL, leverage, sizing, policy, blacklist,
+#   drift, or order placement geometry is changed.
+
+YVER133_VERSION = 'yver133_2026_06_24_autotrade_preentry_email_screen_sync'
+YVER133_AUTOTRADE_PREENTRY_EMAIL_SYNC = str(os.environ.get('YVER133_AUTOTRADE_PREENTRY_EMAIL_SYNC', '1')).strip().lower() not in {'0','false','no','off'}
+YVER133_AUTOTRADE_EMAIL_FAIL_BLOCKS_ENTRY = str(os.environ.get('YVER133_AUTOTRADE_EMAIL_FAIL_BLOCKS_ENTRY', '1')).strip().lower() not in {'0','false','no','off'}
+
+
+def _yver133_setup_sid(s) -> str:
+    try:
+        return str(getattr(s, 'setup_id', '') or getattr(s, 'id', '') or '').strip()
+    except Exception:
+        return ''
+
+
+def _yver133_setup_sym_side(s) -> tuple[str, str]:
+    try:
+        sym = str(getattr(s, 'symbol', '') or '').upper().strip()
+        side = str(getattr(s, 'side', '') or '').upper().strip()
+        return sym, side
+    except Exception:
+        return '', ''
+
+
+def _yver133_recent_email_exists(uid: int, s, max_age_sec: float | None = None) -> bool:
+    """Exact setup-id recent delivery check for AutoTrade pre-entry sync."""
+    try:
+        sid = _yver133_setup_sid(s)
+        if not sid:
+            return False
+        now_ts = float(time.time())
+        age_sec = float(max_age_sec if max_age_sec is not None else max(60, int(_autotrade_entry_window_min()) * 60))
+        for attr in ('email_logged_ts', 'emailed_ts'):
+            try:
+                ts = float(getattr(s, attr, 0.0) or 0.0)
+                if ts > 0 and (now_ts - ts) <= age_sec:
+                    return True
+            except Exception:
+                pass
+        ids = []
+        for x in (uid, globals().get('AUTOTRADE_OWNER_UID', 0), 0):
+            try:
+                xi = int(x or 0)
+                if xi >= 0 and xi not in ids:
+                    ids.append(xi)
+            except Exception:
+                pass
+        if not ids:
+            return False
+        cutoff = now_ts - age_sec
+        qmarks = ','.join(['?'] * len(ids))
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute(
+                f"SELECT MAX(COALESCE(emailed_ts,0)) FROM emailed_setups WHERE user_id IN ({qmarks}) AND setup_id=? AND COALESCE(emailed_ts,0)>=?",
+                tuple(ids + [sid, float(cutoff)]),
+            ).fetchone()
+            if row and float(row[0] or 0.0) >= cutoff:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _yver133_terminal_before_delivery(uid: int, s) -> str:
+    """Avoid emailing setups that the current code already knows are terminal."""
+    try:
+        fn = globals().get('_yver110_terminal_reason_for_setup')
+        if callable(fn):
+            why = str(fn(int(uid or 0), s) or '').upper().strip()
+            if why:
+                return why
+    except Exception:
+        pass
+    try:
+        fn = globals().get('_yver61_setup_terminal_for_visibility')
+        if callable(fn):
+            terminal, why = fn(s, uid=int(uid or 0))
+            if terminal:
+                return str(why or 'terminal').upper().strip()
+    except Exception:
+        pass
+    return ''
+
+
+def _yver133_setup_policy_is_deliverable(uid: int, session_label: str, s) -> tuple[bool, str]:
+    """Same user-visible KEEP gate used by /screen/setup-email/AutoTrade."""
+    try:
+        ok, why, meta = _setup_user_visible_keep_policy_allows(s, session_name=str(session_label or ''), user_id=int(uid or 0), lane='autotrade_preentry_delivery')
+        if not ok:
+            return False, str(why or 'user_visible_keep_gate_block')
+    except Exception as exc:
+        return False, f'user_visible_keep_gate_exception:{type(exc).__name__}'
+    try:
+        if not _setup_combo_policy_allows_setup(s, str(session_label or ''), user_id=int(uid or 0)):
+            return False, 'combo_policy_not_keep'
+    except Exception:
+        pass
+    return True, 'ok'
+
+
+def _yver133_best_fut_fast() -> dict:
+    try:
+        fn = globals().get('get_cached_futures_tickers')
+        if callable(fn):
+            data = fn() or {}
+            if data:
+                return data
+    except Exception:
+        pass
+    # Do not fetch live tickers here; this runs inside AutoTrade entry path.
+    return {}
+
+
+def _yver133_format_autotrade_setup_email(uid: int, session_label: str, setups: list, best_fut: dict | None = None) -> tuple[str, str, str]:
+    """Build a normal setup email body without invoking the email-pick loop again."""
+    sess_u = str(session_label or '').upper().strip() or 'ASIA'
+    first = list(setups or [None])[0]
+    sym = str(getattr(first, 'symbol', '') or '').upper().strip() if first is not None else ''
+    side = str(getattr(first, 'side', '') or '').upper().strip() if first is not None else ''
+    subject = f"PulseFutures • {sess_u} • {side} {sym}".strip()
+    if len(list(setups or [])) > 1:
+        subject += f" (+{len(list(setups or []))-1} more)"
+    try:
+        user = get_user(int(uid or 0)) or {}
+    except Exception:
+        user = {}
+    try:
+        tz, user_tz = _zoneinfo_or_default((user or {}).get('tz') or (user or {}).get('timezone'))
+    except Exception:
+        tz, user_tz = MEL_TZ, 'Australia/Melbourne'
+    try:
+        now_local = datetime.now(tz)
+    except Exception:
+        now_local = datetime.now(MEL_TZ)
+    body = ''
+    body_html = ''
+    try:
+        body = _email_body_pretty(session_name=sess_u, now_local=now_local, user_tz=user_tz, setups=list(setups or []), best_fut=best_fut or {})
+    except Exception:
+        lines = [f"PulseFutures • {sess_u}", HDR, "AutoTrade pre-entry setup delivery", ""]
+        for s in list(setups or []):
+            try:
+                tp = float(_setup_target_tp(s, 0.0) or 0.0)
+                rr = rr_to_tp(float(getattr(s, 'entry', 0.0) or 0.0), float(getattr(s, 'sl', 0.0) or 0.0), tp) if tp else 0.0
+                pos = 'long' if str(getattr(s, 'side', '') or '').upper() == 'BUY' else 'short'
+                lines += [
+                    f"{str(getattr(s, 'side', '') or '').upper()} {str(getattr(s, 'symbol', '') or '').upper()} | Conf {int(getattr(s, 'conf', 0) or 0)} | Family {str(getattr(s, 'family_id', '') or getattr(s, 'engine', '') or '')}",
+                    f"Entry: {float(getattr(s, 'entry', 0.0) or 0.0):.8g} | SL: {float(getattr(s, 'sl', 0.0) or 0.0):.8g} | TP: {tp:.8g} | RR(TP): {rr:.2f}",
+                    f"/size {str(getattr(s, 'symbol', '') or '').upper()} {pos} entry {float(getattr(s, 'entry', 0.0) or 0.0):.6g} sl {float(getattr(s, 'sl', 0.0) or 0.0):.6g}",
+                    "",
+                ]
+            except Exception:
+                continue
+        body = '\n'.join(lines).strip()
+    try:
+        body_html = _email_body_pretty_html(session_name=sess_u, now_local=now_local, user_tz=user_tz, setups=list(setups or []), best_fut=best_fut or {})
+    except Exception:
+        body_html = ''
+    return subject, body, body_html
+
+
+def _yver133_mark_delivery_side_effects(uid: int, session_label: str, setups: list, best_fut: dict | None = None, status: str = 'autotrade_preentry_sent') -> int:
+    """Make /screen, /setup_audit, email gate and executable lane see the same setup."""
+    try:
+        sess_u = str(session_label or '').upper().strip()
+        now_ts = float(time.time())
+        for s in list(setups or []):
+            try:
+                setattr(s, 'email_logged_ts', now_ts)
+                setattr(s, 'emailed_ts', now_ts)
+                setattr(s, 'source_kind', 'emailed_setups')
+                setattr(s, 'source_session', sess_u)
+                setattr(s, 'delivery_lane_locked', True)
+            except Exception:
+                pass
+        fn = globals().get('_record_setup_email_delivery_side_effects')
+        if callable(fn):
+            return int(fn(int(uid or 0), sess_u, list(setups or []), best_fut or {}, status=str(status or 'autotrade_preentry_sent')) or 0)
+        n = 0
+        for s in list(setups or []):
+            sid = _yver133_setup_sid(s)
+            if not sid:
+                continue
+            try:
+                db_insert_signal(s, user_id=int(uid or 0))
+            except Exception:
+                pass
+            try:
+                db_mark_emailed_setup(int(uid or 0), sid, sess_u, now_ts)
+            except Exception:
+                pass
+            try:
+                db_mark_executable_setup(int(uid or 0), sid, sess_u, now_ts, s=s, source_kind='emailed_setups', state='executable_pending')
+            except Exception:
+                pass
+            try:
+                _cache_recent_emailed_setup(int(uid or 0), s, session=sess_u, emailed_ts=now_ts, source_kind='recent_email_cache')
+            except Exception:
+                pass
+            try:
+                _mark_emailed_setup_identity(int(uid or 0), s, emailed_ts=now_ts)
+            except Exception:
+                pass
+            n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def _yver133_send_preentry_setup_email(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    if not list(setups or []):
+        return True, 'no_setups'
+    best_fut = _yver133_best_fut_fast()
+    subject, body, body_html = _yver133_format_autotrade_setup_email(int(uid or 0), str(session_label or ''), list(setups or []), best_fut=best_fut)
+    sent = False
+    err = ''
+    try:
+        sent = bool(send_email(subject, body, body_html=body_html or None, user_id_for_debug=int(uid or 0), enforce_trade_window=False, bypass_user_email_master=False))
+    except Exception as exc:
+        sent = False
+        err = f'{type(exc).__name__}: {exc}'
+        try:
+            _LAST_SMTP_ERROR[int(uid or 0)] = err
+        except Exception:
+            pass
+    soft = False
+    try:
+        soft = (not sent) and callable(globals().get('_smtp_error_probably_delivered')) and bool(_smtp_error_probably_delivered(str(_LAST_SMTP_ERROR.get(int(uid or 0), '') or err)))
+    except Exception:
+        soft = False
+    if sent or soft:
+        n = _yver133_mark_delivery_side_effects(int(uid or 0), str(session_label or ''), list(setups or []), best_fut=best_fut, status='autotrade_preentry_sent' if sent else 'autotrade_preentry_soft_sent')
+        try:
+            _LAST_EMAIL_DECISION[int(uid or 0)] = {
+                'status': 'SENT' if sent else 'SENT_SOFT',
+                'picked': ', '.join([f"{str(getattr(s, 'side', '') or '').upper()} {str(getattr(s, 'symbol', '') or '').upper()}" for s in list(setups or [])]),
+                'when': datetime.now(MEL_TZ).isoformat(timespec='seconds'),
+                'reasons': ['autotrade_preentry_delivery_sync'],
+                'setups': int(n or 0),
+            }
+        except Exception:
+            pass
+        try:
+            db_log_setup_pipeline_event(int(uid or 0), stage='autotrade_preentry_email_sync', status='sent' if sent else 'soft_sent', session=str(session_label or ''), mode='autotrade', details={'setups': len(list(setups or [])), 'subject': str(subject or '')[:180], 'side_effects': int(n or 0)})
+        except Exception:
+            pass
+        return True, 'sent'
+    try:
+        db_log_setup_pipeline_event(int(uid or 0), stage='autotrade_preentry_email_sync', status='failed', session=str(session_label or ''), mode='autotrade', details={'setups': len(list(setups or [])), 'subject': str(subject or '')[:180], 'error': str(_LAST_SMTP_ERROR.get(int(uid or 0), '') or err)[:240]})
+    except Exception:
+        pass
+    return False, 'setup_email_failed_before_autotrade'
+
+
+def _yver133_autotrade_delivery_sync(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    if not YVER133_AUTOTRADE_PREENTRY_EMAIL_SYNC:
+        return True, 'disabled'
+    try:
+        uid_i = int(uid or 0)
+    except Exception:
+        uid_i = 0
+    sess_u = str(session_label or '').upper().strip()
+    if uid_i <= 0 or sess_u not in {'ASIA', 'LON', 'NY'}:
+        return True, 'not_applicable'
+    to_send = []
+    for s in list(setups or []):
+        try:
+            sid = _yver133_setup_sid(s)
+            if not sid:
+                continue
+            if _yver133_recent_email_exists(uid_i, s):
+                try:
+                    setattr(s, 'source_kind', 'emailed_setups')
+                    setattr(s, 'source_session', sess_u)
+                    setattr(s, 'delivery_lane_locked', True)
+                except Exception:
+                    pass
+                continue
+            terminal = _yver133_terminal_before_delivery(uid_i, s)
+            if terminal:
+                continue
+            ok_pol, why_pol = _yver133_setup_policy_is_deliverable(uid_i, sess_u, s)
+            if not ok_pol:
+                continue
+            # Keep the runtime lightweight and email only the candidate being attempted.
+            to_send.append(s)
+            break
+        except Exception:
+            continue
+    if not to_send:
+        return True, 'already_delivered_or_no_candidate'
+    return _yver133_send_preentry_setup_email(uid_i, sess_u, list(to_send or []))
+
+
+try:
+    _YVER133_ORIG_AUTOTRADE_PLACE_TRADE = _autotrade_place_trade
+except Exception:
+    _YVER133_ORIG_AUTOTRADE_PLACE_TRADE = None
+
+
+def _autotrade_place_trade(uid: int, session_label: str, setups: list) -> tuple[bool, str]:
+    """Before any AutoTrade open, ensure the same setup is emailed/logged for /screen."""
+    try:
+        ok_sync, why_sync = _yver133_autotrade_delivery_sync(int(uid or 0), str(session_label or ''), list(setups or []))
+        if not ok_sync and YVER133_AUTOTRADE_EMAIL_FAIL_BLOCKS_ENTRY:
+            try:
+                _LAST_AUTOTRADE_DETAIL.setdefault(int(uid or 0), {})
+                _LAST_AUTOTRADE_DETAIL[int(uid or 0)].update({'reject_reason': str(why_sync or 'setup_email_failed_before_autotrade'), 'autotrade_preentry_email_sync': 'failed'})
+            except Exception:
+                pass
+            return False, str(why_sync or 'setup_email_failed_before_autotrade')
+    except Exception as exc:
+        if YVER133_AUTOTRADE_EMAIL_FAIL_BLOCKS_ENTRY:
+            return False, f'autotrade_preentry_email_sync_exception:{type(exc).__name__}'
+    if callable(_YVER133_ORIG_AUTOTRADE_PLACE_TRADE):
+        return _YVER133_ORIG_AUTOTRADE_PLACE_TRADE(uid, session_label, setups)
+    return False, 'autotrade_place_trade_missing'
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v133'
+    SETUP_AUDIT_CACHE_VERSION = 'v133'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver133_version', YVER133_VERSION)
+except Exception:
+    pass
+try:
+    logger.info('yver133 loaded before main: AutoTrade pre-entry setup email + /screen delivery sync; no risk/TP/SL/leverage/order logic changes')
+except Exception:
+    pass
+# =========================================================
+# end yver133
+# =========================================================
+
 if __name__ == "__main__":
     main()
 
