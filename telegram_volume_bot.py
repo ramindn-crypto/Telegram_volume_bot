@@ -1,3 +1,4 @@
+# yver145: removes the old v114 policy-repair footer from /setup_matrix policy and adds a debounced background /setup_matrix policy refresh trigger after terminal setup TP/SL results; no setup/email/AutoTrade/order/risk logic changes.
 # yver144: sync hardening for current setup delivery/reporting; BigMove/F8 and F9 reports align with visible audit rows; Render startup noise reduced; no TP/SL/risk/leverage/order changes.
 # yver143: F8/BigMove AutoTrade sync fix; confirmed emailed F8 KEEP setups no longer get blocked by the secondary strict-edge sample-count guard (AUTOTRADE_STRICT) after setup email/audit visibility. Downstream risk, blackout, direction, duplicate, leverage, drift and order safety gates unchanged.
 # yver142: repairs BigMove/F8 setup generation reliability so every confirmed BigMove alert can create a durable F8 generated/setup-audit row; failed cache-price attempts no longer memo-block later hooks. No order/risk/TP/SL/leverage changes.
@@ -47159,8 +47160,83 @@ def _setup_audit_upsert_result(user_id: int, row: dict, result_payload: dict, ho
                 )
             )
             conn.commit()
+        try:
+            if str(result or '').upper().strip() in {'TP', 'SL'}:
+                _yver145_trigger_matrix_refresh_after_terminal_result(int(user_id), 'setup_audit_upsert_terminal_result')
+        except Exception:
+            pass
     except Exception:
         pass
+
+
+# yver145: after a setup reaches TP/SL, keep /setup_matrix policy fresh without
+# blocking command/email/autotrade paths.  A direct rebuild after every row can be
+# too heavy for Render, so this is debounced and runs in a daemon thread.
+_YVER145_MATRIX_REFRESH_LOCK = globals().get('_YVER145_MATRIX_REFRESH_LOCK') or __import__('threading').Lock()
+_YVER145_MATRIX_REFRESH_LAST_TS = float(globals().get('_YVER145_MATRIX_REFRESH_LAST_TS', 0.0) or 0.0)
+YVER145_MATRIX_RESULT_REFRESH_MIN_SEC = float(os.environ.get('YVER145_MATRIX_RESULT_REFRESH_MIN_SEC', '600') or 600)
+
+
+def _yver145_trigger_matrix_refresh_after_terminal_result(uid: int, reason: str = 'terminal_setup_result') -> None:
+    global _YVER145_MATRIX_REFRESH_LAST_TS
+    try:
+        uid_i = int(uid or globals().get('AUTOTRADE_OWNER_UID', 0) or 0)
+        if uid_i <= 0:
+            return
+        now = float(time.time())
+        # Always invalidate read caches immediately so the next explicit report does
+        # not reuse stale text while the debounced background refresh catches up.
+        try:
+            globals().setdefault('_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE', {'ts': 0.0})['ts'] = 0.0
+            globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0})['ts'] = 0.0
+            globals().setdefault('_SETUP_COMBO_POLICY_CACHE', {'ts': 0.0})['ts'] = 0.0
+        except Exception:
+            pass
+        min_sec = max(60.0, float(globals().get('YVER145_MATRIX_RESULT_REFRESH_MIN_SEC', 600.0) or 600.0))
+        if now - float(globals().get('_YVER145_MATRIX_REFRESH_LAST_TS', 0.0) or 0.0) < min_sec:
+            return
+        lock = globals().get('_YVER145_MATRIX_REFRESH_LOCK')
+        if lock is None or not lock.acquire(blocking=False):
+            return
+        _YVER145_MATRIX_REFRESH_LAST_TS = now
+        globals()['_YVER145_MATRIX_REFRESH_LAST_TS'] = now
+
+        def _worker():
+            try:
+                _setup_combo_matrix_build(
+                    int(uid_i),
+                    _overall_report_effective_hours(max(int(SETUP_COMBO_REVIEW_WINDOW_HOURS), int(SETUP_COMBO_POLICY_MIN_WINDOW_HOURS))),
+                    True,
+                    True,
+                    'terminal_result_refresh',
+                    _overall_report_start_ts(),
+                )
+                try:
+                    globals().setdefault('_SETUP_COMBO_FORCE_KEEP_SCORE_CACHE', {'ts': 0.0})['ts'] = 0.0
+                    globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0})['ts'] = 0.0
+                    globals().setdefault('_SETUP_COMBO_POLICY_CACHE', {'ts': 0.0})['ts'] = 0.0
+                except Exception:
+                    pass
+            except Exception as exc:
+                try:
+                    logger.debug('yver145_matrix_refresh_after_result_skip: %s: %s', type(exc).__name__, exc)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
+        import threading
+        threading.Thread(target=_worker, name='yver145_matrix_result_refresh', daemon=True).start()
+    except Exception:
+        try:
+            lock = globals().get('_YVER145_MATRIX_REFRESH_LOCK')
+            if lock:
+                lock.release()
+        except Exception:
+            pass
 
 
 def _setup_audit_price_result_payload(row: dict, horizon_hours: int = 24, user_id: int = 0, force: bool = False, actual_pnl_usdt: float = 0.0) -> dict:
@@ -79108,14 +79184,12 @@ def _setup_combo_policy_text(uid: int) -> str:
     else:
         txt = '❌ setup_combo_policy unavailable'
     try:
-        if isinstance(recovery, dict) and recovery.get('changed'):
-            selected = (recovery.get('selected') or {})
-            txt += ("\nPolicy repair: v114 restored /setup_matrix policy from the stable v110 score run "
-                    f"{html.escape(str(selected.get('run_id') or recovery.get('yver114_setup_matrix_recovered_from_run') or '-'))}; "
-                    "v111-v113 F9 policy-reset rewrite is not included in this build.")
-        elif 'F9 policy reset:' in str(txt or ''):
-            # Defensive cleanup if a stale cached text somehow leaks into the new key.
-            txt = re.sub(r'\n?F9 policy reset:.*$', '', str(txt), flags=re.IGNORECASE | re.MULTILINE)
+        # yver145: keep /setup_matrix policy output clean.  The old v114 one-time
+        # repair notice was useful during recovery but is now noisy and should never
+        # be appended to the user-facing policy table.  Also strip any stale cached
+        # legacy footer if it somehow leaks from an older cache key.
+        txt = re.sub(r'\n?Policy repair: v114 restored /setup_matrix policy from the stable v110 score run.*$', '', str(txt), flags=re.IGNORECASE | re.MULTILINE)
+        txt = re.sub(r'\n?F9 policy reset:.*$', '', str(txt), flags=re.IGNORECASE | re.MULTILINE)
     except Exception:
         pass
     return txt
