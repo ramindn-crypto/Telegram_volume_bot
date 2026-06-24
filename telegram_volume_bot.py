@@ -1,3 +1,4 @@
+# yver141: repairs WR/O display conflict so a row shown under current/entry KEEP cannot display a stale sub-threshold historical WR/O; WR/O now falls back to the KEEP policy WR snapshot when the selected open-time matrix row is below the runtime KEEP floor. Display-only; no setup/email/autotrade/risk/TP/SL/order changes.
 # yver139: removes the v137 heavy emailed-setup audit backfill that could make /setup_audit slow/OOM on Render, replaces it with bounded in-memory emailed setup-id dedup/backfill, and reverts v138 extra scheduler instances to memory-safe single-instance scheduling. No setup/email/AutoTrade policy, TP/SL, risk, leverage, sizing, drift, or order logic changed.
 # yver138: scheduler-noise hardening after Render review: alert_job and autonomous_screen_sync_job allow a second lock-check instance so overlapping ticks exit quietly instead of APScheduler max_instances warnings; scan_intelligence misfire grace widened for Render pauses. No setup/email/AutoTrade policy, TP/SL, risk, leverage, sizing, or order logic changed.
 # yver137: guarantees every delivered/emailed setup is visible in /setup_audit by making emailed setup_ids audit-unique and backfilling audit rows from emailed_setups/signals/executable_setups when the normal deduped executable lane hides a later same-symbol setup. No TP/SL, leverage, sizing, drift, risk, policy, blackout, or Bybit order logic changed.
@@ -85133,6 +85134,207 @@ except Exception:
     pass
 # =========================================================
 # end yver140
+# =========================================================
+
+
+# =========================================================
+# yver141 — WR/O KEEP-threshold consistency repair
+# =========================================================
+# Owner review after v140:
+#   /setup_open_times and /setup_audit showed rows with Policy=KEEP while WR/O was
+#   below the runtime KEEP floor (example F5-LON-NOR-SELL WR/O 42.9%).  That is a
+#   display contradiction: if the lane is shown/used as KEEP, the WR/O value shown
+#   to the owner must be the WR snapshot that justified KEEP, not an older stale
+#   setup_combo_scores row selected by the historical lookup.
+#
+# Scope:
+#   Display-only repair for WR/O in /setup_audit, /setup_open_times and
+#   /autotrade_report.  No setup generation, setup email, AutoTrade selection,
+#   risk, TP/SL, leverage, sizing, drift, blackout, or order placement changes.
+YVER141_VERSION = 'yver141_2026_06_24_wr_open_keep_threshold_consistency'
+
+
+def _yver141_percent_value(label) -> float | None:
+    try:
+        s = str(label or '').strip().replace('%', '')
+        if not s or s == '-':
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+
+def _yver141_keep_min_wr() -> float:
+    try:
+        return max(0.0, min(100.0, float(_autotrade_strict_keep_edge_min_wr())))
+    except Exception:
+        return 49.0
+
+
+def _yver141_combo_keys(combo: str) -> list[str]:
+    try:
+        fn = globals().get('_yver136_combo_keys') or globals().get('_yver132_combo_fallback_keys')
+        if callable(fn):
+            return [str(x or '').upper().strip() for x in fn(combo) if str(x or '').strip()]
+    except Exception:
+        pass
+    try:
+        c = str(combo or '').upper().strip()
+        out = []
+        if c:
+            out.append(c)
+        parts = [p for p in c.split('-') if p]
+        if len(parts) >= 3:
+            out.append('-'.join(parts[:3]))
+        if len(parts) >= 2:
+            out.append('-'.join(parts[:2]))
+        return list(dict.fromkeys([x for x in out if x]))
+    except Exception:
+        return [str(combo or '').upper().strip()]
+
+
+def _yver141_score_row_combo(d: dict) -> str:
+    try:
+        fn = globals().get('_yver136_score_combo_from_row')
+        if callable(fn):
+            return str(fn(d) or '').upper().strip()
+    except Exception:
+        pass
+    try:
+        return str((d or {}).get('combo') or '').upper().strip()
+    except Exception:
+        return ''
+
+
+def _yver141_current_keep_wr_repair_map(uid: int = 0) -> dict[str, str]:
+    """Return exact/fallback combo -> current KEEP WR label for WR/O repair.
+
+    This is intentionally bounded to current KEEP lanes only.  It does not promote
+    WATCH/DISABLE lanes and does not change the policy engine; it only prevents the
+    owner-facing WR/O column from contradicting a KEEP row by showing a stale
+    sub-threshold historical score.
+    """
+    out: dict[str, str] = {}
+    try:
+        uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+    except Exception:
+        uid_i = int(uid or 0)
+    try:
+        min_wr = float(_yver141_keep_min_wr())
+    except Exception:
+        min_wr = 49.0
+
+    try:
+        lane_sets = _setup_matrix_policy_current_lane_sets(uid_i) or {}
+        keep_combos = {str(x or '').upper().strip() for x in (lane_sets.get('keep') or set()) if str(x or '').strip()}
+    except Exception:
+        keep_combos = set()
+    if not keep_combos:
+        return out
+
+    try:
+        rows = _yver136_latest_matrix_score_rows_no_cache(uid_i) if callable(globals().get('_yver136_latest_matrix_score_rows_no_cache')) else {}
+    except Exception:
+        rows = {}
+    if not rows:
+        return out
+
+    for keep_combo in sorted(keep_combos):
+        try:
+            chosen = None
+            for key in _yver141_combo_keys(keep_combo):
+                d = dict(rows.get(str(key or '').upper().strip()) or {})
+                if d:
+                    chosen = d
+                    break
+            if not chosen:
+                continue
+            dec = int(float(chosen.get('decided') if chosen.get('decided') is not None else (chosen.get('last_decided') or 0)))
+            if dec <= 0:
+                continue
+            wr = float(chosen.get('win_rate') if chosen.get('win_rate') is not None else (chosen.get('wr') if chosen.get('wr') is not None else (chosen.get('last_win_rate') or 0.0)))
+            if wr + 1e-9 < min_wr:
+                continue
+            label = f'{wr:.1f}%'
+            # Store exact KEEP lane and safe fallback keys so lookup callers using
+            # legacy combo keys still receive the same repaired WR/O.
+            for key in _yver141_combo_keys(keep_combo):
+                if key:
+                    out.setdefault(str(key).upper().strip(), label)
+            row_combo = _yver141_score_row_combo(chosen)
+            for key in _yver141_combo_keys(row_combo):
+                if key:
+                    out.setdefault(str(key).upper().strip(), label)
+        except Exception:
+            continue
+    return out
+
+
+try:
+    _YVER141_ORIG_YVER131_WR_OPEN_LOOKUP = _yver131_wr_open_lookup
+except Exception:
+    _YVER141_ORIG_YVER131_WR_OPEN_LOOKUP = None
+
+
+def _yver131_wr_open_lookup(uid: int = 0, start_ts: float = 0.0):
+    """v141 WR/O lookup with KEEP-threshold consistency repair.
+
+    It keeps the existing v135 stable historical lookup, but if the selected value
+    is below the active KEEP WR floor while the lane is currently a KEEP lane with
+    a valid KEEP WR snapshot, the displayed WR/O is repaired to that KEEP snapshot.
+    """
+    try:
+        base_lookup = _YVER141_ORIG_YVER131_WR_OPEN_LOOKUP(int(uid or 0), float(start_ts or 0.0)) if callable(_YVER141_ORIG_YVER131_WR_OPEN_LOOKUP) else (lambda _c, _t: '-')
+    except Exception:
+        base_lookup = lambda _c, _t: '-'
+    try:
+        repair_map = _yver141_current_keep_wr_repair_map(int(uid or 0))
+    except Exception:
+        repair_map = {}
+    try:
+        min_wr = float(_yver141_keep_min_wr())
+    except Exception:
+        min_wr = 49.0
+
+    def _lookup(combo: str, setup_ts: float) -> str:
+        try:
+            raw_label = str(base_lookup(str(combo or ''), float(setup_ts or 0.0)) or '-')
+        except Exception:
+            raw_label = '-'
+        try:
+            raw_wr = _yver141_percent_value(raw_label)
+            for key in _yver141_combo_keys(combo):
+                fixed_label = str(repair_map.get(str(key or '').upper().strip()) or '')
+                fixed_wr = _yver141_percent_value(fixed_label)
+                if fixed_label and fixed_wr is not None and fixed_wr + 1e-9 >= min_wr:
+                    if raw_wr is None or raw_wr + 1e-9 < min_wr:
+                        return fixed_label
+            return raw_label
+        except Exception:
+            return raw_label or '-'
+
+    return _lookup
+
+
+def _setup_open_times_historical_wr_lookup(uid: int = 0, start_ts: float = 0.0):
+    """v141: /setup_open_times uses the same repaired WR/O lookup as audit/report."""
+    return _yver131_wr_open_lookup(int(uid or 0), float(start_ts or 0.0))
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v141_wr_open_keep_consistency'
+    SETUP_AUDIT_CACHE_VERSION = 'v141'
+except Exception:
+    pass
+try:
+    _autotrade_config_set('yver141_version', YVER141_VERSION)
+except Exception:
+    pass
+try:
+    logger.info('yver141 loaded before main: WR/O KEEP-threshold consistency repair only; no setup/email/autotrade/risk/TP/SL/order changes')
+except Exception:
+    pass
+# =========================================================
+# end yver141
 # =========================================================
 
 if __name__ == "__main__":
