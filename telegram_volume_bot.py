@@ -8262,7 +8262,7 @@ except Exception:
     AUTOTRADE_OWNER_UID = 0
 
 # Risk controls
-AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "1.5") or 1.5)
+AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get("AUTOTRADE_RISK_PER_TRADE_PCT", "2") or 2)
 AUTOTRADE_OPEN_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_OPEN_RISK_CAP_PCT", "3") or 3)
 AUTOTRADE_DAILY_RISK_CAP_PCT = float(os.environ.get("AUTOTRADE_DAILY_RISK_CAP_PCT", "15") or 15)
 # Open-trade count cap for commercial/live safety.
@@ -43641,7 +43641,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             '• /autotrade_config AUTOTRADE_REQUIRE_SETUP_EMAIL_FOR_ENTRY false   (direct KEEP queue entry)',
             '',
             'Examples — risk / caps:',
-            '• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1',
+            '• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 2',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MIN_MULT 1.0',
             '• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5',
@@ -43788,7 +43788,7 @@ async def autotrade_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
             f"Router: {'ON' if bool(summary.get('SETUP_ADAPTIVE_STRATEGY_ROUTER_ENABLED', True)) else 'OFF'} | Reverse disabled lanes: {'ON' if bool(summary.get('SETUP_ADAPTIVE_REVERSE_FOR_DISABLED', True)) else 'OFF'} | Reverse setup RR/base: {float(summary.get('SETUP_REVERSE_TARGET_RR', 1.50)):.2f}R",
             "",
             "Common commands",
-            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1",
+            "• /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 2",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_ENABLED true",
             "• /autotrade_config AUTOTRADE_DYNAMIC_RISK_MAX_MULT 1.5",
             "• /autotrade_config AUTOTRADE_DYNAMIC_TP_RR_ENABLED false",
@@ -88407,6 +88407,226 @@ except Exception:
     pass
 # =========================================================
 # end yver147
+# =========================================================
+
+
+# =========================================================
+# yver148 — 2026-06-25 noon sync, F9 diagnostics, Render timeout hardening
+# =========================================================
+# - Default AutoTrade risk/trade is now 2.00% for future deployments.
+# - One-time migration repairs legacy owner config values of 1.00% to 2.00%.
+# - Telegram send/network timeouts are treated as transient delivery failures, not
+#   handler crashes, so Render no longer prints huge tracebacks for reply_text timeouts.
+# - /engine_health F9 gets a lightweight dry-run candidate diagnostic so a quiet F9
+#   period is distinguishable from a broken F9 pipeline. No setup/trade is created
+#   by this diagnostic.
+# - No setup geometry, TP/SL, leverage, drift, F8/F9 thresholds, or Bybit order logic changed.
+YVER148_VERSION = 'yver148_2026_06_25_noon_sync_risk2_f9_diag_render_timeout_guard'
+
+# -----------------------------
+# Risk default = 2%
+# -----------------------------
+try:
+    # Keep environment override support, but use 2% as code default.
+    AUTOTRADE_RISK_PER_TRADE_PCT = float(os.environ.get('AUTOTRADE_RISK_PER_TRADE_PCT', '2') or 2)
+except Exception:
+    AUTOTRADE_RISK_PER_TRADE_PCT = 2.0
+
+
+def _yver148_apply_risk2_default_once() -> None:
+    """Migrate legacy stored 1% risk to the new owner default of 2% once.
+
+    This is intentionally one-time: after v148 has migrated, a future manual
+    /autotrade_config AUTOTRADE_RISK_PER_TRADE_PCT 1 will be respected.
+    """
+    try:
+        mig_key = 'yver148_risk2_default_migrated'
+        if str(_autotrade_config_get(mig_key, '') or '').strip() == '1':
+            return
+        cur_raw = _autotrade_config_get(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, None)
+        try:
+            cur = float(cur_raw) if cur_raw not in (None, '') else 0.0
+        except Exception:
+            cur = 0.0
+        if cur <= 0.0 or abs(cur - 1.0) < 1e-9:
+            _autotrade_config_set(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, 2.0)
+        _autotrade_config_set(mig_key, '1')
+    except Exception:
+        pass
+
+try:
+    _yver148_apply_risk2_default_once()
+except Exception:
+    pass
+
+try:
+    _YVER148_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT = _autotrade_runtime_summary_dict
+except Exception:
+    _YVER148_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT = None
+
+
+def _autotrade_runtime_summary_dict() -> dict:
+    try:
+        _yver148_apply_risk2_default_once()
+    except Exception:
+        pass
+    if callable(_YVER148_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT):
+        d = dict(_YVER148_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT() or {})
+    else:
+        d = {}
+    # Make the display and downstream runtime read the repaired value immediately.
+    try:
+        d['AUTOTRADE_RISK_PER_TRADE_PCT'] = float(_autotrade_config_get(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, AUTOTRADE_RISK_PER_TRADE_PCT) or AUTOTRADE_RISK_PER_TRADE_PCT)
+    except Exception:
+        d['AUTOTRADE_RISK_PER_TRADE_PCT'] = float(AUTOTRADE_RISK_PER_TRADE_PCT or 2.0)
+    return d
+
+# -----------------------------
+# Telegram timeout / Render log guard
+# -----------------------------
+try:
+    _YVER148_ORIG_SEND_CACHED_OR_QUEUE_ADMIN_REPORT = _send_cached_or_queue_admin_report
+except Exception:
+    _YVER148_ORIG_SEND_CACHED_OR_QUEUE_ADMIN_REPORT = None
+
+
+async def _send_cached_or_queue_admin_report(update: Update, title: str, cache_key: str, fn, args: tuple = (), kwargs: dict | None = None, parse_mode=None, fresh_ttl: int = 60, stale_ttl: int = 12 * 3600, background_timeout: int | None = 600, force_refresh: bool = True) -> None:
+    try:
+        if callable(_YVER148_ORIG_SEND_CACHED_OR_QUEUE_ADMIN_REPORT):
+            return await _YVER148_ORIG_SEND_CACHED_OR_QUEUE_ADMIN_REPORT(update, title, cache_key, fn, args=args, kwargs=kwargs, parse_mode=parse_mode, fresh_ttl=fresh_ttl, stale_ttl=stale_ttl, background_timeout=background_timeout, force_refresh=force_refresh)
+    except (TimedOut, NetworkError) as e:
+        # Network delivery failure only. The report cache/background task may still
+        # have completed; do not route this into the global crash handler.
+        try:
+            logger.warning('Telegram report send timed out/failed for %s; suppressed traceback: %s: %s', str(title or cache_key or 'report'), type(e).__name__, e)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        raise
+    try:
+        if update and getattr(update, 'message', None):
+            await update.message.reply_text(str(title or 'Report') + ' is unavailable right now; try again in a few seconds.')
+    except Exception:
+        pass
+    return None
+
+try:
+    _YVER148_ORIG_ERROR_HANDLER = error_handler
+except Exception:
+    _YVER148_ORIG_ERROR_HANDLER = None
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = getattr(context, 'error', None)
+    if isinstance(err, (TimedOut, NetworkError)):
+        try:
+            _log_transient_telegram_error(err)
+        except Exception:
+            try:
+                logger.warning('Telegram transient send/network error ignored: %s: %s', type(err).__name__, err)
+            except Exception:
+                pass
+        return
+    if callable(_YVER148_ORIG_ERROR_HANDLER):
+        return await _YVER148_ORIG_ERROR_HANDLER(update, context)
+    try:
+        logger.exception('Telegram handler/job error', exc_info=(type(err), err, getattr(err, '__traceback__', None)) if err else True)
+    except Exception:
+        pass
+
+# Suppress noisy APScheduler overlap warnings for alert_job. ALERT_LOCK still
+# protects execution; skipped overlapping ticks are expected when Telegram/network
+# I/O is slow on Render.
+class _Yver148ApschedulerNoiseFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            msg = str(record.getMessage() or '')
+            if 'maximum number of running instances reached' in msg and 'alert_job' in msg:
+                return False
+        except Exception:
+            pass
+        return True
+
+try:
+    logging.getLogger('apscheduler.scheduler').addFilter(_Yver148ApschedulerNoiseFilter())
+except Exception:
+    pass
+
+# -----------------------------
+# F9 dry-run diagnostic: no DB writes, no emails, no trades
+# -----------------------------
+def _yver148_f9_dryrun_diagnostic(limit: int = 6) -> dict:
+    out = {'ok': False, 'session': '-', 'leaders': 0, 'losers': 0, 'candidates': 0, 'sample': [], 'reason': ''}
+    try:
+        sess = str(scan_session_name_utc() or '').upper().strip() or 'ASIA'
+        out['session'] = sess
+        best = get_cached_futures_tickers() or {}
+        if not best:
+            out['reason'] = 'no_cached_futures_tickers'
+            return out
+        try:
+            leaders, losers = compute_directional_lists(best)
+        except Exception:
+            leaders, losers = [], []
+        out['leaders'] = len(leaders or [])
+        out['losers'] = len(losers or [])
+        try:
+            setups = list(pick_multiday_mover_family_setups(best, leaders or [], losers or [], max(1, int(limit or 6)), sess) or [])
+        except Exception as exc:
+            out['reason'] = f'picker_error:{type(exc).__name__}'
+            setups = []
+        out['candidates'] = len(setups or [])
+        sample = []
+        for s in list(setups or [])[:max(1, int(limit or 6))]:
+            try:
+                sample.append(f"{str(getattr(s,'symbol','') or '').upper()} {str(getattr(s,'side','') or '').upper()} {str(getattr(s,'setup_id','') or '')}")
+            except Exception:
+                pass
+        out['sample'] = sample
+        out['ok'] = True
+        if not setups:
+            out['reason'] = 'no_current_repeated_leader_loser_entry'
+    except Exception as exc:
+        out['reason'] = f'{type(exc).__name__}: {exc}'
+    return out
+
+try:
+    _YVER148_ORIG_ENGINE_HEALTH_TEXT = _yver90_engine_health_text
+except Exception:
+    _YVER148_ORIG_ENGINE_HEALTH_TEXT = None
+
+
+def _yver90_engine_health_text(uid: int, engine: str = 'F8', hours: int = 24) -> str:
+    out = _YVER148_ORIG_ENGINE_HEALTH_TEXT(uid, engine, hours) if callable(_YVER148_ORIG_ENGINE_HEALTH_TEXT) else ''
+    try:
+        eng = 'F9' if str(engine or '').upper().strip() == 'F9' else 'F8'
+        if eng == 'F9':
+            diag = _yver148_f9_dryrun_diagnostic(limit=6)
+            if int(diag.get('candidates', 0) or 0) > 0:
+                out += ("\n\n🧬 F9 dry-run now: scanner is callable and found "
+                        f"{int(diag.get('candidates',0) or 0)} candidate(s) in {str(diag.get('session') or '-')}. "
+                        f"Sample: {', '.join(diag.get('sample') or []) or '-'}")
+            else:
+                out += ("\n\n🧬 F9 dry-run now: scanner is callable but found no current strict 2-day repeated leader/loser entry. "
+                        "That means no recent F9 rows can be normal; it is not proof of a broken F9 pipeline. "
+                        f"Leaders checked: {int(diag.get('leaders',0) or 0)} | Losers checked: {int(diag.get('losers',0) or 0)} | Reason: {str(diag.get('reason') or '-')}")
+    except Exception:
+        pass
+    return out
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v148'
+    SETUP_AUDIT_CACHE_VERSION = str(globals().get('SETUP_AUDIT_CACHE_VERSION', '')) + ':v148'
+    _autotrade_config_set('yver148_version', YVER148_VERSION)
+except Exception:
+    pass
+try:
+    logger.debug('yver148 loaded: risk default 2pct, F9 dry-run diagnostic, Telegram timeout traceback guard')
+except Exception:
+    pass
+# =========================================================
+# end yver148
 # =========================================================
 
 if __name__ == "__main__":
