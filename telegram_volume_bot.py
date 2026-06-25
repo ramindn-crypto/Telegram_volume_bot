@@ -1,5 +1,6 @@
 # yver145: removes the old v114 policy-repair footer from /setup_matrix policy and adds a debounced background /setup_matrix policy refresh trigger after terminal setup TP/SL results; no setup/email/AutoTrade/order/risk logic changes.
 # yver144: sync hardening for current setup delivery/reporting; BigMove/F8 and F9 reports align with visible audit rows; Render startup noise reduced; no TP/SL/risk/leverage/order changes.
+# yver147: unifies /setup_open_times 7d and AUTO_BLACKOUT on one canonical 7d KEEP-row basis, fixes the v146 display-vs-config blackout mismatch, refreshes active blackout hourly, and keeps weekend safety. No setup/email/AutoTrade/order/risk/TP/SL changes.
 # yver146: Auto-blackout active windows are reconciled to the exact /setup_open_times 7d suggestion set plus weekend safety; no stale/smoothing hours remain in /autotrade_config or AUTO_BLACKOUT_STATUS; setup_open_times note updated. No trading/order/risk/TP/SL changes.
 # yver143: F8/BigMove AutoTrade sync fix; confirmed emailed F8 KEEP setups no longer get blocked by the secondary strict-edge sample-count guard (AUTOTRADE_STRICT) after setup email/audit visibility. Downstream risk, blackout, direction, duplicate, leverage, drift and order safety gates unchanged.
 # yver142: repairs BigMove/F8 setup generation reliability so every confirmed BigMove alert can create a durable F8 generated/setup-audit row; failed cache-price attempts no longer memo-block later hooks. No order/risk/TP/SL/leverage changes.
@@ -87914,6 +87915,498 @@ except Exception:
     pass
 # =========================================================
 # end yver146
+# =========================================================
+
+
+# =========================================================
+# yver147 blackout/open-times canonical sync
+# =========================================================
+YVER147_VERSION = 'yver147_2026_06_25_blackout_open_times_canonical_hourly_sync'
+YVER147_AUTO_BLACKOUT_METHOD_TEXT = '7d-only exact auto-blackout: /setup_open_times 7d and active blackout use the same canonical current-KEEP setup rows; WR<45%, AvgR<0, decided TP+SL>=5; refreshed hourly; no smoothing/stale retained hours; weekend safety preserved; setup generation stays SHADOW ON'
+YVER147_AUTO_BLACKOUT_INTERVAL_SEC = 3600.0
+
+
+def _yver147_owner_uid(uid: int = 0) -> int:
+    try:
+        return int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+    except Exception:
+        try:
+            return int(uid or 0)
+        except Exception:
+            return 0
+
+
+def _yver147_clear_policy_source_cache() -> None:
+    """Force /setup_matrix policy source to be fresh for blackout/open-times reports.
+
+    v146 could render /setup_open_times from a stale/different policy snapshot than
+    AUTO_BLACKOUT_STATUS.  This is cheap compared with the report itself and keeps
+    policy rows, WR/C and active blackout windows aligned.
+    """
+    try:
+        cache = globals().setdefault('_SETUP_MATRIX_POLICY_SOURCE_CACHE', {'ts': 0.0, 'user_id': 0, 'data': {}})
+        if isinstance(cache, dict):
+            cache['ts'] = 0.0
+            cache['data'] = {}
+    except Exception:
+        pass
+
+
+def _yver147_parse_scope(scope_arg: str | None = '7d') -> tuple[str, float, int]:
+    try:
+        scope_label, start_ts, scope_hours = _setup_open_times_parse_scope(str(scope_arg or '7d'))
+    except Exception:
+        scope_label = 'last 7d'
+        start_ts = float(time.time()) - 7.0 * 86400.0
+        scope_hours = 168
+    try:
+        start_ts = float(start_ts or 0.0)
+    except Exception:
+        start_ts = float(time.time()) - 7.0 * 86400.0
+    try:
+        scope_hours = int(scope_hours or 0)
+    except Exception:
+        scope_hours = 0
+    return str(scope_label or 'last 7d'), float(start_ts or 0.0), int(scope_hours or 0)
+
+
+def _yver147_current_keep_combo_set(uid: int = 0) -> set[str]:
+    _yver147_clear_policy_source_cache()
+    try:
+        sets = _setup_matrix_policy_current_lane_sets(_yver147_owner_uid(uid)) or {}
+        return {str(x or '').upper().strip() for x in (sets.get('keep') or set()) if str(x or '').strip()}
+    except Exception:
+        return set()
+
+
+def _yver147_canonical_setup_open_rows(uid: int = 0, scope_arg: str = '7d') -> list[dict]:
+    """Rows used by both /setup_open_times and AUTO_BLACKOUT.
+
+    This intentionally matches the older v65/v66 auto-blackout evidence basis that
+    produced the stable 05:00 and 16:00 windows, but exposes the same rows in
+    /setup_open_times so the report and /autotrade_config cannot disagree again.
+    """
+    uid_i = _yver147_owner_uid(uid)
+    _scope_label, start_ts, _scope_hours = _yver147_parse_scope(scope_arg)
+    keep_combos = _yver147_current_keep_combo_set(uid_i)
+    if not keep_combos:
+        return []
+    try:
+        rows = _setup_audit_load_rows(
+            int(uid_i),
+            hours=None,
+            limit=0,
+            dedup=True,
+            start_ts=float(start_ts or 0.0),
+            apply_final_quality_gate=False,
+            source_mode_override='ALL',
+        ) or []
+        if not rows:
+            rows, _src = _overall_report_source_rows(uid_i, start_ts=float(start_ts or 0.0), limit=0, dedup=True)
+    except Exception:
+        rows = []
+    out: list[dict] = []
+    seen: set[str] = set()
+    try:
+        result_horizon = _setup_audit_result_horizon_hours()
+    except Exception:
+        result_horizon = 0.0
+    for r0 in list(rows or []):
+        try:
+            r = dict(r0 or {})
+            ok, combo = _yver65_is_setup_keep_row(r, keep_combos)
+            combo = str(combo or '').upper().strip()
+            if not ok or not combo:
+                continue
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            if ts <= 0 or ts < float(start_ts or 0.0):
+                continue
+            # Stable de-dup key: keep separate emailed setup_ids, otherwise one
+            # canonical row per symbol/side/combo/entry minute.
+            setup_id = str(r.get('setup_id') or r.get('id') or r.get('signal_id') or '').strip()
+            if setup_id:
+                key = f'id:{setup_id}'
+            else:
+                sym = str(r.get('symbol') or r.get('market_symbol') or '').upper().strip()
+                side = str(r.get('side') or '').upper().strip()
+                key = f'row:{int(ts//60)}:{sym}:{side}:{combo}'
+            if key in seen:
+                continue
+            seen.add(key)
+            res = _setup_audit_result_label(_setup_audit_keep_watch_fast_result_label(r, result_horizon))
+            local_dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MEL_TZ)
+            r['_combo'] = combo
+            r['_res'] = res
+            r['_time_txt'] = local_dt.strftime('%m-%d %H:%M')
+            r['_hour'] = int(local_dt.hour) % 24
+            out.append(r)
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: float(_setup_audit_row_ts(x) or 0.0), reverse=True)
+
+
+def _yver147_hour_stats_from_rows(rows: list[dict]) -> dict[int, dict]:
+    stats = defaultdict(lambda: {'set': 0, 'tp': 0, 'sl': 0, 'nh': 0, 'open': 0, 'r_sum': 0.0})
+    for r in list(rows or []):
+        try:
+            h = int(r.get('_hour') if r.get('_hour') is not None else datetime.fromtimestamp(float(_setup_audit_row_ts(r) or 0.0), tz=timezone.utc).astimezone(MEL_TZ).hour) % 24
+            res = _setup_audit_result_label(r.get('_res') or _setup_audit_keep_watch_fast_result_label(r, _setup_audit_result_horizon_hours()))
+            st = stats[h]
+            st['set'] += 1
+            if res == 'TP':
+                st['tp'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or 0.0)
+            elif res == 'SL':
+                st['sl'] += 1
+                st['r_sum'] += float(_setup_audit_net_r_for_result(r, res) or -1.0)
+            elif res == 'NOHIT':
+                st['nh'] += 1
+            else:
+                st['open'] += 1
+        except Exception:
+            continue
+    return stats
+
+
+# Auto-blackout and /setup_open_times now share the same canonical stats source.
+def _yver65_setup_open_hour_stats(uid: int, scope_arg: str) -> dict[int, dict]:
+    try:
+        return _yver147_hour_stats_from_rows(_yver147_canonical_setup_open_rows(uid, scope_arg or '7d'))
+    except Exception:
+        return defaultdict(lambda: {'set': 0, 'tp': 0, 'sl': 0, 'open': 0, 'r_sum': 0.0})
+
+
+def _yver147_exact_auto_blackout_recommendation(uid: int = 0) -> dict:
+    uid_i = _yver147_owner_uid(uid)
+    try:
+        min_decided = int(os.environ.get('PULSE_AUTO_BLACKOUT_MIN_DECIDED', '5') or 5)
+    except Exception:
+        min_decided = 5
+    try:
+        wr_lt = float(os.environ.get('PULSE_AUTO_BLACKOUT_WR_LT', '45') or 45.0)
+    except Exception:
+        wr_lt = 45.0
+    try:
+        avg_r_lt = float(os.environ.get('PULSE_AUTO_BLACKOUT_AVGR_LT', '0') or 0.0)
+    except Exception:
+        avg_r_lt = 0.0
+    stats_7 = _yver65_setup_open_hour_stats(uid_i, '7d')
+    weak7 = _yver65_weak_hours_from_stats(stats_7, min_decided=min_decided, wr_lt=wr_lt, avg_r_lt=avg_r_lt)
+    final_hours = {int(h) % 24 for h in (weak7 or set())}
+    daily_windows = _yver65_compact_daily_hours_to_windows(final_hours)
+    windows_parts = list(daily_windows)
+    try:
+        weekend = str(YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW or '').strip()
+    except Exception:
+        weekend = 'SUN 22:00-MON 10:00'
+    if weekend:
+        windows_parts.append(weekend)
+    windows = _normalise_melbourne_blackout_windows(','.join(windows_parts), default='')
+    details = {}
+    try:
+        for h in sorted(final_hours):
+            m7 = _yver65_hour_metric(stats_7, h)
+            details[str(int(h) % 24)] = {
+                'h': int(h) % 24,
+                'wr7': round(float(m7.get('wr', 0.0)), 2),
+                'avg7': round(float(m7.get('avg_r', 0.0)), 3),
+                'dec7': int(m7.get('decided', 0) or 0),
+                'set7': int(m7.get('set', 0) or 0),
+                'open7': int(m7.get('open', 0) or 0),
+                'support': ['7d_exact_canonical'],
+            }
+    except Exception:
+        details = {}
+    return {
+        'ok': bool(windows),
+        'windows': windows,
+        'daily_hours': sorted(final_hours),
+        'candidate_hours': sorted(final_hours),
+        'weak7': sorted(final_hours),
+        'weak3': [],
+        'weak10': [],
+        'weak24': [],
+        'details': details,
+        'miss': {},
+        'method': YVER147_AUTO_BLACKOUT_METHOD_TEXT,
+        'version': YVER147_VERSION,
+    }
+
+
+# Override v146 builder with the canonical v147 one.
+def _yver146_exact_auto_blackout_recommendation(uid: int = 0) -> dict:
+    return _yver147_exact_auto_blackout_recommendation(uid)
+
+
+def _yver126_build_auto_blackout_recommendation(uid: int = 0) -> dict:
+    return _yver147_exact_auto_blackout_recommendation(uid)
+
+
+def _yver65_build_auto_blackout_recommendation(uid: int = 0) -> dict:
+    return _yver147_exact_auto_blackout_recommendation(uid)
+
+
+try:
+    _YVER147_ORIG_APPLY_EXACT_AUTO_BLACKOUT = _yver146_apply_exact_auto_blackout
+except Exception:
+    _YVER147_ORIG_APPLY_EXACT_AUTO_BLACKOUT = None
+
+
+def _yver146_apply_exact_auto_blackout(reason: str = 'sync', *, force: bool = False) -> dict:
+    """Apply exact canonical 7d blackout; v147 replacement for v146 sync."""
+    global _YVER146_AUTO_BLACKOUT_LAST_RECONCILE_TS
+    try:
+        if not _yver65_auto_blackout_enabled() and not force:
+            return {'ok': False, 'skipped': 'disabled'}
+        now_ts = float(time.time())
+        if not force:
+            try:
+                min_gap = float(os.environ.get('PULSE_AUTO_BLACKOUT_DISPLAY_SYNC_MIN_SEC', '60') or 60)
+            except Exception:
+                min_gap = 60.0
+            if _YVER146_AUTO_BLACKOUT_LAST_RECONCILE_TS > 0 and now_ts - _YVER146_AUTO_BLACKOUT_LAST_RECONCILE_TS < max(10.0, min_gap):
+                return {'ok': True, 'skipped': 'recent_display_sync'}
+        rec = _yver147_exact_auto_blackout_recommendation(_yver147_owner_uid(0))
+        windows = str((rec or {}).get('windows') or '').strip()
+        if not windows:
+            return {'ok': False, 'skipped': 'no_windows', 'recommendation': rec}
+        old_entry = str(_autotrade_entry_blackout_windows() or '').strip()
+        old_setup = str(_setup_generation_blackout_windows() or '').strip()
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, windows)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, windows)
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, now_ts)
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_LAST_WINDOWS_KEY, windows)
+        state = {
+            'version': YVER147_VERSION,
+            'ts': now_ts,
+            'reason': str(reason or 'sync'),
+            'windows': windows,
+            'hours': list((rec or {}).get('daily_hours') or []),
+            'candidate_hours': list((rec or {}).get('candidate_hours') or []),
+            'weak7': list((rec or {}).get('weak7') or []),
+            'weak3': [],
+            'weak10': [],
+            'weak24': [],
+            'miss': {},
+            'method': YVER147_AUTO_BLACKOUT_METHOD_TEXT,
+        }
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_STATE_KEY, _yver65_json_dump(state))
+        _YVER146_AUTO_BLACKOUT_LAST_RECONCILE_TS = now_ts
+        try:
+            if old_entry != windows or old_setup != windows:
+                logger.info('yver147 auto blackout canonical hourly sync: %s -> %s', old_entry, windows)
+        except Exception:
+            pass
+        return {'ok': True, 'windows': windows, 'old_entry': old_entry, 'old_setup': old_setup, 'recommendation': rec}
+    except Exception as e:
+        try:
+            logger.warning('yver147 auto blackout canonical sync failed: %s: %s', type(e).__name__, e)
+        except Exception:
+            pass
+        return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+
+
+def _yver65_auto_blackout_update_once(reason: str = 'scheduled', force: bool = False) -> dict:
+    return _yver146_apply_exact_auto_blackout(reason=reason, force=force)
+
+
+def _yver65_seconds_until_next_auto_blackout_review() -> float:
+    """v147: update once per hour instead of daily."""
+    try:
+        interval = float(os.environ.get('PULSE_AUTO_BLACKOUT_INTERVAL_SEC', str(int(YVER147_AUTO_BLACKOUT_INTERVAL_SEC))) or YVER147_AUTO_BLACKOUT_INTERVAL_SEC)
+        return max(900.0, interval)
+    except Exception:
+        return YVER147_AUTO_BLACKOUT_INTERVAL_SEC
+
+
+def _yver65_auto_blackout_status_text() -> str:
+    try:
+        _yver146_apply_exact_auto_blackout(reason='status_sync_v147', force=True)
+        state = _yver65_json_load(_autotrade_config_get(YVER65_AUTO_BLACKOUT_STATE_KEY, '{}'), default={})
+        last_ts = float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, 0) or 0)
+        last_txt = '-'
+        if last_ts > 0:
+            last_txt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        return (
+            '🤖 Auto Blackout\n' + HDR + '\n'
+            f"Enabled: {'YES' if _yver65_auto_blackout_enabled() else 'NO'}\n"
+            f"Review cadence: hourly Melbourne\n"
+            f"Last sync: {last_txt}\n"
+            f"Windows: {str(_autotrade_entry_blackout_windows() or '-')}\n"
+            f"Method: {YVER147_AUTO_BLACKOUT_METHOD_TEXT}\n"
+            f"7d candidate hours: {','.join(str(x).zfill(2) for x in (state or {}).get('candidate_hours', [])) or '-'}\n"
+            f"Applied daily hours: {','.join(str(x).zfill(2) for x in (state or {}).get('hours', [])) or '-'}"
+        )
+    except Exception as e:
+        return f'Auto blackout status unavailable: {type(e).__name__}: {e}'
+
+
+try:
+    _YVER147_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT = _autotrade_runtime_summary_dict
+except Exception:
+    _YVER147_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT = None
+
+
+def _autotrade_runtime_summary_dict() -> dict:
+    try:
+        _yver146_apply_exact_auto_blackout(reason='autotrade_config_sync_v147', force=False)
+    except Exception:
+        pass
+    if _YVER147_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT is not None:
+        return dict(_YVER147_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT() or {})
+    return {}
+
+
+def _yver147_auto_blackout_full_keys_block() -> str:
+    try:
+        _yver146_apply_exact_auto_blackout(reason='full_keys_sync_v147', force=True)
+    except Exception:
+        pass
+    try:
+        enabled_txt = 'true' if _yver65_auto_blackout_enabled() else 'false'
+        last_ts = float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, 0) or 0)
+        last_txt = '-'
+        if last_ts > 0:
+            last_txt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M Melbourne')
+        windows_txt = str(_autotrade_entry_blackout_windows() or '-')
+        state = _yver65_json_load(_autotrade_config_get(YVER65_AUTO_BLACKOUT_STATE_KEY, '{}'), default={})
+        cand_txt = ','.join(str(x).zfill(2) for x in (state or {}).get('candidate_hours', [])) or '-'
+        hours_txt = ','.join(str(x).zfill(2) for x in (state or {}).get('hours', [])) or '-'
+    except Exception:
+        enabled_txt, last_txt, windows_txt, cand_txt, hours_txt = '-', '-', '-', '-', '-'
+    lines = [
+        '🤖 Auto Blackout — Full Keys', HDR,
+        f'AUTO_BLACKOUT_ENABLED = {enabled_txt}',
+        'AUTO_BLACKOUT_REVIEW_CADENCE = hourly',
+        f'AUTO_BLACKOUT_LAST_RUN = {last_txt}',
+        f'AUTO_BLACKOUT_CURRENT_WINDOWS = {windows_txt}',
+        f'AUTO_BLACKOUT_METHOD = {YVER147_AUTO_BLACKOUT_METHOD_TEXT}',
+        f'AUTO_BLACKOUT_7D_CANDIDATE_HOURS = {cand_txt}',
+        f'AUTO_BLACKOUT_APPLIED_DAILY_HOURS = {hours_txt}',
+        '',
+        'Examples — automatic evidence-based blackout:',
+        '• /autotrade_config AUTO_BLACKOUT_STATUS',
+        '• /autotrade_config AUTO_BLACKOUT_NOW',
+        '• /autotrade_config AUTO_BLACKOUT_ENABLED true',
+        '• /autotrade_config AUTO_BLACKOUT_ENABLED false',
+        '',
+        'Method: last 7d /setup_open_times canonical evidence only; active windows are refreshed hourly and overwritten exactly, plus the fixed weekend safety window. Setup generation stays SHADOW ON.',
+    ]
+    return '\n'.join(lines)
+
+
+try:
+    # The existing v67 FULL wrapper calls this function by name, so replacing the
+    # function keeps /autotrade_config FULL single-source and avoids duplicate or
+    # stale auto-blackout blocks.
+    _yver67_auto_blackout_full_keys_block = _yver147_auto_blackout_full_keys_block
+except Exception:
+    pass
+
+
+try:
+    _YVER147_ORIG_SETUP_OPEN_TIMES_TEXT = _setup_open_times_text
+except Exception:
+    _YVER147_ORIG_SETUP_OPEN_TIMES_TEXT = None
+
+
+def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> str:
+    """v147: render from the same canonical row/stat basis as AUTO_BLACKOUT."""
+    uid_i = _yver147_owner_uid(uid)
+    scope_label, start_ts, scope_hours = _yver147_parse_scope(scope or 'all')
+    try:
+        row_limit = max(20, min(600, int(rows_limit or 220)))
+    except Exception:
+        row_limit = 220
+    rows = _yver147_canonical_setup_open_rows(uid_i, scope or 'all')
+    hour_stats = _yver147_hour_stats_from_rows(rows)
+    proposals = _setup_open_times_proposals(hour_stats, scope_hours=int(scope_hours or 0))
+    try:
+        if str(scope or '').strip().lower() in {'7d', '7', 'week'}:
+            _yver146_apply_exact_auto_blackout(reason='setup_open_times_7d_sync_v147', force=True)
+    except Exception:
+        pass
+    top_lines = []
+    if proposals:
+        for p in proposals:
+            top_lines.append(f"• <b>{html.escape(str(p.get('label') or '-'))}</b> — WR {float(p.get('wr', 0.0)):.1f}% | AvgR {float(p.get('avg_r', 0.0)):+.2f} | TP/SL {int(p.get('tp',0) or 0)}/{int(p.get('sl',0) or 0)} | Set {int(p.get('set',0) or 0)}")
+    else:
+        top_lines.append("• <b>No blackout suggested</b> — no KEEP setup-time hour had enough weak decided evidence in this window.")
+    try:
+        historical_wr = _setup_open_times_historical_wr_lookup(int(uid_i), float(start_ts or 0.0))
+    except Exception:
+        try:
+            historical_wr = _yver131_wr_open_lookup(int(uid_i), float(start_ts or 0.0))
+        except Exception:
+            historical_wr = lambda _c, _t: '-'
+    detail_rows = []
+    for r in list(rows or [])[:row_limit]:
+        try:
+            sym = str(r.get('symbol') or r.get('market_symbol') or '').upper().strip()
+            if sym.endswith('USDT'):
+                sym = sym[:-4]
+            combo = str(r.get('_combo') or '').upper().strip() or _yver65_is_setup_keep_row(r, _yver147_current_keep_combo_set(uid_i))[1]
+            ts = float(_setup_audit_row_ts(r) or 0.0)
+            try:
+                wr_o = historical_wr(combo, ts) if callable(historical_wr) else '-'
+            except Exception:
+                wr_o = '-'
+            try:
+                sess_row = str((r or {}).get('session') or (r or {}).get('source_session') or '').upper().strip()
+                side_row = str((r or {}).get('side') or '').upper().strip()
+                wr_c = _setup_audit_policy_wr_label(r, uid=int(uid_i), session_name=sess_row, side=side_row)
+            except Exception:
+                wr_c = '-'
+            detail_rows.append([str(r.get('_time_txt') or '-'), sym or '-', str(r.get('side') or '').upper().strip() or '-', combo or '-', 'KEEP', str(wr_o or '-'), str(wr_c or '-'), str(r.get('_res') or '-')])
+        except Exception:
+            continue
+    table = tabulate(detail_rows, headers=['Time', 'Sym', 'Side', 'Combo', 'Policy', 'WR/O', 'WR/C', 'Res'], tablefmt='plain', colalign=('left', 'left', 'center', 'left', 'center', 'right', 'right', 'center')) if detail_rows else 'No KEEP setup rows matched this window.'
+    try:
+        win = _setup_audit_window_summary(rows)
+        start_txt = str(win.get('start_txt') or '-')
+        end_txt = str(win.get('end_txt') or '-')
+    except Exception:
+        start_txt = end_txt = '-'
+    decided = sum(int((st or {}).get('tp', 0) or 0) + int((st or {}).get('sl', 0) or 0) for st in hour_stats.values())
+    tp_n = sum(int((st or {}).get('tp', 0) or 0) for st in hour_stats.values())
+    sl_n = sum(int((st or {}).get('sl', 0) or 0) for st in hour_stats.values())
+    wr = (tp_n / decided * 100.0) if decided else 0.0
+    try:
+        now_txt = datetime.fromtimestamp(time.time(), tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+    except Exception:
+        now_txt = ''
+    lines = [
+        "⏱️ <b>KEEP Setup Opening-Time Analysis</b>", HDR,
+        "<b>Suggested blackout windows only:</b>",
+        html.escape('Auto-blackout rule sync: /setup_open_times 7d and active blackout use the same canonical current-KEEP row basis. Rule: WR<45%, AvgR<0, decided TP+SL>=5. Active blackout refreshes hourly; no stale/smoothing hours are retained; weekend safety is preserved.'),
+        *top_lines, HDR,
+        f"Window: <b>{html.escape(scope_label)}</b>" + (f" | Now: <b>{html.escape(now_txt)}</b>" if now_txt else ''),
+        f"Rows: <b>{len(rows)}</b> KEEP setups | Decided: <b>{decided}</b> | TP/SL: <b>{tp_n}/{sl_n}</b> | WR: <b>{wr:.1f}%</b>",
+        f"Data start: <b>{html.escape(start_txt)}</b> | Data end: <b>{html.escape(end_txt)}</b> | Source: <b>EXECUTABLE+GENERATED</b>",
+        "WR/O = open-time / generated-time /setup_matrix WR snapshot. WR/C = current /setup_matrix lane WR after latest TP/SL evidence.",
+        "Detailed rows below use the exact same canonical KEEP-row basis as active auto-blackout.",
+        "<pre>" + html.escape(table) + "</pre>",
+    ]
+    if len(rows) > row_limit:
+        lines.append(f"Rows shown: <b>{row_limit}</b> / <b>{len(rows)}</b>. Increase the second argument to show more rows, e.g. <code>/setup_open_times all 400</code>.")
+    return "\n".join(lines)
+
+
+try:
+    # Force fresh background report rebuilds after this reporting-basis change.
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v147_blackout_canonical_hourly'
+    SETUP_AUDIT_CACHE_VERSION = str(globals().get('SETUP_AUDIT_CACHE_VERSION', '')) + ':v147'
+    _autotrade_config_set('yver147_version', YVER147_VERSION)
+except Exception:
+    pass
+try:
+    logger.debug('yver147 loaded: setup_open_times and active auto-blackout share canonical 7d KEEP rows; hourly auto-blackout sync enabled')
+except Exception:
+    pass
+# =========================================================
+# end yver147
 # =========================================================
 
 if __name__ == "__main__":
