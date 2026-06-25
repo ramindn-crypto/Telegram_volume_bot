@@ -88727,3 +88727,75 @@ except Exception:
 
 if __name__ == "__main__":
     main()
+
+# =========================================================
+# yver151: confirmed-email delivery lock
+# =========================================================
+# Fix: /screen and AutoTrade delivery lane must not show "Setup emailed" or
+# consume a setup as emailed unless SMTP returned confirmed success.  Older builds
+# defaulted EMAIL_ASSUME_SENT_ON_SOFT_SMTP=1, so a Telegram/thread timeout or soft
+# SMTP error could be recorded as sent even when Gmail did not receive the message.
+# This patch is intentionally lightweight: no setup scan, matrix, blackout,
+# AutoTrade sizing, TP/SL, leverage, risk, or order-geometry changes.
+
+YVER151_VERSION = 'yver151_2026_06_25_confirmed_smtp_email_only_no_phantom_screen_sent'
+
+try:
+    _YVER151_ORIG_EMAIL_ASSUME_SENT_ON_SOFT_SMTP = _email_assume_sent_on_soft_smtp
+except Exception:
+    _YVER151_ORIG_EMAIL_ASSUME_SENT_ON_SOFT_SMTP = None
+
+
+def _email_assume_sent_on_soft_smtp() -> bool:
+    """Default OFF: only treat soft SMTP/timeout as sent when explicitly enabled.
+
+    The owner prefers correctness over optimistic delivery assumptions: if Gmail
+    does not show the message, /screen must not say the setup was emailed, and
+    AutoTrade must not use the emailed-setup lane from that unconfirmed send.
+    """
+    try:
+        return str(os.environ.get('EMAIL_ASSUME_SENT_ON_SOFT_SMTP', '0')).strip().lower() in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        return False
+
+
+try:
+    _YVER151_ORIG_RECORD_SETUP_EMAIL_DELIVERY_SIDE_EFFECTS = _record_setup_email_delivery_side_effects
+except Exception:
+    _YVER151_ORIG_RECORD_SETUP_EMAIL_DELIVERY_SIDE_EFFECTS = None
+
+
+def _record_setup_email_delivery_side_effects(user_id: int, session_name: str, setups: list, best_fut: dict | None = None, status: str = 'sent') -> int:
+    """Record setup-email side effects only for confirmed sends by default.
+
+    Blocks timeout_assumed_sent / exception_assumed_sent / soft_smtp_assumed_sent
+    unless EMAIL_ASSUME_SENT_ON_SOFT_SMTP is explicitly enabled in Render env vars.
+    """
+    try:
+        st = str(status or '').lower()
+        if ('assumed' in st or 'timeout' in st) and not _email_assume_sent_on_soft_smtp():
+            try:
+                db_log_setup_pipeline_event(
+                    int(user_id or 0),
+                    stage='email_delivery_side_effects',
+                    status='blocked_unconfirmed_smtp',
+                    session=str(session_name or '').upper().strip(),
+                    mode='email',
+                    details={'requested_status': str(status or ''), 'setups': len(list(setups or []))},
+                )
+            except Exception:
+                pass
+            return 0
+    except Exception:
+        pass
+    if callable(_YVER151_ORIG_RECORD_SETUP_EMAIL_DELIVERY_SIDE_EFFECTS):
+        return _YVER151_ORIG_RECORD_SETUP_EMAIL_DELIVERY_SIDE_EFFECTS(user_id, session_name, setups, best_fut, status=status)
+    return 0
+
+try:
+    logger.info('pulsefutures:%s loaded: confirmed SMTP success required before setup emails are recorded as sent; no setup/autotrade/risk changes', YVER151_VERSION)
+except Exception:
+    pass
+# =========================================================
+# end yver151
+# =========================================================
