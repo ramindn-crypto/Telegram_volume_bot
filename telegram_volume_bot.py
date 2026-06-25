@@ -1,5 +1,6 @@
 # yver145: removes the old v114 policy-repair footer from /setup_matrix policy and adds a debounced background /setup_matrix policy refresh trigger after terminal setup TP/SL results; no setup/email/AutoTrade/order/risk logic changes.
 # yver144: sync hardening for current setup delivery/reporting; BigMove/F8 and F9 reports align with visible audit rows; Render startup noise reduced; no TP/SL/risk/leverage/order changes.
+# yver146: Auto-blackout active windows are reconciled to the exact /setup_open_times 7d suggestion set plus weekend safety; no stale/smoothing hours remain in /autotrade_config or AUTO_BLACKOUT_STATUS; setup_open_times note updated. No trading/order/risk/TP/SL changes.
 # yver143: F8/BigMove AutoTrade sync fix; confirmed emailed F8 KEEP setups no longer get blocked by the secondary strict-edge sample-count guard (AUTOTRADE_STRICT) after setup email/audit visibility. Downstream risk, blackout, direction, duplicate, leverage, drift and order safety gates unchanged.
 # yver142: repairs BigMove/F8 setup generation reliability so every confirmed BigMove alert can create a durable F8 generated/setup-audit row; failed cache-price attempts no longer memo-block later hooks. No order/risk/TP/SL/leverage changes.
 # yver141: repairs WR/O display conflict so a row shown under current/entry KEEP cannot display a stale sub-threshold historical WR/O; WR/O now falls back to the KEEP policy WR snapshot when the selected open-time matrix row is below the runtime KEEP floor. Display-only; no setup/email/autotrade/risk/TP/SL/order changes.
@@ -87660,6 +87661,259 @@ except Exception:
     pass
 # =========================================================
 # end yver144
+# =========================================================
+
+
+# =========================================================
+# yver146 auto-blackout active/status sync to exact 7d suggestions
+# =========================================================
+YVER146_VERSION = 'yver146_2026_06_25_auto_blackout_exact_7d_active_sync'
+YVER146_AUTO_BLACKOUT_METHOD_TEXT = '7d-only exact auto-blackout: active daily windows = /setup_open_times 7d suggestions (WR<45%, AvgR<0, decided TP+SL>=5); no smoothing/stale retained hours; weekend safety preserved; setup generation stays SHADOW ON'
+_YVER146_AUTO_BLACKOUT_LAST_RECONCILE_TS = 0.0
+
+
+def _yver146_exact_auto_blackout_recommendation(uid: int = 0) -> dict:
+    """Return the exact active blackout recommendation from current 7d evidence only.
+
+    This mirrors /setup_open_times 7d proposal logic.  It deliberately does not
+    retain old weak hours for smoothing because the live /autotrade_config output
+    must not disagree with the current 7d report.
+    """
+    uid_i = int(globals().get('AUTOTRADE_OWNER_UID', 0) or uid or 0)
+    try:
+        min_decided = int(os.environ.get('PULSE_AUTO_BLACKOUT_MIN_DECIDED', '5') or 5)
+    except Exception:
+        min_decided = 5
+    try:
+        wr_lt = float(os.environ.get('PULSE_AUTO_BLACKOUT_WR_LT', '45') or 45.0)
+    except Exception:
+        wr_lt = 45.0
+    try:
+        avg_r_lt = float(os.environ.get('PULSE_AUTO_BLACKOUT_AVGR_LT', '0') or 0.0)
+    except Exception:
+        avg_r_lt = 0.0
+
+    stats_7 = _yver65_setup_open_hour_stats(uid_i, '7d')
+    weak7 = _yver65_weak_hours_from_stats(stats_7, min_decided=min_decided, wr_lt=wr_lt, avg_r_lt=avg_r_lt)
+    final_hours = {int(h) % 24 for h in (weak7 or set())}
+    daily_windows = _yver65_compact_daily_hours_to_windows(final_hours)
+    windows_parts = list(daily_windows)
+    try:
+        weekend = str(YVER65_AUTO_BLACKOUT_WEEKEND_WINDOW or '').strip()
+    except Exception:
+        weekend = 'SUN 22:00-MON 10:00'
+    if weekend:
+        windows_parts.append(weekend)
+    windows = _normalise_melbourne_blackout_windows(','.join(windows_parts), default='')
+
+    details = {}
+    try:
+        for h in sorted(final_hours):
+            m7 = _yver65_hour_metric(stats_7, h)
+            details[str(int(h) % 24)] = {
+                'h': int(h) % 24,
+                'wr7': round(float(m7.get('wr', 0.0)), 2),
+                'avg7': round(float(m7.get('avg_r', 0.0)), 3),
+                'dec7': int(m7.get('decided', 0) or 0),
+                'set7': int(m7.get('set', 0) or 0),
+                'open7': int(m7.get('open', 0) or 0),
+                'support': ['7d_exact'],
+            }
+    except Exception:
+        details = {}
+
+    return {
+        'ok': bool(windows),
+        'windows': windows,
+        'daily_hours': sorted(final_hours),
+        'candidate_hours': sorted(final_hours),
+        'weak7': sorted(final_hours),
+        'weak3': [],
+        'weak10': [],
+        'weak24': [],
+        'details': details,
+        'miss': {},
+        'method': YVER146_AUTO_BLACKOUT_METHOD_TEXT,
+        'version': YVER146_VERSION,
+    }
+
+
+# Override previous builders so scheduled/manual AUTO_BLACKOUT_NOW also uses exact
+# current /setup_open_times 7d suggestions, not stale retained hours.
+def _yver126_build_auto_blackout_recommendation(uid: int = 0) -> dict:
+    return _yver146_exact_auto_blackout_recommendation(uid)
+
+
+def _yver65_build_auto_blackout_recommendation(uid: int = 0) -> dict:
+    return _yver146_exact_auto_blackout_recommendation(uid)
+
+
+def _yver146_apply_exact_auto_blackout(reason: str = 'sync', *, force: bool = False) -> dict:
+    """Reconcile active blackout config to exact 7d evidence plus weekend.
+
+    Lightweight guard avoids repeating the DB scan too often from display-only
+    commands, while AUTO_BLACKOUT_NOW/startup can call with force=True.
+    """
+    global _YVER146_AUTO_BLACKOUT_LAST_RECONCILE_TS
+    try:
+        if not _yver65_auto_blackout_enabled() and not force:
+            return {'ok': False, 'skipped': 'disabled'}
+        now_ts = float(time.time())
+        if not force:
+            try:
+                min_gap = float(os.environ.get('PULSE_AUTO_BLACKOUT_DISPLAY_SYNC_MIN_SEC', '60') or 60)
+            except Exception:
+                min_gap = 60.0
+            if _YVER146_AUTO_BLACKOUT_LAST_RECONCILE_TS > 0 and now_ts - _YVER146_AUTO_BLACKOUT_LAST_RECONCILE_TS < max(10.0, min_gap):
+                return {'ok': True, 'skipped': 'recent_display_sync'}
+        rec = _yver146_exact_auto_blackout_recommendation(int(globals().get('AUTOTRADE_OWNER_UID', 0) or 0))
+        windows = str((rec or {}).get('windows') or '').strip()
+        if not windows:
+            return {'ok': False, 'skipped': 'no_windows', 'recommendation': rec}
+        old_entry = str(_autotrade_entry_blackout_windows() or '').strip()
+        old_setup = str(_setup_generation_blackout_windows() or '').strip()
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_ENTRY_BLACKOUT_WINDOWS_KEY, windows)
+        _autotrade_config_set(SETUP_CFG_GENERATION_BLACKOUT_WINDOWS_KEY, windows)
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, now_ts)
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_LAST_WINDOWS_KEY, windows)
+        state = {
+            'version': YVER146_VERSION,
+            'ts': now_ts,
+            'reason': str(reason or 'sync'),
+            'windows': windows,
+            'hours': list((rec or {}).get('daily_hours') or []),
+            'candidate_hours': list((rec or {}).get('candidate_hours') or []),
+            'weak7': list((rec or {}).get('weak7') or []),
+            'weak3': [],
+            'weak10': [],
+            'weak24': [],
+            'miss': {},
+            'method': YVER146_AUTO_BLACKOUT_METHOD_TEXT,
+        }
+        _autotrade_config_set(YVER65_AUTO_BLACKOUT_STATE_KEY, _yver65_json_dump(state))
+        _YVER146_AUTO_BLACKOUT_LAST_RECONCILE_TS = now_ts
+        try:
+            if old_entry != windows or old_setup != windows:
+                logger.info('yver146 auto blackout exact 7d sync: %s -> %s', old_entry, windows)
+        except Exception:
+            pass
+        return {'ok': True, 'windows': windows, 'old_entry': old_entry, 'old_setup': old_setup, 'recommendation': rec}
+    except Exception as e:
+        try:
+            logger.warning('yver146 auto blackout exact sync failed: %s: %s', type(e).__name__, e)
+        except Exception:
+            pass
+        return {'ok': False, 'error': f'{type(e).__name__}: {e}'}
+
+
+try:
+    _YVER146_ORIG_AUTO_BLACKOUT_UPDATE_ONCE = _yver65_auto_blackout_update_once
+except Exception:
+    _YVER146_ORIG_AUTO_BLACKOUT_UPDATE_ONCE = None
+
+
+def _yver65_auto_blackout_update_once(reason: str = 'scheduled', force: bool = False) -> dict:
+    return _yver146_apply_exact_auto_blackout(reason=reason, force=force)
+
+
+def _yver65_auto_blackout_status_text() -> str:
+    try:
+        # User-facing status must reflect the same current 7d evidence as
+        # /setup_open_times 7d, so reconcile first.
+        _yver146_apply_exact_auto_blackout(reason='status_sync_v146', force=True)
+        state = _yver65_json_load(_autotrade_config_get(YVER65_AUTO_BLACKOUT_STATE_KEY, '{}'), default={})
+        last_ts = float(_autotrade_config_get(YVER65_AUTO_BLACKOUT_LAST_RUN_TS_KEY, 0) or 0)
+        last_txt = '-'
+        if last_ts > 0:
+            last_txt = datetime.fromtimestamp(last_ts, tz=timezone.utc).astimezone(MEL_TZ).strftime('%Y-%m-%d %H:%M')
+        h, m = _yver65_auto_blackout_review_time()
+        return (
+            '🤖 Auto Blackout\n' + HDR + '\n'
+            f"Enabled: {'YES' if _yver65_auto_blackout_enabled() else 'NO'}\n"
+            f"Review time: {h:02d}:{m:02d} Melbourne daily\n"
+            f"Last sync: {last_txt}\n"
+            f"Windows: {str(_autotrade_entry_blackout_windows() or '-')}\n"
+            f"Method: {YVER146_AUTO_BLACKOUT_METHOD_TEXT}\n"
+            f"7d candidate hours: {','.join(str(x).zfill(2) for x in (state or {}).get('candidate_hours', [])) or '-'}\n"
+            f"Applied daily hours: {','.join(str(x).zfill(2) for x in (state or {}).get('hours', [])) or '-'}"
+        )
+    except Exception as e:
+        return f'Auto blackout status unavailable: {type(e).__name__}: {e}'
+
+
+try:
+    _YVER146_ORIG_RUNTIME_SUMMARY_DICT = _autotrade_runtime_summary_dict
+except Exception:
+    _YVER146_ORIG_RUNTIME_SUMMARY_DICT = None
+
+
+def _autotrade_runtime_summary_dict() -> dict:
+    try:
+        # Keep /autotrade_config aligned with /setup_open_times 7d.  The sync is
+        # debounced so normal command use does not create Render lag.
+        _yver146_apply_exact_auto_blackout(reason='autotrade_config_sync_v146', force=False)
+    except Exception:
+        pass
+    if _YVER146_ORIG_RUNTIME_SUMMARY_DICT is not None:
+        return dict(_YVER146_ORIG_RUNTIME_SUMMARY_DICT() or {})
+    return {}
+
+
+try:
+    _YVER146_ORIG_SETUP_OPEN_TIMES_TEXT = _setup_open_times_text
+except Exception:
+    _YVER146_ORIG_SETUP_OPEN_TIMES_TEXT = None
+
+
+def _setup_open_times_text(uid: int, scope: str = '', rows_limit: int = 220) -> str:
+    # Keep active blackout config synced when the owner checks the 7d evidence.
+    try:
+        scope_txt = str(scope or '').strip().lower()
+        if scope_txt in {'7d', '7', 'week'}:
+            _yver146_apply_exact_auto_blackout(reason='setup_open_times_7d_sync_v146', force=True)
+    except Exception:
+        pass
+    txt = _YVER146_ORIG_SETUP_OPEN_TIMES_TEXT(uid, scope, rows_limit) if _YVER146_ORIG_SETUP_OPEN_TIMES_TEXT is not None else 'setup_open_times unavailable.'
+    try:
+        old_note = 'Auto-blackout rule sync: suggestions above use the same 7d-only AUTO_BLACKOUT candidate rule: WR<45%, AvgR<0, decided TP+SL>=5. Applied windows may also retain a previous weak hour for one review for smoothing.'
+        new_note = 'Auto-blackout rule sync: active blackout windows use this exact 7d-only rule: WR<45%, AvgR<0, decided TP+SL>=5. No stale/smoothing hours are retained; only the fixed weekend safety window is preserved.'
+        txt = str(txt or '').replace(html.escape(old_note), html.escape(new_note)).replace(old_note, new_note)
+    except Exception:
+        pass
+    return txt
+
+
+try:
+    _YVER146_ORIG_MAIN = main
+except Exception:
+    _YVER146_ORIG_MAIN = None
+
+
+def main():
+    try:
+        if _yver65_auto_blackout_enabled():
+            _yver146_apply_exact_auto_blackout(reason='startup_sync_v146', force=True)
+    except Exception:
+        pass
+    if _YVER146_ORIG_MAIN is not None:
+        return _YVER146_ORIG_MAIN()
+    return None
+
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v146_auto_blackout_exact_7d'
+    SETUP_AUDIT_CACHE_VERSION = str(globals().get('SETUP_AUDIT_CACHE_VERSION', '')) + ':v146'
+    _autotrade_config_set('yver146_version', YVER146_VERSION)
+except Exception:
+    pass
+try:
+    logger.debug('yver146 loaded: auto blackout active windows reconcile to exact /setup_open_times 7d suggestions plus weekend safety; no stale smoothing hours')
+except Exception:
+    pass
+# =========================================================
+# end yver146
 # =========================================================
 
 if __name__ == "__main__":
