@@ -88629,5 +88629,301 @@ except Exception:
 # end yver148
 # =========================================================
 
+
+
+# =========================================================
+# yver149 — 2026-06-25 15:20 review: dynamic-risk WR-tier hardening
+# =========================================================
+# - Dynamic risk multiplier is now explicitly controlled by current /setup_matrix
+#   KEEP evidence plus exact 7d lane evidence, not by the composite diagnostic score.
+# - Base configured risk remains 2.00%; dynamic multiplier remains 1.00x-1.50x.
+# - 1.25x/1.50x boosts require current Policy=KEEP, enough decided samples,
+#   positive AvgR, adequate confidence, and strong WR evidence.
+# - Prevents stale/high composite scores from oversizing lanes whose current WR/C or
+#   fresh exact-lane evidence does not justify a boost.
+# - No TP/SL, leverage, entry drift, setup generation, F8/F9 thresholds, blackout,
+#   email delivery, or Bybit order placement logic changed.
+YVER149_VERSION = 'yver149_2026_06_25_dynamic_risk_wr_tier_hardening'
+
+try:
+    _YVER149_ORIG_AUTOTRADE_DYNAMIC_RISK_SCORE = _autotrade_dynamic_risk_score
+except Exception:
+    _YVER149_ORIG_AUTOTRADE_DYNAMIC_RISK_SCORE = None
+
+
+def _yver149_apply_owner_risk2_default_once() -> None:
+    """Owner default is 2% risk/trade for v149+.
+
+    One-time repair only. If a later manual command intentionally changes risk after
+    v149, that later value is respected unless it is the stale legacy 1% left over
+    before this migration key is written.
+    """
+    try:
+        mig_key = 'yver149_risk2_default_migrated'
+        if str(_autotrade_config_get(mig_key, '') or '').strip() == '1':
+            return
+        cur_raw = _autotrade_config_get(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, None)
+        try:
+            cur = float(cur_raw) if cur_raw not in (None, '') else 0.0
+        except Exception:
+            cur = 0.0
+        if cur <= 0.0 or abs(cur - 1.0) < 1e-9:
+            _autotrade_config_set(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, 2.0)
+        _autotrade_config_set(mig_key, '1')
+    except Exception:
+        pass
+
+try:
+    _yver149_apply_owner_risk2_default_once()
+except Exception:
+    pass
+
+
+def _yver149_float(v, default=0.0) -> float:
+    try:
+        if v in (None, ''):
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _yver149_int(v, default=0) -> int:
+    try:
+        if v in (None, ''):
+            return int(default)
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+
+def _yver149_dynamic_risk_tier(uid: int, setup, session_name: str, base_info: dict) -> dict:
+    """Return the v149 final dynamic-risk tier decision.
+
+    The tier is intentionally conservative:
+    - Use /setup_matrix policy state as the source-of-truth current WR/C.
+    - Use the exact 7d lane edge from the original dynamic-risk scorer as a fresh
+      evidence check when available.
+    - Use the lower of current WR/C and exact 7d WR for boost eligibility when both
+      are available, so a stale/high current lane or stale/high 7d lane cannot alone
+      oversize the trade.
+    """
+    try:
+        info = dict(base_info or {})
+        min_mult, max_mult, low_score, base_score, high_score = _autotrade_dynamic_risk_bounds()
+        high_mult = max(1.0, float(max_mult or 1.0))
+        mid_mult = min(high_mult, 1.0 + ((high_mult - 1.0) * 0.50))
+
+        # Current /setup_matrix policy state for the exact family-session-strategy-side lane.
+        state = {}
+        try:
+            state = dict(_setup_matrix_policy_source_state_for_setup(setup, session_name=session_name, user_id=int(uid or 0)) or {})
+        except Exception:
+            state = {}
+        current_policy = str(state.get('policy') or '').upper().strip()
+        current_wr = _yver149_float(state.get('wr'), 0.0)
+        current_avg = _yver149_float(state.get('avg_r'), 0.0)
+        current_dec = _yver149_int(state.get('decided') or state.get('setups'), 0)
+        current_combo = str(state.get('combo') or '').upper().strip()
+
+        # Fresh exact-lane evidence already calculated by the original scorer.
+        edge_wr = _yver149_float(info.get('edge_wr'), 0.0)
+        edge_avg = _yver149_float(info.get('edge_avg_r'), 0.0)
+        edge_dec = _yver149_int(info.get('edge_decided'), 0)
+
+        # Setup quality/context factors.
+        conf = _yver149_int(_autotrade_setup_attr(setup, 'conf', 0), 0)
+        rr = _yver149_float(_autotrade_setup_rr(setup), 0.0)
+        vol_usd = _yver149_float(_autotrade_setup_attr(setup, 'fut_vol_usd', 0.0), 0.0)
+        vol_m = vol_usd / 1_000_000.0 if vol_usd > 0 else 0.0
+
+        # If one of the WR sources is missing, use the available one. If both exist,
+        # use the lower value for boost eligibility.
+        wr_candidates = [x for x in (current_wr, edge_wr) if x > 0]
+        avg_candidates = [x for x in (current_avg, edge_avg) if x != 0]
+        effective_wr = min(wr_candidates) if len(wr_candidates) >= 2 else (wr_candidates[0] if wr_candidates else 0.0)
+        effective_avg = min(avg_candidates) if len(avg_candidates) >= 2 else (avg_candidates[0] if avg_candidates else 0.0)
+        effective_dec = min([x for x in (current_dec, edge_dec) if x > 0]) if current_dec > 0 and edge_dec > 0 else max(current_dec, edge_dec)
+
+        try:
+            min_dec = max(1, int(_autotrade_strict_keep_edge_min_decided()))
+        except Exception:
+            min_dec = 3
+        try:
+            min_wr = float(_autotrade_strict_keep_edge_min_wr())
+        except Exception:
+            min_wr = 49.0
+        try:
+            min_avg = float(_autotrade_strict_keep_edge_min_avgr())
+        except Exception:
+            min_avg = 0.05
+
+        reason = []
+        mult = 1.0
+        tier = 'base_1.00x'
+
+        base_ok = (
+            current_policy == 'KEEP'
+            and effective_dec >= int(min_dec)
+            and effective_wr >= float(min_wr)
+            and effective_avg >= float(min_avg)
+            and rr >= 1.45
+            and (vol_m <= 0 or vol_m >= 10.0)
+        )
+        if not base_ok:
+            reason.append(
+                f"v149:no_boost policy={current_policy or '-'} effWR={effective_wr:.1f}% "
+                f"AvgR={effective_avg:+.2f} n={effective_dec} conf={conf} RR={rr:.2f} vol={vol_m:.0f}M"
+            )
+        else:
+            # Max boost is reserved for very strong, repeated, profitable lanes.
+            if effective_wr >= 70.0 and effective_avg >= 0.25 and effective_dec >= max(5, int(min_dec)) and conf >= 80:
+                mult = float(high_mult)
+                tier = f'max_{high_mult:.2f}x'
+            # Mid boost for strong positive edge, but not full max.
+            elif effective_wr >= 60.0 and effective_avg >= 0.10 and effective_dec >= max(5, int(min_dec)) and conf >= 78:
+                mult = float(mid_mult)
+                tier = f'mid_{mid_mult:.2f}x'
+            else:
+                mult = 1.0
+                tier = 'base_1.00x'
+            reason.append(
+                f"v149:{tier} currentWR={current_wr:.1f}% edgeWR={edge_wr:.1f}% "
+                f"effWR={effective_wr:.1f}% AvgR={effective_avg:+.2f} n={effective_dec} "
+                f"conf={conf} RR={rr:.2f} vol={vol_m:.0f}M combo={current_combo or '-'}"
+            )
+
+        # Keep score user-facing and aligned with the multiplier. The raw composite
+        # remains available in original_score/original_unclamped_score for diagnostics.
+        if mult >= high_mult and high_mult > 1.0:
+            tier_score = float(high_score)
+        elif mult > 1.0:
+            tier_score = float((base_score + high_score) / 2.0)
+        else:
+            tier_score = float(base_score)
+
+        return {
+            'multiplier': float(_clamp(mult, 1.0, high_mult)),
+            'tier': tier,
+            'tier_score': float(tier_score),
+            'reason': reason,
+            'current_policy': current_policy,
+            'current_combo': current_combo,
+            'current_wr': float(current_wr),
+            'current_avg_r': float(current_avg),
+            'current_decided': int(current_dec),
+            'effective_wr': float(effective_wr),
+            'effective_avg_r': float(effective_avg),
+            'effective_decided': int(effective_dec),
+            'conf': int(conf),
+            'rr': float(rr),
+            'volume_m': float(vol_m),
+        }
+    except Exception as exc:
+        return {'multiplier': 1.0, 'tier': 'base_1.00x_error', 'tier_score': 60.0, 'reason': [f'v149_tier_error:{type(exc).__name__}']}
+
+
+def _autotrade_dynamic_risk_score(uid: int, setup, session_name: str = '', regime: str = 'UNKNOWN') -> dict:
+    """v149 final dynamic risk rule.
+
+    Dynamic risk remains a multiplier on the configured base risk. The multiplier
+    is selected by WR/AvgR evidence first, then confirmed by confidence/RR/volume.
+    The composite score remains diagnostic only.
+    """
+    if callable(_YVER149_ORIG_AUTOTRADE_DYNAMIC_RISK_SCORE):
+        info = dict(_YVER149_ORIG_AUTOTRADE_DYNAMIC_RISK_SCORE(uid=int(uid or 0), setup=setup, session_name=session_name, regime=regime) or {})
+    else:
+        info = {'enabled': bool(_autotrade_dynamic_risk_enabled()), 'score': 60.0, 'multiplier': 1.0, 'components': []}
+    try:
+        if not bool(info.get('enabled', True)):
+            return info
+        original_score = _yver149_float(info.get('score'), 0.0)
+        tier = _yver149_dynamic_risk_tier(int(uid or 0), setup, session_name, info)
+        comps = list(info.get('components') or [])
+        comps.append(str((tier.get('reason') or ['v149:base_1.00x'])[0]))
+        info['original_dynamic_risk_score'] = float(original_score)
+        info['score'] = float(tier.get('tier_score') or original_score or 60.0)
+        info['multiplier'] = float(tier.get('multiplier') or 1.0)
+        info['edge_target_mult'] = float(tier.get('multiplier') or 1.0)
+        info['v149_tier'] = str(tier.get('tier') or 'base_1.00x')
+        info['v149_current_policy'] = str(tier.get('current_policy') or '')
+        info['v149_current_combo'] = str(tier.get('current_combo') or '')
+        info['v149_current_wr'] = float(tier.get('current_wr') or 0.0)
+        info['v149_current_avg_r'] = float(tier.get('current_avg_r') or 0.0)
+        info['v149_current_decided'] = int(tier.get('current_decided') or 0)
+        info['v149_effective_wr'] = float(tier.get('effective_wr') or 0.0)
+        info['v149_effective_avg_r'] = float(tier.get('effective_avg_r') or 0.0)
+        info['v149_effective_decided'] = int(tier.get('effective_decided') or 0)
+        info['components'] = comps[:24]
+        return info
+    except Exception as exc:
+        info['components'] = list(info.get('components') or [])[:20] + [f'v149_dynamic_risk_error:{type(exc).__name__}']
+        info['multiplier'] = 1.0
+        return info
+
+# Make v149 dynamic risk evidence visible to /autotrade_last/debug detail payloads.
+try:
+    _YVER149_ORIG_AUTOTRADE_EFFECTIVE_RISK_USD = _autotrade_effective_risk_usd
+except Exception:
+    _YVER149_ORIG_AUTOTRADE_EFFECTIVE_RISK_USD = None
+
+
+def _autotrade_effective_risk_usd(uid: int, setup, equity: float, base_risk_usd: float, remaining_risk_usd: float, open_risk_usd: float, daily_cap_usd: float, session_name: str = '') -> tuple[float, float, str]:
+    if callable(_YVER149_ORIG_AUTOTRADE_EFFECTIVE_RISK_USD):
+        res = _YVER149_ORIG_AUTOTRADE_EFFECTIVE_RISK_USD(uid, setup, equity, base_risk_usd, remaining_risk_usd, open_risk_usd, daily_cap_usd, session_name=session_name)
+    else:
+        res = (max(0.0, float(base_risk_usd or 0.0)), 1.0, 'UNKNOWN')
+    try:
+        # Recompute detail only for explanation fields; risk amount already uses the
+        # wrapped scorer through the original effective-risk function above.
+        det = _autotrade_dynamic_risk_score(uid=int(uid or 0), setup=setup, session_name=session_name, regime=str(res[2] if len(res) > 2 else 'UNKNOWN'))
+        _LAST_AUTOTRADE_DETAIL.setdefault(int(uid), {})
+        _LAST_AUTOTRADE_DETAIL[int(uid)].update({
+            'v149_dynamic_risk_rule': '1.00x base unless current KEEP lane and exact evidence pass; 1.25x for WR>=60% AvgR>=+0.10 n>=5 conf>=78; 1.50x for WR>=70% AvgR>=+0.25 n>=5 conf>=80; no boost if current Policy is not KEEP',
+            'v149_dynamic_risk_tier': str(det.get('v149_tier') or ''),
+            'v149_dynamic_risk_current_combo': str(det.get('v149_current_combo') or ''),
+            'v149_dynamic_risk_current_wr': float(det.get('v149_current_wr') or 0.0),
+            'v149_dynamic_risk_current_avg_r': float(det.get('v149_current_avg_r') or 0.0),
+            'v149_dynamic_risk_effective_wr': float(det.get('v149_effective_wr') or 0.0),
+            'v149_dynamic_risk_effective_avg_r': float(det.get('v149_effective_avg_r') or 0.0),
+            'v149_dynamic_risk_effective_decided': int(det.get('v149_effective_decided') or 0),
+        })
+    except Exception:
+        pass
+    return res
+
+# Runtime summary should keep showing the owner default immediately after restart.
+try:
+    _YVER149_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT = _autotrade_runtime_summary_dict
+except Exception:
+    _YVER149_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT = None
+
+
+def _autotrade_runtime_summary_dict() -> dict:
+    try:
+        _yver149_apply_owner_risk2_default_once()
+    except Exception:
+        pass
+    d = dict(_YVER149_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT() or {}) if callable(_YVER149_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT) else {}
+    try:
+        d['AUTOTRADE_RISK_PER_TRADE_PCT'] = float(_autotrade_config_get(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, 2.0) or 2.0)
+    except Exception:
+        d['AUTOTRADE_RISK_PER_TRADE_PCT'] = 2.0
+    return d
+
+try:
+    ADMIN_REPORT_CACHE_VERSION = str(globals().get('ADMIN_REPORT_CACHE_VERSION', '')) + ':v149_dynrisk'
+    SETUP_AUDIT_CACHE_VERSION = str(globals().get('SETUP_AUDIT_CACHE_VERSION', '')) + ':v149_dynrisk'
+    _autotrade_config_set('yver149_version', YVER149_VERSION)
+except Exception:
+    pass
+try:
+    logger.debug('yver149 loaded: dynamic risk WR-tier hardening, risk default 2pct retained')
+except Exception:
+    pass
+# =========================================================
+# end yver149
+# =========================================================
+
 if __name__ == "__main__":
     main()
