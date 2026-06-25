@@ -88629,5 +88629,101 @@ except Exception:
 # end yver148
 # =========================================================
 
+
+# =========================================================
+# yver150 — 2026-06-25 rollback-to-v148 speed-safe dynamic risk sync
+# =========================================================
+# - Built from yver148, not yver149, to remove the v149 lag source.
+# - Does NOT wrap _autotrade_dynamic_risk_score and does NOT call /setup_matrix
+#   policy lookups inside every AutoTrade sizing attempt.
+# - Keeps v148's existing lightweight dynamic-risk rule: exact-lane edge evidence
+#   from the setup edge guard controls the multiplier.
+# - Ensures owner default risk/trade is 2.00% and dynamic risk range is ON at
+#   1.00x-1.50x, without changing TP/SL, entry, leverage, setup generation,
+#   F8/F9 thresholds, blackout, email delivery, or Bybit order placement.
+YVER150_VERSION = 'yver150_2026_06_25_v148_speed_safe_dynamic_risk_sync'
+
+
+def _yver150_float(v, default=0.0) -> float:
+    try:
+        if v is None or str(v).strip() == '':
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _yver150_apply_speed_safe_risk_defaults_once() -> None:
+    """Apply only cheap config defaults; do not add per-candidate DB/report work.
+
+    Dynamic risk remains the existing v148/v81 lane-WR tier model:
+      - base risk for pass/min edge
+      - mid multiplier when exact lane WR >= 60% and AvgR passes the strict edge floor
+      - max multiplier when exact lane WR >= 70% and AvgR passes the strict edge floor
+    """
+    try:
+        mig_key = 'yver150_speed_safe_risk_defaults_migrated'
+        if str(_autotrade_config_get(mig_key, '') or '').strip() == '1':
+            return
+
+        # Owner default: 2% base risk. Do not overwrite a later intentional non-1% edit.
+        cur_risk = _yver150_float(_autotrade_config_get(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, None), 0.0)
+        if cur_risk <= 0.0 or abs(cur_risk - 1.0) < 1e-9:
+            _autotrade_config_set(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, 2.0)
+
+        # Owner requested dynamic range: 1.00x to 1.50x. This is just config sync;
+        # the existing v148 scorer already uses exact lane WR/AvgR tiers.
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_ENABLED_KEY, 1)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, 1.0)
+        _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.5)
+
+        # Keep the existing score thresholds visible/compatible. They are diagnostic
+        # because the multiplier is ultimately forced by exact lane WR tiers in v148.
+        if _autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY, None) in (None, ''):
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_LOW_SCORE_KEY, 55.0)
+        if _autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY, None) in (None, ''):
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_BASE_SCORE_KEY, 60.0)
+        if _autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, None) in (None, ''):
+            _autotrade_config_set(AUTOTRADE_CFG_DYNAMIC_RISK_HIGH_SCORE_KEY, 70.0)
+
+        _autotrade_config_set(mig_key, '1')
+        _autotrade_config_set('yver150_version', YVER150_VERSION)
+    except Exception:
+        pass
+
+try:
+    _yver150_apply_speed_safe_risk_defaults_once()
+except Exception:
+    pass
+
+try:
+    _YVER150_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT = _autotrade_runtime_summary_dict
+except Exception:
+    _YVER150_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT = None
+
+
+def _autotrade_runtime_summary_dict() -> dict:
+    try:
+        _yver150_apply_speed_safe_risk_defaults_once()
+    except Exception:
+        pass
+    d = dict(_YVER150_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT() or {}) if callable(_YVER150_ORIG_AUTOTRADE_RUNTIME_SUMMARY_DICT) else {}
+    try:
+        d['AUTOTRADE_RISK_PER_TRADE_PCT'] = float(_autotrade_config_get(AUTOTRADE_CFG_RISK_PER_TRADE_PCT_KEY, 2.0) or 2.0)
+        d['AUTOTRADE_DYNAMIC_RISK_ENABLED'] = True
+        d['AUTOTRADE_DYNAMIC_RISK_MIN_MULT'] = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MIN_MULT_KEY, 1.0) or 1.0)
+        d['AUTOTRADE_DYNAMIC_RISK_MAX_MULT'] = float(_autotrade_config_get(AUTOTRADE_CFG_DYNAMIC_RISK_MAX_MULT_KEY, 1.5) or 1.5)
+    except Exception:
+        pass
+    return d
+
+try:
+    logger.debug('yver150 loaded: v148 base restored; no v149 heavy per-candidate policy lookup; dynamic risk 1.00x-1.50x synced')
+except Exception:
+    pass
+# =========================================================
+# end yver150
+# =========================================================
+
 if __name__ == "__main__":
     main()
