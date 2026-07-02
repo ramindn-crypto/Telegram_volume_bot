@@ -26,7 +26,7 @@ services:
         sync: false
 
       - key: EMAIL_ENABLED
-        value: "false"
+        value: "true"
       - key: EMAIL_HOST
         sync: false
       - key: EMAIL_PORT
